@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a2332"/>
+      <stop offset="100%" stop-color="#0d1117"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#sky)"/>
+  <rect x="0" y="480" width="1280" height="240" fill="#1e293b"/>
+  <rect x="0" y="478" width="1280" height="4" fill="#fbbf24" opacity="0.6"/>
+  <rect x="200" y="300" width="180" height="120" rx="8" fill="#334155" opacity="0.9"/>
+  <rect x="420" y="320" width="160" height="100" rx="6" fill="#475569"/>
+  <rect x="700" y="310" width="200" height="110" rx="8" fill="#334155"/>
+  <rect x="950" y="340" width="140" height="80" rx="6" fill="#475569"/>
+  <rect x="620" y="80" width="40" height="120" fill="#374151"/>
+  <circle cx="640" cy="70" r="18" fill="#ef4444" opacity="0.9"/>
+  <circle cx="640" cy="110" r="18" fill="#eab308" opacity="0.5"/>
+  <circle cx="640" cy="150" r="18" fill="#22c55e" opacity="0.5"/>
+  <text x="640" y="400" text-anchor="middle" fill="#64748b" font-family="monospace" font-size="14">CCTV FEED  MAIN STREET INTERSECTION</text>
+  <text x="20" y="30" fill="#94a3b8" font-family="monospace" font-size="12">CAM-01 | 1920x1080 | REC</text>
+  <circle cx="1240" cy="20" r="8" fill="#ef4444">
+    <animate attributeName="opacity" values="1;0.3;1" dur="1.5s" repeatCount="indefinite"/>
+  </circle>
+</svg>

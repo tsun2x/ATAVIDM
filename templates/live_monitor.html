@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+
+{% block title %}Live Monitor{% endblock %}
+{% block page_title %}Live Monitor{% endblock %}
+{% block page_subtitle %}Real-time CCTV feed simulation with AI detection overlays{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Main Feed -->
+    <div class="col-lg-8">
+        <div class="card card-panel">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="live-indicator"><span class="pulse"></span> LIVE</span>
+                    <h5 class="card-title mb-0" id="activeCameraName">{{ default_camera.name }}</h5>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <span class="badge bg-dark" id="feedFps">{{ default_camera.fps }} FPS</span>
+                    <span class="badge bg-success-subtle text-success" id="feedStatus">Online</span>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="cctv-feed-container" id="cctvFeed">
+                    <img src="{{ url_for('static', filename='images/' + default_camera.feed_image) }}"
+                         alt="CCTV Feed" class="cctv-feed-image" id="feedImage">
+                    <div class="detection-overlay" id="detectionOverlay">
+                        {% for box in detection_boxes %}
+                        <div class="detection-box"
+                             data-label="{{ box.label }}"
+                             style="left: {{ box.x }}%; top: {{ box.y }}%; width: {{ box.w }}%; height: {{ box.h }}%;">
+                            <span class="detection-label">{{ box.label }} {{ (box.confidence * 100)|int }}%</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <div class="feed-timestamp" id="feedTimestamp"></div>
+                </div>
+            </div>
+            <div class="card-footer d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <div class="btn-group" role="group">
+                    <button class="btn btn-sm btn-outline-secondary" id="btnSnapshot"><i class="bi bi-camera me-1"></i> Snapshot</button>
+                    <button class="btn btn-sm btn-outline-secondary" id="btnRecord"><i class="bi bi-record-circle me-1"></i> Record</button>
+                    <button class="btn btn-sm btn-outline-secondary" id="btnFullscreen"><i class="bi bi-fullscreen me-1"></i> Fullscreen</button>
+                </div>
+                <span class="text-muted small" id="feedLocation">{{ default_camera.location }}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sidebar Panel -->
+    <div class="col-lg-4">
+        <!-- Camera Selector -->
+        <div class="card card-panel mb-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-camera-reels me-2"></i>Camera Sectors</h5>
+            </div>
+            <div class="card-body p-0">
+                <div class="camera-list" id="cameraList">
+                    {% for cam in cameras %}
+                    <button class="camera-item {% if cam.id == default_camera.id %}active{% endif %}"
+                            data-camera-id="{{ cam.id }}"
+                            data-camera-name="{{ cam.name }}"
+                            data-camera-location="{{ cam.location }}"
+                            data-camera-status="{{ cam.status }}"
+                            data-camera-fps="{{ cam.fps }}"
+                            data-camera-feed="{{ cam.feed_image }}">
+                        <div class="camera-thumb">
+                            <img src="{{ url_for('static', filename='images/camera_thumb.svg') }}" alt="">
+                            {% if cam.status == 'online' %}
+                            <span class="cam-status-dot online"></span>
+                            {% else %}
+                            <span class="cam-status-dot offline"></span>
+                            {% endif %}
+                        </div>
+                        <div class="camera-info">
+                            <span class="camera-name">{{ cam.name }}</span>
+                            <span class="camera-location">{{ cam.location }}</span>
+                        </div>
+                        <i class="bi bi-chevron-right"></i>
+                    </button>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Detections -->
+        <div class="card card-panel mb-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-bounding-box me-2"></i>Active Detections</h5>
+            </div>
+            <div class="card-body">
+                <div id="activeDetections">
+                    {% for box in detection_boxes %}
+                    <div class="detection-item">
+                        <span class="detection-type">{{ box.label }}</span>
+                        <span class="confidence-badge confidence-{% if box.confidence >= 0.9 %}high{% elif box.confidence >= 0.8 %}medium{% else %}low{% endif %}">
+                            {{ (box.confidence * 100)|int }}%
+                        </span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Alert Feed -->
+        <div class="card card-panel">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-bell me-2"></i>Violation Alerts</h5>
+                <button class="btn btn-sm btn-link" id="clearAlerts">Clear</button>
+            </div>
+            <div class="card-body p-0">
+                <div class="alert-feed" id="alertFeed">
+                    <div class="alert-feed-item alert-critical">
+                        <div class="alert-icon"><i class="bi bi-exclamation-octagon"></i></div>
+                        <div class="alert-content">
+                            <strong>Red Light Violation</strong>
+                            <span>ABC 456 XY detected</span>
+                            <small>Just now · 98% confidence</small>
+                        </div>
+                    </div>
+                    <div class="alert-feed-item alert-warning">
+                        <div class="alert-icon"><i class="bi bi-speedometer2"></i></div>
+                        <div class="alert-content">
+                            <strong>Speeding</strong>
+                            <span>TAV 789 AB · 72 km/h</span>
+                            <small>2 min ago · 91% confidence</small>
+                        </div>
+                    </div>
+                    <div class="alert-feed-item alert-info">
+                        <div class="alert-icon"><i class="bi bi-sign-stop"></i></div>
+                        <div class="alert-content">
+                            <strong>Wrong Lane</strong>
+                            <span>PHL 234 CD detected</span>
+                            <small>5 min ago · 85% confidence</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>
+{% endblock %}

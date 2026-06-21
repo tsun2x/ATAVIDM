@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+
+{% block title %}Violations{% endblock %}
+{% block page_title %}Violations{% endblock %}
+{% block page_subtitle %}Search, filter, and manage detected traffic violations{% endblock %}
+
+{% block content %}
+<!-- Search & Filters -->
+<div class="card card-panel mb-4">
+    <div class="card-body">
+        <div class="row g-3 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label" for="searchInput">Search</label>
+                <div class="input-group">
+                    <span class="input-group-text"><i class="bi bi-search"></i></span>
+                    <input type="text" class="form-control" id="searchInput" placeholder="ID, plate, camera...">
+                </div>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label" for="filterType">Violation Type</label>
+                <select class="form-select" id="filterType">
+                    <option value="">All Types</option>
+                    {% for t in violation_types %}
+                    <option value="{{ t }}">{{ t }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label" for="filterCamera">Camera</label>
+                <select class="form-select" id="filterCamera">
+                    <option value="">All Cameras</option>
+                    {% for cam in cameras %}
+                    <option value="{{ cam.name }}">{{ cam.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label" for="filterStatus">Status</label>
+                <select class="form-select" id="filterStatus">
+                    <option value="">All Statuses</option>
+                    {% for s in statuses %}
+                    <option value="{{ s }}">{{ s }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-2">
+                <button class="btn btn-outline-secondary w-100" id="resetFilters">
+                    <i class="bi bi-arrow-counterclockwise me-1"></i> Reset
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Violations Table -->
+<div class="card card-panel">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="card-title mb-0">
+            <i class="bi bi-table me-2"></i>Violation Records
+            <span class="badge bg-primary ms-2" id="resultCount">{{ violations|length }}</span>
+        </h5>
+        <div class="d-flex align-items-center gap-2">
+            <label class="form-label mb-0 small text-muted" for="pageSize">Show</label>
+            <select class="form-select form-select-sm" id="pageSize" style="width: auto;">
+                <option value="10">10</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+            </select>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 align-middle" id="violationsTable">
+                <thead>
+                    <tr>
+                        <th class="sortable" data-sort="id">ID <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="type">Type <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="plate">Plate <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="camera">Camera <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="timestamp">Timestamp <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="confidence">Confidence <i class="bi bi-arrow-down-up"></i></th>
+                        <th class="sortable" data-sort="status">Status <i class="bi bi-arrow-down-up"></i></th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="violationsBody">
+                    {% for v in violations %}
+                    <tr data-violation='{{ v | tojson }}'>
+                        <td><code>{{ v.id }}</code></td>
+                        <td>{{ v.type }}</td>
+                        <td><span class="plate-badge">{{ v.plate }}</span></td>
+                        <td>{{ v.camera_name }}</td>
+                        <td data-value="{{ v.timestamp_iso }}">{{ v.timestamp }}</td>
+                        <td data-value="{{ v.confidence }}">
+                            <span class="confidence-badge confidence-{% if v.confidence >= 0.9 %}high{% elif v.confidence >= 0.8 %}medium{% else %}low{% endif %}">
+                                {{ (v.confidence * 100)|int }}%
+                            </span>
+                        </td>
+                        <td><span class="badge status-badge status-{{ v.status|lower }}">{{ v.status }}</span></td>
+                        <td>
+                            <div class="btn-group btn-group-sm">
+                                <button class="btn btn-outline-primary btn-view-detail" title="View Details">
+                                    <i class="bi bi-eye"></i>
+                                </button>
+                                <button class="btn btn-outline-secondary btn-view-evidence" title="View Evidence">
+                                    <i class="bi bi-image"></i>
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card-footer d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <span class="text-muted small" id="paginationInfo">Showing 1–10 of {{ violations|length }}</span>
+        <nav>
+            <ul class="pagination pagination-sm mb-0" id="pagination"></ul>
+        </nav>
+    </div>
+</div>
+
+<!-- Detail Modal -->
+<div class="modal fade" id="detailModal" tabindex="-1" aria-labelledby="detailModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="detailModalLabel"><i class="bi bi-info-circle me-2"></i>Violation Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="detailModalBody"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="btnViewEvidenceFromDetail">
+                    <i class="bi bi-image me-1"></i> View Evidence
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Evidence Modal -->
+<div class="modal fade" id="evidenceModal" tabindex="-1" aria-labelledby="evidenceModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="evidenceModalLabel"><i class="bi bi-image me-2"></i>Evidence Capture</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body text-center" id="evidenceModalBody"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="btnDownloadEvidence">
+                    <i class="bi bi-download me-1"></i> Download (Demo)
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    window.TAVIDM_VIOLATIONS = {{ violations | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/violations.js') }}"></script>
+{% endblock %}

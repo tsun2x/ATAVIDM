@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+
+{% block title %}Reports{% endblock %}
+{% block page_title %}Reports{% endblock %}
+{% block page_subtitle %}Generate and download violation reports{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Report Generator -->
+    <div class="col-lg-4">
+        <div class="card card-panel">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-sliders me-2"></i>Report Generator</h5>
+            </div>
+            <div class="card-body">
+                <form id="reportForm">
+                    <div class="mb-3">
+                        <label class="form-label" for="reportName">Report Name</label>
+                        <input type="text" class="form-control" id="reportName" value="Violation Summary Report" placeholder="Enter report name">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Date Range</label>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <input type="date" class="form-control" id="dateFrom" value="2025-06-01">
+                            </div>
+                            <div class="col-6">
+                                <input type="date" class="form-control" id="dateTo" value="2025-06-21">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="reportViolationType">Violation Type</label>
+                        <select class="form-select" id="reportViolationType">
+                            <option value="">All Types</option>
+                            {% for t in violation_types %}
+                            <option value="{{ t }}">{{ t }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Include Sections</label>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="includeSummary" checked>
+                            <label class="form-check-label" for="includeSummary">Executive Summary</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="includeCharts" checked>
+                            <label class="form-check-label" for="includeCharts">Charts & Graphs</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="includeEvidence">
+                            <label class="form-check-label" for="includeEvidence">Evidence Images</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="includeRaw" checked>
+                            <label class="form-check-label" for="includeRaw">Raw Data Table</label>
+                        </div>
+                    </div>
+                    <div class="d-grid gap-2">
+                        <button type="button" class="btn btn-danger" id="btnGeneratePdf">
+                            <i class="bi bi-file-earmark-pdf me-2"></i>Generate PDF
+                        </button>
+                        <button type="button" class="btn btn-success" id="btnGenerateExcel">
+                            <i class="bi bi-file-earmark-excel me-2"></i>Generate Excel
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Quick Stats -->
+        <div class="card card-panel mt-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-info-circle me-2"></i>Report Preview</h5>
+            </div>
+            <div class="card-body">
+                <ul class="list-unstyled report-preview-list mb-0">
+                    <li><span>Estimated Records</span><strong id="previewRecords">48</strong></li>
+                    <li><span>Date Range</span><strong id="previewRange">Jun 1 – Jun 21, 2025</strong></li>
+                    <li><span>Format</span><strong id="previewFormat">—</strong></li>
+                    <li><span>Est. File Size</span><strong id="previewSize">—</strong></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Download History -->
+    <div class="col-lg-8">
+        <div class="card card-panel">
+            <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Download History</h5>
+                <button class="btn btn-sm btn-outline-secondary" id="btnRefreshHistory">
+                    <i class="bi bi-arrow-clockwise me-1"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle" id="historyTable">
+                        <thead>
+                            <tr>
+                                <th>Report ID</th>
+                                <th>Name</th>
+                                <th>Type</th>
+                                <th>Date Generated</th>
+                                <th>Size</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="historyBody">
+                            {% for r in report_history %}
+                            <tr>
+                                <td><code>{{ r.id }}</code></td>
+                                <td>{{ r.name }}</td>
+                                <td>
+                                    {% if r.type == 'PDF' %}
+                                    <span class="badge bg-danger-subtle text-danger"><i class="bi bi-file-earmark-pdf me-1"></i>PDF</span>
+                                    {% else %}
+                                    <span class="badge bg-success-subtle text-success"><i class="bi bi-file-earmark-excel me-1"></i>Excel</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ r.date }}</td>
+                                <td>{{ r.size }}</td>
+                                <td>
+                                    {% if r.status == 'Ready' %}
+                                    <span class="badge bg-success-subtle text-success">{{ r.status }}</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary-subtle text-secondary">{{ r.status }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-primary btn-download-report"
+                                            data-report-id="{{ r.id }}"
+                                            data-report-name="{{ r.name }}"
+                                            {% if r.status != 'Ready' %}disabled{% endif %}>
+                                        <i class="bi bi-download"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/reports.js') }}"></script>
+{% endblock %}

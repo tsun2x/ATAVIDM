@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+
+{% block title %}Settings{% endblock %}
+{% block page_title %}Settings{% endblock %}
+{% block page_subtitle %}System configuration, cameras, and user management{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Camera Configuration -->
+    <div class="col-lg-6">
+        <div class="card card-panel">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-camera-video me-2"></i>Camera Sectors</h5>
+                <button class="btn btn-sm btn-primary" id="btnAddCamera">
+                    <i class="bi bi-plus-lg me-1"></i> Add Camera
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Location</th>
+                                <th>Status</th>
+                                <th>FPS</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for cam in cameras %}
+                            <tr>
+                                <td><code>{{ cam.id }}</code></td>
+                                <td>{{ cam.name }}</td>
+                                <td>{{ cam.location }}</td>
+                                <td>
+                                    {% if cam.status == 'online' %}
+                                    <span class="badge bg-success-subtle text-success">Online</span>
+                                    {% else %}
+                                    <span class="badge bg-danger-subtle text-danger">Offline</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ cam.fps }}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-secondary btn-edit-camera" data-camera-id="{{ cam.id }}">
+                                        <i class="bi bi-pencil"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detection Thresholds -->
+        <div class="card card-panel mt-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection Thresholds</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-4">
+                    <div class="d-flex justify-content-between mb-1">
+                        <label class="form-label mb-0" for="confidenceThreshold">Confidence Threshold</label>
+                        <span class="threshold-value" id="confidenceValue">{{ settings.confidence_threshold }}%</span>
+                    </div>
+                    <input type="range" class="form-range" id="confidenceThreshold"
+                           min="50" max="99" value="{{ settings.confidence_threshold }}">
+                    <small class="text-muted">Minimum AI confidence to flag a violation</small>
+                </div>
+                <div class="mb-4">
+                    <div class="d-flex justify-content-between mb-1">
+                        <label class="form-label mb-0" for="speedThreshold">Speed Limit (km/h)</label>
+                        <span class="threshold-value" id="speedValue">{{ settings.speed_threshold }} km/h</span>
+                    </div>
+                    <input type="range" class="form-range" id="speedThreshold"
+                           min="30" max="120" value="{{ settings.speed_threshold }}">
+                </div>
+                <div class="mb-4">
+                    <div class="d-flex justify-content-between mb-1">
+                        <label class="form-label mb-0" for="redLightSensitivity">Red Light Sensitivity</label>
+                        <span class="threshold-value" id="redLightValue">{{ settings.red_light_sensitivity }}%</span>
+                    </div>
+                    <input type="range" class="form-range" id="redLightSensitivity"
+                           min="50" max="100" value="{{ settings.red_light_sensitivity }}">
+                </div>
+                <div class="form-check form-switch mb-2">
+                    <input class="form-check-input" type="checkbox" id="helmetDetection" {% if settings.helmet_detection %}checked{% endif %}>
+                    <label class="form-check-label" for="helmetDetection">Enable Helmet Detection</label>
+                </div>
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="nightModeEnhance" {% if settings.night_mode_enhance %}checked{% endif %}>
+                    <label class="form-check-label" for="nightModeEnhance">Night Mode Enhancement</label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- User Management & Preferences -->
+    <div class="col-lg-6">
+        <!-- User Management -->
+        <div class="card card-panel">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-people me-2"></i>User Management</h5>
+                <button class="btn btn-sm btn-primary" id="btnAddUser">
+                    <i class="bi bi-person-plus me-1"></i> Add User
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Email</th>
+                                <th>Role</th>
+                                <th>Status</th>
+                                <th>Last Login</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for user in users %}
+                            <tr>
+                                <td>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <div class="user-avatar-sm">{{ user.name[:2]|upper }}</div>
+                                        {{ user.name }}
+                                    </div>
+                                </td>
+                                <td>{{ user.email }}</td>
+                                <td><span class="badge bg-primary-subtle text-primary">{{ user.role }}</span></td>
+                                <td>
+                                    {% if user.status == 'Active' %}
+                                    <span class="badge bg-success-subtle text-success">{{ user.status }}</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary-subtle text-secondary">{{ user.status }}</span>
+                                    {% endif %}
+                                </td>
+                                <td class="small">{{ user.last_login }}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-secondary btn-edit-user" data-user-id="{{ user.id }}">
+                                        <i class="bi bi-pencil"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Preferences -->
+        <div class="card card-panel mt-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-gear me-2"></i>System Preferences</h5>
+            </div>
+            <div class="card-body">
+                <form id="settingsForm">
+                    <div class="mb-3">
+                        <label class="form-label" for="siteName">Site Name</label>
+                        <input type="text" class="form-control" id="siteName" value="{{ settings.site_name }}">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="timezone">Timezone</label>
+                        <select class="form-select" id="timezone">
+                            <option value="Asia/Manila" {% if settings.timezone == 'Asia/Manila' %}selected{% endif %}>Asia/Manila (UTC+8)</option>
+                            <option value="Asia/Singapore">Asia/Singapore (UTC+8)</option>
+                            <option value="UTC">UTC</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="retentionDays">Data Retention (days)</label>
+                        <input type="number" class="form-control" id="retentionDays" value="{{ settings.retention_days }}" min="30" max="365">
+                    </div>
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="alertSound" {% if settings.alert_sound %}checked{% endif %}>
+                        <label class="form-check-label" for="alertSound">Enable Alert Sound</label>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="autoExport" {% if settings.auto_export %}checked{% endif %}>
+                        <label class="form-check-label" for="autoExport">Auto-export Weekly Reports</label>
+                    </div>
+                    <button type="button" class="btn btn-primary" id="btnSaveSettings">
+                        <i class="bi bi-check-lg me-1"></i> Save Settings
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+{% endblock %}

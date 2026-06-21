@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+
+{% block title %}Analytics{% endblock %}
+{% block page_title %}Analytics{% endblock %}
+{% block page_subtitle %}Violation trends, breakdowns, and performance metrics{% endblock %}
+
+{% block content %}
+<!-- KPI Cards -->
+<div class="row g-4 mb-4">
+    <div class="col-sm-6 col-xl-3">
+        <div class="kpi-card">
+            <div class="kpi-icon bg-primary-subtle text-primary"><i class="bi bi-bar-chart-fill"></i></div>
+            <div>
+                <span class="kpi-label">Total Violations</span>
+                <span class="kpi-value">{{ analytics.kpi.total_violations }}</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="kpi-card">
+            <div class="kpi-icon bg-success-subtle text-success"><i class="bi bi-bullseye"></i></div>
+            <div>
+                <span class="kpi-label">Detection Rate</span>
+                <span class="kpi-value">{{ analytics.kpi.detection_rate }}%</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="kpi-card">
+            <div class="kpi-icon bg-warning-subtle text-warning"><i class="bi bi-stopwatch"></i></div>
+            <div>
+                <span class="kpi-label">Avg. Response Time</span>
+                <span class="kpi-value">{{ analytics.kpi.avg_response_time }}</span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="kpi-card">
+            <div class="kpi-icon bg-info-subtle text-info"><i class="bi bi-check2-circle"></i></div>
+            <div>
+                <span class="kpi-label">Model Accuracy</span>
+                <span class="kpi-value">{{ analytics.kpi.accuracy }}%</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4 mb-4">
+    <!-- Daily Chart -->
+    <div class="col-lg-6">
+        <div class="card card-panel h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-calendar-day me-2"></i>Daily Violations</h5>
+                <span class="badge bg-secondary-subtle text-secondary">This Week</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="dailyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monthly Chart -->
+    <div class="col-lg-6">
+        <div class="card card-panel h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-calendar-month me-2"></i>Monthly Violations</h5>
+                <span class="badge bg-secondary-subtle text-secondary">2025</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="monthlyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4">
+    <!-- Pie Chart -->
+    <div class="col-lg-5">
+        <div class="card card-panel h-100">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-pie-chart me-2"></i>Violation Breakdown</h5>
+            </div>
+            <div class="card-body">
+                <div class="chart-container chart-container-pie">
+                    <canvas id="breakdownChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Summary Table -->
+    <div class="col-lg-7">
+        <div class="card card-panel h-100">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-list-ol me-2"></i>Top Violation Types</h5>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Type</th>
+                                <th>Count</th>
+                                <th>Share</th>
+                                <th>Trend</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for item in violation_summary %}
+                            <tr>
+                                <td>{{ loop.index }}</td>
+                                <td>
+                                    <span class="d-inline-block rounded-circle me-2" style="width:10px;height:10px;background:{{ item.color }};"></span>
+                                    {{ item.type }}
+                                </td>
+                                <td><strong>{{ item.count }}</strong></td>
+                                <td>{{ item.share }}%</td>
+                                <td>
+                                    <span class="{% if item.change >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                        {% if item.change >= 0 %}+{% endif %}{{ item.change }}%
+                                    </span>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+    window.TAVIDM_ANALYTICS = {{ analytics | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/analytics.js') }}"></script>
+{% endblock %}

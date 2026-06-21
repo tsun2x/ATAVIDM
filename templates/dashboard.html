@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+{% block page_subtitle %}Overview of traffic violations and system status{% endblock %}
+
+{% block content %}
+<!-- Stat Cards -->
+<div class="row g-4 mb-4">
+    <div class="col-sm-6 col-xl-3">
+        <div class="stat-card stat-primary">
+            <div class="stat-icon"><i class="bi bi-exclamation-circle"></i></div>
+            <div class="stat-body">
+                <span class="stat-label">Violations Today</span>
+                <span class="stat-value">{{ stats.total_today }}</span>
+                <span class="stat-trend {% if stats.trend_today >= 0 %}trend-up{% else %}trend-down{% endif %}">
+                    <i class="bi bi-arrow-{% if stats.trend_today >= 0 %}up{% else %}down{% endif %}-short"></i>
+                    {{ stats.trend_today|abs }}% vs yesterday
+                </span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="stat-card stat-warning">
+            <div class="stat-icon"><i class="bi bi-calendar-week"></i></div>
+            <div class="stat-body">
+                <span class="stat-label">This Week</span>
+                <span class="stat-value">{{ stats.total_week }}</span>
+                <span class="stat-trend {% if stats.trend_week >= 0 %}trend-up{% else %}trend-down{% endif %}">
+                    <i class="bi bi-arrow-{% if stats.trend_week >= 0 %}up{% else %}down{% endif %}-short"></i>
+                    {{ stats.trend_week|abs }}% vs last week
+                </span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="stat-card stat-success">
+            <div class="stat-icon"><i class="bi bi-camera-video"></i></div>
+            <div class="stat-body">
+                <span class="stat-label">Active Cameras</span>
+                <span class="stat-value">{{ stats.active_cameras }}/{{ stats.total_cameras }}</span>
+                <span class="stat-trend text-muted">
+                    <i class="bi bi-broadcast"></i> Live monitoring
+                </span>
+            </div>
+        </div>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+        <div class="stat-card stat-info">
+            <div class="stat-icon"><i class="bi bi-percent"></i></div>
+            <div class="stat-body">
+                <span class="stat-label">Avg. Confidence</span>
+                <span class="stat-value">{{ stats.avg_confidence }}%</span>
+                <span class="stat-trend text-muted">
+                    <i class="bi bi-hourglass-split"></i> {{ stats.pending_review }} pending review
+                </span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-4 mb-4">
+    <!-- Hourly Chart -->
+    <div class="col-lg-8">
+        <div class="card card-panel h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-graph-up me-2"></i>Hourly Violations</h5>
+                <span class="badge bg-primary-subtle text-primary">Today</span>
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="hourlyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Weekly Chart -->
+    <div class="col-lg-4">
+        <div class="card card-panel h-100">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-bar-chart me-2"></i>Weekly Trend</h5>
+            </div>
+            <div class="card-body">
+                <div class="chart-container">
+                    <canvas id="weeklyChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Violation Summary Cards -->
+<div class="row g-3 mb-4">
+    {% for item in violation_summary %}
+    <div class="col-sm-6 col-lg">
+        <div class="summary-card">
+            <div class="summary-indicator" style="background-color: {{ item.color }};"></div>
+            <div class="summary-content">
+                <span class="summary-type">{{ item.type }}</span>
+                <span class="summary-count">{{ item.count }}</span>
+                <span class="summary-change {% if item.change >= 0 %}text-success{% else %}text-danger{% endif %}">
+                    {% if item.change >= 0 %}+{% endif %}{{ item.change }}%
+                </span>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Recent Violations Table -->
+<div class="card card-panel">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Recent Violations</h5>
+        <a href="{{ url_for('violations') }}" class="btn btn-sm btn-outline-primary">
+            View All <i class="bi bi-arrow-right ms-1"></i>
+        </a>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 align-middle">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Type</th>
+                        <th>Plate</th>
+                        <th>Camera</th>
+                        <th>Time</th>
+                        <th>Confidence</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for v in recent_violations %}
+                    <tr>
+                        <td><code>{{ v.id }}</code></td>
+                        <td>{{ v.type }}</td>
+                        <td><span class="plate-badge">{{ v.plate }}</span></td>
+                        <td>{{ v.camera_name }}</td>
+                        <td>{{ v.timestamp }}</td>
+                        <td>
+                            <div class="confidence-bar-wrap">
+                                <div class="confidence-bar" style="width: {{ (v.confidence * 100)|int }}%;"></div>
+                                <span>{{ (v.confidence * 100)|int }}%</span>
+                            </div>
+                        </td>
+                        <td>
+                            <span class="badge status-badge status-{{ v.status|lower }}">{{ v.status }}</span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+    window.TAVIDM_CHART_DATA = {{ chart_data | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+{% endblock %}
