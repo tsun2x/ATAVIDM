@@ -1,0 +1,41 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+
+# Generated evidence snapshots
+static/evidence/*.jpg
+static/evidence/*.png
+
+# Generated reports
+exports/*
+!exports/.gitkeep
+
+# Model weights
+models/*.pt
+
+# Raw footage
+dataset/raw/*.mp4
+dataset/raw/*.avi
+dataset/raw/*.mov
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
