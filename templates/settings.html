@@ -2,36 +2,55 @@
 
 {% block title %}Settings{% endblock %}
 {% block page_title %}Settings{% endblock %}
-{% block page_subtitle %}Detection thresholds, zone configuration, and user management{% endblock %}
+{% block page_subtitle %}Zone templates, detection thresholds, and user management{% endblock %}
 
 {% block content %}
 <div class="row g-4">
     <div class="col-lg-6">
         <div class="card card-panel">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-camera-video me-2"></i>Camera Configuration</h5></div>
-            <div class="card-body">
-                <div class="mb-3">
-                    <label class="form-label" for="videoSource">Default Video Source</label>
-                    <select class="form-select" id="videoSource">
-                        {% for vid in videos %}
-                        <option value="{{ vid.id }}">{{ vid.filename }} ({{ vid.condition }})</option>
-                        {% endfor %}
-                    </select>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label" for="calibrationPpm">Calibration (pixels per meter)</label>
-                    <input type="number" class="form-control" id="calibrationPpm" value="{{ settings.calibration_ppm }}" step="0.1">
-                    <small class="text-muted">Used for speed estimation from pixel displacement</small>
-                </div>
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-layers me-2"></i>Zone Templates</h5>
+                <button class="btn btn-sm btn-danger" id="btnCreateTemplate"><i class="bi bi-plus-lg me-1"></i> New Template</button>
             </div>
-        </div>
-
-        <div class="card card-panel mt-4">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-bounding-box me-2"></i>Zone Configuration</h5></div>
-            <div class="card-body">
-                <label class="form-label" for="zonesJson">Zone Polygons (JSON)</label>
-                <textarea class="form-control font-monospace" id="zonesJson" rows="8">{{ settings.zones_json }}</textarea>
-                <small class="text-muted">Define no_parking, active_lane, pedestrian_crossing, truck_ban_zone polygons</small>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle" id="templatesTable">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Usage</th>
+                                <th>Last Used</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="templatesTableBody">
+                            {% for tpl in zone_templates %}
+                            <tr data-template-id="{{ tpl.id }}">
+                                <td>
+                                    <div class="fw-semibold">{{ tpl.template_name }}</div>
+                                    {% if tpl.description %}
+                                    <small class="text-muted">{{ tpl.description }}</small>
+                                    {% endif %}
+                                </td>
+                                <td><span class="badge bg-secondary-subtle text-secondary">{{ tpl.usage_count }}</span></td>
+                                <td class="small text-muted">{{ tpl.last_used_at or '—' }}</td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-secondary btn-preview-template" title="Preview"><i class="bi bi-eye"></i></button>
+                                        <button class="btn btn-outline-secondary btn-edit-template" title="Edit"><i class="bi bi-pencil"></i></button>
+                                        <button class="btn btn-outline-secondary btn-duplicate-template" title="Duplicate"><i class="bi bi-copy"></i></button>
+                                        <button class="btn btn-outline-danger btn-delete-template" title="Delete"><i class="bi bi-trash"></i></button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr id="templatesEmptyRow">
+                                <td colspan="4" class="text-center text-muted py-4">No zone templates yet. Upload a video and save an annotation as a template.</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -69,6 +88,11 @@
                         <label class="form-label" for="truckBanEnd">Truck Ban End</label>
                         <input type="time" class="form-control" id="truckBanEnd" value="{{ settings.truck_ban_end }}">
                     </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="calibrationPpm">Calibration (pixels per meter)</label>
+                    <input type="number" class="form-control" id="calibrationPpm" value="{{ settings.calibration_ppm }}" step="0.1">
+                    <small class="text-muted">Used for speed estimation from pixel displacement</small>
                 </div>
             </div>
         </div>
@@ -136,8 +160,56 @@
         </div>
     </div>
 </div>
+
+<!-- Template Editor Modal -->
+<div class="modal fade" id="templateEditorModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="templateEditorTitle">Edit Zone Template</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editTemplateId">
+                <div class="mb-3">
+                    <label class="form-label" for="editTemplateName">Template Name</label>
+                    <input type="text" class="form-control" id="editTemplateName">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editTemplateDescription">Description</label>
+                    <input type="text" class="form-control" id="editTemplateDescription">
+                </div>
+                <label class="form-label">Zone Polygons (JSON)</label>
+                <textarea class="form-control font-monospace" id="editTemplateZones" rows="10"></textarea>
+                <small class="text-muted">Required keys: no_parking, active_lane, pedestrian_crossing, truck_ban_zone</small>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btnSaveTemplate"><i class="bi bi-check-lg me-1"></i> Save Template</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Template Preview Modal -->
+<div class="modal fade" id="templatePreviewModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="templatePreviewTitle">Template Preview</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <pre class="template-preview-json mb-0" id="templatePreviewJson"></pre>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
+<script>
+    window.TAVIDM_ZONE_TYPES = {{ zone_types | tojson }};
+</script>
 <script src="{{ url_for('static', filename='js/settings.js') }}"></script>
 {% endblock %}

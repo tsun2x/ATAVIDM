@@ -3,13 +3,22 @@ Frontend prototype with mock data. Decision-support tool only.
 """
 
 from datetime import datetime, timedelta
+import json
 import os
 import random
+from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
 import config
+from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
 from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
+from core.zone_config import (
+    dumps_zones,
+    parse_zones_json,
+    zones_complete,
+    zones_for_api,
+)
 from database import db
 
 app = Flask(__name__)
@@ -88,19 +97,40 @@ def _format_duration(duration_sec: float | None) -> str:
 
 def _db_video_to_ui(row: dict) -> dict:
     condition = row.get("condition") or "peak"
+    status = row.get("status") or ("processed" if row.get("processed") else "uploaded")
+    db_id = row["id"]
+    has_annotation = bool(row.get("annotation_id"))
     return {
-        "id": f"vid-db-{row['id']}",
-        "db_id": row["id"],
+        "id": f"vid-db-{db_id}",
+        "db_id": db_id,
         "name": row["filename"],
         "filename": row["filename"],
         "location": f"Uploaded · {condition.title()}",
         "condition": condition,
         "duration": _format_duration(row.get("duration_sec")),
         "processed": bool(row.get("processed")),
+        "status": status,
+        "has_annotation": has_annotation,
+        "template_id": row.get("template_id"),
         "thumbnail": "cctv_feed.svg",
         "filepath": row["filepath"],
         "is_uploaded": True,
         "created_at": row.get("created_at"),
+        "frame_url": f"/api/videos/{db_id}/frame",
+    }
+
+
+def _template_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "template_name": row["template_name"],
+        "description": row.get("description") or "",
+        "zones_json": row.get("zones_json") or "{}",
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_used_at": row.get("last_used_at"),
+        "usage_count": row.get("usage_count") or 0,
+        "video_count": db.count_videos_for_template(row["id"]),
     }
 
 
@@ -228,7 +258,6 @@ SYSTEM_SETTINGS = {
     "evidence_retention_days": 90,
     "fps": 30,
     "calibration_ppm": 12.5,
-    "zones_json": '{\n  "no_parking": [[100,200],[300,200],[300,400],[100,400]],\n  "active_lane": [[400,150],[800,150],[800,450],[400,450]]\n}',
 }
 
 DETECTION_BOXES = [
@@ -282,6 +311,205 @@ def api_list_videos():
     return jsonify({"success": True, "videos": get_videos_for_ui()})
 
 
+@app.route("/api/zone-types", methods=["GET"])
+def api_zone_types():
+    return jsonify({"success": True, "zone_types": zones_for_api()})
+
+
+@app.route("/api/zone-templates", methods=["GET"])
+def api_list_zone_templates():
+    templates = [_template_to_ui(row) for row in db.list_zone_templates()]
+    return jsonify({"success": True, "templates": templates})
+
+
+@app.route("/api/zone-templates", methods=["POST"])
+def api_create_zone_template():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("template_name") or "").strip()
+    if not name:
+        return jsonify({"success": False, "error": "Template name is required."}), 400
+    try:
+        zones_json = dumps_zones(payload.get("zones_json") or payload.get("zones") or {})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    template_id = db.create_zone_template(
+        template_name=name,
+        zones_json=zones_json,
+        description=(payload.get("description") or "").strip() or None,
+    )
+    row = db.get_zone_template(template_id)
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["GET"])
+def api_get_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["PUT"])
+def api_update_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    zones_json = None
+    if "zones_json" in payload or "zones" in payload:
+        try:
+            zones_json = dumps_zones(payload.get("zones_json") or payload.get("zones") or {})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+
+    name = payload.get("template_name")
+    if name is not None:
+        name = name.strip()
+        if not name:
+            return jsonify({"success": False, "error": "Template name cannot be empty."}), 400
+
+    db.update_zone_template(
+        template_id,
+        template_name=name,
+        description=payload.get("description"),
+        zones_json=zones_json,
+    )
+    updated = db.get_zone_template(template_id)
+    return jsonify({"success": True, "template": _template_to_ui(updated)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["DELETE"])
+def api_delete_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+    db.delete_zone_template(template_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/zone-templates/<int:template_id>/duplicate", methods=["POST"])
+def api_duplicate_zone_template(template_id: int):
+    payload = request.get_json(silent=True) or {}
+    new_name = (payload.get("template_name") or "").strip()
+    if not new_name:
+        source = db.get_zone_template(template_id)
+        if source is None:
+            return jsonify({"success": False, "error": "Template not found."}), 404
+        new_name = f"{source['template_name']} (Copy)"
+    try:
+        new_id = db.duplicate_zone_template(template_id, new_name)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    row = db.get_zone_template(new_id)
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/videos/<int:video_id>/frame")
+def api_video_frame(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+
+    frame_path = frame_path_for_video(video_id)
+    if not frame_path.is_file():
+        annotation = db.get_annotation_by_video(video_id)
+        ref = annotation.get("reference_frame_path") if annotation else None
+        if ref and Path(ref).is_file():
+            frame_path = Path(ref)
+        else:
+            try:
+                extract_first_frame(row["filepath"], video_id)
+            except FrameExtractError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 500
+
+    return send_from_directory(
+        frame_path.parent,
+        frame_path.name,
+        mimetype="image/jpeg",
+    )
+
+
+@app.route("/api/videos/<int:video_id>/annotation", methods=["GET"])
+def api_get_annotation(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    annotation = db.get_annotation_by_video(video_id)
+    if annotation is None:
+        return jsonify({"success": True, "annotation": None})
+    return jsonify({"success": True, "annotation": annotation})
+
+
+@app.route("/api/videos/<int:video_id>/annotation", methods=["POST", "PUT"])
+def api_save_annotation(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    save_mode = payload.get("save_mode", "video_only")
+    source_template_id = payload.get("source_template_id")
+
+    try:
+        zones = parse_zones_json(payload.get("zones_json") or payload.get("zones") or {})
+        zones_json = dumps_zones(zones)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    if not zones_complete(zones):
+        return jsonify({
+            "success": False,
+            "error": "All required zones must have at least 3 points.",
+        }), 400
+
+    frame_path = frame_path_for_video(video_id)
+    ref_path = str(frame_path) if frame_path.is_file() else None
+    annotation_id = db.upsert_annotation(video_id, zones_json, ref_path)
+
+    template_id = row.get("template_id")
+    template_row = None
+
+    if save_mode == "new_template":
+        name = (payload.get("template_name") or "").strip()
+        if not name:
+            return jsonify({"success": False, "error": "Template name is required."}), 400
+        template_id = db.create_zone_template(
+            template_name=name,
+            zones_json=zones_json,
+            description=(payload.get("template_description") or "").strip() or None,
+        )
+        db.update_video(video_id, template_id=template_id)
+        template_row = db.get_zone_template(template_id)
+    elif save_mode == "update_template":
+        update_id = payload.get("template_id") or source_template_id or template_id
+        if not update_id:
+            return jsonify({"success": False, "error": "No template selected to update."}), 400
+        db.update_zone_template(int(update_id), zones_json=zones_json)
+        db.record_template_usage(int(update_id))
+        db.update_video(video_id, template_id=int(update_id))
+        template_row = db.get_zone_template(int(update_id))
+    else:
+        if source_template_id:
+            db.record_template_usage(int(source_template_id))
+            db.update_video(video_id, template_id=int(source_template_id))
+        else:
+            db.update_video(video_id, clear_template=True)
+
+    annotation = db.get_annotation(annotation_id)
+    video = _db_video_to_ui(db.get_video(video_id))
+    response = {
+        "success": True,
+        "message": "Annotation saved successfully.",
+        "annotation": annotation,
+        "video": video,
+    }
+    if template_row:
+        response["template"] = _template_to_ui(template_row)
+    return jsonify(response)
+
+
 @app.route("/api/upload-video", methods=["POST"])
 def api_upload_video():
     file = request.files.get("video")
@@ -306,15 +534,32 @@ def api_upload_video():
             filepath=filepath,
             recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             condition=condition,
+            status="uploaded",
         )
+
+        frame_error = None
+        try:
+            frame_path = extract_first_frame(filepath, video_id)
+            db.update_video(video_id, status="annotating")
+        except FrameExtractError as exc:
+            frame_path = None
+            frame_error = str(exc)
+
         row = db.get_video(video_id)
         video = _db_video_to_ui(row)
+        templates = [_template_to_ui(t) for t in db.list_zone_templates()]
 
         return jsonify({
             "success": True,
-            "message": "Video uploaded successfully and queued for processing.",
+            "message": "Video uploaded. Configure zone annotations to continue.",
             "video": video,
             "size": format_file_size(file_size),
+            "frame_url": f"/api/videos/{video_id}/frame",
+            "frame_ready": frame_path is not None,
+            "frame_error": frame_error,
+            "templates": templates,
+            "zone_types": zones_for_api(),
+            "requires_annotation": True,
         })
     except UploadError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
@@ -350,6 +595,8 @@ def live_monitor():
         default_video=default_video,
         detection_boxes=DETECTION_BOXES,
         conditions=CONDITIONS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
     )
 
 
@@ -389,9 +636,10 @@ def reports():
 def settings():
     return render_template(
         "settings.html",
-        videos=get_videos_for_ui(),
         users=USERS,
         settings=SYSTEM_SETTINGS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
     )
 
 

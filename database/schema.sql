@@ -8,6 +8,17 @@ CREATE TABLE IF NOT EXISTS users (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS zone_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  template_name TEXT NOT NULL,
+  description TEXT,
+  zones_json TEXT NOT NULL DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  last_used_at DATETIME,
+  usage_count INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS videos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   filename TEXT NOT NULL,
@@ -16,7 +27,19 @@ CREATE TABLE IF NOT EXISTS videos (
   recorded_at DATETIME,
   condition TEXT CHECK(condition IN ('morning','peak','nighttime')),
   processed BOOLEAN DEFAULT 0,
+  status TEXT CHECK(status IN ('uploaded','annotating','ready','processing','processed')) DEFAULT 'uploaded',
+  annotation_id INTEGER,
+  template_id INTEGER REFERENCES zone_templates(id),
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS annotations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  video_id INTEGER NOT NULL UNIQUE REFERENCES videos(id) ON DELETE CASCADE,
+  zones_json TEXT NOT NULL DEFAULT '{}',
+  reference_frame_path TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS detections (
@@ -63,6 +86,10 @@ CREATE TABLE IF NOT EXISTS review_queue (
   reviewed_at DATETIME
 );
 
+CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
+CREATE INDEX IF NOT EXISTS idx_videos_template_id ON videos(template_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_video_id ON annotations(video_id);
+CREATE INDEX IF NOT EXISTS idx_zone_templates_name ON zone_templates(template_name);
 CREATE INDEX IF NOT EXISTS idx_violations_video_id ON violations(video_id);
 CREATE INDEX IF NOT EXISTS idx_violations_status ON violations(status);
 CREATE INDEX IF NOT EXISTS idx_violations_detected_at ON violations(detected_at);

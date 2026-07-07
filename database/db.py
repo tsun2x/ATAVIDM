@@ -65,6 +65,42 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row[1] == column_name for row in rows)
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    migration_path = Path(__file__).parent / "migrations" / "001_zone_templates.sql"
+    if migration_path.is_file():
+        conn.executescript(migration_path.read_text(encoding="utf-8"))
+
+    if _table_exists(conn, "videos"):
+        if not _column_exists(conn, "videos", "status"):
+            conn.execute(
+                "ALTER TABLE videos ADD COLUMN status TEXT DEFAULT 'uploaded'"
+            )
+        if not _column_exists(conn, "videos", "annotation_id"):
+            conn.execute("ALTER TABLE videos ADD COLUMN annotation_id INTEGER")
+        if not _column_exists(conn, "videos", "template_id"):
+            conn.execute("ALTER TABLE videos ADD COLUMN template_id INTEGER")
+
+        conn.execute(
+            """
+            UPDATE videos
+            SET status = 'processed'
+            WHERE processed = 1 AND (status IS NULL OR status = 'uploaded')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE videos
+            SET status = 'uploaded'
+            WHERE status IS NULL
+            """
+        )
+
+
 def init_db(force: bool = False) -> None:
     with db_session() as conn:
         if force:
@@ -73,14 +109,18 @@ def init_db(force: bool = False) -> None:
                 DROP TABLE IF EXISTS review_queue;
                 DROP TABLE IF EXISTS violations;
                 DROP TABLE IF EXISTS detections;
+                DROP TABLE IF EXISTS annotations;
                 DROP TABLE IF EXISTS videos;
+                DROP TABLE IF EXISTS zone_templates;
                 DROP TABLE IF EXISTS users;
                 """
             )
-        elif _table_exists(conn, "users"):
-            return
-        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-        conn.executescript(schema_sql)
+            schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+            conn.executescript(schema_sql)
+        elif not _table_exists(conn, "users"):
+            schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
+            conn.executescript(schema_sql)
+        _run_migrations(conn)
 
 
 # --- Users ---
@@ -121,16 +161,55 @@ def insert_video(
     duration_sec: float | None = None,
     recorded_at: str | None = None,
     condition: str | None = None,
+    status: str = "uploaded",
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO videos (filename, filepath, duration_sec, recorded_at, condition)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO videos (filename, filepath, duration_sec, recorded_at, condition, status)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (filename, filepath, duration_sec, recorded_at, condition),
+            (filename, filepath, duration_sec, recorded_at, condition, status),
         )
         return cursor.lastrowid
+
+
+def update_video(
+    video_id: int,
+    *,
+    status: str | None = None,
+    annotation_id: int | None = None,
+    template_id: int | None = None,
+    processed: bool | None = None,
+    clear_template: bool = False,
+) -> None:
+    fields: list[str] = []
+    params: list[Any] = []
+
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if annotation_id is not None:
+        fields.append("annotation_id = ?")
+        params.append(annotation_id)
+    if template_id is not None:
+        fields.append("template_id = ?")
+        params.append(template_id)
+    elif clear_template:
+        fields.append("template_id = NULL")
+    if processed is not None:
+        fields.append("processed = ?")
+        params.append(int(processed))
+
+    if not fields:
+        return
+
+    params.append(video_id)
+    with db_session() as conn:
+        conn.execute(
+            f"UPDATE videos SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
 
 
 def get_video(video_id: int) -> dict[str, Any] | None:
@@ -159,9 +238,181 @@ def list_videos(processed: bool | None = None) -> list[dict[str, Any]]:
 def mark_video_processed(video_id: int) -> None:
     with db_session() as conn:
         conn.execute(
-            "UPDATE videos SET processed = 1 WHERE id = ?",
+            "UPDATE videos SET processed = 1, status = 'processed' WHERE id = ?",
             (video_id,),
         )
+
+
+# --- Zone Templates ---
+
+
+def list_zone_templates() -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM zone_templates
+            ORDER BY COALESCE(last_used_at, created_at) DESC, template_name ASC
+            """
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def get_zone_template(template_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM zone_templates WHERE id = ?",
+            (template_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def create_zone_template(
+    template_name: str,
+    zones_json: str,
+    description: str | None = None,
+) -> int:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO zone_templates (template_name, description, zones_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (template_name, description, zones_json, now),
+        )
+        return cursor.lastrowid
+
+
+def update_zone_template(
+    template_id: int,
+    *,
+    template_name: str | None = None,
+    description: str | None = None,
+    zones_json: str | None = None,
+) -> None:
+    fields: list[str] = ["updated_at = ?"]
+    params: list[Any] = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+
+    if template_name is not None:
+        fields.append("template_name = ?")
+        params.append(template_name)
+    if description is not None:
+        fields.append("description = ?")
+        params.append(description)
+    if zones_json is not None:
+        fields.append("zones_json = ?")
+        params.append(zones_json)
+
+    params.append(template_id)
+    with db_session() as conn:
+        conn.execute(
+            f"UPDATE zone_templates SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+
+
+def delete_zone_template(template_id: int) -> None:
+    with db_session() as conn:
+        conn.execute(
+            "UPDATE videos SET template_id = NULL WHERE template_id = ?",
+            (template_id,),
+        )
+        conn.execute("DELETE FROM zone_templates WHERE id = ?", (template_id,))
+
+
+def duplicate_zone_template(template_id: int, new_name: str) -> int:
+    source = get_zone_template(template_id)
+    if source is None:
+        raise ValueError(f"Template {template_id} not found.")
+    return create_zone_template(
+        template_name=new_name,
+        zones_json=source["zones_json"],
+        description=source.get("description"),
+    )
+
+
+def record_template_usage(template_id: int) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE zone_templates
+            SET usage_count = usage_count + 1,
+                last_used_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, template_id),
+        )
+
+
+def count_videos_for_template(template_id: int) -> int:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM videos WHERE template_id = ?",
+            (template_id,),
+        ).fetchone()
+        return row["total"] if row else 0
+
+
+# --- Annotations ---
+
+
+def get_annotation(annotation_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM annotations WHERE id = ?",
+            (annotation_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_annotation_by_video(video_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM annotations WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def upsert_annotation(
+    video_id: int,
+    zones_json: str,
+    reference_frame_path: str | None = None,
+) -> int:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    existing = get_annotation_by_video(video_id)
+    with db_session() as conn:
+        if existing:
+            conn.execute(
+                """
+                UPDATE annotations
+                SET zones_json = ?, reference_frame_path = COALESCE(?, reference_frame_path), updated_at = ?
+                WHERE video_id = ?
+                """,
+                (zones_json, reference_frame_path, now, video_id),
+            )
+            annotation_id = existing["id"]
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO annotations (video_id, zones_json, reference_frame_path, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (video_id, zones_json, reference_frame_path, now),
+            )
+            annotation_id = cursor.lastrowid
+
+        conn.execute(
+            """
+            UPDATE videos
+            SET annotation_id = ?, status = 'ready'
+            WHERE id = ?
+            """,
+            (annotation_id, video_id),
+        )
+        return annotation_id
 
 
 # --- Detections ---

@@ -423,6 +423,34 @@ body {
 .camera-name { font-size: 0.875rem; font-weight: 600; }
 .camera-location { font-size: 0.75rem; color: var(--text-secondary); }
 
+/* Zone editor + annotation wizard */
+.wizard-option-card { cursor: pointer; border: 2px solid transparent; transition: border-color var(--transition); }
+.wizard-option-card.active { border-color: var(--brand-accent); }
+.wizard-option-card:hover { border-color: rgba(230, 57, 70, 0.4); }
+
+.zone-editor-wrap {
+    overflow: auto;
+    max-height: 60vh;
+    background: #0f172a;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    text-align: center;
+}
+
+#zoneEditorCanvas { display: block; margin: 0 auto; cursor: crosshair; max-width: 100%; }
+
+.zone-type-tabs .btn { display: inline-flex; align-items: center; gap: 6px; }
+.zone-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+.template-preview-json {
+    background: var(--body-bg);
+    border-radius: var(--radius-sm);
+    padding: 16px;
+    font-size: 0.8rem;
+    max-height: 400px;
+    overflow: auto;
+}
+
 .detection-item {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 0; border-bottom: 1px solid var(--border-color);

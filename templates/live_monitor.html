@@ -175,9 +175,92 @@
         </div>
     </div>
 </div>
+
+<!-- Annotation Wizard Modal -->
+<div class="modal fade" id="annotationWizardModal" tabindex="-1" aria-labelledby="annotationWizardLabel" aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="annotationWizardLabel"><i class="bi bi-bounding-box me-2"></i>Zone Annotation</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" id="btnCloseWizard"></button>
+            </div>
+            <div class="modal-body">
+                <div id="wizardStepChoose">
+                    <p class="text-muted small mb-3">Choose a reusable zone template or create a new annotation for this video.</p>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <div class="card card-panel h-100 wizard-option-card" id="optionUseTemplate">
+                                <div class="card-body">
+                                    <h6 class="card-title"><i class="bi bi-layers me-2"></i>Use Existing Zone Template</h6>
+                                    <select class="form-select form-select-sm mt-2" id="wizardTemplateSelect">
+                                        <option value="">— Select template —</option>
+                                    </select>
+                                    <p class="small text-muted mt-2 mb-0">Load saved polygons and edit before saving.</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card card-panel h-100 wizard-option-card active" id="optionNewAnnotation">
+                                <div class="card-body">
+                                    <h6 class="card-title"><i class="bi bi-pencil-square me-2"></i>Create New Zone Annotation</h6>
+                                    <p class="small text-muted mt-2 mb-0">Draw all required traffic zones on the extracted first frame.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="d-flex justify-content-end mt-3">
+                        <button type="button" class="btn btn-danger" id="btnWizardContinue"><i class="bi bi-arrow-right me-1"></i> Continue to Editor</button>
+                    </div>
+                </div>
+
+                <div id="wizardStepEditor" class="d-none">
+                    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                        <div class="btn-group btn-group-sm zone-type-tabs" id="zoneTypeTabs" role="group"></div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnResetZone"><i class="bi bi-arrow-counterclockwise"></i> Reset Zone</button>
+                        </div>
+                    </div>
+                    <p class="small text-muted mb-2">Click to add points · Drag to move · Double-click point to delete · Shift+drag to pan · Scroll to zoom</p>
+                    <div class="zone-editor-wrap" id="zoneEditorWrap">
+                        <canvas id="zoneEditorCanvas"></canvas>
+                    </div>
+                    <div class="d-flex justify-content-between mt-3">
+                        <button type="button" class="btn btn-outline-secondary btn-sm" id="btnWizardBack"><i class="bi bi-arrow-left me-1"></i> Back</button>
+                        <button type="button" class="btn btn-danger btn-sm" id="btnWizardSaveAnnotation"><i class="bi bi-check-lg me-1"></i> Save Annotation</button>
+                    </div>
+                </div>
+
+                <div id="wizardStepTemplatePrompt" class="d-none">
+                    <p class="mb-3">Would you like to save this annotation as a reusable Zone Template?</p>
+                    <div class="d-grid gap-2">
+                        <button type="button" class="btn btn-outline-danger" id="btnSaveVideoOnly"><i class="bi bi-film me-2"></i>Use for This Video Only</button>
+                        <button type="button" class="btn btn-danger" id="btnSaveAsTemplate"><i class="bi bi-layers me-2"></i>Save as New Template</button>
+                        <button type="button" class="btn btn-outline-secondary d-none" id="btnUpdateTemplate"><i class="bi bi-pencil me-2"></i>Update Existing Template</button>
+                    </div>
+                    <div id="templateNameFields" class="mt-3 d-none">
+                        <div class="mb-2">
+                            <label class="form-label" for="wizardTemplateName">Template Name</label>
+                            <input type="text" class="form-control" id="wizardTemplateName" placeholder="e.g. Main Street Intersection">
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label" for="wizardTemplateDescription">Description (optional)</label>
+                            <input type="text" class="form-control" id="wizardTemplateDescription" placeholder="Brief description">
+                        </div>
+                        <button type="button" class="btn btn-danger w-100" id="btnConfirmTemplateSave">Confirm Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
+<script>
+    window.TAVIDM_ZONE_TYPES = {{ zone_types | tojson }};
+    window.TAVIDM_ZONE_TEMPLATES = {{ zone_templates | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>
 {% endblock %}
