@@ -1,0 +1,23 @@
+---
+description: Enforce segmented 3-day development log updates after every completed coding task
+alwaysApply: true
+---
+
+# Segmented Development Log
+
+After completing any coding task (feature, bug fix, refactor, UI update, documentation, configuration, database, testing, or architecture change), update the development log before ending your response.
+
+Use the **segmented-development-log** skill (`@segmented-development-log`).
+
+## Requirements
+
+- Log path: `docs/development_logs/`
+- One Markdown file per 3-day calendar period: `YYYY-MM-DD_to_YYYY-MM-DD.md`
+- **Append only** — never overwrite, delete, reorder, or summarize previous entries
+- Document only files actually created, modified, renamed, or deleted
+- Ignore viewed-only files, reverted changes, and unimplemented plans
+- Read the active period log first, then append chronologically at the end
+- Update **Last Updated** in the file header when appending
+- Use templates from `~/.cursor/skills/segmented-development-log/entry-template.md`
+
+Skip logging only when: no file changes occurred, the task was question/plan/review-only, or the user says not to log.
