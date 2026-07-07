@@ -133,9 +133,11 @@ A list of Python dictionaries representing the two CCTV cameras in the system.
 ### VIOLATION_TYPES, PLATE_PREFIXES, STATUSES
 
 ```python
-VIOLATION_TYPES = ["Red Light Violation", "Speeding", "Wrong Lane", ...]
-PLATE_PREFIXES = ["ABC", "XYZ", "TAV", "PHL", "NCR", "MNL"]
-STATUSES = ["Pending", "Verified", "Dismissed", "Escalated"]
+VIOLATION_TYPES = [
+    "Illegal Parking", "Counterflowing", "Obstruction",
+    "Illegal Loading/Unloading", "Blocking Pedestrian Crossing",
+    "Truck Ban", "Reckless Driving",
+]
 ```
 
 These three lists are used as the population pools for `random.choice()` inside `generate_violations()`.
@@ -280,8 +282,8 @@ SYSTEM_SETTINGS = {
     "auto_export": False,
     "retention_days": 90,
     "confidence_threshold": 75,
-    "speed_threshold": 60,
-    "red_light_sensitivity": 80,
+    "truck_ban_start": "06:00",
+    "truck_ban_end": "09:00",
     "helmet_detection": True,
     "night_mode_enhance": True,
 }

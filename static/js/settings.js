@@ -8,7 +8,6 @@
     const sliders = [
         { input: "confidenceThreshold", display: "confidenceValue", suffix: "%" },
         { input: "reviewThreshold", display: "reviewValue", suffix: "%" },
-        { input: "speedLimit", display: "speedValue", suffix: " km/h" },
     ];
 
     sliders.forEach(function (s) {

@@ -7,7 +7,7 @@
 
     const tbody = document.getElementById("reviewBody");
     const evidenceModal = new bootstrap.Modal(document.getElementById("evidenceModal"));
-    const forceReviewTypes = ["Speeding", "Reckless Driving"];
+    const forceReviewTypes = ["Reckless Driving"];
 
     function showEvidence(item) {
         const body = document.getElementById("evidenceModalBody");

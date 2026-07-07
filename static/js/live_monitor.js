@@ -17,7 +17,7 @@
 
     const MOCK_ALERTS = [
         { type: "critical", icon: "bi-arrow-left-right", title: "Counterflowing", detail: "Track #7 · car", confidence: 88 },
-        { type: "warning", icon: "bi-speedometer2", title: "Speeding", detail: "Track #12 · motorcycle → Review Queue", confidence: 72 },
+        { type: "warning", icon: "bi-truck", title: "Truck Ban", detail: "Track #12 · truck", confidence: 72 },
         { type: "warning", icon: "bi-parking", title: "Illegal Parking", detail: "Track #3 · jeepney", confidence: 86 },
         { type: "critical", icon: "bi-exclamation-triangle", title: "Reckless Driving", detail: "Track #15 · car → Review Queue", confidence: 68 },
         { type: "info", icon: "bi-sign-stop", title: "Obstruction", detail: "Track #9 · truck", confidence: 84 },

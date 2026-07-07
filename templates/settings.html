@@ -72,13 +72,6 @@
                     <input type="range" class="form-range" id="reviewThreshold" min="50" max="95" value="{{ settings.review_threshold }}">
                     <small class="text-muted">Below this → manual review queue</small>
                 </div>
-                <div class="mb-4">
-                    <div class="d-flex justify-content-between mb-1">
-                        <label class="form-label mb-0" for="speedLimit">Speed Limit (km/h)</label>
-                        <span class="threshold-value" id="speedValue">{{ settings.speed_limit }} km/h</span>
-                    </div>
-                    <input type="range" class="form-range" id="speedLimit" min="30" max="100" value="{{ settings.speed_limit }}">
-                </div>
                 <div class="row g-2 mb-3">
                     <div class="col-6">
                         <label class="form-label" for="truckBanStart">Truck Ban Start</label>
@@ -88,11 +81,6 @@
                         <label class="form-label" for="truckBanEnd">Truck Ban End</label>
                         <input type="time" class="form-control" id="truckBanEnd" value="{{ settings.truck_ban_end }}">
                     </div>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label" for="calibrationPpm">Calibration (pixels per meter)</label>
-                    <input type="number" class="form-control" id="calibrationPpm" value="{{ settings.calibration_ppm }}" step="0.1">
-                    <small class="text-muted">Used for speed estimation from pixel displacement</small>
                 </div>
             </div>
         </div>
@@ -154,7 +142,7 @@
         <div class="card card-panel mt-4">
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-inbox me-2"></i>Review Queue</h5></div>
             <div class="card-body">
-                <p class="text-muted small mb-3">Low-confidence and force-review detections (Speeding, Reckless Driving) require admin approval.</p>
+                <p class="text-muted small mb-3">Low-confidence detections and Reckless Driving require admin approval.</p>
                 <a href="{{ url_for('review_queue') }}" class="btn btn-outline-danger w-100"><i class="bi bi-inbox me-2"></i>Open Review Queue</a>
             </div>
         </div>

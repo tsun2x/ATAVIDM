@@ -219,10 +219,13 @@ CAMERAS = [
 
 ```python
 VIOLATION_TYPES = [
-    "Red Light Violation",
-    "Speeding",
-    ...
-    "Your New Type",   # Add here
+    "Illegal Parking",
+    "Counterflowing",
+    "Obstruction",
+    "Illegal Loading/Unloading",
+    "Blocking Pedestrian Crossing",
+    "Truck Ban",
+    "Reckless Driving",
 ]
 ```
 

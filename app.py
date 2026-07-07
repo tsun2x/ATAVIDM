@@ -39,7 +39,6 @@ VIOLATION_TYPES = [
     "Illegal Loading/Unloading",
     "Blocking Pedestrian Crossing",
     "Truck Ban",
-    "Speeding",
     "Reckless Driving",
 ]
 
@@ -212,7 +211,7 @@ VIOLATION_SUMMARY = [
     {"type": "Counterflowing", "count": 42, "change": 5.1, "color": "#e63946", "share": 22.3},
     {"type": "Illegal Parking", "count": 38, "change": -2.4, "color": "#f59e0b", "share": 20.2},
     {"type": "Obstruction", "count": 28, "change": 3.8, "color": "#f97316", "share": 14.9},
-    {"type": "Speeding", "count": 24, "change": 1.2, "color": "#f43f5e", "share": 12.8},
+    {"type": "Truck Ban", "count": 24, "change": 1.2, "color": "#8b5cf6", "share": 12.8},
     {"type": "Illegal Loading/Unloading", "count": 19, "change": -1.0, "color": "#22c55e", "share": 10.1},
 ]
 
@@ -222,7 +221,7 @@ ANALYTICS_DATA = {
     "monthly_labels": ["Jan", "Feb", "Mar", "Apr", "May", "Jun"],
     "monthly_values": [312, 348, 329, 401, 438, 389],
     "breakdown_labels": VIOLATION_TYPES,
-    "breakdown_values": [38, 42, 28, 19, 15, 12, 24, 11],
+    "breakdown_values": [38, 42, 28, 19, 15, 12, 11],
     "condition_labels": ["Morning", "Peak", "Nighttime"],
     "condition_values": [142, 198, 89],
     "confidence_labels": ["≥85%", "65–84%", "<65%"],
@@ -251,13 +250,11 @@ USERS = [
 SYSTEM_SETTINGS = {
     "confidence_threshold": 60,
     "review_threshold": 75,
-    "speed_limit": 60,
     "truck_ban_start": "06:00",
     "truck_ban_end": "09:00",
     "frame_skip": 2,
     "evidence_retention_days": 90,
     "fps": 30,
-    "calibration_ppm": 12.5,
 }
 
 DETECTION_BOXES = [
