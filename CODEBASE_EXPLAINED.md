@@ -137,6 +137,7 @@ VIOLATION_TYPES = [
     "Illegal Parking", "Counterflowing", "Obstruction",
     "Illegal Loading/Unloading", "Blocking Pedestrian Crossing",
     "Truck Ban", "Reckless Driving",
+    "No Helmet Violation", "Motorcycle Overloading",
 ]
 ```
 
@@ -284,8 +285,7 @@ SYSTEM_SETTINGS = {
     "confidence_threshold": 75,
     "truck_ban_start": "06:00",
     "truck_ban_end": "09:00",
-    "helmet_detection": True,
-    "night_mode_enhance": True,
+    "review_threshold": 75,
 }
 ```
 

@@ -15,6 +15,8 @@ window.TAVIDM = window.TAVIDM || {};
         "Blocking Pedestrian Crossing",
         "Truck Ban",
         "Reckless Driving",
+        "No Helmet Violation",
+        "Motorcycle Overloading",
     ];
 
     const STATUSES = ["confirmed", "dismissed", "pending"];
@@ -129,14 +131,15 @@ window.TAVIDM = window.TAVIDM || {};
         { type: "Illegal Parking", count: 38, change: -2.4, color: "#f59e0b", share: 20.2 },
         { type: "Obstruction", count: 28, change: 3.8, color: "#f97316", share: 14.9 },
         { type: "Truck Ban", count: 24, change: 1.2, color: "#8b5cf6", share: 12.8 },
-        { type: "Illegal Loading/Unloading", count: 19, change: -1.0, color: "#22c55e", share: 10.1 },
+        { type: "No Helmet Violation", count: 21, change: 4.5, color: "#06b6d4", share: 11.2 },
+        { type: "Motorcycle Overloading", count: 16, change: 2.1, color: "#ec4899", share: 8.5 },
     ];
 
     const CHART_DATA = {
         hourly_labels: ["06:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"],
         hourly_values: [2, 5, 8, 6, 11, 9, 7, 4],
         distribution_labels: VIOLATION_TYPES,
-        distribution_values: [38, 42, 28, 19, 15, 12, 11],
+        distribution_values: [38, 42, 28, 19, 15, 12, 11, 21, 16],
     };
 
     const ANALYTICS_DATA = {
@@ -145,7 +148,7 @@ window.TAVIDM = window.TAVIDM || {};
         monthly_labels: ["Jan", "Feb", "Mar", "Apr", "May", "Jun"],
         monthly_values: [312, 348, 329, 401, 438, 389],
         breakdown_labels: VIOLATION_TYPES,
-        breakdown_values: [38, 42, 28, 19, 15, 12, 11],
+        breakdown_values: [38, 42, 28, 19, 15, 12, 11, 21, 16],
         condition_labels: ["Morning", "Peak", "Nighttime"],
         condition_values: [142, 198, 89],
         confidence_labels: ["≥85%", "65–84%", "<65%"],

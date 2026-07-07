@@ -226,6 +226,8 @@ VIOLATION_TYPES = [
     "Blocking Pedestrian Crossing",
     "Truck Ban",
     "Reckless Driving",
+    "No Helmet Violation",
+    "Motorcycle Overloading",
 ]
 ```
 
