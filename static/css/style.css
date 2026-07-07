@@ -356,6 +356,25 @@ body {
 
 .playback-controls .btn-play { min-width: 40px; }
 
+.upload-dropzone {
+    border: 2px dashed var(--border-color);
+    border-radius: var(--radius-sm);
+    padding: 24px 16px;
+    text-align: center;
+    background: var(--body-bg);
+    transition: border-color var(--transition), background var(--transition);
+    cursor: pointer;
+}
+.upload-dropzone.dragover {
+    border-color: var(--brand-accent);
+    background: rgba(230, 57, 70, 0.06);
+}
+.upload-dropzone-icon { font-size: 2rem; color: var(--brand-accent); display: block; margin-bottom: 8px; }
+.upload-dropzone-title { font-weight: 600; font-size: 0.9rem; }
+.upload-dropzone-hint, .upload-dropzone-limit { font-size: 0.75rem; color: var(--text-muted); }
+.upload-selected { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-color); }
+.upload-badge { font-size: 0.625rem; font-weight: 700; color: var(--brand-accent); }
+
 .system-status-panel .status-row {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 0; border-bottom: 1px solid var(--border-color);

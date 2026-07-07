@@ -55,6 +55,50 @@
     <div class="col-lg-4">
         <div class="card card-panel mb-4">
             <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-cloud-upload me-2"></i>Upload Video</h5>
+            </div>
+            <div class="card-body">
+                <div class="upload-dropzone" id="uploadDropzone" data-max-mb="{{ max_upload_mb }}">
+                    <input type="file" id="videoFileInput" accept=".mp4,video/mp4" hidden>
+                    <i class="bi bi-film upload-dropzone-icon"></i>
+                    <p class="upload-dropzone-title mb-1">Drag & drop MP4 here</p>
+                    <p class="upload-dropzone-hint mb-3">or browse from your device</p>
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="btnBrowseVideo">
+                        <i class="bi bi-folder2-open me-1"></i> Browse Files
+                    </button>
+                    <p class="upload-dropzone-limit mt-3 mb-0">MP4 only · Max {{ max_upload_mb }} MB</p>
+                </div>
+
+                <div class="upload-selected d-none" id="uploadSelected">
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        <i class="bi bi-file-earmark-play text-danger"></i>
+                        <span class="small fw-semibold text-truncate" id="selectedFileName">—</span>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small mb-1" for="uploadCondition">Traffic Condition</label>
+                        <select class="form-select form-select-sm" id="uploadCondition">
+                            {% for c in conditions %}
+                            <option value="{{ c }}">{{ c|title }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="progress mb-2 d-none" id="uploadProgressWrap" style="height: 8px;">
+                        <div class="progress-bar bg-danger" id="uploadProgressBar" style="width: 0%;"></div>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-sm btn-danger flex-grow-1" id="btnUploadVideo">
+                            <i class="bi bi-upload me-1"></i> Upload
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="btnCancelUpload" disabled>
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card card-panel mb-4">
+            <div class="card-header">
                 <h5 class="card-title mb-0"><i class="bi bi-collection-play me-2"></i>Uploaded Videos</h5>
             </div>
             <div class="card-body p-0">
@@ -134,5 +178,6 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>
 {% endblock %}

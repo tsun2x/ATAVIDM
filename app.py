@@ -3,15 +3,24 @@ Frontend prototype with mock data. Decision-support tool only.
 """
 
 from datetime import datetime, timedelta
+import os
 import random
 
-from flask import Flask, render_template
+from flask import Flask, jsonify, render_template, request
+
+import config
+from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
+from database import db
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "tavidm-prototype-dev-key"
+app.config["SECRET_KEY"] = config.FLASK_SECRET_KEY
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+
+ensure_upload_dir()
+db.init_db()
 
 # ---------------------------------------------------------------------------
-# Mock Data — mirrors static/js/mock-data.js
+# Mock Data — mirrors static/js/mock-data.js (demo seed when DB is empty)
 # ---------------------------------------------------------------------------
 
 VIOLATION_TYPES = [
@@ -28,7 +37,7 @@ VIOLATION_TYPES = [
 STATUSES = ["confirmed", "dismissed", "pending"]
 CONDITIONS = ["morning", "peak", "nighttime"]
 
-VIDEOS = [
+SEED_VIDEOS = [
     {
         "id": "vid-01",
         "name": "Morning Traffic — Footbridge Cam A",
@@ -38,6 +47,7 @@ VIDEOS = [
         "duration": "12:34",
         "processed": True,
         "thumbnail": "cctv_inbound.svg",
+        "is_uploaded": False,
     },
     {
         "id": "vid-02",
@@ -48,6 +58,7 @@ VIDEOS = [
         "duration": "18:02",
         "processed": True,
         "thumbnail": "cctv_outbound.svg",
+        "is_uploaded": False,
     },
     {
         "id": "vid-03",
@@ -58,6 +69,7 @@ VIDEOS = [
         "duration": "09:47",
         "processed": False,
         "thumbnail": "cctv_feed.svg",
+        "is_uploaded": False,
     },
 ]
 
@@ -66,12 +78,49 @@ def _vtype_slug(vtype):
     return vtype.lower().replace(" ", "-").replace("/", "-")
 
 
+def _format_duration(duration_sec: float | None) -> str:
+    if not duration_sec:
+        return "—"
+    total = int(duration_sec)
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _db_video_to_ui(row: dict) -> dict:
+    condition = row.get("condition") or "peak"
+    return {
+        "id": f"vid-db-{row['id']}",
+        "db_id": row["id"],
+        "name": row["filename"],
+        "filename": row["filename"],
+        "location": f"Uploaded · {condition.title()}",
+        "condition": condition,
+        "duration": _format_duration(row.get("duration_sec")),
+        "processed": bool(row.get("processed")),
+        "thumbnail": "cctv_feed.svg",
+        "filepath": row["filepath"],
+        "is_uploaded": True,
+        "created_at": row.get("created_at"),
+    }
+
+
+def get_videos_for_ui() -> list[dict]:
+    uploaded = [_db_video_to_ui(row) for row in db.list_videos()]
+    if uploaded:
+        return uploaded + [v for v in SEED_VIDEOS if not any(u["filename"] == v["filename"] for u in uploaded)]
+    return list(SEED_VIDEOS)
+
+
+VIDEOS = get_videos_for_ui()
+
+
 def generate_violations(count=48):
     violations = []
     base_time = datetime.now()
+    videos = get_videos_for_ui()
     for i in range(1, count + 1):
         vtype = VIOLATION_TYPES[i % len(VIOLATION_TYPES)]
-        video = VIDEOS[i % len(VIDEOS)]
+        video = videos[i % len(videos)]
         ts = base_time - timedelta(hours=i, minutes=random.randint(0, 59))
         confidence = round(random.uniform(0.58, 0.96), 2)
         status = "pending" if confidence < 0.75 else random.choice(["confirmed", "confirmed", "dismissed"])
@@ -123,8 +172,8 @@ DASHBOARD_STATS = {
     "counterflow": 8,
     "illegal_parking": 11,
     "review_queue": len(REVIEW_QUEUE),
-    "videos_processed": 2,
-    "total_videos": len(VIDEOS),
+    "videos_processed": sum(1 for v in get_videos_for_ui() if v.get("processed")),
+    "total_videos": len(get_videos_for_ui()),
     "avg_confidence": 81.4,
     "trend_today": 6.2,
 }
@@ -216,7 +265,61 @@ def inject_globals():
             {"endpoint": "settings", "label": "Settings", "icon": "bi-gear"},
         ],
         "review_queue_count": len(REVIEW_QUEUE),
+        "max_upload_mb": config.MAX_UPLOAD_MB,
     }
+
+
+@app.errorhandler(413)
+def request_entity_too_large(_error):
+    return jsonify({
+        "success": False,
+        "error": f"File exceeds maximum upload size of {config.MAX_UPLOAD_MB} MB.",
+    }), 413
+
+
+@app.route("/api/videos", methods=["GET"])
+def api_list_videos():
+    return jsonify({"success": True, "videos": get_videos_for_ui()})
+
+
+@app.route("/api/upload-video", methods=["POST"])
+def api_upload_video():
+    file = request.files.get("video")
+    condition = request.form.get("condition", "peak")
+    if condition not in CONDITIONS:
+        condition = "peak"
+
+    try:
+        validate_upload(file, request.content_length)
+        filename, filepath = save_video_file(file)
+        file_size = 0
+        if file.content_length:
+            file_size = file.content_length
+        else:
+            try:
+                file_size = os.path.getsize(filepath)
+            except OSError:
+                file_size = 0
+
+        video_id = db.insert_video(
+            filename=filename,
+            filepath=filepath,
+            recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            condition=condition,
+        )
+        row = db.get_video(video_id)
+        video = _db_video_to_ui(row)
+
+        return jsonify({
+            "success": True,
+            "message": "Video uploaded successfully and queued for processing.",
+            "video": video,
+            "size": format_file_size(file_size),
+        })
+    except UploadError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception:
+        return jsonify({"success": False, "error": "Upload failed. Please try again."}), 500
 
 
 @app.route("/")
@@ -239,11 +342,14 @@ def dashboard():
 
 @app.route("/live-monitor")
 def live_monitor():
+    videos = get_videos_for_ui()
+    default_video = videos[0] if videos else SEED_VIDEOS[0]
     return render_template(
         "live_monitor.html",
-        videos=VIDEOS,
-        default_video=VIDEOS[0],
+        videos=videos,
+        default_video=default_video,
         detection_boxes=DETECTION_BOXES,
+        conditions=CONDITIONS,
     )
 
 
@@ -253,7 +359,7 @@ def violations():
         "violations.html",
         violations=MOCK_VIOLATIONS,
         violation_types=VIOLATION_TYPES,
-        videos=VIDEOS,
+        videos=get_videos_for_ui(),
         statuses=STATUSES,
     )
 
@@ -274,7 +380,7 @@ def reports():
         "reports.html",
         report_history=REPORT_HISTORY,
         violation_types=VIOLATION_TYPES,
-        videos=VIDEOS,
+        videos=get_videos_for_ui(),
         conditions=CONDITIONS,
     )
 
@@ -283,7 +389,7 @@ def reports():
 def settings():
     return render_template(
         "settings.html",
-        videos=VIDEOS,
+        videos=get_videos_for_ui(),
         users=USERS,
         settings=SYSTEM_SETTINGS,
     )
