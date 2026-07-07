@@ -1,0 +1,307 @@
+# First-Time Setup — TAVIDM
+
+**Traffic Violation Detection and Monitoring System**
+
+Use this guide after cloning the repository from GitHub for the first time on a new machine.
+
+Repository: [https://github.com/tsun2x/ATAVIDM](https://github.com/tsun2x/ATAVIDM)
+
+---
+
+## What you are setting up
+
+TAVIDM is a **Flask web application** for reviewing pre-recorded traffic videos. The current branch includes:
+
+- Dashboard, violations, analytics, and reports UI (mostly demo/mock data)
+- **Real** MP4 video upload with SQLite storage
+- **Zone Templates** and per-video polygon annotations
+- First-frame extraction for the zone editor (OpenCV)
+
+The AI detection pipeline (YOLOv8, ByteTrack) is **not fully implemented yet** — upload and annotation are the main working features.
+
+---
+
+## Requirements
+
+| Requirement | Version | Check |
+|-------------|---------|-------|
+| Python | 3.10 or newer (3.9+ may work) | `python --version` |
+| pip | Recent | `pip --version` |
+| Git | Any | `git --version` |
+| Internet | For CDN assets | Bootstrap, Chart.js, fonts load from CDN in the browser |
+
+**Recommended:** 4 GB+ RAM, Windows/macOS/Linux.
+
+---
+
+## 1. Clone the repository
+
+```bash
+git clone https://github.com/tsun2x/ATAVIDM.git
+cd ATAVIDM
+```
+
+If you use a specific branch (for example Phase 1 work):
+
+```bash
+git checkout cursor/phase-1-foundation
+```
+
+---
+
+## 2. Create a virtual environment
+
+Isolates project dependencies from your system Python.
+
+### Windows (PowerShell)
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\venv\Scripts\Activate.ps1
+```
+
+### Windows (Command Prompt)
+
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+### macOS / Linux
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+When active, your prompt shows `(venv)`.
+
+---
+
+## 3. Install dependencies
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+This installs Flask, OpenCV, NumPy, and other packages listed in `requirements.txt`. The first install may take several minutes (OpenCV and related packages are large).
+
+**Verify Flask:**
+
+```bash
+python -c "import flask; print(flask.__version__)"
+```
+
+**Verify OpenCV (needed for frame extraction on upload):**
+
+```bash
+python -c "import cv2; print(cv2.__version__)"
+```
+
+---
+
+## 4. Optional environment configuration
+
+Copy the example env file:
+
+```bash
+# Windows
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
+```
+
+Edit `.env` if needed:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FLASK_SECRET_KEY` | (change in production) | Flask session signing |
+| `SQLITE_PATH` | `database/tavidm.db` | SQLite database file |
+| `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
+| `MAX_UPLOAD_MB` | `500` | Max upload size in MB |
+
+The app runs without a `.env` file — defaults are used. `.env` is gitignored.
+
+---
+
+## 5. Folder structure (created automatically)
+
+On first run, the app creates what it needs:
+
+```
+tavidm/
+├── database/tavidm.db      ← SQLite (created on first run)
+├── dataset/raw/            ← Uploaded MP4 files
+├── dataset/frames/         ← Extracted first frames for zone editor
+└── venv/                   ← Your virtual environment (not in git)
+```
+
+You do **not** need to run a separate database script. Starting the app calls `db.init_db()` and applies schema migrations automatically.
+
+---
+
+## 6. Run the application
+
+From the project root (where `app.py` is located), with the virtual environment active:
+
+```bash
+python app.py
+```
+
+Expected output:
+
+```
+ * Serving Flask app 'app'
+ * Debug mode: on
+ * Running on http://127.0.0.1:5000
+```
+
+Open a browser:
+
+**http://localhost:5000**
+
+---
+
+## 7. First-time walkthrough
+
+### A. Explore the UI
+
+| URL | Page |
+|-----|------|
+| `/` | Dashboard |
+| `/live-monitor` | Video upload + monitor |
+| `/violations` | Violations table (mock data) |
+| `/analytics` | Charts (mock data) |
+| `/reports` | Reports (demo) |
+| `/settings` | Zone Templates + thresholds |
+| `/review-queue` | Review queue (mock data) |
+
+### B. Upload your first video
+
+1. Go to **Live Monitor**.
+2. Drag and drop an **MP4** file (or click Browse).
+3. Choose a traffic condition (morning / peak / nighttime).
+4. Click **Upload**.
+5. The **Zone Annotation** wizard opens with the first frame extracted from the video.
+6. Choose **Use Existing Zone Template** or **Create New Zone Annotation**.
+7. Draw polygons for all four required zones:
+   - No Parking Zone
+   - Active Lane
+   - Pedestrian Crossing
+   - Truck Ban Zone
+8. Click **Save Annotation**, then choose:
+   - **Use for This Video Only**, or
+   - **Save as New Template** (reusable on future uploads).
+
+### C. Manage templates
+
+Go to **Settings → Zone Templates** to view, edit, duplicate, or delete saved templates.
+
+---
+
+## 8. Stopping the server
+
+In the terminal running the app:
+
+```
+Ctrl + C
+```
+
+Deactivate the virtual environment:
+
+```bash
+deactivate
+```
+
+---
+
+## 9. Troubleshooting
+
+### `ModuleNotFoundError: No module named 'flask'`
+
+Virtual environment is not active or dependencies were not installed:
+
+```bash
+.\venv\Scripts\Activate.ps1   # Windows PowerShell
+pip install -r requirements.txt
+```
+
+### `ModuleNotFoundError: No module named 'cv2'`
+
+OpenCV is missing:
+
+```bash
+pip install opencv-python
+```
+
+### Port 5000 already in use
+
+Edit the bottom of `app.py`:
+
+```python
+app.run(debug=True, port=5001)
+```
+
+Or stop the other process using port 5000.
+
+### Upload fails or frame extraction error
+
+- Use **MP4** only.
+- Check file size (default max 500 MB).
+- Ensure `dataset/raw/` and `dataset/frames/` are writable.
+- Confirm OpenCV imports: `python -c "import cv2"`.
+
+### Database issues after pulling new code
+
+Restart the app — migrations run on startup. If the database is corrupted, delete `database/tavidm.db` and restart (this removes uploaded videos and annotations).
+
+### Charts or styles look broken
+
+Bootstrap and Chart.js load from CDN. You need internet in the browser on first load.
+
+### PowerShell: `&&` not valid
+
+Use separate commands or semicolons:
+
+```powershell
+cd ATAVIDM; .\venv\Scripts\Activate.ps1; python app.py
+```
+
+---
+
+## 10. Project status (prototype)
+
+| Feature | Status |
+|---------|--------|
+| Web UI | Working |
+| Video upload + SQLite | Working |
+| Zone annotations + templates | Working |
+| First-frame extraction | Working |
+| YOLOv8 / ByteTrack detection | Planned (stubs in `core/`) |
+| Violations from real pipeline | Mock data in UI |
+| User authentication | UI only |
+
+For more technical detail, see `CODEBASE_EXPLAINED.md` and `HOW_TO_RUN.md` (some sections in older docs may be outdated).
+
+---
+
+## Quick reference
+
+```bash
+git clone https://github.com/tsun2x/ATAVIDM.git
+cd ATAVIDM
+python -m venv venv
+.\venv\Scripts\Activate.ps1          # Windows
+pip install -r requirements.txt
+python app.py
+# → http://localhost:5000
+```
