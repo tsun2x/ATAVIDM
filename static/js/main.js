@@ -62,8 +62,8 @@
             success: "text-bg-success",
             danger: "text-bg-danger",
             warning: "text-bg-warning",
-            info: "text-bg-primary",
-        }[type] || "text-bg-primary";
+            info: "text-bg-danger",
+        }[type] || "text-bg-danger";
 
         const html =
             '<div id="' + toastId + '" class="toast ' + bgClass + '" role="alert" aria-live="assertive" aria-atomic="true">' +

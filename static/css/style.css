@@ -1,23 +1,25 @@
 /* TAVIDM - Traffic Violation Detection and Monitoring System */
 
 :root {
-    --sidebar-width: 260px;
-    --sidebar-bg: #0f172a;
-    --sidebar-hover: #1e293b;
-    --sidebar-active: #2563eb;
+    --sidebar-width: 250px;
+    --sidebar-bg: #111827;
+    --sidebar-hover: #1f2937;
+    --sidebar-active: #e63946;
     --sidebar-text: #94a3b8;
     --sidebar-text-active: #ffffff;
-    --topbar-height: 72px;
-    --primary: #2563eb;
+    --topbar-height: 60px;
+    --brand-accent: #e63946;
+    --primary: #e63946;
     --success: #16a34a;
-    --warning: #ea580c;
+    --warning: #eab308;
     --danger: #dc2626;
     --info: #0891b2;
     --body-bg: #f1f5f9;
     --card-bg: #ffffff;
     --border-color: #e2e8f0;
     --text-primary: #0f172a;
-    --text-secondary: #64748b;
+    --text-secondary: #475569;
+    --text-muted: #94a3b8;
     --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
     --shadow-md: 0 4px 6px -1px rgba(15, 23, 42, 0.08);
     --radius: 12px;
@@ -55,7 +57,7 @@ body {
 
 .brand-icon {
     width: 42px; height: 42px;
-    background: linear-gradient(135deg, var(--primary), #7c3aed);
+    background: linear-gradient(135deg, var(--brand-accent), #b91c1c);
     border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
     color: #fff; font-size: 1.25rem;
@@ -78,8 +80,24 @@ body {
 .sidebar-nav .nav-link:hover { background: var(--sidebar-hover); color: #e2e8f0; }
 .sidebar-nav .nav-link.active {
     background: var(--sidebar-active); color: var(--sidebar-text-active);
-    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+    box-shadow: 0 4px 12px rgba(230, 57, 70, 0.35);
 }
+
+.nav-badge {
+    margin-left: auto; font-size: 0.625rem; font-weight: 700;
+    padding: 2px 7px; border-radius: 10px;
+}
+
+.nav-badge-live { background: rgba(230, 57, 70, 0.2); color: #fca5a5; }
+.nav-badge-count { background: rgba(255, 255, 255, 0.12); color: #e2e8f0; }
+
+.disclaimer-banner {
+    background: rgba(230, 57, 70, 0.08); border: 1px solid rgba(230, 57, 70, 0.2);
+    border-radius: var(--radius-sm); padding: 10px 14px;
+    font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 20px;
+}
+
+.disclaimer-banner i { color: var(--brand-accent); }
 
 .sidebar-footer {
     padding: 16px 20px;
@@ -149,14 +167,14 @@ body {
 
 .user-avatar {
     width: 32px; height: 32px;
-    background: linear-gradient(135deg, var(--primary), #7c3aed);
+    background: linear-gradient(135deg, var(--brand-accent), #b91c1c);
     color: #fff; border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
     font-size: 0.75rem; font-weight: 700;
 }
 
 .user-avatar-sm {
-    width: 28px; height: 28px; background: var(--primary); color: #fff;
+    width: 28px; height: 28px; background: var(--brand-accent); color: #fff;
     border-radius: 6px; display: flex; align-items: center; justify-content: center;
     font-size: 0.625rem; font-weight: 700;
 }
@@ -199,7 +217,7 @@ body {
     font-size: 1.25rem; flex-shrink: 0;
 }
 
-.stat-primary .stat-icon { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
+.stat-primary .stat-icon { background: rgba(230, 57, 70, 0.12); color: var(--brand-accent); }
 .stat-warning .stat-icon { background: rgba(234, 88, 12, 0.12); color: var(--warning); }
 .stat-success .stat-icon { background: rgba(22, 163, 74, 0.12); color: var(--success); }
 .stat-info .stat-icon { background: rgba(8, 145, 178, 0.12); color: var(--info); }
@@ -246,9 +264,9 @@ body {
 }
 
 .table tbody td { padding: 12px 16px; vertical-align: middle; }
-.table-hover tbody tr:hover { background: rgba(37, 99, 235, 0.04); }
+.table-hover tbody tr:hover { background: rgba(230, 57, 70, 0.04); }
 .sortable { cursor: pointer; user-select: none; }
-.sortable:hover { color: var(--primary); }
+.sortable:hover { color: var(--brand-accent); }
 
 .plate-badge {
     display: inline-block; padding: 3px 10px; background: #1e293b; color: #f8fafc;
@@ -256,11 +274,23 @@ body {
     font-size: 0.8125rem; font-weight: 600;
 }
 
-.status-badge { font-weight: 500; font-size: 0.75rem; padding: 5px 10px; }
+.status-badge { font-weight: 500; font-size: 0.75rem; padding: 5px 10px; text-transform: capitalize; }
 .status-pending { background: rgba(234, 179, 8, 0.15) !important; color: #a16207 !important; }
-.status-verified { background: rgba(22, 163, 74, 0.15) !important; color: #15803d !important; }
+.status-confirmed { background: rgba(22, 163, 74, 0.15) !important; color: #15803d !important; }
 .status-dismissed { background: rgba(100, 116, 139, 0.15) !important; color: #475569 !important; }
-.status-escalated { background: rgba(220, 38, 38, 0.15) !important; color: #b91c1c !important; }
+
+.vtype-badge {
+    display: inline-block; padding: 4px 10px; border-radius: 6px;
+    font-size: 0.75rem; font-weight: 600;
+}
+.vtype-counterflowing { background: rgba(230, 57, 70, 0.12); color: #b91c1c; }
+.vtype-illegal-parking { background: rgba(245, 158, 11, 0.15); color: #b45309; }
+.vtype-obstruction { background: rgba(249, 115, 22, 0.15); color: #c2410c; }
+.vtype-illegal-loading-unloading { background: rgba(34, 197, 94, 0.15); color: #15803d; }
+.vtype-blocking-pedestrian-crossing { background: rgba(59, 130, 246, 0.15); color: #1d4ed8; }
+.vtype-truck-ban { background: rgba(139, 92, 246, 0.15); color: #6d28d9; }
+.vtype-speeding { background: rgba(244, 63, 94, 0.15); color: #be123c; }
+.vtype-reckless-driving { background: rgba(185, 28, 28, 0.15); color: #7f1d1d; }
 
 .confidence-badge {
     display: inline-block; padding: 3px 10px; border-radius: 20px;
@@ -273,7 +303,7 @@ body {
 
 .confidence-bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 100px; }
 .confidence-bar-wrap .confidence-bar {
-    height: 6px; background: linear-gradient(90deg, var(--primary), #7c3aed);
+    height: 6px; background: linear-gradient(90deg, var(--brand-accent), #b91c1c);
     border-radius: 3px; flex: 1; max-width: 60px;
 }
 
@@ -307,8 +337,31 @@ body {
     box-shadow: 0 0 8px rgba(34, 197, 94, 0.4);
 }
 
-.detection-box[data-label="Red Light"] { border-color: #ef4444; }
-.detection-box[data-label="Plate"] { border-color: #3b82f6; }
+.detection-box[data-label="jeepney"] { border-color: #f59e0b; }
+.detection-box[data-label="motorcycle"] { border-color: #3b82f6; }
+.detection-box[data-label="truck"] { border-color: #8b5cf6; }
+
+.video-progress { height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
+.video-progress-bar { height: 100%; background: var(--brand-accent); transition: width 0.3s ease; }
+
+.detection-timeline {
+    display: flex; gap: 4px; padding: 8px 0; overflow-x: auto;
+}
+.timeline-marker {
+    width: 8px; height: 24px; border-radius: 2px; background: #334155; flex-shrink: 0;
+    cursor: pointer; transition: background var(--transition);
+}
+.timeline-marker.active { background: var(--brand-accent); }
+.timeline-marker.has-violation { background: #f59e0b; }
+
+.playback-controls .btn-play { min-width: 40px; }
+
+.system-status-panel .status-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 0; border-bottom: 1px solid var(--border-color);
+    font-size: 0.875rem;
+}
+.system-status-panel .status-row:last-child { border-bottom: none; }
 
 .detection-label {
     position: absolute; top: -22px; left: -2px;
@@ -331,7 +384,7 @@ body {
 }
 
 .camera-item:hover { background: var(--body-bg); }
-.camera-item.active { background: rgba(37, 99, 235, 0.08); border-left: 3px solid var(--primary); }
+.camera-item.active { background: rgba(230, 57, 70, 0.08); border-left: 3px solid var(--brand-accent); }
 
 .camera-thumb {
     position: relative; width: 56px; height: 36px;
@@ -385,7 +438,7 @@ body {
     padding: 10px 0; border-bottom: 1px solid var(--border-color);
 }
 
-.threshold-value { font-weight: 600; color: var(--primary); }
+.threshold-value { font-weight: 600; color: var(--brand-accent); }
 
 .detail-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
 .detail-item label {
