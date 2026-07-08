@@ -125,7 +125,9 @@ Edit `.env` if needed:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `FLASK_SECRET_KEY` | (change in production) | Flask session signing |
-| `SQLITE_PATH` | `database/tavidm.db` | SQLite database file |
+| `DB_BACKEND` | `sqlite` | Active database backend |
+| `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
+| `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
 | `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
 | `MAX_UPLOAD_MB` | `500` | Max upload size in MB |
 
