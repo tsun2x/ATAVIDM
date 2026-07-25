@@ -1,18 +1,41 @@
-"""TAVIDM - Traffic Violation Detection and Monitoring System
-Frontend prototype with mock data. Decision-support tool only.
+"""TAVIDM - Traffic and Vehicle Intelligence Detection and Monitoring.
+
+Flask application: YOLOv8m + ByteTrack detection pipeline, rule-based
+violation detection, manual review queue, analytics, and reporting.
+Decision-support tool only — violations are confirmed by human reviewers.
 """
 
-from datetime import datetime, timedelta
+from __future__ import annotations
+
 import json
 import os
-import random
+import threading
+from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+    url_for,
+)
 
 import config
+from core import analytics as analytics_core
+from core import auth
+from core import reports as reports_core
+from core.detection_config import IMPLEMENTED_VIOLATIONS, MODEL_FAMILY
+from core.detector import resolve_weights_path
 from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
+from core.live_stream import mjpeg_generator, stream_manager
 from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
+from core.video_processor import process_video
 from core.zone_config import (
     dumps_zones,
     parse_zones_json,
@@ -27,64 +50,20 @@ app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 
 ensure_upload_dir()
 db.init_db()
+auth.ensure_default_admin()
 
-# ---------------------------------------------------------------------------
-# Mock Data — mirrors static/js/mock-data.js (demo seed when DB is empty)
-# ---------------------------------------------------------------------------
-
-VIOLATION_TYPES = [
-    "Illegal Parking",
-    "Counterflowing",
-    "Obstruction",
-    "Illegal Loading/Unloading",
-    "Blocking Pedestrian Crossing",
-    "Truck Ban",
-    "Reckless Driving",
-    "No Helmet Violation",
-    "Motorcycle Overloading",
-]
-
-STATUSES = ["confirmed", "dismissed", "pending"]
 CONDITIONS = ["morning", "peak", "nighttime"]
+STATUSES = ["confirmed", "dismissed", "pending"]
 
-SEED_VIDEOS = [
-    {
-        "id": "vid-01",
-        "name": "Morning Traffic — Footbridge Cam A",
-        "filename": "morning_traffic.mp4",
-        "location": "Normal Road Sector — Northbound",
-        "condition": "morning",
-        "duration": "12:34",
-        "processed": True,
-        "thumbnail": "cctv_inbound.svg",
-        "is_uploaded": False,
-    },
-    {
-        "id": "vid-02",
-        "name": "Peak Hour — Footbridge Cam B",
-        "filename": "peak_traffic.mp4",
-        "location": "Normal Road Sector — Southbound",
-        "condition": "peak",
-        "duration": "18:02",
-        "processed": True,
-        "thumbnail": "cctv_outbound.svg",
-        "is_uploaded": False,
-    },
-    {
-        "id": "vid-03",
-        "name": "Nighttime — Footbridge Cam A",
-        "filename": "night_traffic.mp4",
-        "location": "Normal Road Sector — Northbound",
-        "condition": "nighttime",
-        "duration": "09:47",
-        "processed": False,
-        "thumbnail": "cctv_feed.svg",
-        "is_uploaded": False,
-    },
-]
+# video_id -> {"state": "processing"|"done"|"error", "error": str|None}
+_processing_jobs: dict[int, dict] = {}
 
 
-def _vtype_slug(vtype):
+# ---------------------------------------------------------------------------
+# UI mapping helpers
+# ---------------------------------------------------------------------------
+
+def _vtype_slug(vtype: str) -> str:
     return vtype.lower().replace(" ", "-").replace("/", "-")
 
 
@@ -100,7 +79,6 @@ def _db_video_to_ui(row: dict) -> dict:
     condition = row.get("condition") or "peak"
     status = row.get("status") or ("processed" if row.get("processed") else "uploaded")
     db_id = row["id"]
-    has_annotation = bool(row.get("annotation_id"))
     return {
         "id": f"vid-db-{db_id}",
         "db_id": db_id,
@@ -111,13 +89,12 @@ def _db_video_to_ui(row: dict) -> dict:
         "duration": _format_duration(row.get("duration_sec")),
         "processed": bool(row.get("processed")),
         "status": status,
-        "has_annotation": has_annotation,
+        "has_annotation": bool(row.get("annotation_id")),
         "template_id": row.get("template_id"),
-        "thumbnail": "cctv_feed.svg",
         "filepath": row["filepath"],
-        "is_uploaded": True,
         "created_at": row.get("created_at"),
         "frame_url": f"/api/videos/{db_id}/frame",
+        "processing": _processing_jobs.get(db_id, {}).get("state") == "processing",
     }
 
 
@@ -135,165 +112,147 @@ def _template_to_ui(row: dict) -> dict:
     }
 
 
-def get_videos_for_ui() -> list[dict]:
-    uploaded = [_db_video_to_ui(row) for row in db.list_videos()]
-    if uploaded:
-        return uploaded + [v for v in SEED_VIDEOS if not any(u["filename"] == v["filename"] for u in uploaded)]
-    return list(SEED_VIDEOS)
+def _video_name_map() -> dict[int, dict]:
+    return {row["id"]: row for row in db.list_videos()}
 
 
-VIDEOS = get_videos_for_ui()
+def _source_label(video_id: int | None, videos: dict[int, dict]) -> str:
+    if video_id is None:
+        return "Live Camera"
+    video = videos.get(video_id)
+    return video["filename"] if video else f"Video #{video_id}"
 
 
-def generate_violations(count=48):
-    violations = []
-    base_time = datetime.now()
-    videos = get_videos_for_ui()
-    for i in range(1, count + 1):
-        vtype = VIOLATION_TYPES[i % len(VIOLATION_TYPES)]
-        video = videos[i % len(videos)]
-        ts = base_time - timedelta(hours=i, minutes=random.randint(0, 59))
-        confidence = round(random.uniform(0.58, 0.96), 2)
-        status = "pending" if confidence < 0.75 else random.choice(["confirmed", "confirmed", "dismissed"])
-        violations.append(
-            {
-                "id": f"VIO-2026{i:04d}",
-                "type": vtype,
-                "type_slug": _vtype_slug(vtype),
-                "video_id": video["id"],
-                "video_name": video["name"],
-                "track_id": random.randint(1, 20),
-                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "timestamp_iso": ts.isoformat(),
-                "confidence": confidence,
-                "status": status,
-                "condition": video["condition"],
-                "evidence_image": f"evidence_{(i % 6) + 1}.svg",
-                "reason_log": "Rule-based detection via YOLOv8 + ByteTrack pipeline (mock).",
-                "frame_number": random.randint(100, 18000),
-            }
-        )
-    violations.sort(key=lambda v: v["timestamp_iso"], reverse=True)
-    return violations
+def _evidence_url(evidence_path: str | None) -> str | None:
+    if not evidence_path:
+        return None
+    return "/" + evidence_path.lstrip("/")
 
 
-MOCK_VIOLATIONS = generate_violations()
-
-REVIEW_QUEUE = [
-    {
-        "id": f"RQ-{i:04d}",
-        "violation_id": v["id"],
-        "video_id": v["video_id"],
-        "video_name": v["video_name"],
-        "track_id": v["track_id"],
-        "violation_type": v["type"],
-        "type_slug": v["type_slug"],
-        "confidence": v["confidence"],
-        "frame_number": v["frame_number"],
-        "evidence_image": v["evidence_image"],
-        "reason_log": v["reason_log"],
-        "queued_at": v["timestamp"],
-        "status": "pending",
+def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    video = videos.get(row.get("video_id"))
+    detected = row.get("detected_at") or ""
+    return {
+        "id": f"VIO-{row['id']:06d}",
+        "db_id": row["id"],
+        "type": row["violation_type"],
+        "type_slug": _vtype_slug(row["violation_type"]),
+        "video_id": row.get("video_id"),
+        "video_name": _source_label(row.get("video_id"), videos),
+        "track_id": row.get("track_id"),
+        "timestamp": detected,
+        "timestamp_iso": detected.replace(" ", "T"),
+        "confidence": row.get("confidence") or 0,
+        "status": row.get("status"),
+        "condition": (video or {}).get("condition") or "—",
+        "vehicle_class": row.get("vehicle_class") or "—",
+        "evidence_url": _evidence_url(row.get("evidence_path")),
+        "reason_log": row.get("reason_log") or "",
+        "frame_number": row.get("frame_number"),
     }
-    for i, v in enumerate([v for v in MOCK_VIOLATIONS if v["status"] == "pending"][:12], 1)
-]
 
-DASHBOARD_STATS = {
-    "total_today": 34,
-    "counterflow": 8,
-    "illegal_parking": 11,
-    "review_queue": len(REVIEW_QUEUE),
-    "videos_processed": sum(1 for v in get_videos_for_ui() if v.get("processed")),
-    "total_videos": len(get_videos_for_ui()),
-    "avg_confidence": 81.4,
-    "trend_today": 6.2,
-}
 
-VIOLATION_SUMMARY = [
-    {"type": "Counterflowing", "count": 42, "change": 5.1, "color": "#e63946", "share": 22.3},
-    {"type": "Illegal Parking", "count": 38, "change": -2.4, "color": "#f59e0b", "share": 20.2},
-    {"type": "Obstruction", "count": 28, "change": 3.8, "color": "#f97316", "share": 14.9},
-    {"type": "Truck Ban", "count": 24, "change": 1.2, "color": "#8b5cf6", "share": 12.8},
-    {"type": "No Helmet Violation", "count": 21, "change": 4.5, "color": "#06b6d4", "share": 11.2},
-    {"type": "Motorcycle Overloading", "count": 16, "change": 2.1, "color": "#ec4899", "share": 8.5},
-]
+def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    return {
+        "id": row["id"],
+        "display_id": f"RQ-{row['id']:05d}",
+        "video_id": row.get("video_id"),
+        "video_name": _source_label(row.get("video_id"), videos),
+        "track_id": row.get("track_id"),
+        "violation_type": row.get("violation_type"),
+        "type_slug": _vtype_slug(row.get("violation_type") or ""),
+        "confidence": row.get("confidence") or 0,
+        "frame_number": row.get("frame_number"),
+        "vehicle_class": row.get("vehicle_class") or "—",
+        "evidence_url": _evidence_url(row.get("evidence_path")),
+        "reason_log": row.get("reason_log") or "",
+        "queued_at": row.get("queued_at"),
+        "status": row.get("status"),
+    }
 
-ANALYTICS_DATA = {
-    "daily_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    "daily_values": [28, 35, 31, 42, 48, 22, 18],
-    "monthly_labels": ["Jan", "Feb", "Mar", "Apr", "May", "Jun"],
-    "monthly_values": [312, 348, 329, 401, 438, 389],
-    "breakdown_labels": VIOLATION_TYPES,
-    "breakdown_values": [38, 42, 28, 19, 15, 12, 11, 21, 16],
-    "condition_labels": ["Morning", "Peak", "Nighttime"],
-    "condition_values": [142, 198, 89],
-    "confidence_labels": ["≥85%", "65–84%", "<65%"],
-    "confidence_values": [112, 58, 19],
-    "kpi": {
-        "total_week": 224,
-        "peak_hour": "16:00",
-        "most_common": "Counterflowing",
-        "accuracy": 87.6,
-    },
-}
 
-REPORT_HISTORY = [
-    {"id": "RPT-001", "name": "Weekly Violation Summary", "type": "PDF", "date": "2026-06-20", "size": "2.4 MB", "status": "Ready", "filters": "Jun 14–20 · All types"},
-    {"id": "RPT-002", "name": "Counterflowing Analysis", "type": "Excel", "date": "2026-06-15", "size": "1.8 MB", "status": "Ready", "filters": "Jun 1–15 · Counterflowing"},
-    {"id": "RPT-003", "name": "Peak Hour Violations", "type": "PDF", "date": "2026-06-10", "size": "3.1 MB", "status": "Ready", "filters": "Peak condition"},
-    {"id": "RPT-004", "name": "Review Queue Export", "type": "Excel", "date": "2026-06-05", "size": "956 KB", "status": "Ready", "filters": "Pending items"},
-]
+def _report_to_ui(row: dict) -> dict:
+    filters = {}
+    try:
+        filters = json.loads(row.get("filters_json") or "{}")
+    except json.JSONDecodeError:
+        pass
+    filter_parts = [str(v) for v in filters.values() if v]
+    return {
+        "id": row["id"],
+        "name": row["title"],
+        "type": "PDF" if row["report_format"] == "pdf" else "Excel",
+        "date": row.get("generated_at"),
+        "filters": " · ".join(filter_parts) if filter_parts else "All violations",
+        "generated_by": row.get("generated_by_username") or "—",
+        "download_url": f"/api/reports/{row['id']}/download",
+    }
 
-USERS = [
-    {"id": 1, "username": "admin", "name": "Admin User", "role": "admin", "created_at": "2026-01-15"},
-    {"id": 2, "username": "enforcer1", "name": "Juan Dela Cruz", "role": "enforcer", "created_at": "2026-02-03"},
-    {"id": 3, "username": "enforcer2", "name": "Maria Santos", "role": "enforcer", "created_at": "2026-02-10"},
-]
 
-SYSTEM_SETTINGS = {
-    "confidence_threshold": 60,
-    "review_threshold": 75,
-    "truck_ban_start": "06:00",
-    "truck_ban_end": "09:00",
-    "frame_skip": 2,
-    "evidence_retention_days": 90,
-    "fps": 30,
-}
+def _user_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "name": row.get("full_name") or row["username"],
+        "role": row["role"],
+        "role_label": auth.ROLE_LABELS.get(row["role"], row["role"]),
+        "is_active": bool(row.get("is_active", 1)),
+        "created_at": row.get("created_at"),
+    }
 
-DETECTION_BOXES = [
-    {"label": "car", "track_id": 3, "x": 12, "y": 35, "w": 28, "h": 22, "confidence": 0.91},
-    {"label": "jeepney", "track_id": 7, "x": 48, "y": 28, "w": 22, "h": 18, "confidence": 0.87},
-    {"label": "motorcycle", "track_id": 12, "x": 68, "y": 42, "w": 10, "h": 14, "confidence": 0.84},
-]
 
-SYSTEM_STATUS = {
-    "pipeline": "Ready",
-    "model": "YOLOv8n (mock)",
-    "tracker": "ByteTrack",
-    "db": "SQLite",
-    "last_processed": "peak_traffic.mp4",
-}
+def _camera_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row.get("location") or "",
+        "rtsp_url": row["rtsp_url"],
+        "zones_json": row.get("zones_json") or "{}",
+        "is_active": bool(row.get("is_active", 1)),
+        "created_at": row.get("created_at"),
+        "stream_url": f"/api/cameras/{row['id']}/stream",
+        "stream_status": stream_manager.status(row["id"]),
+    }
+
+
+def _system_status() -> dict:
+    weights, is_custom = resolve_weights_path()
+    videos = db.list_videos()
+    last_processed = next((v["filename"] for v in videos if v.get("processed")), "—")
+    return {
+        "pipeline": "Ready",
+        "model": f"{MODEL_FAMILY} ({'custom' if is_custom else 'COCO pretrained'})",
+        "tracker": "ByteTrack",
+        "db": db.active_backend().upper(),
+        "last_processed": last_processed,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Context + error handlers
 # ---------------------------------------------------------------------------
 
 @app.context_processor
 def inject_globals():
+    user = auth.current_user()
+    role = user["role"] if user else None
+    nav_items = [
+        {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
+        {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video", "badge": "live"},
+        {"endpoint": "violations", "label": "Violations", "icon": "bi-exclamation-triangle"},
+        {"endpoint": "analytics", "label": "Analytics", "icon": "bi-bar-chart-line"},
+    ]
+    if role in ("admin", "enforcer"):
+        nav_items.append({"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"})
+    if role == "admin":
+        nav_items.append({"endpoint": "settings", "label": "Settings", "icon": "bi-gear"})
     return {
         "app_name": "TAVIDM",
-        "app_full_name": "Traffic Violation Detection and Monitoring System",
+        "app_full_name": "Traffic and Vehicle Intelligence Detection and Monitoring",
         "current_year": datetime.now().year,
-        "nav_items": [
-            {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
-            {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video", "badge": "live"},
-            {"endpoint": "violations", "label": "Violations", "icon": "bi-exclamation-triangle", "badge_count": len(MOCK_VIOLATIONS)},
-            {"endpoint": "analytics", "label": "Analytics", "icon": "bi-bar-chart-line"},
-            {"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"},
-            {"endpoint": "settings", "label": "Settings", "icon": "bi-gear"},
-        ],
-        "review_queue_count": len(REVIEW_QUEUE),
+        "nav_items": nav_items,
+        "current_user": user,
+        "review_queue_count": db.count_review_pending() if user else 0,
         "max_upload_mb": config.MAX_UPLOAD_MB,
     }
 
@@ -306,23 +265,164 @@ def request_entity_too_large(_error):
     }), 413
 
 
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        user = auth.authenticate(username, password)
+        if user is None:
+            flash("Invalid username or password.", "danger")
+            return render_template("login.html"), 401
+        auth.login_user(user)
+        next_url = request.args.get("next") or url_for("dashboard")
+        return redirect(next_url)
+    if auth.current_user():
+        return redirect(url_for("dashboard"))
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    auth.logout_user()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+@auth.login_required
+def dashboard():
+    stats = analytics_core.dashboard_stats()
+    summary = analytics_core.violation_summary()
+    hourly_labels, hourly_values = analytics_core.hourly_chart_today()
+    videos = _video_name_map()
+    recent_rows, _total = db.list_violations(page=1, per_page=8, sort="newest")
+    chart_data = {
+        "hourly_labels": hourly_labels,
+        "hourly_values": hourly_values,
+        "distribution_labels": [s["type"] for s in summary],
+        "distribution_values": [s["count"] for s in summary],
+    }
+    return render_template(
+        "dashboard.html",
+        stats=stats,
+        recent_violations=[_violation_to_ui(r, videos) for r in recent_rows],
+        violation_summary=summary,
+        chart_data=chart_data,
+        system_status=_system_status(),
+    )
+
+
+@app.route("/live-monitor")
+@auth.login_required
+def live_monitor():
+    videos = [_db_video_to_ui(row) for row in db.list_videos()]
+    cameras = [_camera_to_ui(row) for row in db.list_cameras()]
+    return render_template(
+        "live_monitor.html",
+        videos=videos,
+        cameras=cameras,
+        conditions=CONDITIONS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
+    )
+
+
+@app.route("/violations")
+@auth.login_required
+def violations():
+    videos = _video_name_map()
+    rows, _total = db.list_violations(page=1, per_page=1000, sort="newest")
+    return render_template(
+        "violations.html",
+        violations=[_violation_to_ui(r, videos) for r in rows],
+        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        videos=[_db_video_to_ui(row) for row in db.list_videos()],
+        statuses=STATUSES,
+    )
+
+
+@app.route("/analytics")
+@auth.login_required
+def analytics():
+    return render_template(
+        "analytics.html",
+        analytics=analytics_core.analytics_data(),
+        violation_summary=analytics_core.violation_summary(),
+    )
+
+
+@app.route("/reports")
+@auth.role_required("enforcer")
+def reports():
+    return render_template(
+        "reports.html",
+        report_history=[_report_to_ui(r) for r in db.list_reports()],
+        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        videos=[_db_video_to_ui(row) for row in db.list_videos()],
+        statuses=STATUSES,
+    )
+
+
+@app.route("/settings")
+@auth.role_required("admin")
+def settings():
+    from core.video_processor import load_rule_parameters
+
+    return render_template(
+        "settings.html",
+        users=[_user_to_ui(u) for u in db.list_users()],
+        settings=load_rule_parameters(),
+        cameras=[_camera_to_ui(c) for c in db.list_cameras()],
+        roles=auth.ROLE_LABELS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
+    )
+
+
+@app.route("/review-queue")
+@auth.role_required("enforcer")
+def review_queue():
+    videos = _video_name_map()
+    rows, _total = db.list_review_queue(status="pending", page=1, per_page=200)
+    return render_template(
+        "review_queue.html",
+        review_items=[_review_to_ui(r, videos) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video + annotation APIs
+# ---------------------------------------------------------------------------
+
 @app.route("/api/videos", methods=["GET"])
+@auth.login_required
 def api_list_videos():
-    return jsonify({"success": True, "videos": get_videos_for_ui()})
+    return jsonify({"success": True, "videos": [_db_video_to_ui(row) for row in db.list_videos()]})
 
 
 @app.route("/api/zone-types", methods=["GET"])
+@auth.login_required
 def api_zone_types():
     return jsonify({"success": True, "zone_types": zones_for_api()})
 
 
 @app.route("/api/zone-templates", methods=["GET"])
+@auth.login_required
 def api_list_zone_templates():
     templates = [_template_to_ui(row) for row in db.list_zone_templates()]
     return jsonify({"success": True, "templates": templates})
 
 
 @app.route("/api/zone-templates", methods=["POST"])
+@auth.role_required("enforcer")
 def api_create_zone_template():
     payload = request.get_json(silent=True) or {}
     name = (payload.get("template_name") or "").strip()
@@ -343,6 +443,7 @@ def api_create_zone_template():
 
 
 @app.route("/api/zone-templates/<int:template_id>", methods=["GET"])
+@auth.login_required
 def api_get_zone_template(template_id: int):
     row = db.get_zone_template(template_id)
     if row is None:
@@ -351,6 +452,7 @@ def api_get_zone_template(template_id: int):
 
 
 @app.route("/api/zone-templates/<int:template_id>", methods=["PUT"])
+@auth.role_required("enforcer")
 def api_update_zone_template(template_id: int):
     row = db.get_zone_template(template_id)
     if row is None:
@@ -381,6 +483,7 @@ def api_update_zone_template(template_id: int):
 
 
 @app.route("/api/zone-templates/<int:template_id>", methods=["DELETE"])
+@auth.role_required("enforcer")
 def api_delete_zone_template(template_id: int):
     row = db.get_zone_template(template_id)
     if row is None:
@@ -390,6 +493,7 @@ def api_delete_zone_template(template_id: int):
 
 
 @app.route("/api/zone-templates/<int:template_id>/duplicate", methods=["POST"])
+@auth.role_required("enforcer")
 def api_duplicate_zone_template(template_id: int):
     payload = request.get_json(silent=True) or {}
     new_name = (payload.get("template_name") or "").strip()
@@ -407,6 +511,7 @@ def api_duplicate_zone_template(template_id: int):
 
 
 @app.route("/api/videos/<int:video_id>/frame")
+@auth.login_required
 def api_video_frame(video_id: int):
     row = db.get_video(video_id)
     if row is None:
@@ -432,6 +537,7 @@ def api_video_frame(video_id: int):
 
 
 @app.route("/api/videos/<int:video_id>/annotation", methods=["GET"])
+@auth.login_required
 def api_get_annotation(video_id: int):
     row = db.get_video(video_id)
     if row is None:
@@ -443,6 +549,7 @@ def api_get_annotation(video_id: int):
 
 
 @app.route("/api/videos/<int:video_id>/annotation", methods=["POST", "PUT"])
+@auth.role_required("enforcer")
 def api_save_annotation(video_id: int):
     row = db.get_video(video_id)
     if row is None:
@@ -461,7 +568,7 @@ def api_save_annotation(video_id: int):
     if not zones_complete(zones):
         return jsonify({
             "success": False,
-            "error": "All required zones must have at least 3 points.",
+            "error": "Draw at least one zone; each drawn zone needs at least 3 points.",
         }), 400
 
     frame_path = frame_path_for_video(video_id)
@@ -511,6 +618,7 @@ def api_save_annotation(video_id: int):
 
 
 @app.route("/api/upload-video", methods=["POST"])
+@auth.role_required("enforcer")
 def api_upload_video():
     file = request.files.get("video")
     condition = request.form.get("condition", "peak")
@@ -567,88 +675,299 @@ def api_upload_video():
         return jsonify({"success": False, "error": "Upload failed. Please try again."}), 500
 
 
-@app.route("/")
-def dashboard():
-    chart_data = {
-        "hourly_labels": ["06:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"],
-        "hourly_values": [2, 5, 8, 6, 11, 9, 7, 4],
-        "distribution_labels": [s["type"] for s in VIOLATION_SUMMARY],
-        "distribution_values": [s["count"] for s in VIOLATION_SUMMARY],
+# ---------------------------------------------------------------------------
+# Detection pipeline APIs
+# ---------------------------------------------------------------------------
+
+def _run_processing(video_id: int) -> None:
+    try:
+        process_video(video_id)
+        _processing_jobs[video_id] = {"state": "done", "error": None}
+    except Exception as exc:  # surface pipeline failures to the UI
+        _processing_jobs[video_id] = {"state": "error", "error": str(exc)}
+        db.update_video(video_id, status="ready")
+
+
+@app.route("/api/videos/<int:video_id>/process", methods=["POST"])
+@auth.role_required("enforcer")
+def api_process_video(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    if _processing_jobs.get(video_id, {}).get("state") == "processing":
+        return jsonify({"success": False, "error": "Video is already being processed."}), 409
+    if not row.get("annotation_id"):
+        return jsonify({
+            "success": False,
+            "error": "Annotate traffic zones before processing this video.",
+        }), 400
+
+    _processing_jobs[video_id] = {"state": "processing", "error": None}
+    thread = threading.Thread(target=_run_processing, args=(video_id,), daemon=True)
+    thread.start()
+    return jsonify({"success": True, "message": "Processing started."})
+
+
+@app.route("/api/videos/<int:video_id>/process-status", methods=["GET"])
+@auth.login_required
+def api_process_status(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    job = _processing_jobs.get(video_id, {})
+    return jsonify({
+        "success": True,
+        "video_status": row.get("status"),
+        "job_state": job.get("state"),
+        "job_error": job.get("error"),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Review queue APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/review-queue", methods=["GET"])
+@auth.login_required
+def api_review_queue():
+    status = request.args.get("status", "pending")
+    videos = _video_name_map()
+    rows, total = db.list_review_queue(status=status, page=1, per_page=200)
+    return jsonify({
+        "success": True,
+        "items": [_review_to_ui(r, videos) for r in rows],
+        "total": total,
+    })
+
+
+@app.route("/api/review-queue/<int:review_id>/confirm", methods=["POST"])
+@auth.role_required("enforcer")
+def api_confirm_review(review_id: int):
+    user = auth.current_user()
+    try:
+        violation_id = db.confirm_review_item(review_id, reviewed_by=user["id"])
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    return jsonify({"success": True, "violation_id": violation_id})
+
+
+@app.route("/api/review-queue/<int:review_id>/dismiss", methods=["POST"])
+@auth.role_required("enforcer")
+def api_dismiss_review(review_id: int):
+    user = auth.current_user()
+    if db.get_review_item(review_id) is None:
+        return jsonify({"success": False, "error": "Review item not found."}), 404
+    db.dismiss_review_item(review_id, reviewed_by=user["id"])
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Report APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/reports", methods=["GET"])
+@auth.role_required("enforcer")
+def api_list_reports():
+    return jsonify({"success": True, "reports": [_report_to_ui(r) for r in db.list_reports()]})
+
+
+@app.route("/api/reports", methods=["POST"])
+@auth.role_required("enforcer")
+def api_generate_report():
+    payload = request.get_json(silent=True) or {}
+    report_format = (payload.get("format") or "pdf").lower()
+    filters = {
+        key: payload.get(key)
+        for key in ("date_from", "date_to", "violation_type", "status", "video_id")
+        if payload.get(key)
     }
-    return render_template(
-        "dashboard.html",
-        stats=DASHBOARD_STATS,
-        recent_violations=MOCK_VIOLATIONS[:8],
-        violation_summary=VIOLATION_SUMMARY,
-        chart_data=chart_data,
-        system_status=SYSTEM_STATUS,
+    user = auth.current_user()
+    try:
+        row = reports_core.generate_report(
+            report_format=report_format,
+            filters=filters,
+            title=(payload.get("title") or "").strip() or None,
+            generated_by=user["id"],
+        )
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "report": _report_to_ui(row)})
+
+
+@app.route("/api/reports/<int:report_id>/download", methods=["GET"])
+@auth.role_required("enforcer")
+def api_download_report(report_id: int):
+    row = db.get_report(report_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Report not found."}), 404
+    file_path = Path(config.BASE_DIR) / row["file_path"]
+    if not file_path.is_file():
+        return jsonify({"success": False, "error": "Report file is missing."}), 404
+    return send_file(file_path, as_attachment=True)
+
+
+# ---------------------------------------------------------------------------
+# Settings + user management APIs (admin)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/settings", methods=["GET"])
+@auth.role_required("admin")
+def api_get_settings():
+    from core.video_processor import load_rule_parameters
+
+    return jsonify({"success": True, "settings": load_rule_parameters()})
+
+
+@app.route("/api/settings", methods=["POST"])
+@auth.role_required("admin")
+def api_save_settings():
+    from core.detection_config import DEFAULT_RULE_PARAMETERS
+
+    payload = request.get_json(silent=True) or {}
+    values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
+    if not values:
+        return jsonify({"success": False, "error": "No recognized settings provided."}), 400
+    db.set_settings(values)
+    return jsonify({"success": True, "message": "Settings saved."})
+
+
+@app.route("/api/users", methods=["GET"])
+@auth.role_required("admin")
+def api_list_users():
+    return jsonify({"success": True, "users": [_user_to_ui(u) for u in db.list_users()]})
+
+
+@app.route("/api/users", methods=["POST"])
+@auth.role_required("admin")
+def api_create_user():
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    role = payload.get("role") or "enforcer"
+    if not username or not password:
+        return jsonify({"success": False, "error": "Username and password are required."}), 400
+    if role not in auth.ROLES:
+        return jsonify({"success": False, "error": f"Role must be one of: {', '.join(auth.ROLES)}."}), 400
+    if db.get_user_by_username(username):
+        return jsonify({"success": False, "error": "Username already exists."}), 400
+    user_id = db.create_user(
+        username,
+        auth.hash_password(password),
+        role=role,
+        full_name=(payload.get("full_name") or "").strip() or None,
+    )
+    return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
+
+
+@app.route("/api/users/<int:user_id>", methods=["PUT"])
+@auth.role_required("admin")
+def api_update_user(user_id: int):
+    if db.get_user(user_id) is None:
+        return jsonify({"success": False, "error": "User not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role")
+    if role is not None and role not in auth.ROLES:
+        return jsonify({"success": False, "error": f"Role must be one of: {', '.join(auth.ROLES)}."}), 400
+    password = payload.get("password")
+    db.update_user(
+        user_id,
+        full_name=payload.get("full_name"),
+        role=role,
+        password_hash=auth.hash_password(password) if password else None,
+        is_active=payload.get("is_active"),
+    )
+    return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
+
+
+# ---------------------------------------------------------------------------
+# Camera (RTSP live stream) APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/cameras", methods=["GET"])
+@auth.login_required
+def api_list_cameras():
+    return jsonify({"success": True, "cameras": [_camera_to_ui(c) for c in db.list_cameras()]})
+
+
+@app.route("/api/cameras", methods=["POST"])
+@auth.role_required("admin")
+def api_create_camera():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    rtsp_url = (payload.get("rtsp_url") or "").strip()
+    if not name or not rtsp_url:
+        return jsonify({"success": False, "error": "Camera name and RTSP URL are required."}), 400
+    try:
+        zones_json = dumps_zones(payload.get("zones_json") or {})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    camera_id = db.create_camera(
+        name=name,
+        rtsp_url=rtsp_url,
+        location=(payload.get("location") or "").strip() or None,
+        zones_json=zones_json,
+    )
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+
+
+@app.route("/api/cameras/<int:camera_id>", methods=["PUT"])
+@auth.role_required("admin")
+def api_update_camera(camera_id: int):
+    if db.get_camera(camera_id) is None:
+        return jsonify({"success": False, "error": "Camera not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    zones_json = None
+    if "zones_json" in payload:
+        try:
+            zones_json = dumps_zones(payload.get("zones_json") or {})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+    db.update_camera(
+        camera_id,
+        name=payload.get("name"),
+        location=payload.get("location"),
+        rtsp_url=payload.get("rtsp_url"),
+        zones_json=zones_json,
+        is_active=payload.get("is_active"),
+    )
+    stream_manager.stop(camera_id)  # restart picks up the new configuration
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+
+
+@app.route("/api/cameras/<int:camera_id>", methods=["DELETE"])
+@auth.role_required("admin")
+def api_delete_camera(camera_id: int):
+    if db.get_camera(camera_id) is None:
+        return jsonify({"success": False, "error": "Camera not found."}), 404
+    stream_manager.stop(camera_id)
+    db.delete_camera(camera_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/cameras/<int:camera_id>/stream")
+@auth.login_required
+def api_camera_stream(camera_id: int):
+    try:
+        worker = stream_manager.start(camera_id)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    return Response(
+        mjpeg_generator(worker),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-@app.route("/live-monitor")
-def live_monitor():
-    videos = get_videos_for_ui()
-    default_video = videos[0] if videos else SEED_VIDEOS[0]
-    return render_template(
-        "live_monitor.html",
-        videos=videos,
-        default_video=default_video,
-        detection_boxes=DETECTION_BOXES,
-        conditions=CONDITIONS,
-        zone_types=zones_for_api(),
-        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
-    )
+@app.route("/api/cameras/<int:camera_id>/stream-status")
+@auth.login_required
+def api_camera_stream_status(camera_id: int):
+    return jsonify({"success": True, **stream_manager.status(camera_id)})
 
 
-@app.route("/violations")
-def violations():
-    return render_template(
-        "violations.html",
-        violations=MOCK_VIOLATIONS,
-        violation_types=VIOLATION_TYPES,
-        videos=get_videos_for_ui(),
-        statuses=STATUSES,
-    )
-
-
-@app.route("/analytics")
-def analytics():
-    return render_template(
-        "analytics.html",
-        analytics=ANALYTICS_DATA,
-        violation_summary=VIOLATION_SUMMARY,
-        conditions=CONDITIONS,
-    )
-
-
-@app.route("/reports")
-def reports():
-    return render_template(
-        "reports.html",
-        report_history=REPORT_HISTORY,
-        violation_types=VIOLATION_TYPES,
-        videos=get_videos_for_ui(),
-        conditions=CONDITIONS,
-    )
-
-
-@app.route("/settings")
-def settings():
-    return render_template(
-        "settings.html",
-        users=USERS,
-        settings=SYSTEM_SETTINGS,
-        zone_types=zones_for_api(),
-        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
-    )
-
-
-@app.route("/review-queue")
-def review_queue():
-    return render_template(
-        "review_queue.html",
-        review_items=REVIEW_QUEUE,
-    )
+@app.route("/api/cameras/<int:camera_id>/stop", methods=["POST"])
+@auth.role_required("enforcer")
+def api_camera_stop(camera_id: int):
+    stream_manager.stop(camera_id)
+    return jsonify({"success": True})
 
 
 if __name__ == "__main__":

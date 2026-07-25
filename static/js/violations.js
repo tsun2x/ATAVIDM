@@ -155,8 +155,11 @@
         selectedViolation = v;
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
+        const image = v.evidence_url
+            ? '<img src="' + v.evidence_url + '" alt="Evidence" class="evidence-preview">'
+            : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
         body.innerHTML =
-            '<img src="/static/images/' + v.evidence_image + '" alt="Evidence" class="evidence-preview">' +
+            image +
             "<p class=\"mt-3 text-muted\">" + v.id + " · " + v.type + " · Track #" + v.track_id + " · " + v.timestamp + "</p>";
         evidenceModal.show();
     }
@@ -201,6 +204,10 @@
     document.getElementById("btnViewEvidenceFromDetail")?.addEventListener("click", function () {
         if (selectedViolation) { detailModal.hide(); setTimeout(function () { showEvidence(selectedViolation); }, 300); }
     });
+
+    // Prefill search from ?q= (global navbar search redirects here).
+    const urlQuery = new URLSearchParams(window.location.search).get("q");
+    if (urlQuery && searchInput) searchInput.value = urlQuery;
 
     applyFilters();
 })();

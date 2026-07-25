@@ -36,12 +36,12 @@
         }
     });
 
-    // Global search (demo toast)
+    // Global search: jump to the violations page with the query applied.
     const globalSearch = document.getElementById("globalSearch");
     if (globalSearch) {
         globalSearch.addEventListener("keydown", function (e) {
             if (e.key === "Enter" && this.value.trim()) {
-                showToast("Search", 'Demo search for: "' + this.value.trim() + '" — no backend connected.', "info");
+                window.location.href = "/violations?q=" + encodeURIComponent(this.value.trim());
             }
         });
     }

@@ -201,7 +201,7 @@
     function saveAnnotation(saveMode, extra) {
         const zones = wizardState.pendingZones || (zoneEditor ? zoneEditor.getZones() : {});
         if (!window.TAVIDMZoneEditor.zonesComplete(zones, zoneTypes)) {
-            showToast("Incomplete Zones", "Each zone needs at least 3 points.", "warning");
+            showToast("Incomplete Zones", "Draw at least one zone; each drawn zone needs at least 3 points.", "warning");
             return;
         }
 
@@ -273,7 +273,7 @@
         if (!zoneEditor) return;
         wizardState.pendingZones = zoneEditor.getZones();
         if (!window.TAVIDMZoneEditor.zonesComplete(wizardState.pendingZones, zoneTypes)) {
-            showToast("Incomplete Zones", "Each zone needs at least 3 points.", "warning");
+            showToast("Incomplete Zones", "Draw at least one zone; each drawn zone needs at least 3 points.", "warning");
             return;
         }
         const updateBtn = document.getElementById("btnUpdateTemplate");

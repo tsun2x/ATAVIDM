@@ -74,10 +74,90 @@ def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) 
     return any(row[1] == column_name for row in rows)
 
 
+def _users_table_allows_viewer(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    return row is not None and "'viewer'" in (row[0] or "")
+
+
+def _rebuild_users_table(conn: sqlite3.Connection) -> None:
+    """Recreate users with the manuscript's three roles (admin/enforcer/viewer)."""
+    # FK references to users(id) would block the DROP; the copy preserves ids.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript(
+        """
+        CREATE TABLE users_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          full_name TEXT,
+          role TEXT CHECK(role IN ('admin','enforcer','viewer')) DEFAULT 'enforcer',
+          is_active BOOLEAN DEFAULT 1,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO users_new (id, username, password_hash, role, created_at)
+          SELECT id, username, password_hash, role, created_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+        """
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     migration_path = Path(__file__).parent / "migrations" / "001_zone_templates.sql"
     if migration_path.is_file():
         conn.executescript(migration_path.read_text(encoding="utf-8"))
+
+    if _table_exists(conn, "users"):
+        if not _users_table_allows_viewer(conn):
+            _rebuild_users_table(conn)
+        if not _column_exists(conn, "users", "full_name"):
+            conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+        if not _column_exists(conn, "users", "is_active"):
+            conn.execute("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1")
+
+    if _table_exists(conn, "violations"):
+        if not _column_exists(conn, "violations", "vehicle_class"):
+            conn.execute("ALTER TABLE violations ADD COLUMN vehicle_class TEXT")
+
+    if _table_exists(conn, "review_queue"):
+        if not _column_exists(conn, "review_queue", "vehicle_class"):
+            conn.execute("ALTER TABLE review_queue ADD COLUMN vehicle_class TEXT")
+        if not _column_exists(conn, "review_queue", "timestamp_sec"):
+            conn.execute("ALTER TABLE review_queue ADD COLUMN timestamp_sec REAL")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS cameras (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          location TEXT,
+          rtsp_url TEXT NOT NULL,
+          zones_json TEXT NOT NULL DEFAULT '{}',
+          is_active BOOLEAN DEFAULT 1,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS system_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          report_format TEXT CHECK(report_format IN ('pdf','excel')) NOT NULL,
+          filters_json TEXT NOT NULL DEFAULT '{}',
+          file_path TEXT NOT NULL,
+          generated_by INTEGER REFERENCES users(id),
+          generated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);
+        """
+    )
 
     if _table_exists(conn, "videos"):
         if not _column_exists(conn, "videos", "status"):
@@ -110,6 +190,9 @@ def init_db(force: bool = False) -> None:
         if force:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS reports;
+                DROP TABLE IF EXISTS system_settings;
+                DROP TABLE IF EXISTS cameras;
                 DROP TABLE IF EXISTS review_queue;
                 DROP TABLE IF EXISTS violations;
                 DROP TABLE IF EXISTS detections;
@@ -130,13 +213,27 @@ def init_db(force: bool = False) -> None:
 # --- Users ---
 
 
-def create_user(username: str, password_hash: str, role: str = "enforcer") -> int:
+def create_user(
+    username: str,
+    password_hash: str,
+    role: str = "enforcer",
+    full_name: str | None = None,
+) -> int:
     with db_session() as conn:
         cursor = conn.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-            (username, password_hash, role),
+            "INSERT INTO users (username, password_hash, role, full_name) VALUES (?, ?, ?, ?)",
+            (username, password_hash, role, full_name),
         )
         return cursor.lastrowid
+
+
+def get_user(user_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        return _row_to_dict(row)
 
 
 def get_user_by_username(username: str) -> dict[str, Any] | None:
@@ -154,6 +251,35 @@ def list_users() -> list[dict[str, Any]]:
             "SELECT * FROM users ORDER BY created_at DESC"
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+
+def update_user(
+    user_id: int,
+    *,
+    full_name: str | None = None,
+    role: str | None = None,
+    password_hash: str | None = None,
+    is_active: bool | None = None,
+) -> None:
+    fields: list[str] = []
+    params: list[Any] = []
+    if full_name is not None:
+        fields.append("full_name = ?")
+        params.append(full_name)
+    if role is not None:
+        fields.append("role = ?")
+        params.append(role)
+    if password_hash is not None:
+        fields.append("password_hash = ?")
+        params.append(password_hash)
+    if is_active is not None:
+        fields.append("is_active = ?")
+        params.append(int(is_active))
+    if not fields:
+        return
+    params.append(user_id)
+    with db_session() as conn:
+        conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
 
 
 # --- Videos ---
@@ -512,19 +638,21 @@ def insert_violation(
     reason_log: str | None = None,
     status: str = "confirmed",
     reviewed_by: int | None = None,
+    vehicle_class: str | None = None,
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO violations (
-                video_id, track_id, violation_type, confidence, frame_number,
-                timestamp_sec, evidence_path, reason_log, status, reviewed_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                video_id, track_id, violation_type, vehicle_class, confidence,
+                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
                 track_id,
                 violation_type,
+                vehicle_class,
                 confidence,
                 frame_number,
                 timestamp_sec,
@@ -674,21 +802,25 @@ def insert_review_queue(
     evidence_path: str | None = None,
     reason_log: str | None = None,
     status: str = "pending",
+    vehicle_class: str | None = None,
+    timestamp_sec: float | None = None,
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO review_queue (
-                video_id, track_id, violation_type, confidence, frame_number,
-                evidence_path, reason_log, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                video_id, track_id, violation_type, vehicle_class, confidence,
+                frame_number, timestamp_sec, evidence_path, reason_log, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
                 track_id,
                 violation_type,
+                vehicle_class,
                 confidence,
                 frame_number,
+                timestamp_sec,
                 evidence_path,
                 reason_log,
                 status,
@@ -733,20 +865,27 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
             raise ValueError(f"Review item {review_id} not found")
 
         reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+        row_keys = row.keys()
+        timestamp_sec = (
+            row["timestamp_sec"]
+            if "timestamp_sec" in row_keys and row["timestamp_sec"] is not None
+            else (row["frame_number"] or 0) / 30.0
+        )
         cursor = conn.execute(
             """
             INSERT INTO violations (
-                video_id, track_id, violation_type, confidence, frame_number,
-                timestamp_sec, evidence_path, reason_log, status, reviewed_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
+                video_id, track_id, violation_type, vehicle_class, confidence,
+                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
             """,
             (
                 row["video_id"],
                 row["track_id"],
                 row["violation_type"],
+                row["vehicle_class"] if "vehicle_class" in row_keys else None,
                 row["confidence"],
                 row["frame_number"],
-                row["frame_number"] / 30.0,
+                timestamp_sec,
                 row["evidence_path"],
                 row["reason_log"],
                 reviewed_by,
@@ -779,16 +918,259 @@ def dismiss_review_item(review_id: int, reviewed_by: int) -> None:
         )
 
 
-# --- Dev seed ---
-
-
-def seed_demo_data() -> None:
-    """Insert minimal demo records for local verification."""
+def get_review_item(review_id: int) -> dict[str, Any] | None:
     with db_session() as conn:
-        existing = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()
-        if existing and existing["total"] > 0:
-            return
+        row = conn.execute(
+            "SELECT * FROM review_queue WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        return _row_to_dict(row)
 
-    create_user("admin", "changeme-hash", role="admin")
-    insert_video("morning_traffic.mp4", "dataset/raw/morning_traffic.mp4", condition="morning")
-    insert_video("peak_traffic.mp4", "dataset/raw/peak_traffic.mp4", condition="peak")
+
+def count_review_pending() -> int:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM review_queue WHERE status = 'pending'"
+        ).fetchone()
+        return row["total"] if row else 0
+
+
+# --- System settings ---
+
+
+def get_all_settings() -> dict[str, str]:
+    with db_session() as conn:
+        rows = conn.execute("SELECT key, value FROM system_settings").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def set_settings(values: dict[str, Any]) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        conn.executemany(
+            """
+            INSERT INTO system_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            [(key, str(value), now) for key, value in values.items()],
+        )
+
+
+# --- Cameras ---
+
+
+def list_cameras(active_only: bool = False) -> list[dict[str, Any]]:
+    query = "SELECT * FROM cameras"
+    if active_only:
+        query += " WHERE is_active = 1"
+    query += " ORDER BY created_at DESC"
+    with db_session() as conn:
+        rows = conn.execute(query).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def get_camera(camera_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM cameras WHERE id = ?",
+            (camera_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def create_camera(
+    name: str,
+    rtsp_url: str,
+    location: str | None = None,
+    zones_json: str = "{}",
+) -> int:
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO cameras (name, location, rtsp_url, zones_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, location, rtsp_url, zones_json),
+        )
+        return cursor.lastrowid
+
+
+def update_camera(
+    camera_id: int,
+    *,
+    name: str | None = None,
+    location: str | None = None,
+    rtsp_url: str | None = None,
+    zones_json: str | None = None,
+    is_active: bool | None = None,
+) -> None:
+    fields: list[str] = ["updated_at = ?"]
+    params: list[Any] = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+    if name is not None:
+        fields.append("name = ?")
+        params.append(name)
+    if location is not None:
+        fields.append("location = ?")
+        params.append(location)
+    if rtsp_url is not None:
+        fields.append("rtsp_url = ?")
+        params.append(rtsp_url)
+    if zones_json is not None:
+        fields.append("zones_json = ?")
+        params.append(zones_json)
+    if is_active is not None:
+        fields.append("is_active = ?")
+        params.append(int(is_active))
+    params.append(camera_id)
+    with db_session() as conn:
+        conn.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id = ?", params)
+
+
+def delete_camera(camera_id: int) -> None:
+    with db_session() as conn:
+        conn.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+
+
+# --- Reports ---
+
+
+def insert_report(
+    title: str,
+    report_format: str,
+    file_path: str,
+    filters_json: str = "{}",
+    generated_by: int | None = None,
+) -> int:
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO reports (title, report_format, filters_json, file_path, generated_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (title, report_format, filters_json, file_path, generated_by),
+        )
+        return cursor.lastrowid
+
+
+def get_report(report_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_reports(limit: int = 50) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, u.username AS generated_by_username
+            FROM reports r
+            LEFT JOIN users u ON u.id = r.generated_by
+            ORDER BY r.generated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+# --- Analytics aggregations ---
+
+
+def violations_per_day(days: int = 30) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT date(detected_at) AS day, COUNT(*) AS count
+            FROM violations
+            WHERE status != 'dismissed'
+              AND date(detected_at) >= date('now', ?)
+            GROUP BY date(detected_at)
+            ORDER BY day ASC
+            """,
+            (f"-{int(days)} days",),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def violations_by_hour(day: str | None = None) -> list[dict[str, Any]]:
+    query = """
+        SELECT CAST(strftime('%H', detected_at) AS INTEGER) AS hour, COUNT(*) AS count
+        FROM violations
+        WHERE status != 'dismissed'
+    """
+    params: list[Any] = []
+    if day:
+        query += " AND date(detected_at) = date(?)"
+        params.append(day)
+    query += " GROUP BY hour ORDER BY hour ASC"
+    with db_session() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def count_violations_by_type_on(day: str) -> dict[str, int]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT violation_type, COUNT(*) AS count
+            FROM violations
+            WHERE status != 'dismissed' AND date(detected_at) = date(?)
+            GROUP BY violation_type
+            """,
+            (day,),
+        ).fetchall()
+        return {row["violation_type"]: row["count"] for row in rows}
+
+
+def violations_by_vehicle_class() -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(vehicle_class, 'Unclassified') AS vehicle_class, COUNT(*) AS count
+            FROM violations
+            WHERE status != 'dismissed'
+            GROUP BY vehicle_class
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def violations_by_video() -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT v.video_id, vid.filename, COUNT(*) AS count
+            FROM violations v
+            LEFT JOIN videos vid ON vid.id = v.video_id
+            WHERE v.status != 'dismissed'
+            GROUP BY v.video_id
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def count_all_violations(status: str | None = None) -> int:
+    with db_session() as conn:
+        if status:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM violations WHERE status = ?",
+                (status,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS total FROM violations").fetchone()
+        return row["total"] if row else 0

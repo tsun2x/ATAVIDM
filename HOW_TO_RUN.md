@@ -1,7 +1,7 @@
 # HOW TO RUN — TAVIDM
 
 **Traffic Violation Detection and Monitoring System**
-Frontend Prototype · Flask · Python 3
+Flask · Python 3 · YOLOv8m + ByteTrack · SQLite
 
 ---
 
@@ -29,7 +29,7 @@ Before running TAVIDM you need the following installed on your machine:
 | pip | 21+ | `pip --version` |
 | Git (optional) | Any | `git --version` |
 
-> **Note:** This is a **frontend prototype only**. There is no database, no authentication backend, and no real AI pipeline. All data is mocked in Python at startup.
+> **Note:** The system uses a real detection pipeline (OpenCV → YOLOv8m → ByteTrack → rule engine), SQLite storage, and bcrypt-based authentication. Sign in with the bootstrap account `admin` / `admin123` on first run, then change the password.
 
 ---
 
@@ -37,35 +37,28 @@ Before running TAVIDM you need the following installed on your machine:
 
 ```
 tavidm/
-├── app.py                   ← Flask application entry point (all routes + mock data)
+├── app.py                   ← Flask application entry point (routes + APIs)
+├── config.py                ← Paths, upload limits, environment configuration
 ├── requirements.txt         ← Python package dependencies
 │
-├── templates/               ← Jinja2 HTML templates
-│   ├── base.html            ← Master layout (sidebar, navbar, footer)
-│   ├── dashboard.html       ← Main dashboard with stat cards and charts
-│   ├── live_monitor.html    ← CCTV feed simulation with detection overlays
-│   ├── violations.html      ← Paginated & filterable violations table
-│   ├── analytics.html       ← KPI cards, bar/line/doughnut charts
-│   ├── reports.html         ← Report generator and download history
-│   └── settings.html        ← Camera config, user management, system preferences
+├── core/                    ← Processing modules
+│   ├── detection_config.py  ← YOLOv8m model config, classes, violation registry
+│   ├── detector.py          ← YOLOv8m inference + ByteTrack (Ultralytics)
+│   ├── tracker.py           ← Track motion history (trajectory/direction/dwell)
+│   ├── zone_config.py       ← Zone types and validation
+│   ├── violation_engine.py  ← Rule-based violation detection
+│   ├── video_processor.py   ← End-to-end pipeline orchestrator
+│   ├── live_stream.py       ← RTSP live stream workers (MJPEG)
+│   ├── evidence.py          ← Annotated evidence snapshots
+│   ├── analytics.py         ← Dashboard/analytics aggregations
+│   ├── reports.py           ← PDF (fpdf2) / Excel (openpyxl) reports
+│   └── auth.py              ← bcrypt auth + role-based access
 │
-└── static/
-    ├── css/
-    │   └── style.css        ← All custom styles (no Sass, plain CSS with variables)
-    ├── js/
-    │   ├── main.js          ← Shared utilities: sidebar toggle, toast notifications
-    │   ├── dashboard.js     ← Chart.js: hourly line chart + weekly bar chart
-    │   ├── live_monitor.js  ← Simulated CCTV: moving boxes, alert feed, camera switch
-    │   ├── violations.js    ← Client-side search, filter, sort, pagination, modals
-    │   ├── analytics.js     ← Chart.js: daily bar, monthly line, violation doughnut
-    │   ├── reports.js       ← Report generation simulation, download history
-    │   └── settings.js      ← Slider live-update, save/edit toast feedback
-    └── images/
-        ├── camera_thumb.svg
-        ├── cctv_feed.svg
-        ├── cctv_inbound.svg
-        ├── cctv_outbound.svg
-        └── evidence_1.svg … evidence_6.svg
+├── database/                ← SQLite schema, adapter, and db facade
+├── templates/               ← Jinja2 HTML templates (login, dashboard, …)
+├── static/                  ← CSS, JS, evidence snapshots, generated reports
+├── dataset/raw/             ← Uploaded MP4 files
+└── models/                  ← Custom YOLOv8m weights (optional)
 ```
 
 ---
@@ -115,14 +108,18 @@ You will see `(venv)` prepended to your terminal prompt when the environment is 
 pip install -r requirements.txt
 ```
 
-This installs exactly two packages:
+Key packages installed:
 
-| Package | Version | Purpose |
-|---|---|---|
-| `Flask` | 3.0.3 | Web framework — routing, template rendering, dev server |
-| `Werkzeug` | 3.0.3 | WSGI utilities — Flask's internal dependency for request/response handling |
+| Package | Purpose |
+|---|---|
+| `Flask` / `Werkzeug` | Web framework, routing, dev server |
+| `ultralytics` | YOLOv8m inference and ByteTrack tracking |
+| `opencv-python` | Video decoding, frame extraction, drawing |
+| `numpy` | Array math for the pipeline |
+| `bcrypt` | Password hashing |
+| `fpdf2` / `openpyxl` | PDF and Excel report generation |
 
-> Flask automatically installs Werkzeug as a dependency, but pinning it in `requirements.txt` ensures version consistency across environments.
+> The first install may take several minutes (Ultralytics pulls PyTorch). On the first video processing run, the pretrained `yolov8m.pt` checkpoint (~50 MB) is downloaded automatically unless custom weights exist in `models/`.
 
 ---
 
@@ -161,20 +158,23 @@ The application is now live at **http://127.0.0.1:5000** (also accessible as htt
 
 Once the server is running, open a browser and navigate to:
 
+You will be redirected to `/login` first — sign in with `admin` / `admin123` (bootstrap account).
+
 | URL | Page | Description |
 |---|---|---|
-| `http://localhost:5000/` | Dashboard | Overview: stat cards, hourly & weekly charts, recent violations table |
-| `http://localhost:5000/live-monitor` | Live Monitor | Simulated CCTV feed with animated AI detection bounding boxes |
-| `http://localhost:5000/violations` | Violations | Full paginated table with search, filter by type/camera/status, sort, detail modals |
-| `http://localhost:5000/analytics` | Analytics | KPI cards, daily/monthly charts, doughnut breakdown, top-violations table |
-| `http://localhost:5000/reports` | Reports | Report generator form (PDF/Excel demo), download history table |
-| `http://localhost:5000/settings` | Settings | Camera list, detection threshold sliders, user management, system preferences |
+| `http://localhost:5000/` | Dashboard | Stat cards, hourly chart, recent violations (live database data) |
+| `http://localhost:5000/live-monitor` | Live Monitor | RTSP camera feeds, video upload, processing controls |
+| `http://localhost:5000/violations` | Violations | Paginated table with search/filter, evidence snapshots, detail modals |
+| `http://localhost:5000/review-queue` | Review Queue | Manual validation of detections (enforcer/admin) |
+| `http://localhost:5000/analytics` | Analytics | KPI cards, daily/monthly charts, vehicle class breakdowns |
+| `http://localhost:5000/reports` | Reports | Real PDF/Excel report generation and download history (enforcer/admin) |
+| `http://localhost:5000/settings` | Settings | Rule parameters, cameras, zone templates, user management (admin) |
 
 ---
 
 ## 6. Configuration & Customization
 
-All configuration lives inside **`app.py`** as Python constants near the top of the file.
+File paths and upload limits live in **`config.py`** (overridable via `.env`). Detection and rule parameters are managed at runtime from the **Settings** page and stored in the `system_settings` database table.
 
 ### Change the port
 
@@ -184,52 +184,21 @@ if __name__ == "__main__":
     app.run(debug=True, port=5000)  # Change 5000 to any available port
 ```
 
-### Adjust mock data volume
-
-```python
-MOCK_VIOLATIONS = generate_violations(count=48)  # Increase or decrease this number
-```
-
 ### Change the secret key
 
-```python
-app.config["SECRET_KEY"] = "tavidm-prototype-dev-key"
-# Replace with a long random string in production
-```
+Set `FLASK_SECRET_KEY` in `.env` (see `.env.example`). Use a long random string in production.
 
 ### Add cameras
 
-Edit the `CAMERAS` list in `app.py`:
+Go to **Settings → Cameras** (admin) and add a camera with its RTSP URL. Streams appear on the Live Monitor page.
 
-```python
-CAMERAS = [
-    {
-        "id": "cam-03",
-        "name": "Highway Overpass",
-        "location": "North Sector — Highway",
-        "status": "online",
-        "fps": 60,
-        "feed_image": "cctv_feed.svg",   # must exist in static/images/
-    },
-    ...
-]
-```
+### Adjust rule parameters
 
-### Add violation types
+Go to **Settings → Detection Parameters** (admin): confidence threshold, dwell-time thresholds, truck ban hours, and review confidence bands.
 
-```python
-VIOLATION_TYPES = [
-    "Illegal Parking",
-    "Counterflowing",
-    "Obstruction",
-    "Illegal Loading/Unloading",
-    "Blocking Pedestrian Crossing",
-    "Truck Ban",
-    "Reckless Driving",
-    "No Helmet Violation",
-    "Motorcycle Overloading",
-]
-```
+### Custom model weights
+
+Place custom-trained YOLOv8m weights (with helmet/rider classes) at `models/tavidm_yolov8m.pt` (or any `.pt` in `models/`). Without them, the pretrained COCO checkpoint is used and helmet-based rules stay inactive. The supported violation types are defined in `core/detection_config.py`.
 
 ---
 
@@ -288,6 +257,6 @@ The app loads **Bootstrap 5.3.3** and **Bootstrap Icons 1.11.3** from CDN. These
 
 - **OS:** Developed and tested on Windows. Runs identically on macOS and Linux.
 - **Browser support:** Modern Chromium-based browsers (Chrome, Edge), Firefox, Safari. IE is not supported.
-- **No database required.** All data is generated in memory at server startup using `random` from the Python standard library.
-- **No `.env` file required.** There are no secrets to configure for the prototype.
-- **No external API calls.** All CDN assets (Bootstrap, Chart.js, Google Fonts) are the only external network requests, made by the browser.
+- **Database:** SQLite (`database/tavidm.db`), created and migrated automatically on startup. PostgreSQL/Supabase is planned for production deployment.
+- **`.env` file:** optional — defaults work for development. Set `FLASK_SECRET_KEY` for anything beyond local testing.
+- **Network:** CDN assets (Bootstrap, Chart.js) load in the browser; the server downloads the pretrained YOLOv8m checkpoint once on first processing run.

@@ -1,10 +1,14 @@
 -- TAVIDM SQLite schema
 
+-- Roles (manuscript Ch3): admin = System Administrator,
+-- enforcer = Traffic Enforcement Officer, viewer = Guest Viewer.
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
-  role TEXT CHECK(role IN ('admin','enforcer')) DEFAULT 'enforcer',
+  full_name TEXT,
+  role TEXT CHECK(role IN ('admin','enforcer','viewer')) DEFAULT 'enforcer',
+  is_active BOOLEAN DEFAULT 1,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -61,6 +65,7 @@ CREATE TABLE IF NOT EXISTS violations (
   video_id INTEGER REFERENCES videos(id),
   track_id INTEGER,
   violation_type TEXT NOT NULL,
+  vehicle_class TEXT,
   confidence REAL NOT NULL,
   frame_number INTEGER,
   timestamp_sec REAL,
@@ -76,14 +81,46 @@ CREATE TABLE IF NOT EXISTS review_queue (
   video_id INTEGER REFERENCES videos(id),
   track_id INTEGER,
   violation_type TEXT,
+  vehicle_class TEXT,
   confidence REAL,
   frame_number INTEGER,
+  timestamp_sec REAL,
   evidence_path TEXT,
   reason_log TEXT,
   status TEXT CHECK(status IN ('pending','confirmed','dismissed')) DEFAULT 'pending',
   queued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   reviewed_by INTEGER REFERENCES users(id),
   reviewed_at DATETIME
+);
+
+-- RTSP-supported live CCTV camera streams (manuscript Ch1 Scope, Ch3 Data Source).
+CREATE TABLE IF NOT EXISTS cameras (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  location TEXT,
+  rtsp_url TEXT NOT NULL,
+  zones_json TEXT NOT NULL DEFAULT '{}',
+  is_active BOOLEAN DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- System Configuration Module: traffic rule parameters, detection settings.
+CREATE TABLE IF NOT EXISTS system_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Generated report history (Reporting Module).
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  report_format TEXT CHECK(report_format IN ('pdf','excel')) NOT NULL,
+  filters_json TEXT NOT NULL DEFAULT '{}',
+  file_path TEXT NOT NULL,
+  generated_by INTEGER REFERENCES users(id),
+  generated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
@@ -95,3 +132,4 @@ CREATE INDEX IF NOT EXISTS idx_violations_status ON violations(status);
 CREATE INDEX IF NOT EXISTS idx_violations_detected_at ON violations(detected_at);
 CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
 CREATE INDEX IF NOT EXISTS idx_detections_video_frame ON detections(video_id, frame_number);
+CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);

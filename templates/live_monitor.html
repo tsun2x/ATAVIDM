@@ -2,7 +2,7 @@
 
 {% block title %}Live Monitor{% endblock %}
 {% block page_title %}Live Monitor{% endblock %}
-{% block page_subtitle %}Pre-recorded video analysis with detection overlay simulation{% endblock %}
+{% block page_subtitle %}RTSP live streams and recorded video processing{% endblock %}
 
 {% block content %}
 <div class="row g-4">
@@ -10,44 +10,34 @@
         <div class="card card-panel">
             <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
                 <div class="d-flex align-items-center gap-2">
-                    <span class="live-indicator"><span class="pulse"></span> SIM</span>
-                    <h5 class="card-title mb-0" id="activeVideoName">{{ default_video.name }}</h5>
+                    <span class="live-indicator d-none" id="liveIndicator"><span class="pulse"></span> LIVE</span>
+                    <h5 class="card-title mb-0" id="activeSourceName">Select a camera or video</h5>
                 </div>
                 <div class="d-flex align-items-center gap-2">
-                    <span class="badge bg-dark" id="videoDuration">{{ default_video.duration }}</span>
-                    <span class="badge bg-secondary-subtle text-secondary" id="videoCondition">{{ default_video.condition|title }}</span>
+                    <span class="badge bg-secondary-subtle text-secondary" id="sourceMeta">—</span>
                 </div>
             </div>
             <div class="card-body p-0">
                 <div class="cctv-feed-container" id="videoFeed">
-                    <img src="{{ url_for('static', filename='images/' + default_video.thumbnail) }}"
-                         alt="Video frame" class="cctv-feed-image" id="feedImage">
-                    <div class="detection-overlay" id="detectionOverlay">
-                        {% for box in detection_boxes %}
-                        <div class="detection-box"
-                             data-label="{{ box.label }}"
-                             style="left: {{ box.x }}%; top: {{ box.y }}%; width: {{ box.w }}%; height: {{ box.h }}%;">
-                            <span class="detection-label">{{ box.label }} #{{ box.track_id }} {{ (box.confidence * 100)|int }}%</span>
-                        </div>
-                        {% endfor %}
+                    <img src="" alt="Feed" class="cctv-feed-image d-none" id="feedImage">
+                    <div class="text-center text-muted py-5" id="feedPlaceholder">
+                        <i class="bi bi-camera-video-off fs-1 d-block mb-2"></i>
+                        Select a live camera or an uploaded video from the right panel.
                     </div>
-                    <div class="feed-timestamp" id="feedTimestamp">00:00:00</div>
                 </div>
             </div>
             <div class="card-footer">
-                <div class="video-progress mb-2">
-                    <div class="video-progress-bar" id="progressBar" style="width: 0%;"></div>
-                </div>
-                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 playback-controls">
-                    <div class="btn-group" role="group">
-                        <button class="btn btn-sm btn-danger btn-play" id="btnPlay"><i class="bi bi-play-fill"></i></button>
-                        <button class="btn btn-sm btn-outline-secondary" id="btnStepBack"><i class="bi bi-skip-backward"></i></button>
-                        <button class="btn btn-sm btn-outline-secondary" id="btnStepForward"><i class="bi bi-skip-forward"></i></button>
-                        <button class="btn btn-sm btn-outline-secondary" id="btnFullscreen"><i class="bi bi-fullscreen"></i></button>
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                    <span class="text-muted small" id="feedStatus">No source selected</span>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-danger d-none" id="btnProcessVideo">
+                            <i class="bi bi-cpu me-1"></i> Process Video
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary d-none" id="btnStopStream">
+                            <i class="bi bi-stop-circle me-1"></i> Stop Stream
+                        </button>
                     </div>
-                    <span class="text-muted small" id="progressLabel">0:00 / {{ default_video.duration }}</span>
                 </div>
-                <div class="detection-timeline mt-2" id="detectionTimeline"></div>
             </div>
         </div>
     </div>
@@ -61,7 +51,7 @@
                 <div class="upload-dropzone" id="uploadDropzone" data-max-mb="{{ max_upload_mb }}">
                     <input type="file" id="videoFileInput" accept=".mp4,video/mp4" hidden>
                     <i class="bi bi-film upload-dropzone-icon"></i>
-                    <p class="upload-dropzone-title mb-1">Drag & drop MP4 here</p>
+                    <p class="upload-dropzone-title mb-1">Drag &amp; drop MP4 here</p>
                     <p class="upload-dropzone-hint mb-3">or browse from your device</p>
                     <button type="button" class="btn btn-sm btn-outline-danger" id="btnBrowseVideo">
                         <i class="bi bi-folder2-open me-1"></i> Browse Files
@@ -99,33 +89,25 @@
 
         <div class="card card-panel mb-4">
             <div class="card-header">
-                <h5 class="card-title mb-0"><i class="bi bi-collection-play me-2"></i>Uploaded Videos</h5>
+                <h5 class="card-title mb-0"><i class="bi bi-broadcast me-2"></i>Live Cameras</h5>
             </div>
             <div class="card-body p-0">
-                <div class="camera-list" id="videoList">
-                    {% for vid in videos %}
-                    <button class="camera-item {% if vid.id == default_video.id %}active{% endif %}"
-                            data-video-id="{{ vid.id }}"
-                            data-video-name="{{ vid.name }}"
-                            data-video-location="{{ vid.location }}"
-                            data-video-condition="{{ vid.condition }}"
-                            data-video-duration="{{ vid.duration }}"
-                            data-video-thumbnail="{{ vid.thumbnail }}"
-                            data-video-processed="{{ vid.processed|lower }}">
+                <div class="camera-list" id="cameraList">
+                    {% for cam in cameras %}
+                    <button class="camera-item"
+                            data-camera='{{ cam | tojson }}'>
                         <div class="camera-thumb">
                             <img src="{{ url_for('static', filename='images/camera_thumb.svg') }}" alt="">
-                            {% if vid.processed %}
-                            <span class="cam-status-dot online"></span>
-                            {% else %}
-                            <span class="cam-status-dot offline"></span>
-                            {% endif %}
+                            <span class="cam-status-dot {% if cam.is_active %}online{% else %}offline{% endif %}"></span>
                         </div>
                         <div class="camera-info">
-                            <span class="camera-name">{{ vid.filename }}</span>
-                            <span class="camera-location">{{ vid.condition|title }} · {{ vid.duration }}</span>
+                            <span class="camera-name">{{ cam.name }}</span>
+                            <span class="camera-location">{{ cam.location or 'RTSP stream' }}</span>
                         </div>
                         <i class="bi bi-chevron-right"></i>
                     </button>
+                    {% else %}
+                    <div class="text-center text-muted small py-4">No cameras configured. Add RTSP cameras in Settings.</div>
                     {% endfor %}
                 </div>
             </div>
@@ -133,42 +115,38 @@
 
         <div class="card card-panel mb-4">
             <div class="card-header">
-                <h5 class="card-title mb-0"><i class="bi bi-bounding-box me-2"></i>Detected Objects</h5>
+                <h5 class="card-title mb-0"><i class="bi bi-collection-play me-2"></i>Uploaded Videos</h5>
             </div>
-            <div class="card-body" id="activeDetections">
-                {% for box in detection_boxes %}
-                <div class="detection-item">
-                    <span class="detection-type">{{ box.label }} <small class="text-muted">#{{ box.track_id }}</small></span>
-                    <span class="confidence-badge confidence-{% if box.confidence >= 0.85 %}high{% elif box.confidence >= 0.65 %}medium{% else %}low{% endif %}">
-                        {{ (box.confidence * 100)|int }}%
-                    </span>
+            <div class="card-body p-0">
+                <div class="camera-list" id="videoList">
+                    {% for vid in videos %}
+                    <button class="camera-item" data-video='{{ vid | tojson }}'>
+                        <div class="camera-thumb">
+                            <img src="{{ url_for('static', filename='images/camera_thumb.svg') }}" alt="">
+                            <span class="cam-status-dot {% if vid.processed %}online{% else %}offline{% endif %}"></span>
+                        </div>
+                        <div class="camera-info">
+                            <span class="camera-name">{{ vid.filename }}</span>
+                            <span class="camera-location">{{ vid.condition|title }} · {{ vid.status|title }}</span>
+                        </div>
+                        <i class="bi bi-chevron-right"></i>
+                    </button>
+                    {% else %}
+                    <div class="text-center text-muted small py-4">No videos uploaded yet.</div>
+                    {% endfor %}
                 </div>
-                {% endfor %}
             </div>
         </div>
 
         <div class="card card-panel">
             <div class="card-header d-flex justify-content-between align-items-center">
                 <h5 class="card-title mb-0"><i class="bi bi-bell me-2"></i>Violation Alerts</h5>
-                <button class="btn btn-sm btn-link" id="clearAlerts">Clear</button>
+                <span class="badge bg-danger-subtle text-danger" id="alertCount">0</span>
             </div>
             <div class="card-body p-0">
                 <div class="alert-feed" id="alertFeed">
-                    <div class="alert-feed-item alert-critical">
-                        <div class="alert-icon"><i class="bi bi-arrow-left-right"></i></div>
-                        <div class="alert-content">
-                            <strong>Counterflowing</strong>
-                            <span>Track #7 · car</span>
-                            <small>Frame 4520 · 88% confidence</small>
-                        </div>
-                    </div>
-                    <div class="alert-feed-item alert-warning">
-                        <div class="alert-icon"><i class="bi bi-truck"></i></div>
-                        <div class="alert-content">
-                            <strong>Truck Ban</strong>
-                            <span>Track #12 · truck</span>
-                            <small>Frame 8100 · 72% confidence</small>
-                        </div>
+                    <div class="text-center text-muted small py-4" id="alertPlaceholder">
+                        Pending detections from processing and live streams appear here.
                     </div>
                 </div>
             </div>
@@ -203,7 +181,7 @@
                             <div class="card card-panel h-100 wizard-option-card active" id="optionNewAnnotation">
                                 <div class="card-body">
                                     <h6 class="card-title"><i class="bi bi-pencil-square me-2"></i>Create New Zone Annotation</h6>
-                                    <p class="small text-muted mt-2 mb-0">Draw all required traffic zones on the extracted first frame.</p>
+                                    <p class="small text-muted mt-2 mb-0">Draw traffic zones on the extracted first frame.</p>
                                 </div>
                             </div>
                         </div>

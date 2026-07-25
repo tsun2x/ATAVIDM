@@ -253,10 +253,13 @@
             return zones;
         },
         zonesComplete: function (zones, zoneTypes, minPoints) {
+            // At least one zone drawn; every drawn zone needs >= minPoints points.
             minPoints = minPoints || 3;
-            return (zoneTypes || []).every(function (zt) {
-                return (zones[zt.key] || []).length >= minPoints;
-            });
+            const drawn = (zoneTypes || [])
+                .map(function (zt) { return zones[zt.key] || []; })
+                .filter(function (pts) { return pts.length > 0; });
+            if (!drawn.length) return false;
+            return drawn.every(function (pts) { return pts.length >= minPoints; });
         },
     };
 })(window);

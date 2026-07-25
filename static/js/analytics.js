@@ -45,13 +45,13 @@
         });
     }
 
-    const conditionCtx = document.getElementById("conditionChart");
-    if (conditionCtx) {
-        new Chart(conditionCtx, {
+    const vehicleCtx = document.getElementById("vehicleChart");
+    if (vehicleCtx) {
+        new Chart(vehicleCtx, {
             type: "bar",
             data: {
-                labels: data.condition_labels,
-                datasets: [{ label: "Violations", data: data.condition_values, backgroundColor: ["#fbbf24", "#e63946", "#1e3a5f"], borderRadius: 6 }],
+                labels: data.vehicle_labels,
+                datasets: [{ label: "Violations", data: data.vehicle_values, backgroundColor: colors, borderRadius: 6 }],
             },
             options: { ...defaults, scales: { y: { beginAtZero: true }, x: { grid: { display: false } } } },
         });

@@ -1,33 +1,48 @@
-"""Rule-based violation logic (9 classes) — Phase 3.
+"""Rule-based violation engine (manuscript Ch3, Layer 4).
 
-Zone polygons come from video annotations at runtime.
-Helmet and motorcycle-overloading rules use YOLO detections + ByteTrack IDs.
+Implements the rule features named in the manuscript: ROI (zone) analysis,
+direction analysis, trajectory analysis, object counting, dwell-time analysis,
+and time-based rules. Zone polygons come from the video/camera annotations;
+tunable parameters come from system settings (DEFAULT_RULE_PARAMETERS).
+
+Each violation fires at most once per track per violation type.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, time as dtime
 from typing import Any
 
 from core.detection_config import (
+    BLOCKING_PEDESTRIAN_CROSSING,
+    COUNTERFLOW,
+    DEFAULT_RULE_PARAMETERS,
+    ILLEGAL_LOADING_UNLOADING,
+    ILLEGAL_PARKING,
+    ILLEGAL_STOPPING,
     MOTORCYCLE_OVERLOADING,
     NO_HELMET_VIOLATION,
+    OBSTRUCTION,
+    RESTRICTED_LANE,
     RIDER_ASSOCIATION_PADDING,
+    TRUCK_BAN,
+    VEHICLE_CLASSES,
     VIOLATION_PERSISTENCE_SEC,
+    YOLO_CLASS_BUS,
     YOLO_CLASS_HELMET,
+    YOLO_CLASS_JEEPNEY,
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_PERSON,
+    YOLO_CLASS_TRUCK,
+    vehicle_category,
 )
+from core.tracker import angle_difference, point_in_polygon
 
-VIOLATION_ZONE_RULES = (
-    "Illegal Parking",
-    "Counterflowing",
-    "Obstruction",
-    "Illegal Loading/Unloading",
-    "Blocking Pedestrian Crossing",
-    "Truck Ban",
-    "Reckless Driving",
-)
+# Public Utility Vehicles subject to loading/unloading restrictions.
+PUV_CLASSES = (YOLO_CLASS_JEEPNEY, YOLO_CLASS_BUS)
+# Classes barred from restricted lanes (Ord. 576); configurable via settings.
+DEFAULT_RESTRICTED_LANE_CLASSES = (YOLO_CLASS_MOTORCYCLE, "bicycle")
 
 
 @dataclass
@@ -38,6 +53,7 @@ class ViolationEvent:
     frame_number: int
     timestamp_sec: float
     reason_log: str
+    vehicle_class: str | None = None
 
 
 @dataclass
@@ -46,25 +62,62 @@ class _PersistenceTracker:
 
     started_at: float | None = None
 
-    def update(self, condition: bool, timestamp_sec: float) -> bool:
+    def update(
+        self,
+        condition: bool,
+        timestamp_sec: float,
+        threshold_sec: float = VIOLATION_PERSISTENCE_SEC,
+    ) -> bool:
         if condition:
             if self.started_at is None:
                 self.started_at = timestamp_sec
-            return (timestamp_sec - self.started_at) >= VIOLATION_PERSISTENCE_SEC
+            return (timestamp_sec - self.started_at) >= threshold_sec
         self.started_at = None
         return False
+
+    def elapsed(self, timestamp_sec: float) -> float:
+        if self.started_at is None:
+            return 0.0
+        return timestamp_sec - self.started_at
 
 
 @dataclass
 class RuleEngineState:
-    no_helmet: dict[int, _PersistenceTracker] = field(default_factory=dict)
-    motorcycle_overloading: dict[int, _PersistenceTracker] = field(default_factory=dict)
+    # (rule_key, track_id) -> persistence tracker
+    persistence: dict[tuple[str, int], _PersistenceTracker] = field(default_factory=dict)
+    # (violation_type, track_id) pairs that already fired (one event per track)
+    fired: set[tuple[str, int]] = field(default_factory=set)
 
+    def tracker_for(self, rule_key: str, track_id: int) -> _PersistenceTracker:
+        return self.persistence.setdefault((rule_key, track_id), _PersistenceTracker())
+
+    def already_fired(self, violation_type: str, track_id: int) -> bool:
+        return (violation_type, track_id) in self.fired
+
+    def mark_fired(self, violation_type: str, track_id: int) -> None:
+        self.fired.add((violation_type, track_id))
+
+
+# ---------------------------------------------------------------------------
+# Geometry / association helpers
+# ---------------------------------------------------------------------------
 
 def _bbox_center(det: dict[str, Any]) -> tuple[float, float]:
     x = float(det["bbox_x"]) + float(det["bbox_w"]) / 2
     y = float(det["bbox_y"]) + float(det["bbox_h"]) / 2
     return x, y
+
+
+def _bottom_center(det: dict[str, Any]) -> tuple[float, float]:
+    """Ground contact point — best proxy for a vehicle's road position."""
+    x = float(det["bbox_x"]) + float(det["bbox_w"]) / 2
+    y = float(det["bbox_y"]) + float(det["bbox_h"])
+    return x, y
+
+
+def _in_zone(det: dict[str, Any], polygon: list[list[float]]) -> bool:
+    x, y = _bottom_center(det)
+    return point_in_polygon(x, y, polygon)
 
 
 def _point_in_padded_bbox(point: tuple[float, float], anchor: dict[str, Any], padding: float) -> bool:
@@ -86,16 +139,6 @@ def _boxes_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
 
 
-def _latest_by_track(detections: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    by_track: dict[int, dict[str, Any]] = {}
-    for det in detections:
-        tid = det.get("track_id")
-        if tid is None:
-            continue
-        by_track[int(tid)] = det
-    return by_track
-
-
 def _associate_riders(
     motorcycle: dict[str, Any],
     persons: list[dict[str, Any]],
@@ -112,17 +155,63 @@ def _rider_has_helmet(rider: dict[str, Any], helmets: list[dict[str, Any]]) -> b
     return any(_boxes_overlap(rider, helmet) for helmet in helmets)
 
 
+def _is_stationary(det: dict[str, Any], stationary_px: float) -> bool:
+    speed = det.get("speed_px_per_sec")
+    return speed is not None and float(speed) <= stationary_px
+
+
+def _parse_clock(value: str) -> dtime:
+    hour, minute = value.split(":")
+    return dtime(int(hour), int(minute))
+
+
+def _within_time_window(now: dtime, start: str, end: str) -> bool:
+    start_t, end_t = _parse_clock(start), _parse_clock(end)
+    if start_t <= end_t:
+        return start_t <= now <= end_t
+    return now >= start_t or now <= end_t  # window wraps past midnight
+
+
+def _emit(
+    state: RuleEngineState,
+    events: list[ViolationEvent],
+    violation_type: str,
+    det: dict[str, Any],
+    frame_number: int,
+    reason: str,
+) -> None:
+    track_id = int(det["track_id"])
+    if state.already_fired(violation_type, track_id):
+        return
+    state.mark_fired(violation_type, track_id)
+    events.append(
+        ViolationEvent(
+            violation_type=violation_type,
+            track_id=track_id,
+            confidence=float(det.get("confidence", 0)),
+            frame_number=frame_number,
+            timestamp_sec=float(det.get("timestamp_sec", 0)),
+            reason_log=reason,
+            vehicle_class=vehicle_category(str(det.get("class_label", ""))),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Detection-only rules (no zones required)
+# ---------------------------------------------------------------------------
+
 def check_no_helmet(
     tracked: list[dict[str, Any]],
     state: RuleEngineState,
     frame_number: int,
 ) -> list[ViolationEvent]:
     """
-    IF motorcycle + rider detected AND no helmet on rider for >= persistence window
-    THEN No Helmet Violation.
+    IF motorcycle + rider detected AND no helmet on rider for >= persistence
+    window THEN No Helmet Violation (RA 10054).
+    Requires the custom model's helmet class; inert with COCO weights.
     """
     if not any(d.get("class_label") == YOLO_CLASS_HELMET for d in tracked):
-        # Model does not output helmet class yet — do not fabricate violations.
         return []
 
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
@@ -134,28 +223,19 @@ def check_no_helmet(
         track_id = int(mc["track_id"])
         riders = _associate_riders(mc, persons)
         if not riders:
-            state.no_helmet.pop(track_id, None)
+            state.persistence.pop(("no_helmet", track_id), None)
             continue
 
         unhelmeted = [r for r in riders if not _rider_has_helmet(r, helmets)]
-        condition = len(unhelmeted) > 0
-        tracker = state.no_helmet.setdefault(track_id, _PersistenceTracker())
+        tracker = state.tracker_for("no_helmet", track_id)
         ts = float(mc.get("timestamp_sec", 0))
 
-        if tracker.update(condition, ts):
+        if tracker.update(len(unhelmeted) > 0, ts):
             rider_ids = ", ".join(str(int(r["track_id"])) for r in unhelmeted)
-            events.append(
-                ViolationEvent(
-                    violation_type=NO_HELMET_VIOLATION,
-                    track_id=track_id,
-                    confidence=float(min(r["confidence"] for r in unhelmeted)),
-                    frame_number=frame_number,
-                    timestamp_sec=ts,
-                    reason_log=(
-                        f"Motorcycle track #{track_id}: rider(s) #{rider_ids} "
-                        f"without helmet for >={VIOLATION_PERSISTENCE_SEC}s."
-                    ),
-                )
+            _emit(
+                state, events, NO_HELMET_VIOLATION, mc, frame_number,
+                f"Motorcycle track #{track_id}: rider(s) #{rider_ids} without "
+                f"helmet for >={VIOLATION_PERSISTENCE_SEC}s.",
             )
     return events
 
@@ -176,40 +256,265 @@ def check_motorcycle_overloading(
     for mc in motorcycles:
         track_id = int(mc["track_id"])
         riders = _associate_riders(mc, persons)
-        condition = len(riders) > 2
-        tracker = state.motorcycle_overloading.setdefault(track_id, _PersistenceTracker())
+        tracker = state.tracker_for("overloading", track_id)
         ts = float(mc.get("timestamp_sec", 0))
 
-        if tracker.update(condition, ts):
-            events.append(
-                ViolationEvent(
-                    violation_type=MOTORCYCLE_OVERLOADING,
-                    track_id=track_id,
-                    confidence=float(mc.get("confidence", 0)),
-                    frame_number=frame_number,
-                    timestamp_sec=ts,
-                    reason_log=(
-                        f"Motorcycle track #{track_id}: {len(riders)} riders detected "
-                        f"(max 2) for >={VIOLATION_PERSISTENCE_SEC}s."
-                    ),
-                )
+        if tracker.update(len(riders) > 2, ts):
+            _emit(
+                state, events, MOTORCYCLE_OVERLOADING, mc, frame_number,
+                f"Motorcycle track #{track_id}: {len(riders)} riders detected "
+                f"(max 2) for >={VIOLATION_PERSISTENCE_SEC}s.",
             )
     return events
 
+
+# ---------------------------------------------------------------------------
+# Zone-based rules (ROI + dwell / direction / class / time)
+# ---------------------------------------------------------------------------
+
+def _check_zone_dwell(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+    *,
+    rule_key: str,
+    violation_type: str,
+    dwell_sec: float,
+    reason_template: str,
+    class_filter: tuple[str, ...] | None = None,
+) -> list[ViolationEvent]:
+    events: list[ViolationEvent] = []
+    for det in vehicles:
+        if class_filter and det.get("class_label") not in class_filter:
+            continue
+        track_id = int(det["track_id"])
+        ts = float(det.get("timestamp_sec", 0))
+        condition = _in_zone(det, polygon) and _is_stationary(det, float(params["stationary_px"]))
+        tracker = state.tracker_for(rule_key, track_id)
+        if tracker.update(condition, ts, dwell_sec):
+            _emit(
+                state, events, violation_type, det, frame_number,
+                reason_template.format(track_id=track_id, dwell=dwell_sec),
+            )
+    return events
+
+
+def check_parking_and_stopping(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """Stationary in a No Parking Zone: Illegal Stopping first, escalating to
+    Illegal Parking once the longer dwell threshold is reached."""
+    events: list[ViolationEvent] = []
+    events.extend(
+        _check_zone_dwell(
+            vehicles, polygon, state, frame_number, params,
+            rule_key="no_parking",
+            violation_type=ILLEGAL_STOPPING,
+            dwell_sec=float(params["stopping_dwell_sec"]),
+            reason_template="Vehicle track #{track_id} stationary in No Parking Zone for >={dwell}s (Illegal Stopping).",
+        )
+    )
+    events.extend(
+        _check_zone_dwell(
+            vehicles, polygon, state, frame_number, params,
+            rule_key="no_parking",
+            violation_type=ILLEGAL_PARKING,
+            dwell_sec=float(params["parking_dwell_sec"]),
+            reason_template="Vehicle track #{track_id} stationary in No Parking Zone for >={dwell}s (Illegal Parking).",
+        )
+    )
+    return events
+
+
+def check_obstruction(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """Stationary vehicle in the Active Lane -> Obstruction."""
+    return _check_zone_dwell(
+        vehicles, polygon, state, frame_number, params,
+        rule_key="obstruction",
+        violation_type=OBSTRUCTION,
+        dwell_sec=float(params["obstruction_dwell_sec"]),
+        reason_template="Vehicle track #{track_id} stationary in Active Lane for >={dwell}s (Obstruction).",
+    )
+
+
+def check_blocking_crossing(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """Stationary vehicle on the Pedestrian Crossing -> Blocking violation."""
+    return _check_zone_dwell(
+        vehicles, polygon, state, frame_number, params,
+        rule_key="crossing",
+        violation_type=BLOCKING_PEDESTRIAN_CROSSING,
+        dwell_sec=float(params["crossing_block_sec"]),
+        reason_template="Vehicle track #{track_id} stationary on Pedestrian Crossing for >={dwell}s.",
+    )
+
+
+def check_loading_unloading(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """PUV dwelling in a No Loading/Unloading Zone."""
+    return _check_zone_dwell(
+        vehicles, polygon, state, frame_number, params,
+        rule_key="loading",
+        violation_type=ILLEGAL_LOADING_UNLOADING,
+        dwell_sec=float(params["loading_dwell_sec"]),
+        class_filter=PUV_CLASSES,
+        reason_template="PUV track #{track_id} stopped in No Loading/Unloading Zone for >={dwell}s.",
+    )
+
+
+def check_counterflow(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """
+    Direction analysis in the Active Lane: a vehicle whose trajectory heading
+    is within tolerance of the OPPOSITE of the configured lane flow direction
+    for >= persistence window is counterflowing.
+    """
+    lane_flow = float(params["lane_flow_degrees"])
+    tolerance = float(params["flow_tolerance_degrees"])
+    opposite = (lane_flow + 180.0) % 360.0
+
+    events: list[ViolationEvent] = []
+    for det in vehicles:
+        track_id = int(det["track_id"])
+        ts = float(det.get("timestamp_sec", 0))
+        heading = det.get("direction_degrees")
+        condition = (
+            heading is not None
+            and _in_zone(det, polygon)
+            and angle_difference(float(heading), opposite) <= tolerance
+        )
+        tracker = state.tracker_for("counterflow", track_id)
+        if tracker.update(condition, ts):
+            _emit(
+                state, events, COUNTERFLOW, det, frame_number,
+                f"Vehicle track #{track_id} travelling {float(heading):.0f}deg "
+                f"against lane flow ({lane_flow:.0f}deg) in Active Lane.",
+            )
+    return events
+
+
+def check_truck_ban(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+    now_time: dtime | None = None,
+) -> list[ViolationEvent]:
+    """Truck inside a Truck Ban Zone during the configured ban window."""
+    now = now_time or datetime.now().time()
+    if not _within_time_window(now, str(params["truck_ban_start"]), str(params["truck_ban_end"])):
+        return []
+
+    events: list[ViolationEvent] = []
+    for det in vehicles:
+        if det.get("class_label") != YOLO_CLASS_TRUCK:
+            continue
+        track_id = int(det["track_id"])
+        ts = float(det.get("timestamp_sec", 0))
+        tracker = state.tracker_for("truck_ban", track_id)
+        if tracker.update(_in_zone(det, polygon), ts):
+            _emit(
+                state, events, TRUCK_BAN, det, frame_number,
+                f"Truck track #{track_id} inside Truck Ban Zone during ban window "
+                f"({params['truck_ban_start']}-{params['truck_ban_end']}).",
+            )
+    return events
+
+
+def check_restricted_lane(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """Prohibited vehicle class travelling inside a Restricted Lane."""
+    restricted = tuple(params.get("restricted_lane_classes", DEFAULT_RESTRICTED_LANE_CLASSES))
+    events: list[ViolationEvent] = []
+    for det in vehicles:
+        if det.get("class_label") not in restricted:
+            continue
+        track_id = int(det["track_id"])
+        ts = float(det.get("timestamp_sec", 0))
+        tracker = state.tracker_for("restricted_lane", track_id)
+        if tracker.update(_in_zone(det, polygon), ts):
+            _emit(
+                state, events, RESTRICTED_LANE, det, frame_number,
+                f"{det.get('class_label', 'vehicle').title()} track #{track_id} "
+                f"inside Restricted Lane.",
+            )
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def evaluate_detection_rules(
     tracked: list[dict[str, Any]],
     state: RuleEngineState,
     frame_number: int,
     zones: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    now_time: dtime | None = None,
 ) -> list[ViolationEvent]:
     """
-    Run all detection-based rules on the current frame.
+    Run every rule on the current frame's tracked detections.
 
-    Zone-based rules (parking, counterflow, etc.) will be added in Phase 3.
+    ``tracked`` must be the output of TrackState.update() (motion-annotated).
+    ``zones`` maps zone keys to pixel polygons (see core.zone_config).
+    ``params`` overrides DEFAULT_RULE_PARAMETERS (from system settings).
     """
-    _ = zones
+    merged = dict(DEFAULT_RULE_PARAMETERS)
+    if params:
+        merged.update(params)
+    zones = zones or {}
+    vehicles = [d for d in tracked if d.get("class_label") in VEHICLE_CLASSES]
+
     events: list[ViolationEvent] = []
     events.extend(check_no_helmet(tracked, state, frame_number))
     events.extend(check_motorcycle_overloading(tracked, state, frame_number))
+
+    if zones.get("no_parking"):
+        events.extend(check_parking_and_stopping(vehicles, zones["no_parking"], state, frame_number, merged))
+    if zones.get("active_lane"):
+        events.extend(check_obstruction(vehicles, zones["active_lane"], state, frame_number, merged))
+        events.extend(check_counterflow(vehicles, zones["active_lane"], state, frame_number, merged))
+    if zones.get("pedestrian_crossing"):
+        events.extend(check_blocking_crossing(vehicles, zones["pedestrian_crossing"], state, frame_number, merged))
+    if zones.get("truck_ban_zone"):
+        events.extend(check_truck_ban(vehicles, zones["truck_ban_zone"], state, frame_number, merged, now_time))
+    if zones.get("loading_unloading"):
+        events.extend(check_loading_unloading(vehicles, zones["loading_unloading"], state, frame_number, merged))
+    if zones.get("restricted_lane"):
+        events.extend(check_restricted_lane(vehicles, zones["restricted_lane"], state, frame_number, merged))
+
     return events

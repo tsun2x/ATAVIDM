@@ -15,15 +15,16 @@ build/
 *.db
 
 # Generated evidence snapshots
-static/evidence/*.jpg
-static/evidence/*.png
+static/evidence/
 
 # Generated reports
+static/reports/
 exports/*
 !exports/.gitkeep
 
 # Model weights
 models/*.pt
+*.pt
 
 # Raw footage
 dataset/raw/*.mp4

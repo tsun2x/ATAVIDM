@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+# Manuscript ROI examples (Ch3): No Parking Zones, Loading and Unloading Areas,
+# Truck Ban Areas, Pedestrian Crossings, Restricted Road Segments / Lanes.
 ZONE_TYPES: dict[str, dict[str, str]] = {
     "no_parking": {"label": "No Parking Zone", "color": "#e63946"},
     "active_lane": {"label": "Active Lane", "color": "#3b82f6"},
     "pedestrian_crossing": {"label": "Pedestrian Crossing", "color": "#22c55e"},
     "truck_ban_zone": {"label": "Truck Ban Zone", "color": "#f59e0b"},
+    "loading_unloading": {"label": "No Loading/Unloading Zone", "color": "#8b5cf6"},
+    "restricted_lane": {"label": "Restricted Lane", "color": "#ec4899"},
 }
 
 REQUIRED_ZONE_KEYS: list[str] = list(ZONE_TYPES.keys())
@@ -60,5 +64,9 @@ def dumps_zones(zones: dict[str, Any]) -> str:
 
 
 def zones_complete(zones: dict[str, Any], min_points: int = 3) -> bool:
+    """At least one zone must be drawn; every drawn zone needs >= min_points."""
     parsed = parse_zones_json(zones)
-    return all(len(parsed[key]) >= min_points for key in REQUIRED_ZONE_KEYS)
+    drawn = [pts for pts in parsed.values() if pts]
+    if not drawn:
+        return False
+    return all(len(pts) >= min_points for pts in drawn)

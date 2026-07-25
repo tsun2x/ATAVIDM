@@ -30,8 +30,10 @@ _adapter = cast(DatabaseAdapter, _adapter_module)
 # Preserve existing db.* API by exposing the same callables from selected adapter.
 init_db = _adapter.init_db
 create_user = _adapter.create_user
+get_user = _adapter.get_user
 get_user_by_username = _adapter.get_user_by_username
 list_users = _adapter.list_users
+update_user = _adapter.update_user
 insert_video = _adapter.insert_video
 update_video = _adapter.update_video
 get_video = _adapter.get_video
@@ -59,9 +61,26 @@ count_violations_today = _adapter.count_violations_today
 count_violations_by_type = _adapter.count_violations_by_type
 insert_review_queue = _adapter.insert_review_queue
 list_review_queue = _adapter.list_review_queue
+get_review_item = _adapter.get_review_item
+count_review_pending = _adapter.count_review_pending
 confirm_review_item = _adapter.confirm_review_item
 dismiss_review_item = _adapter.dismiss_review_item
-seed_demo_data = _adapter.seed_demo_data
+get_all_settings = _adapter.get_all_settings
+get_setting = _adapter.get_setting
+set_settings = _adapter.set_settings
+list_cameras = _adapter.list_cameras
+get_camera = _adapter.get_camera
+create_camera = _adapter.create_camera
+update_camera = _adapter.update_camera
+delete_camera = _adapter.delete_camera
+insert_report = _adapter.insert_report
+get_report = _adapter.get_report
+list_reports = _adapter.list_reports
+violations_per_day = _adapter.violations_per_day
+violations_by_hour = _adapter.violations_by_hour
+violations_by_vehicle_class = _adapter.violations_by_vehicle_class
+violations_by_video = _adapter.violations_by_video
+count_all_violations = _adapter.count_all_violations
 
 
 def active_backend() -> str:

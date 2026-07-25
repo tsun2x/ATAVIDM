@@ -2,7 +2,7 @@
 
 {% block title %}Settings{% endblock %}
 {% block page_title %}Settings{% endblock %}
-{% block page_subtitle %}Zone templates, detection thresholds, and user management{% endblock %}
+{% block page_subtitle %}System configuration: rule parameters, cameras, zone templates, and user management{% endblock %}
 
 {% block content %}
 <div class="row g-4">
@@ -55,22 +55,16 @@
         </div>
 
         <div class="card card-panel mt-4">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection Thresholds</h5></div>
+            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection &amp; Rule Parameters</h5></div>
             <div class="card-body">
                 <div class="mb-4">
                     <div class="d-flex justify-content-between mb-1">
-                        <label class="form-label mb-0" for="confidenceThreshold">Confidence Threshold</label>
-                        <span class="threshold-value" id="confidenceValue">{{ settings.confidence_threshold }}%</span>
+                        <label class="form-label mb-0" for="confidenceThreshold">Detection Confidence Threshold</label>
+                        <span class="threshold-value" id="confidenceValue">{{ (settings.confidence_threshold * 100)|int }}%</span>
                     </div>
-                    <input type="range" class="form-range" id="confidenceThreshold" min="40" max="95" value="{{ settings.confidence_threshold }}">
-                </div>
-                <div class="mb-4">
-                    <div class="d-flex justify-content-between mb-1">
-                        <label class="form-label mb-0" for="reviewThreshold">Review Threshold</label>
-                        <span class="threshold-value" id="reviewValue">{{ settings.review_threshold }}%</span>
-                    </div>
-                    <input type="range" class="form-range" id="reviewThreshold" min="50" max="95" value="{{ settings.review_threshold }}">
-                    <small class="text-muted">Below this → manual review queue</small>
+                    <input type="range" class="form-range" id="confidenceThreshold" min="40" max="95"
+                           value="{{ (settings.confidence_threshold * 100)|int }}">
+                    <small class="text-muted">Minimum YOLOv8m confidence for a detection to be tracked</small>
                 </div>
                 <div class="row g-2 mb-3">
                     <div class="col-6">
@@ -82,6 +76,46 @@
                         <input type="time" class="form-control" id="truckBanEnd" value="{{ settings.truck_ban_end }}">
                     </div>
                 </div>
+                <div class="row g-2 mb-3">
+                    <div class="col-4">
+                        <label class="form-label" for="frameSkip">Frame Skip</label>
+                        <input type="number" class="form-control" id="frameSkip" value="{{ settings.frame_skip }}" min="1" max="10">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label" for="stoppingDwell">Stopping Dwell (s)</label>
+                        <input type="number" class="form-control" id="stoppingDwell" value="{{ settings.stopping_dwell_sec }}" min="1" step="0.5">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label" for="parkingDwell">Parking Dwell (s)</label>
+                        <input type="number" class="form-control" id="parkingDwell" value="{{ settings.parking_dwell_sec }}" min="1" step="0.5">
+                    </div>
+                </div>
+                <div class="row g-2 mb-3">
+                    <div class="col-4">
+                        <label class="form-label" for="obstructionDwell">Obstruction (s)</label>
+                        <input type="number" class="form-control" id="obstructionDwell" value="{{ settings.obstruction_dwell_sec }}" min="1" step="0.5">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label" for="loadingDwell">Loading Zone (s)</label>
+                        <input type="number" class="form-control" id="loadingDwell" value="{{ settings.loading_dwell_sec }}" min="1" step="0.5">
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label" for="crossingBlock">Crossing Block (s)</label>
+                        <input type="number" class="form-control" id="crossingBlock" value="{{ settings.crossing_block_sec }}" min="1" step="0.5">
+                    </div>
+                </div>
+                <div class="row g-2 mb-3">
+                    <div class="col-6">
+                        <label class="form-label" for="laneFlow">Lane Flow Direction (°)</label>
+                        <input type="number" class="form-control" id="laneFlow" value="{{ settings.lane_flow_degrees }}" min="0" max="359">
+                        <small class="text-muted">0° = right, 90° = down (image coordinates)</small>
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label" for="flowTolerance">Counterflow Tolerance (°)</label>
+                        <input type="number" class="form-control" id="flowTolerance" value="{{ settings.flow_tolerance_degrees }}" min="10" max="90">
+                    </div>
+                </div>
+                <button type="button" class="btn btn-danger" id="btnSaveSettings"><i class="bi bi-check-lg me-1"></i> Save Settings</button>
             </div>
         </div>
     </div>
@@ -96,20 +130,30 @@
                 <div class="table-responsive">
                     <table class="table table-hover mb-0 align-middle">
                         <thead>
-                            <tr><th>Username</th><th>Role</th><th>Created</th><th>Actions</th></tr>
+                            <tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
                         </thead>
-                        <tbody>
+                        <tbody id="usersTableBody">
                             {% for user in users %}
-                            <tr>
+                            <tr data-user='{{ user | tojson }}'>
                                 <td>
                                     <div class="d-flex align-items-center gap-2">
                                         <div class="user-avatar-sm">{{ user.name[:2]|upper }}</div>
-                                        {{ user.username }}
+                                        <div>
+                                            <div>{{ user.name }}</div>
+                                            <small class="text-muted">{{ user.username }}</small>
+                                        </div>
                                     </div>
                                 </td>
-                                <td><span class="badge {% if user.role == 'admin' %}bg-danger-subtle text-danger{% else %}bg-primary-subtle text-primary{% endif %}">{{ user.role }}</span></td>
+                                <td><span class="badge {% if user.role == 'admin' %}bg-danger-subtle text-danger{% elif user.role == 'enforcer' %}bg-primary-subtle text-primary{% else %}bg-secondary-subtle text-secondary{% endif %}">{{ user.role_label }}</span></td>
+                                <td>
+                                    {% if user.is_active %}
+                                    <span class="badge bg-success-subtle text-success">Active</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary-subtle text-secondary">Inactive</span>
+                                    {% endif %}
+                                </td>
                                 <td class="small">{{ user.created_at }}</td>
-                                <td><button class="btn btn-sm btn-outline-secondary btn-edit-user" data-user-id="{{ user.id }}"><i class="bi bi-pencil"></i></button></td>
+                                <td><button class="btn btn-sm btn-outline-secondary btn-edit-user"><i class="bi bi-pencil"></i></button></td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -119,30 +163,51 @@
         </div>
 
         <div class="card card-panel mt-4">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-gear me-2"></i>System Preferences</h5></div>
-            <div class="card-body">
-                <div class="row g-3 mb-3">
-                    <div class="col-6">
-                        <label class="form-label" for="fpsSetting">FPS Setting</label>
-                        <input type="number" class="form-control" id="fpsSetting" value="{{ settings.fps }}" min="15" max="60">
-                    </div>
-                    <div class="col-6">
-                        <label class="form-label" for="frameSkip">Frame Skip Rate</label>
-                        <input type="number" class="form-control" id="frameSkip" value="{{ settings.frame_skip }}" min="1" max="10">
-                    </div>
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="card-title mb-0"><i class="bi bi-camera-video me-2"></i>Live Cameras (RTSP)</h5>
+                <button class="btn btn-sm btn-danger" id="btnAddCamera"><i class="bi bi-plus-lg me-1"></i> Add Camera</button>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0 align-middle">
+                        <thead>
+                            <tr><th>Camera</th><th>RTSP URL</th><th>Status</th><th>Actions</th></tr>
+                        </thead>
+                        <tbody id="camerasTableBody">
+                            {% for cam in cameras %}
+                            <tr data-camera='{{ cam | tojson }}'>
+                                <td>
+                                    <div class="fw-semibold">{{ cam.name }}</div>
+                                    <small class="text-muted">{{ cam.location or '—' }}</small>
+                                </td>
+                                <td class="small text-muted text-truncate" style="max-width:180px;">{{ cam.rtsp_url }}</td>
+                                <td>
+                                    {% if cam.is_active %}
+                                    <span class="badge bg-success-subtle text-success">Active</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary-subtle text-secondary">Inactive</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-secondary btn-edit-camera" title="Edit"><i class="bi bi-pencil"></i></button>
+                                        <button class="btn btn-outline-danger btn-delete-camera" title="Delete"><i class="bi bi-trash"></i></button>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr><td colspan="4" class="text-center text-muted py-4">No cameras configured. Add an RTSP camera to enable live monitoring.</td></tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
-                <div class="mb-3">
-                    <label class="form-label" for="retentionDays">Evidence Retention (days)</label>
-                    <input type="number" class="form-control" id="retentionDays" value="{{ settings.evidence_retention_days }}" min="30" max="365">
-                </div>
-                <button type="button" class="btn btn-danger" id="btnSaveSettings"><i class="bi bi-check-lg me-1"></i> Save Settings</button>
             </div>
         </div>
 
         <div class="card card-panel mt-4">
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-inbox me-2"></i>Review Queue</h5></div>
             <div class="card-body">
-                <p class="text-muted small mb-3">Low-confidence detections and Reckless Driving require admin approval.</p>
+                <p class="text-muted small mb-3">All detected violations require manual validation before they are confirmed.</p>
                 <a href="{{ url_for('review_queue') }}" class="btn btn-outline-danger w-100"><i class="bi bi-inbox me-2"></i>Open Review Queue</a>
             </div>
         </div>
@@ -169,7 +234,7 @@
                 </div>
                 <label class="form-label">Zone Polygons (JSON)</label>
                 <textarea class="form-control font-monospace" id="editTemplateZones" rows="10"></textarea>
-                <small class="text-muted">Required keys: no_parking, active_lane, pedestrian_crossing, truck_ban_zone</small>
+                <small class="text-muted">Zone keys: no_parking, active_lane, pedestrian_crossing, truck_ban_zone, loading_unloading, restricted_lane</small>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -189,6 +254,88 @@
             </div>
             <div class="modal-body">
                 <pre class="template-preview-json mb-0" id="templatePreviewJson"></pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- User Editor Modal -->
+<div class="modal fade" id="userEditorModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="userEditorTitle">Add User</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editUserId">
+                <div class="mb-3">
+                    <label class="form-label" for="editUserUsername">Username</label>
+                    <input type="text" class="form-control" id="editUserUsername">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editUserFullName">Full Name</label>
+                    <input type="text" class="form-control" id="editUserFullName">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editUserPassword">Password</label>
+                    <input type="password" class="form-control" id="editUserPassword" placeholder="Leave blank to keep current">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editUserRole">Role</label>
+                    <select class="form-select" id="editUserRole">
+                        {% for role_key, role_label in roles.items() %}
+                        <option value="{{ role_key }}">{{ role_label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="editUserActive" checked>
+                    <label class="form-check-label" for="editUserActive">Account Active</label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btnSaveUser"><i class="bi bi-check-lg me-1"></i> Save User</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Camera Editor Modal -->
+<div class="modal fade" id="cameraEditorModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="cameraEditorTitle">Add Camera</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editCameraId">
+                <div class="mb-3">
+                    <label class="form-label" for="editCameraName">Camera Name</label>
+                    <input type="text" class="form-control" id="editCameraName" placeholder="e.g. Main Street Cam A">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editCameraLocation">Location</label>
+                    <input type="text" class="form-control" id="editCameraLocation" placeholder="e.g. Normal Road Sector — Northbound">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editCameraUrl">RTSP URL</label>
+                    <input type="text" class="form-control" id="editCameraUrl" placeholder="rtsp://user:pass@host:554/stream">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label" for="editCameraZones">Zone Polygons (JSON, optional)</label>
+                    <textarea class="form-control font-monospace" id="editCameraZones" rows="6" placeholder='{"no_parking": [[x, y], ...]}'></textarea>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="editCameraActive" checked>
+                    <label class="form-check-label" for="editCameraActive">Camera Active</label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btnSaveCamera"><i class="bi bi-check-lg me-1"></i> Save Camera</button>
             </div>
         </div>
     </div>

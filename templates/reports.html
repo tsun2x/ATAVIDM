@@ -18,8 +18,8 @@
                     <div class="mb-3">
                         <label class="form-label">Date Range</label>
                         <div class="row g-2">
-                            <div class="col-6"><input type="date" class="form-control" id="dateFrom" value="2026-06-01"></div>
-                            <div class="col-6"><input type="date" class="form-control" id="dateTo" value="2026-06-21"></div>
+                            <div class="col-6"><input type="date" class="form-control" id="dateFrom"></div>
+                            <div class="col-6"><input type="date" class="form-control" id="dateTo"></div>
                         </div>
                     </div>
                     <div class="mb-3">
@@ -34,18 +34,18 @@
                     <div class="mb-3">
                         <label class="form-label" for="reportVideo">Video Source</label>
                         <select class="form-select" id="reportVideo">
-                            <option value="">All Videos</option>
+                            <option value="">All Sources</option>
                             {% for vid in videos %}
-                            <option value="{{ vid.filename }}">{{ vid.filename }}</option>
+                            <option value="{{ vid.db_id }}">{{ vid.filename }}</option>
                             {% endfor %}
                         </select>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label" for="reportCondition">Traffic Condition</label>
-                        <select class="form-select" id="reportCondition">
-                            <option value="">All Conditions</option>
-                            {% for c in conditions %}
-                            <option value="{{ c }}">{{ c|title }}</option>
+                        <label class="form-label" for="reportStatus">Status</label>
+                        <select class="form-select" id="reportStatus">
+                            <option value="">All Statuses</option>
+                            {% for s in statuses %}
+                            <option value="{{ s }}">{{ s|title }}</option>
                             {% endfor %}
                         </select>
                     </div>
@@ -56,22 +56,11 @@
                 </form>
             </div>
         </div>
-        <div class="card card-panel mt-4">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-info-circle me-2"></i>Report Preview</h5></div>
-            <div class="card-body">
-                <ul class="list-unstyled report-preview-list mb-0">
-                    <li><span>Estimated Records</span><strong id="previewRecords">48</strong></li>
-                    <li><span>Date Range</span><strong id="previewRange">Jun 1 – Jun 21, 2026</strong></li>
-                    <li><span>Format</span><strong id="previewFormat">—</strong></li>
-                    <li><span>Est. File Size</span><strong id="previewSize">—</strong></li>
-                </ul>
-            </div>
-        </div>
     </div>
     <div class="col-lg-8">
         <div class="card card-panel">
             <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Download History</h5>
+                <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Report History</h5>
                 <button class="btn btn-sm btn-outline-secondary" id="btnRefreshHistory"><i class="bi bi-arrow-clockwise"></i></button>
             </div>
             <div class="card-body p-0">
@@ -79,10 +68,11 @@
                     <table class="table table-hover mb-0 align-middle" id="historyTable">
                         <thead>
                             <tr>
-                                <th>Filename</th>
+                                <th>Report</th>
                                 <th>Generated At</th>
                                 <th>Filters Applied</th>
-                                <th>Type</th>
+                                <th>Format</th>
+                                <th>By</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -90,7 +80,7 @@
                             {% for r in report_history %}
                             <tr>
                                 <td>{{ r.name }}</td>
-                                <td>{{ r.date }}</td>
+                                <td class="small">{{ r.date }}</td>
                                 <td class="small text-muted">{{ r.filters }}</td>
                                 <td>
                                     {% if r.type == 'PDF' %}
@@ -99,11 +89,16 @@
                                     <span class="badge bg-success-subtle text-success">Excel</span>
                                     {% endif %}
                                 </td>
+                                <td class="small">{{ r.generated_by }}</td>
                                 <td>
-                                    <button class="btn btn-sm btn-outline-danger btn-download-report" data-report-name="{{ r.name }}" {% if r.status != 'Ready' %}disabled{% endif %}>
+                                    <a class="btn btn-sm btn-outline-danger" href="{{ r.download_url }}" title="Download">
                                         <i class="bi bi-download"></i>
-                                    </button>
+                                    </a>
                                 </td>
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="6" class="text-center text-muted py-4">No reports generated yet.</td>
                             </tr>
                             {% endfor %}
                         </tbody>

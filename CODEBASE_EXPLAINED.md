@@ -3,6 +3,15 @@
 **Traffic Violation Detection and Monitoring System**
 Line-by-line code walkthrough, architecture overview, and dependency map.
 
+> **OUTDATED — historical document.** This walkthrough describes the original
+> frontend-only prototype (mock data, simulated CCTV, no database or AI
+> pipeline). The codebase has since been synchronized with the thesis
+> manuscript: it now includes a real YOLOv8m + ByteTrack detection pipeline,
+> a rule-based violation engine, SQLite storage, authentication with roles,
+> RTSP live streams, a manual review queue, analytics from database
+> aggregations, and real PDF/Excel reports.
+> For the current system, see `SYSTEM_EXPLANATION.md` and `HOW_TO_RUN.md`.
+
 ---
 
 ## Table of Contents

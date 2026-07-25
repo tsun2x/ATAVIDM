@@ -10,14 +10,16 @@ Repository: [https://github.com/tsun2x/ATAVIDM](https://github.com/tsun2x/ATAVID
 
 ## What you are setting up
 
-TAVIDM is a **Flask web application** for reviewing pre-recorded traffic videos. The current branch includes:
+TAVIDM is a **Flask web application** that detects traffic violations in recorded MP4 videos and RTSP live streams. The current branch includes:
 
-- Dashboard, violations, analytics, and reports UI (mostly demo/mock data)
-- **Real** MP4 video upload with SQLite storage
-- **Zone Templates** and per-video polygon annotations
-- First-frame extraction for the zone editor (OpenCV)
+- **YOLOv8m + ByteTrack** detection pipeline (Ultralytics) with a rule-based violation engine (ROI, dwell-time, direction, object counting, and time-based rules)
+- MP4 video upload, zone annotation, and reusable zone templates
+- RTSP live camera streams with on-frame detection overlays
+- Manual review queue (all detections are validated by an operator before confirmation)
+- Analytics dashboards and real PDF/Excel report generation
+- Authentication with three roles: System Administrator, Traffic Enforcement Officer, Guest Viewer
 
-The AI detection pipeline (YOLOv8, ByteTrack) is **not fully implemented yet** — upload and annotation are the main working features.
+Custom-trained YOLOv8m weights (with helmet/rider classes) are loaded from `models/` when present; otherwise the pretrained COCO YOLOv8m checkpoint is downloaded automatically on first processing run. Helmet-based rules stay inactive until custom weights are provided.
 
 ---
 
@@ -175,19 +177,29 @@ Open a browser:
 
 ## 7. First-time walkthrough
 
-### A. Explore the UI
+### A. Sign in
+
+Open **http://localhost:5000** — you are redirected to the login page.
+
+Default bootstrap account (created on first run — change the password afterwards in Settings):
+
+| Username | Password | Role |
+|----------|----------|------|
+| `admin` | `admin123` | System Administrator |
+
+### B. Explore the UI
 
 | URL | Page |
 |-----|------|
-| `/` | Dashboard |
-| `/live-monitor` | Video upload + monitor |
-| `/violations` | Violations table (mock data) |
-| `/analytics` | Charts (mock data) |
-| `/reports` | Reports (demo) |
-| `/settings` | Zone Templates + thresholds |
-| `/review-queue` | Review queue (mock data) |
+| `/` | Dashboard (live statistics from the database) |
+| `/live-monitor` | RTSP cameras, video upload + processing |
+| `/violations` | Confirmed/dismissed violation records |
+| `/analytics` | Trends, breakdowns, vehicle classifications |
+| `/reports` | PDF / Excel report generation (enforcer/admin) |
+| `/settings` | Rule parameters, cameras, templates, users (admin) |
+| `/review-queue` | Manual validation of detections (enforcer/admin) |
 
-### B. Upload your first video
+### C. Upload and process your first video
 
 1. Go to **Live Monitor**.
 2. Drag and drop an **MP4** file (or click Browse).
@@ -195,18 +207,22 @@ Open a browser:
 4. Click **Upload**.
 5. The **Zone Annotation** wizard opens with the first frame extracted from the video.
 6. Choose **Use Existing Zone Template** or **Create New Zone Annotation**.
-7. Draw polygons for all four required zones:
+7. Draw at least one zone polygon (3+ points each). Available zones:
    - No Parking Zone
    - Active Lane
    - Pedestrian Crossing
    - Truck Ban Zone
-8. Click **Save Annotation**, then choose:
-   - **Use for This Video Only**, or
-   - **Save as New Template** (reusable on future uploads).
+   - No Loading/Unloading Zone
+   - Restricted Lane
+8. Click **Save Annotation**, then choose **Use for This Video Only** or **Save as New Template**.
+9. Select the video in the **Uploaded Videos** list and click **Process Video**.
+   The pipeline (YOLOv8m → ByteTrack → rule engine) runs in the background and
+   queues detected violations for manual review.
+10. Open the **Review Queue** to confirm or dismiss each detection.
 
-### C. Manage templates
+### D. Manage templates, cameras, and users
 
-Go to **Settings → Zone Templates** to view, edit, duplicate, or delete saved templates.
+Go to **Settings** (admin) to manage zone templates, RTSP cameras, rule parameters, and user accounts.
 
 ---
 
@@ -280,7 +296,7 @@ cd ATAVIDM; .\venv\Scripts\Activate.ps1; python app.py
 
 ---
 
-## 10. Project status (prototype)
+## 10. Project status
 
 | Feature | Status |
 |---------|--------|
@@ -288,9 +304,12 @@ cd ATAVIDM; .\venv\Scripts\Activate.ps1; python app.py
 | Video upload + SQLite | Working |
 | Zone annotations + templates | Working |
 | First-frame extraction | Working |
-| YOLOv8 / ByteTrack detection | Planned (stubs in `core/`) |
-| Violations from real pipeline | Mock data in UI |
-| User authentication | UI only |
+| YOLOv8m + ByteTrack detection | Working (COCO fallback; custom weights loaded from `models/`) |
+| Rule-based violation engine | Working (10 rules; helmet rules need custom weights) |
+| RTSP live streams | Working |
+| Manual review queue | Working |
+| Analytics + PDF/Excel reports | Working |
+| Authentication + roles | Working (bcrypt, admin/enforcer/viewer) |
 
 For more technical detail, see `CODEBASE_EXPLAINED.md` and `HOW_TO_RUN.md` (some sections in older docs may be outdated).
 

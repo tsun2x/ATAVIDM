@@ -1,86 +1,93 @@
 /**
- * TAVIDM - Reports Page
+ * TAVIDM - Reports Page (real PDF/Excel generation)
  */
 
 (function () {
     "use strict";
 
-    const dateFrom = document.getElementById("dateFrom");
-    const dateTo = document.getElementById("dateTo");
-    const previewRange = document.getElementById("previewRange");
-    const previewFormat = document.getElementById("previewFormat");
-    const previewSize = document.getElementById("previewSize");
+    const historyBody = document.getElementById("historyBody");
 
-    function formatDateRange() {
-        if (!dateFrom || !dateTo || !previewRange) return;
-        const from = new Date(dateFrom.value);
-        const to = new Date(dateTo.value);
-        const opts = { month: "short", day: "numeric", year: "numeric" };
-        previewRange.textContent = from.toLocaleDateString("en-US", opts) + " \u2013 " + to.toLocaleDateString("en-US", opts);
+    function collectFilters() {
+        return {
+            title: document.getElementById("reportName")?.value.trim() || null,
+            date_from: document.getElementById("dateFrom")?.value || null,
+            date_to: document.getElementById("dateTo")?.value || null,
+            violation_type: document.getElementById("reportViolationType")?.value || null,
+            video_id: document.getElementById("reportVideo")?.value || null,
+            status: document.getElementById("reportStatus")?.value || null,
+        };
     }
 
-    [dateFrom, dateTo].forEach(function (el) {
-        el?.addEventListener("change", formatDateRange);
-    });
+    function formatBadge(type) {
+        return type === "PDF"
+            ? '<span class="badge bg-danger-subtle text-danger">PDF</span>'
+            : '<span class="badge bg-success-subtle text-success">Excel</span>';
+    }
 
-    formatDateRange();
+    function renderHistory(reports) {
+        if (!historyBody) return;
+        if (!reports.length) {
+            historyBody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4">No reports generated yet.</td></tr>';
+            return;
+        }
+        historyBody.innerHTML = reports.map(function (r) {
+            return (
+                "<tr>" +
+                "<td>" + r.name + "</td>" +
+                '<td class="small">' + r.date + "</td>" +
+                '<td class="small text-muted">' + r.filters + "</td>" +
+                "<td>" + formatBadge(r.type) + "</td>" +
+                '<td class="small">' + r.generated_by + "</td>" +
+                '<td><a class="btn btn-sm btn-outline-danger" href="' + r.download_url + '" title="Download"><i class="bi bi-download"></i></a></td>' +
+                "</tr>"
+            );
+        }).join("");
+    }
+
+    function refreshHistory() {
+        return fetch("/api/reports")
+            .then(function (r) { return r.json(); })
+            .then(function (payload) {
+                if (payload.success) renderHistory(payload.reports);
+            });
+    }
 
     function generateReport(format) {
-        const name = document.getElementById("reportName")?.value || "Report";
-        previewFormat.textContent = format;
-        previewSize.textContent = format === "PDF" ? "2.1 MB" : "1.4 MB";
+        const body = collectFilters();
+        body.format = format;
+        showToast("Generating " + format.toUpperCase(), "Building the report from the violations database…", "info");
 
-        showToast(
-            "Generating " + format,
-            '"' + name + '" is being generated. This is a demo — no file will be created.',
-            format === "PDF" ? "danger" : "success"
-        );
-
-        setTimeout(function () {
-            addToHistory(name, format);
-            showToast("Report Ready", name + " (" + format + ") is ready for download (demo).", "success");
-        }, 2000);
-    }
-
-    function addToHistory(name, type) {
-        const tbody = document.getElementById("historyBody");
-        if (!tbody) return;
-
-        const id = "RPT-" + String(Math.floor(Math.random() * 900) + 100);
-        const today = new Date().toISOString().split("T")[0];
-        const size = type === "PDF" ? "2.1 MB" : "1.4 MB";
-        const badge = type === "PDF"
-            ? '<span class="badge bg-danger-subtle text-danger"><i class="bi bi-file-earmark-pdf me-1"></i>PDF</span>'
-            : '<span class="badge bg-success-subtle text-success"><i class="bi bi-file-earmark-excel me-1"></i>Excel</span>';
-
-        const row = document.createElement("tr");
-        row.innerHTML =
-            "<td><code>" + id + "</code></td>" +
-            "<td>" + name + "</td>" +
-            "<td>" + badge + "</td>" +
-            "<td>" + today + "</td>" +
-            "<td>" + size + "</td>" +
-            '<td><span class="badge bg-success-subtle text-success">Ready</span></td>' +
-            '<td><button class="btn btn-sm btn-outline-primary btn-download-report" data-report-id="' + id + '" data-report-name="' + name + '"><i class="bi bi-download"></i></button></td>';
-
-        tbody.insertBefore(row, tbody.firstChild);
+        fetch("/api/reports", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (payload) {
+                if (payload.success) {
+                    showToast("Report Ready", payload.report.name + " (" + payload.report.type + ") is ready.", "success");
+                    refreshHistory();
+                    window.location.href = payload.report.download_url;
+                } else {
+                    showToast("Error", payload.error || "Report generation failed.", "danger");
+                }
+            })
+            .catch(function () {
+                showToast("Error", "Report generation failed. Please try again.", "danger");
+            });
     }
 
     document.getElementById("btnGeneratePdf")?.addEventListener("click", function () {
-        generateReport("PDF");
+        generateReport("pdf");
     });
 
     document.getElementById("btnGenerateExcel")?.addEventListener("click", function () {
-        generateReport("Excel");
+        generateReport("excel");
     });
 
     document.getElementById("btnRefreshHistory")?.addEventListener("click", function () {
-        showToast("Refreshed", "Download history has been refreshed.", "info");
-    });
-
-    document.getElementById("historyTable")?.addEventListener("click", function (e) {
-        const btn = e.target.closest(".btn-download-report");
-        if (!btn || btn.disabled) return;
-        showToast("Downloading", "Downloading " + btn.dataset.reportName + " (demo).", "success");
+        refreshHistory().then(function () {
+            showToast("Refreshed", "Report history updated.", "info");
+        });
     });
 })();
