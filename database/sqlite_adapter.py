@@ -863,6 +863,10 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
         ).fetchone()
         if row is None:
             raise ValueError(f"Review item {review_id} not found")
+        
+        row_status = row["status"] if "status" in row.keys() else None
+        if row_status != "pending":
+            raise ValueError(f"Review item {review_id} is not pending (status: {row_status})")
 
         reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
         row_keys = row.keys()
