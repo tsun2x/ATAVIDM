@@ -1,0 +1,26 @@
+---
+description: Use Mnemosyne as TAVIDM institutional memory; codebase remains source of truth
+alwaysApply: true
+---
+
+# TAVIDM Mnemosyne Persistent Memory
+
+Use the **tavidm-mnemosyne-memory** skill (`@tavidm-mnemosyne-memory`).
+
+TAVIDM knowledge layers:
+
+- **Codebase = Truth** — current workspace and source code override memory
+- **Development Log = History** — `docs/development_logs/` records what happened
+- **Mnemosyne = Institutional Memory** — durable knowledge future agents need
+
+Operating loop: **Inspect → Retrieve → Reconcile → Implement → Test → Log → Remember**
+
+## Required behavior
+
+- Before significant TAVIDM work, retrieve targeted Mnemosyne memories for the subsystem involved. Do not retrieve unrelated memories.
+- After significant work, store a Mnemosyne memory only if durable institutional knowledge was produced. Do not persist change-log noise.
+- If memory conflicts with current code, inspect the implementation, treat the verified codebase as authoritative, and update or replace stale memory.
+- Explicit user instructions take priority over Mnemosyne.
+- Never store secrets.
+- Do not claim memory was saved unless a subsequent recall confirms the stored value.
+- If Mnemosyne is unavailable, continue development and do not pretend persistence succeeded.
