@@ -3,7 +3,7 @@
 Project decision (team): object detector is YOLOv8m (Ultralytics), fine-tuned
 on a custom traffic dataset. (Manuscript text still mixes YOLOv8s/YOLOv8m;
 implementation follows the team's chosen variant.)
-- Tracker: ByteTrack.
+- Tracker: ByteTrack
 - Rule engine features: ROI analysis, direction analysis, trajectory analysis,
   object counting, dwell-time analysis, and time-based rules.
 - Manual review policy (Ch3 flowchart, Step 7):
@@ -94,7 +94,7 @@ CONF_AUTO_QUEUE = 0.95   # >= : auto-queued for operator validation
 CONF_CAREFUL_REVIEW = 0.80  # 80-94%: highlighted for careful manual review
 # < CONF_CAREFUL_REVIEW: logged for monitoring (still routed to review queue —
 # the manuscript's Data Source section requires below-threshold detections to
-# be "routed to the manual review queue rather than being discarded").
+# be "routed to the manual review queue rather than being discarded)."
 
 
 def confidence_band(confidence: float) -> str:
@@ -103,7 +103,6 @@ def confidence_band(confidence: float) -> str:
     if confidence >= CONF_CAREFUL_REVIEW:
         return "careful-review"
     return "low-confidence"
-
 
 # ---------------------------------------------------------------------------
 # Rule-engine tuning (System Configuration Module: "Traffic Rule Parameters")
@@ -120,8 +119,8 @@ DEFAULT_RULE_PARAMETERS = {
     "stopping_dwell_sec": 10.0,       # stationary in no-parking zone -> Illegal Stopping
     "parking_dwell_sec": 30.0,        # stationary in no-parking zone -> Illegal Parking
     "obstruction_dwell_sec": 10.0,    # stationary in active lane -> Obstruction
-    "loading_dwell_sec": 8.0,         # PUV stationary in no-loading zone
     "crossing_block_sec": 3.0,        # stationary on pedestrian crossing
+    "loading_dwell_sec": 8.0,         # PUV stationary in no-loading zone
     "truck_ban_start": "06:00",
     "truck_ban_end": "09:00",
     "lane_flow_degrees": 90.0,        # allowed travel direction in active lane
@@ -130,121 +129,117 @@ DEFAULT_RULE_PARAMETERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Violation registry
+# Violation registry (Canonical 11)
 # ---------------------------------------------------------------------------
-# NOTE: The manuscript defines twenty (20) finalized action-based violations
-# but never enumerates the canonical list. The names below are the violations
-# explicitly cited in Chapters 1-3 (Ordinances 248/576/946 mapping, Functional
-# Requirements examples, and RA 10054/10666 rules). Per the manuscript:
-# "the implementation of specific violations depends on their technical
-# feasibility using the proposed detection pipeline."
+# These are the FINAL canonical violation types for TAVIDM.
+# IMPLEMENTED violations are those with working detection logic.
+# FUTURE violations are stubs requiring new model classes or researcher input.
 
-ILLEGAL_PARKING = "Illegal Parking"
-ILLEGAL_STOPPING = "Illegal Stopping"
-OBSTRUCTION = "Obstruction"
-COUNTERFLOW = "Counterflow Driving"
-BLOCKING_PEDESTRIAN_CROSSING = "Blocking Pedestrian Crossing"
-TRUCK_BAN = "Truck Ban Violation"
-ILLEGAL_LOADING_UNLOADING = "Illegal Loading/Unloading"
-RESTRICTED_LANE = "Restricted Lane Violation"
-NO_HELMET_VIOLATION = "No Helmet Violation"
-MOTORCYCLE_OVERLOADING = "Motorcycle Overloading"
+# ---- IMPLEMENTED (currently executable) ----
+VIOLATION_OBSTRUCTION = "Obstruction"
+VIOLATION_NO_HELMET = "No Helmet"
+VIOLATION_COUNTERFLOW = "Counterflow"
+VIOLATION_TRUCK_BAN = "Truck-Ban Violation"
+VIOLATION_MOTORCYCLE_OVERLOADING = "Motorcycle Overloading"
 
-# Named in the manuscript but not implementable with the described
-# single-camera pipeline and available detection classes.
-RECKLESS_DRIVING = "Reckless Driving"
-OVERTAKING_NO_PASSING = "Overtaking in No-Passing Zone"
-ILLEGAL_U_TURN = "Illegal U-Turn"
-CHILD_ON_MOTORCYCLE = "Child on Motorcycle"
-CARGO_BED_PASSENGERS = "Passengers in Cargo Bed"
-ONE_WAY_SCHEME = "Time-Based One-Way Scheme Violation"
+# ---- FUTURE/STUB (do not appear in analytics/reports until implemented) ----
+VIOLATION_SUBSTANDARD_HELMET = "Substandard Helmet"
+VIOLATION_DISREGARDING_SIGN = "Disregarding Traffic Sign"
+VIOLATION_NO_SIDE_MIRROR = "No Side Mirror"
+VIOLATION_ILLEGAL_PARKING_TERMINAL = "Illegal Parking / Illegal Terminal"
+VIOLATION_PAVEMENT_MARKINGS = "Failure to Follow Road/Pavement Markings"
+VIOLATION_CARGO_PASSENGERS = "Unauthorized Passengers in Pickup/Truck Cargo Area"
 
-VIOLATION_REGISTRY: dict[str, dict] = {
-    ILLEGAL_PARKING: {
-        "implemented": True,
-        "basis": "RA 4136; Zamboanga City Ord. 248 / 601",
-        "technique": "ROI + dwell-time analysis (No Parking Zone)",
-    },
-    ILLEGAL_STOPPING: {
-        "implemented": True,
-        "basis": "Zamboanga City Ord. 248",
-        "technique": "ROI + dwell-time analysis (No Parking Zone, short dwell)",
-    },
-    OBSTRUCTION: {
-        "implemented": True,
-        "basis": "Zamboanga City Ord. 248",
-        "technique": "ROI + dwell-time analysis (Active Lane)",
-    },
-    COUNTERFLOW: {
-        "implemented": True,
-        "basis": "RA 4136; Zamboanga City Ord. 248",
-        "technique": "Direction + trajectory analysis (Active Lane)",
-    },
-    BLOCKING_PEDESTRIAN_CROSSING: {
-        "implemented": True,
-        "basis": "Zamboanga City Ord. 248",
-        "technique": "ROI + dwell-time analysis (Pedestrian Crossing)",
-    },
-    TRUCK_BAN: {
-        "implemented": True,
-        "basis": "Zamboanga City ordinances (time-based truck ban)",
-        "technique": "ROI + vehicle class + time-based rule (Truck Ban Zone)",
-    },
-    ILLEGAL_LOADING_UNLOADING: {
-        "implemented": True,
-        "basis": "Zamboanga City Ord. 248 (PUV loading/unloading restrictions)",
-        "technique": "ROI + vehicle class + dwell-time (No Loading/Unloading Zone)",
-    },
-    RESTRICTED_LANE: {
-        "implemented": True,
-        "basis": "Zamboanga City Ord. 576",
-        "technique": "ROI + vehicle class (Restricted Lane)",
-    },
-    NO_HELMET_VIOLATION: {
-        "implemented": True,
-        "basis": "RA 10054 (Motorcycle Helmet Act)",
-        "technique": "Helmet detection + vehicle-person association",
-        "requires_custom_model": True,
-    },
-    MOTORCYCLE_OVERLOADING: {
-        "implemented": True,
-        "basis": "RA 4136; Zamboanga City Ord. 248 (passenger limit)",
-        "technique": "Passenger counting + vehicle-person association",
-    },
-    RECKLESS_DRIVING: {
-        "implemented": False,
-        "basis": "RA 4136; Zamboanga City Ord. 248",
-        "reason": "Requires behavior classification beyond the described rule features.",
-    },
-    OVERTAKING_NO_PASSING: {
-        "implemented": False,
-        "basis": "RA 4136; Zamboanga City Ord. 248",
-        "reason": "Requires lane estimation; flagged as constrained in the manuscript scope.",
-    },
-    ILLEGAL_U_TURN: {
-        "implemented": False,
-        "basis": "Zamboanga City Ord. 248",
-        "reason": "Requires trajectory curvature analysis not specified in Ch3.",
-    },
-    CHILD_ON_MOTORCYCLE: {
-        "implemented": False,
-        "basis": "RA 10666",
-        "reason": "No child detection class in any manuscript class list.",
-    },
-    CARGO_BED_PASSENGERS: {
-        "implemented": False,
-        "basis": "RA 4136",
-        "reason": "No cargo-bed detection class in any manuscript class list.",
-    },
-    ONE_WAY_SCHEME: {
-        "implemented": False,
-        "basis": "Zamboanga City Ord. 946",
-        "reason": "Requires per-lane schedule direction configuration not specified in Ch3.",
-    },
-}
 
-IMPLEMENTED_VIOLATIONS = tuple(
-    name for name, meta in VIOLATION_REGISTRY.items() if meta["implemented"]
+# Legacy names for backward compatibility with existing data
+# These DO NOT map to canonical names - they preserve existing DB values
+LEGACY_ILLEGAL_PARKING = "Illegal Parking"
+LEGACY_ILLEGAL_STOPPING = "Illegal Stopping"
+LEGACY_BLOCKING_PEDESTRIAN = "Blocking Pedestrian Crossing"
+LEGACY_LOADING_UNLOADING = "Illegal Loading/Unloading"
+LEGACY_RESTRICTED_LANE = "Restricted Lane Violation"
+LEGACY_NO_HELMET_VIOLATION = "No Helmet Violation"
+LEGACY_OVERLOADING = "Motorcycle Overloading"
+LEGACY_TRUCK_BAN = "Truck Ban Violation"
+LEGACY_OBSTRUCTION = "Obstruction"
+LEGACY_COUNTERFLOW = "Counterflow Driving"
+
+
+# All canonical violation types (must be exactly 11)
+CANONICAL_VIOLATIONS = (
+    VIOLATION_OBSTRUCTION,
+    VIOLATION_SUBSTANDARD_HELMET,
+    VIOLATION_DISREGARDING_SIGN,
+    VIOLATION_NO_HELMET,
+    VIOLATION_NO_SIDE_MIRROR,
+    VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    VIOLATION_COUNTERFLOW,
+    VIOLATION_TRUCK_BAN,
+    VIOLATION_PAVEMENT_MARKINGS,
+    VIOLATION_MOTORCYCLE_OVERLOADING,
+    VIOLATION_CARGO_PASSENGERS,
 )
 
-ALL_VIOLATION_TYPES = tuple(VIOLATION_REGISTRY.keys())
+# Currently implemented/active violation types (have working detection)
+IMPLEMENTED_VIOLATIONS = (
+    VIOLATION_OBSTRUCTION,
+    VIOLATION_NO_HELMET,
+    VIOLATION_COUNTERFLOW,
+    VIOLATION_TRUCK_BAN,
+    VIOLATION_MOTORCYCLE_OVERLOADING,
+)
+
+# All known violation types (canonical + legacy)
+ALL_VIOLATION_TYPES = CANONICAL_VIOLATIONS + (
+    LEGACY_ILLEGAL_PARKING,
+    LEGACY_ILLEGAL_STOPPING,
+    LEGACY_BLOCKING_PEDESTRIAN,
+    LEGACY_LOADING_UNLOADING,
+    LEGACY_RESTRICTED_LANE,
+    LEGACY_NO_HELMET_VIOLATION,
+    LEGACY_OVERLOADING,
+)
+
+
+def is_implemented_violation(viol_type: str) -> bool:
+    """Check if a violation type is active/can be detected."""
+    return viol_type in IMPLEMENTED_VIOLATIONS
+
+
+def is_canonical_violation(viol_type: str) -> bool:
+    """Check if a violation type is in the canonical set."""
+    return viol_type in CANONICAL_VIOLATIONS
+
+
+def legacy_to_canonical(viol_type: str) -> str | None:
+    """Convert legacy violation names to canonical names.
+    Returns None if no mapping exists (e.g., already canonical or unmapped).
+    """
+    mapping = {
+        # Legacy maps to canonical
+        LEGACY_OBSTRUCTION: VIOLATION_OBSTRUCTION,
+        LEGACY_COUNTERFLOW: VIOLATION_COUNTERFLOW,
+        LEGACY_TRUCK_BAN: VIOLATION_TRUCK_BAN,
+        LEGACY_NO_HELMET_VIOLATION: VIOLATION_NO_HELMET,
+        LEGACY_OVERLOADING: VIOLATION_MOTORCYCLE_OVERLOADING,
+        # Legacy parking variants -> fused terminal/parking
+        LEGACY_ILLEGAL_PARKING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
+        LEGACY_ILLEGAL_STOPPING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
+        # Legacy pedestrian crossing -> Obstruction (blocking)
+        LEGACY_BLOCKING_PEDESTRIAN: VIOLATION_OBSTRUCTION,
+        # Legacy restricted lane -> pavement markings
+        LEGACY_RESTRICTED_LANE: VIOLATION_PAVEMENT_MARKINGS,
+        LEGACY_LOADING_UNLOADING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    }
+    return mapping.get(viol_type)
+
+
+def canonicalize_violation(viol_type: str) -> str:
+    """Convert any violation name to its canonical form.
+    For unknown names, returns as-is.
+    """
+    result = legacy_to_canonical(viol_type)
+    if result is None:
+        # Already canonical or unknown
+        return viol_type
+    return result
