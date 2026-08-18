@@ -1,0 +1,392 @@
+"""Tests for the violation engine.
+
+Tests all canonical violation types defined in detection_config.py.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from core.detection_config import (
+    IMPLEMENTED_VIOLATIONS,
+    VIOLATION_OBSTRUCTION,
+    VIOLATION_COUNTERFLOW,
+    VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    VIOLATION_NO_HELMET,
+    VIOLATION_PAVEMENT_MARKINGS,
+    VIOLATION_MOTORCYCLE_OVERLOADING,
+    VIOLATION_CARGO_PASSENGERS,
+    VIOLATION_TRUCK_BAN,
+    VIOLATION_SUBSTANDARD_HELMET,
+    VIOLATION_DISREGARDING_SIGN,
+    VIOLATION_NO_SIDE_MIRROR,
+    CANONICAL_VIOLATIONS,
+)
+
+
+@pytest.fixture
+def rule_params():
+    """Default rule parameters for testing."""
+    return {
+        "confidence_threshold": 0.5,
+        "stationary_px": 8.0,
+        "stopping_dwell_sec": 0.5,
+        "parking_dwell_sec": 0.5,
+        "obstruction_dwell_sec": 0.5,
+        "loading_dwell_sec": 8.0,
+        "crossing_block_sec": 1.0,
+        "truck_ban_start": "06:00",
+        "truck_ban_end": "09:00",
+        "lane_flow_degrees": 90.0,
+        "flow_tolerance_degrees": 60.0,
+        "min_direction_px": 40.0,
+    }
+
+
+@pytest.fixture
+def no_parking_zone():
+    """A simple no-parking zone polygon."""
+    return [[100, 100], [200, 100], [200, 150], [100, 150], [100, 100]]
+
+
+@pytest.fixture
+def active_lane_zone():
+    """A simple active lane zone polygon."""
+    return [[50, 50], [250, 50], [250, 120], [50, 120], [50, 50]]
+
+
+@pytest.fixture
+def sample_vehicle():
+    """A sample vehicle detection in the active lane zone."""
+    return {
+        "class_label": "car",
+        "track_id": 1,
+        "bbox_x": 120,
+        "bbox_y": 50,
+        "bbox_w": 40,
+        "bbox_h": 20,
+        "confidence": 0.95,
+        "timestamp_sec": 5.0,
+        "speed_px_per_sec": 0.1,
+        "direction_degrees": 90,
+    }
+
+
+@pytest.fixture
+def sample_motorcycle():
+    """A sample motorcycle detection with person rider."""
+    return {
+        "class_label": "motorcycle",
+        "track_id": 2,
+        "bbox_x": 150,
+        "bbox_y": 100,
+        "bbox_w": 50,
+        "bbox_h": 25,
+        "confidence": 0.90,
+        "timestamp_sec": 3.0,
+        "speed_px_per_sec": 0.0,
+        "direction_degrees": 0,
+    }
+
+
+@pytest.fixture
+def sample_person():
+    """A sample person detection as rider."""
+    return {
+        "class_label": "person",
+        "track_id": 3,
+        "bbox_x": 175,
+        "bbox_y": 95,
+        "bbox_w": 20,
+        "bbox_h": 40,
+        "confidence": 0.85,
+        "timestamp_sec": 3.0,
+        "speed_px_per_sec": 0.0,
+        "direction_degrees": 0,
+    }
+
+
+@pytest.fixture
+def sample_truck():
+    """A sample truck detection."""
+    return {
+        "class_label": "truck",
+        "track_id": 4,
+        "bbox_x": 100,
+        "bbox_y": 100,
+        "bbox_w": 80,
+        "bbox_h": 30,
+        "confidence": 0.92,
+        "timestamp_sec": 7.5,
+        "speed_px_per_sec": 1.0,
+        "direction_degrees": 0,
+    }
+
+
+class TestViolationRegistry:
+    """Tests for violation registry configuration."""
+
+    def test_canonical_violations_count(self):
+        """Verify we have exactly 11 canonical violations."""
+        assert len(CANONICAL_VIOLATIONS) == 11, f"Expected 11 canonical violations, got {len(CANONICAL_VIOLATIONS)}"
+
+    def test_canonical_violations_contains_all_ten(self):
+        """Verify all 11 canonical violations are present."""
+        expected = {
+            VIOLATION_OBSTRUCTION,
+            VIOLATION_SUBSTANDARD_HELMET,
+            VIOLATION_DISREGARDING_SIGN,
+            VIOLATION_NO_HELMET,
+            VIOLATION_NO_SIDE_MIRROR,
+            VIOLATION_ILLEGAL_PARKING_TERMINAL,
+            VIOLATION_COUNTERFLOW,
+            VIOLATION_TRUCK_BAN,
+            VIOLATION_PAVEMENT_MARKINGS,
+            VIOLATION_MOTORCYCLE_OVERLOADING,
+            VIOLATION_CARGO_PASSENGERS,
+        }
+        assert set(CANONICAL_VIOLATIONS) == expected, \
+            f"Canonical violations mismatch. Expected: {expected}, Got: {set(CANONICAL_VIOLATIONS)}"
+
+    def test_implemented_violations_is_subset(self):
+        """Verify IMPLEMENTED_VIOLATIONS is a subset of CANONICAL_VIOLATIONS."""
+        for v in IMPLEMENTED_VIOLATIONS:
+            assert v in CANONICAL_VIOLATIONS, f"{v} in IMPLEMENTED but not in CANONICAL"
+
+    def test_implemented_count(self):
+        """Verify we have exactly 5 implemented violations (core rules)."""
+        assert len(IMPLEMENTED_VIOLATIONS) == 5, f"Expected 5 implemented violations, got {len(IMPLEMENTED_VIOLATIONS)}"
+
+    def test_stub_violations_not_in_implemented(self):
+        """Verify stub violations are NOT in IMPLEMENTED_VIOLATIONS."""
+        stubs = {VIOLATION_SUBSTANDARD_HELMET, VIOLATION_DISREGARDING_SIGN, 
+                 VIOLATION_NO_SIDE_MIRROR, VIOLATION_CARGO_PASSENGERS,
+                 VIOLATION_ILLEGAL_PARKING_TERMINAL, VIOLATION_PAVEMENT_MARKINGS}
+        for stub in stubs:
+            assert stub not in IMPLEMENTED_VIOLATIONS, f"{stub} should be stub, not implemented"
+
+
+class TestObstruction:
+    """Tests for Obstruction violation."""
+
+    def test_obstruction_fires_when_stationary(self, rule_params, active_lane_zone, sample_vehicle):
+        """Obstruction should fire when a vehicle is stationary in active lane."""
+        from core.violation_engine import RuleEngineState, check_obstruction
+        
+        state = RuleEngineState()
+        
+        # Create a fresh vehicle copy
+        vehicle = dict(sample_vehicle)
+        
+        # Accumulate across frames: the engine emits once, then later frames
+        # return [] because the track is already marked fired.
+        events = []
+        for frame in range(0, 10):
+            vehicle["timestamp_sec"] = 5.0 + frame * 0.6
+            events.extend(check_obstruction([vehicle], active_lane_zone, state, frame, rule_params))
+
+        assert any(e.violation_type == VIOLATION_OBSTRUCTION for e in events), \
+            f"Expected Obstruction event, got {events}"
+
+
+class TestCounterflow:
+    """Tests for Counterflow violation."""
+
+    def test_counterflow_fires_when_opposite_heading(self, rule_params, active_lane_zone, sample_vehicle):
+        """Counterflow should fire when vehicle heading is opposite to lane flow."""
+        from core.violation_engine import RuleEngineState, check_counterflow
+        
+        state = RuleEngineState()
+        
+        # Create a fresh vehicle copy
+        vehicle = dict(sample_vehicle)
+        vehicle["direction_degrees"] = 270  # Opposite of 90
+        
+        events = []
+        for frame in range(0, 10):
+            vehicle["timestamp_sec"] = 5.0 + frame * 0.3
+            events.extend(check_counterflow([vehicle], active_lane_zone, state, frame, rule_params))
+
+        assert any(e.violation_type == VIOLATION_COUNTERFLOW for e in events), \
+            f"Expected Counterflow event, got {events}"
+
+
+class TestParkingTerminal:
+    """Tests for Illegal Parking / Illegal Terminal fusion."""
+
+    def test_parking_terminal_fires_for_dwell(self, rule_params, no_parking_zone, sample_vehicle):
+        """Parking/Terminal violation should fire for dwell in no-parking zone."""
+        from core.violation_engine import RuleEngineState, check_illegal_parking_terminal
+        
+        state = RuleEngineState()
+        
+        # Create vehicle in no-parking zone
+        vehicle = {
+            "class_label": "car",
+            "track_id": 1,
+            "bbox_x": 120,
+            "bbox_y": 110,
+            "bbox_w": 40,
+            "bbox_h": 20,
+            "confidence": 0.95,
+            "speed_px_per_sec": 0.0,  # Stationary
+            "direction_degrees": 90,
+        }
+        # bottom_center = (140, 120) - inside no_parking_zone [[100,100], [200,100], [200,150], [100,150]]
+        
+        events = []
+        for frame in range(0, 10):
+            vehicle["timestamp_sec"] = 5.0 + frame * 0.6
+            events.extend(
+                check_illegal_parking_terminal([vehicle], no_parking_zone, state, frame, rule_params)
+            )
+
+        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING_TERMINAL for e in events), \
+            f"Expected Illegal Parking/Terminal event, got {events}"
+
+
+class TestNoHelmet:
+    """Tests for No Helmet violation."""
+
+    def test_no_helmet_fires_without_helmet(self, rule_params):
+        """No Helmet should fire when rider detected without helmet."""
+        from core.violation_engine import RuleEngineState, check_no_helmet
+        
+        state = RuleEngineState()
+        
+        mc = {
+            "class_label": "motorcycle",
+            "track_id": 1,
+            "bbox_x": 100, "bbox_y": 100, "bbox_w": 50, "bbox_h": 25,
+            "confidence": 0.95, "speed_px_per_sec": 0.0, "direction_degrees": 0,
+        }
+        
+        # Rider positioned to be associated with motorcycle
+        person = {
+            "class_label": "person",
+            "track_id": 2,
+            "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40,
+            "confidence": 0.9, "speed_px_per_sec": 0.0,
+        }
+        
+        # No helmets in detections!
+        events = []
+        for frame in range(0, 10):
+            ts = frame * 0.3
+            mc["timestamp_sec"] = ts
+            person["timestamp_sec"] = ts
+            evt = check_no_helmet([mc, person], state, frame, rule_params)
+            events.extend(evt)
+        
+        assert any(e.violation_type == VIOLATION_NO_HELMET for e in events), \
+            f"Expected No Helmet event, got {events}"
+
+
+class TestMotorcycleOverloading:
+    """Tests for Motorcycle Overloading violation."""
+
+    def test_motorcycle_overloading_fires_for_three_riders(self, rule_params):
+        """Motorcycle Overloading (NOT cargo passengers) should fire for 3+ riders."""
+        from core.violation_engine import RuleEngineState, check_motorcycle_overloading
+        
+        state = RuleEngineState()
+        
+        # Create motorcycle with 3+ riders
+        mc = {
+            "class_label": "motorcycle",
+            "track_id": 1,
+            "bbox_x": 100, "bbox_y": 100, "bbox_w": 50, "bbox_h": 25,
+            "confidence": 0.95, "speed_px_per_sec": 0.0, "direction_degrees": 0,
+        }
+        
+        persons = [
+            {"class_label": "person", "track_id": 2, "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
+            {"class_label": "person", "track_id": 3, "bbox_x": 130, "bbox_y": 95, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
+            {"class_label": "person", "track_id": 4, "bbox_x": 118, "bbox_y": 102, "bbox_w": 18, "bbox_h": 22, "confidence": 0.9, "speed_px_per_sec": 0.0},
+        ]
+        
+        events = []
+        for frame in range(0, 10):
+            ts = frame * 0.3
+            mc["timestamp_sec"] = ts
+            for p in persons:
+                p["timestamp_sec"] = ts
+            evt = check_motorcycle_overloading([mc] + persons, state, frame)
+            events.extend(evt)
+        
+        # Should NOT produce Cargo Passengers
+        cargo_events = [e for e in events if e.violation_type == VIOLATION_CARGO_PASSENGERS]
+        assert len(cargo_events) == 0, "Motorcycle Overloading should NOT produce Cargo Passengers"
+        
+        # Should produce Motorcycle Overloading
+        overload_events = [e for e in events if e.violation_type == VIOLATION_MOTORCYCLE_OVERLOADING]
+        assert len(overload_events) > 0, f"Expected Motorcycle Overloading event, got {events}"
+
+
+class TestViolationDetection:
+    """Integration tests for violation detection pipeline."""
+
+    def test_evaluate_detection_rules_full_pipeline(self, tracked_detections, rule_params):
+        """Test full pipeline evaluates rules correctly."""
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+        
+        state = RuleEngineState()
+        zones = {}
+        
+        events = evaluate_detection_rules(
+            tracked_detections, state, 1, zones=zones, params=rule_params
+        )
+        
+        assert isinstance(events, list)
+
+    def test_evaluated_violations_match_enabled_set(self, tracked_detections, rule_params):
+        """Only enabled violations should be evaluated."""
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+        
+        state = RuleEngineState()
+        zones = {}
+        
+        enabled = (VIOLATION_OBSTRUCTION,)
+        
+        events = evaluate_detection_rules(
+            tracked_detections, state, 1, zones=zones, 
+            params=rule_params, enabled_violations=enabled
+        )
+        
+        for event in events:
+            assert event.violation_type == VIOLATION_OBSTRUCTION
+
+    def test_enabled_violations_filter_suppresses_disabled(self, tracked_detections, rule_params):
+        """Disabled violations should produce no events."""
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+        
+        state = RuleEngineState()
+        zones = {"active_lane": [[50, 50], [250, 50], [250, 120], [50, 120], [50, 50]]}
+        
+        enabled = ()  # Empty tuple = no violations enabled
+        
+        events = evaluate_detection_rules(
+            tracked_detections, state, 1, zones=zones, 
+            params=rule_params, enabled_violations=enabled
+        )
+        
+        assert len(events) == 0, f"Expected no events with disabled violations, got {events}"
+
+
+@pytest.fixture
+def tracked_detections():
+    """Sample tracked detections for integration tests."""
+    return [
+        {
+            "class_label": "car",
+            "track_id": 1,
+            "bbox_x": 100,
+            "bbox_y": 70,
+            "bbox_w": 50,
+            "bbox_h": 20,
+            "confidence": 0.9,
+            "timestamp_sec": 5.0,
+            "speed_px_per_sec": 0.0,
+            "direction_degrees": 90,
+        }
+    ]

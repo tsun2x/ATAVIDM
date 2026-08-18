@@ -1,0 +1,15 @@
+[project]
+name = "tavidm"
+version = "0.1.0"
+description = "Traffic Violation Detection and Monitoring System"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
