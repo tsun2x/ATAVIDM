@@ -1,253 +1,1065 @@
-"""TAVIDM - Traffic Violation Detection and Monitoring System
-Frontend prototype only. All data is mocked for demonstration purposes.
+"""TAVIDM - Traffic and Vehicle Intelligence Detection and Monitoring.
+
+Flask application: YOLOv8m + ByteTrack detection pipeline, rule-based
+violation detection, manual review queue, analytics, and reporting.
+Decision-support tool only — violations are confirmed by human reviewers.
 """
 
-from datetime import datetime, timedelta
-import random
+from __future__ import annotations
 
-from flask import Flask, render_template
+import json
+import os
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+    url_for,
+)
+
+import config
+from core import analytics as analytics_core
+from core import auth
+from core import reports as reports_core
+from core.detection_config import IMPLEMENTED_VIOLATIONS, MODEL_FAMILY
+from core.detector import resolve_weights_path
+from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
+from core.live_stream import mjpeg_generator, stream_manager
+from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
+from core.video_processor import process_video
+from core.zone_config import (
+    dumps_zones,
+    parse_zones_json,
+    zones_complete,
+    zones_for_api,
+)
+from core import congestion as congestion_core
+from database import db
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "tavidm-prototype-dev-key"
+app.config["SECRET_KEY"] = config.FLASK_SECRET_KEY
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+
+ensure_upload_dir()
+db.init_db()
+auth.ensure_default_admin()
+
+CONDITIONS = ["morning", "peak", "nighttime"]
+STATUSES = ["confirmed", "dismissed", "pending"]
+
+# video_id -> {"state": "processing"|"done"|"error", "error": str|None}
+_processing_jobs: dict[int, dict] = {}
+
 
 # ---------------------------------------------------------------------------
-# Mock Data
+# UI mapping helpers
 # ---------------------------------------------------------------------------
 
-CAMERAS = [
-    {
-        "id": "cam-01",
-        "name": "Inbound Normal Road",
-        "location": "Inbound Lane — Normal Road Sector",
-        "status": "online",
-        "fps": 30,
-        "feed_image": "cctv_inbound.svg",
-    },
-    {
-        "id": "cam-02",
-        "name": "Outbound Normal Road",
-        "location": "Outbound Lane — Normal Road Sector",
-        "status": "online",
-        "fps": 30,
-        "feed_image": "cctv_outbound.svg",
-    },
-]
-
-VIOLATION_TYPES = [
-    "Red Light Violation",
-    "Speeding",
-    "Wrong Lane",
-    "No Helmet",
-    "Illegal Parking",
-    "Jaywalking",
-    "No Seatbelt",
-    "Illegal Turn",
-]
-
-PLATE_PREFIXES = ["ABC", "XYZ", "TAV", "PHL", "NCR", "MNL"]
-
-STATUSES = ["Pending", "Verified", "Dismissed", "Escalated"]
+def _vtype_slug(vtype: str) -> str:
+    return vtype.lower().replace(" ", "-").replace("/", "-")
 
 
-def _random_plate():
-    return f"{random.choice(PLATE_PREFIXES)} {random.randint(100, 999)} {chr(random.randint(65, 90))}{chr(random.randint(65, 90))}"
+def _format_duration(duration_sec: float | None) -> str:
+    if not duration_sec:
+        return "—"
+    total = int(duration_sec)
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes}:{seconds:02d}"
 
 
-def generate_violations(count=48):
-    violations = []
-    base_time = datetime.now()
-    for i in range(1, count + 1):
-        vtype = random.choice(VIOLATION_TYPES)
-        cam = random.choice(CAMERAS)
-        ts = base_time - timedelta(hours=random.randint(0, 72), minutes=random.randint(0, 59))
-        violations.append(
-            {
-                "id": f"VIO-{2025}{i:04d}",
-                "type": vtype,
-                "plate": _random_plate(),
-                "camera_id": cam["id"],
-                "camera_name": cam["name"],
-                "location": cam["location"],
-                "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "timestamp_iso": ts.isoformat(),
-                "confidence": round(random.uniform(0.72, 0.99), 2),
-                "status": random.choice(STATUSES),
-                "severity": random.choice(["Low", "Medium", "High", "Critical"]),
-                "evidence_image": f"evidence_{(i % 6) + 1}.svg",
-                "notes": "Automated detection via TAVIDM AI pipeline (mock).",
-            }
-        )
-    violations.sort(key=lambda v: v["timestamp_iso"], reverse=True)
-    return violations
-
-
-MOCK_VIOLATIONS = generate_violations()
-
-DASHBOARD_STATS = {
-    "total_today": 127,
-    "total_week": 842,
-    "active_cameras": sum(1 for c in CAMERAS if c["status"] == "online"),
-    "total_cameras": len(CAMERAS),
-    "pending_review": sum(1 for v in MOCK_VIOLATIONS if v["status"] == "Pending"),
-    "avg_confidence": round(sum(v["confidence"] for v in MOCK_VIOLATIONS[:20]) / 20 * 100, 1),
-    "trend_today": 12.4,
-    "trend_week": -3.2,
-}
-
-_VIOLATION_COUNTS = [
-    ("Red Light Violation", 342, 8.2, "#ef4444"),
-    ("Speeding", 218, -2.1, "#f97316"),
-    ("Wrong Lane", 156, 5.4, "#eab308"),
-    ("No Helmet", 134, 11.0, "#8b5cf6"),
-    ("Illegal Parking", 98, -1.5, "#06b6d4"),
-]
-_total_violation_count = sum(v[1] for v in _VIOLATION_COUNTS)
-VIOLATION_SUMMARY = [
-    {
-        "type": t,
-        "count": c,
-        "change": ch,
-        "color": col,
-        "share": round(c / _total_violation_count * 100, 1),
+def _db_video_to_ui(row: dict) -> dict:
+    condition = row.get("condition") or "peak"
+    status = row.get("status") or ("processed" if row.get("processed") else "uploaded")
+    db_id = row["id"]
+    return {
+        "id": f"vid-db-{db_id}",
+        "db_id": db_id,
+        "name": row["filename"],
+        "filename": row["filename"],
+        "location": f"Uploaded · {condition.title()}",
+        "condition": condition,
+        "duration": _format_duration(row.get("duration_sec")),
+        "processed": bool(row.get("processed")),
+        "status": status,
+        "has_annotation": bool(row.get("annotation_id")),
+        "template_id": row.get("template_id"),
+        "filepath": row["filepath"],
+        "created_at": row.get("created_at"),
+        "frame_url": f"/api/videos/{db_id}/frame",
+        "processing": _processing_jobs.get(db_id, {}).get("state") == "processing",
     }
-    for t, c, ch, col in _VIOLATION_COUNTS
-]
 
-ANALYTICS_DATA = {
-    "daily_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    "daily_values": [89, 112, 95, 127, 143, 78, 65],
-    "monthly_labels": ["Jan", "Feb", "Mar", "Apr", "May", "Jun"],
-    "monthly_values": [1840, 2105, 1987, 2340, 2567, 2210],
-    "breakdown_labels": [s["type"] for s in VIOLATION_SUMMARY],
-    "breakdown_values": [s["count"] for s in VIOLATION_SUMMARY],
-    "kpi": {
-        "total_violations": 1248,
-        "detection_rate": 94.7,
-        "avg_response_time": "4.2 min",
-        "accuracy": 91.3,
-    },
-}
 
-REPORT_HISTORY = [
-    {"id": "RPT-001", "name": "Weekly Violation Summary", "type": "PDF", "date": "2025-06-20", "size": "2.4 MB", "status": "Ready"},
-    {"id": "RPT-002", "name": "Monthly Analytics Export", "type": "Excel", "date": "2025-06-15", "size": "1.8 MB", "status": "Ready"},
-    {"id": "RPT-003", "name": "Red Light Violations Q2", "type": "PDF", "date": "2025-06-10", "size": "3.1 MB", "status": "Ready"},
-    {"id": "RPT-004", "name": "Camera Performance Report", "type": "Excel", "date": "2025-06-05", "size": "956 KB", "status": "Ready"},
-    {"id": "RPT-005", "name": "Daily Snapshot", "type": "PDF", "date": "2025-06-01", "size": "1.2 MB", "status": "Expired"},
-]
+def _template_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "template_name": row["template_name"],
+        "description": row.get("description") or "",
+        "zones_json": row.get("zones_json") or "{}",
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_used_at": row.get("last_used_at"),
+        "usage_count": row.get("usage_count") or 0,
+        "video_count": db.count_videos_for_template(row["id"]),
+    }
 
-USERS = [
-    {"id": 1, "name": "Admin User", "email": "admin@tavidm.local", "role": "Administrator", "status": "Active", "last_login": "2025-06-21 08:30"},
-    {"id": 2, "name": "Juan Dela Cruz", "email": "juan.dc@tavidm.local", "role": "Operator", "status": "Active", "last_login": "2025-06-21 07:15"},
-    {"id": 3, "name": "Maria Santos", "email": "maria.s@tavidm.local", "role": "Reviewer", "status": "Active", "last_login": "2025-06-20 16:45"},
-    {"id": 4, "name": "Pedro Reyes", "email": "pedro.r@tavidm.local", "role": "Operator", "status": "Inactive", "last_login": "2025-06-10 09:00"},
-]
 
-SYSTEM_SETTINGS = {
-    "site_name": "TAVIDM",
-    "timezone": "Asia/Manila",
-    "alert_sound": True,
-    "auto_export": False,
-    "retention_days": 90,
-    "confidence_threshold": 75,
-    "speed_threshold": 60,
-    "red_light_sensitivity": 80,
-    "helmet_detection": True,
-    "night_mode_enhance": True,
-}
+def _video_name_map() -> dict[int, dict]:
+    return {row["id"]: row for row in db.list_videos()}
 
-DETECTION_BOXES = [
-    {"label": "Vehicle", "x": 12, "y": 35, "w": 28, "h": 22, "confidence": 0.94},
-    {"label": "Red Light", "x": 68, "y": 8, "w": 8, "h": 12, "confidence": 0.98},
-    {"label": "Plate", "x": 18, "y": 52, "w": 12, "h": 5, "confidence": 0.87},
-]
+
+def _source_label(video_id: int | None, videos: dict[int, dict]) -> str:
+    if video_id is None:
+        return "Live Camera"
+    video = videos.get(video_id)
+    return video["filename"] if video else f"Video #{video_id}"
+
+
+def _evidence_url(evidence_path: str | None) -> str | None:
+    if not evidence_path:
+        return None
+    return "/" + evidence_path.lstrip("/")
+
+
+def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    video = videos.get(row.get("video_id"))
+    detected = row.get("detected_at") or ""
+    return {
+        "id": f"VIO-{row['id']:06d}",
+        "db_id": row["id"],
+        "type": row["violation_type"],
+        "type_slug": _vtype_slug(row["violation_type"]),
+        "video_id": row.get("video_id"),
+        "video_name": _source_label(row.get("video_id"), videos),
+        "track_id": row.get("track_id"),
+        "timestamp": detected,
+        "timestamp_iso": detected.replace(" ", "T"),
+        "confidence": row.get("confidence") or 0,
+        "status": row.get("status"),
+        "condition": (video or {}).get("condition") or "—",
+        "vehicle_class": row.get("vehicle_class") or "—",
+        "evidence_url": _evidence_url(row.get("evidence_path")),
+        "reason_log": row.get("reason_log") or "",
+        "frame_number": row.get("frame_number"),
+    }
+
+
+def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    return {
+        "id": row["id"],
+        "display_id": f"RQ-{row['id']:05d}",
+        "video_id": row.get("video_id"),
+        "video_name": _source_label(row.get("video_id"), videos),
+        "track_id": row.get("track_id"),
+        "violation_type": row.get("violation_type"),
+        "type_slug": _vtype_slug(row.get("violation_type") or ""),
+        "confidence": row.get("confidence") or 0,
+        "frame_number": row.get("frame_number"),
+        "vehicle_class": row.get("vehicle_class") or "—",
+        "evidence_url": _evidence_url(row.get("evidence_path")),
+        "reason_log": row.get("reason_log") or "",
+        "queued_at": row.get("queued_at"),
+        "status": row.get("status"),
+    }
+
+
+def _report_to_ui(row: dict) -> dict:
+    filters = {}
+    try:
+        filters = json.loads(row.get("filters_json") or "{}")
+    except json.JSONDecodeError:
+        pass
+    filter_parts = [str(v) for v in filters.values() if v]
+    return {
+        "id": row["id"],
+        "name": row["title"],
+        "type": "PDF" if row["report_format"] == "pdf" else "Excel",
+        "date": row.get("generated_at"),
+        "filters": " · ".join(filter_parts) if filter_parts else "All violations",
+        "generated_by": row.get("generated_by_username") or "—",
+        "download_url": f"/api/reports/{row['id']}/download",
+    }
+
+
+def _user_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "name": row.get("full_name") or row["username"],
+        "role": row["role"],
+        "role_label": auth.ROLE_LABELS.get(row["role"], row["role"]),
+        "is_active": bool(row.get("is_active", 1)),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _camera_to_ui(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row.get("location") or "",
+        "rtsp_url": row["rtsp_url"],
+        "zones_json": row.get("zones_json") or "{}",
+        "is_active": bool(row.get("is_active", 1)),
+        "created_at": row.get("created_at"),
+        "stream_url": f"/api/cameras/{row['id']}/stream",
+        "stream_status": stream_manager.status(row["id"]),
+    }
+
+
+def _system_status() -> dict:
+    weights, is_custom = resolve_weights_path()
+    videos = db.list_videos()
+    last_processed = next((v["filename"] for v in videos if v.get("processed")), "—")
+    return {
+        "pipeline": "Ready",
+        "model": f"{MODEL_FAMILY} ({'custom' if is_custom else 'COCO pretrained'})",
+        "tracker": "ByteTrack",
+        "db": db.active_backend().upper(),
+        "last_processed": last_processed,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Context + error handlers
 # ---------------------------------------------------------------------------
 
 @app.context_processor
 def inject_globals():
+    user = auth.current_user()
+    role = user["role"] if user else None
+    nav_items = [
+        {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
+        {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video", "badge": "live"},
+        {"endpoint": "violations", "label": "Violations", "icon": "bi-exclamation-triangle"},
+        {"endpoint": "analytics", "label": "Analytics", "icon": "bi-bar-chart-line"},
+        {"endpoint": "traffic_map", "label": "Traffic Map", "icon": "bi-geo-alt"},
+        {"endpoint": "congestion", "label": "Congestion", "icon": "bi-sign-merge-left"},
+        {"endpoint": "hotspots", "label": "Hotspots", "icon": "bi-fire"},
+    ]
+    if role in ("admin", "enforcer"):
+        nav_items.append({"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"})
+    if role == "admin":
+        nav_items.append({"endpoint": "settings", "label": "Settings", "icon": "bi-gear"})
     return {
         "app_name": "TAVIDM",
-        "app_full_name": "Traffic Violation Detection and Monitoring System",
+        "app_full_name": "Traffic and Vehicle Intelligence Detection and Monitoring",
         "current_year": datetime.now().year,
-        "nav_items": [
-            {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
-            {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video"},
-            {"endpoint": "violations", "label": "Violations", "icon": "bi-exclamation-triangle"},
-            {"endpoint": "analytics", "label": "Analytics", "icon": "bi-bar-chart-line"},
-            {"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"},
-            {"endpoint": "settings", "label": "Settings", "icon": "bi-gear"},
-        ],
+        "nav_items": nav_items,
+        "current_user": user,
+        "review_queue_count": db.count_review_pending() if user else 0,
+        "max_upload_mb": config.MAX_UPLOAD_MB,
     }
 
 
+@app.errorhandler(413)
+def request_entity_too_large(_error):
+    return jsonify({
+        "success": False,
+        "error": f"File exceeds maximum upload size of {config.MAX_UPLOAD_MB} MB.",
+    }), 413
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        user = auth.authenticate(username, password)
+        if user is None:
+            flash("Invalid username or password.", "danger")
+            return render_template("login.html"), 401
+        auth.login_user(user)
+        next_url = request.args.get("next") or url_for("dashboard")
+        return redirect(next_url)
+    if auth.current_user():
+        return redirect(url_for("dashboard"))
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    auth.logout_user()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
 @app.route("/")
+@auth.login_required
 def dashboard():
+    stats = analytics_core.dashboard_stats()
+    summary = analytics_core.violation_summary()
+    hourly_labels, hourly_values = analytics_core.hourly_chart_today()
+    videos = _video_name_map()
+    recent_rows, _total = db.list_violations(page=1, per_page=8, sort="newest")
     chart_data = {
-        "hourly_labels": [f"{h:02d}:00" for h in range(6, 22, 2)],
-        "hourly_values": [8, 15, 22, 18, 31, 28, 19, 12],
-        "weekly_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-        "weekly_values": [112, 98, 134, 127, 156, 89, 76],
+        "hourly_labels": hourly_labels,
+        "hourly_values": hourly_values,
+        "distribution_labels": [s["type"] for s in summary],
+        "distribution_values": [s["count"] for s in summary],
     }
     return render_template(
         "dashboard.html",
-        stats=DASHBOARD_STATS,
-        recent_violations=MOCK_VIOLATIONS[:8],
-        violation_summary=VIOLATION_SUMMARY,
+        stats=stats,
+        recent_violations=[_violation_to_ui(r, videos) for r in recent_rows],
+        violation_summary=summary,
         chart_data=chart_data,
+        system_status=_system_status(),
     )
 
 
 @app.route("/live-monitor")
+@auth.login_required
 def live_monitor():
+    videos = [_db_video_to_ui(row) for row in db.list_videos()]
+    cameras = [_camera_to_ui(row) for row in db.list_cameras()]
     return render_template(
         "live_monitor.html",
-        cameras=CAMERAS,
-        default_camera=CAMERAS[0],
-        detection_boxes=DETECTION_BOXES,
+        videos=videos,
+        cameras=cameras,
+        conditions=CONDITIONS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
     )
 
 
 @app.route("/violations")
+@auth.login_required
 def violations():
+    videos = _video_name_map()
+    rows, _total = db.list_violations(page=1, per_page=1000, sort="newest")
     return render_template(
         "violations.html",
-        violations=MOCK_VIOLATIONS,
-        violation_types=VIOLATION_TYPES,
-        cameras=CAMERAS,
+        violations=[_violation_to_ui(r, videos) for r in rows],
+        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        videos=[_db_video_to_ui(row) for row in db.list_videos()],
         statuses=STATUSES,
     )
 
 
 @app.route("/analytics")
+@auth.login_required
 def analytics():
     return render_template(
         "analytics.html",
-        analytics=ANALYTICS_DATA,
-        violation_summary=VIOLATION_SUMMARY,
+        analytics=analytics_core.analytics_data(),
+        violation_summary=analytics_core.violation_summary(),
     )
 
 
 @app.route("/reports")
+@auth.role_required("enforcer")
 def reports():
     return render_template(
         "reports.html",
-        report_history=REPORT_HISTORY,
-        violation_types=VIOLATION_TYPES,
+        report_history=[_report_to_ui(r) for r in db.list_reports()],
+        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        videos=[_db_video_to_ui(row) for row in db.list_videos()],
+        statuses=STATUSES,
     )
 
 
 @app.route("/settings")
+@auth.role_required("admin")
 def settings():
+    from core.video_processor import load_rule_parameters
+
     return render_template(
         "settings.html",
-        cameras=CAMERAS,
-        users=USERS,
-        settings=SYSTEM_SETTINGS,
+        users=[_user_to_ui(u) for u in db.list_users()],
+        settings=load_rule_parameters(),
+        cameras=[_camera_to_ui(c) for c in db.list_cameras()],
+        roles=auth.ROLE_LABELS,
+        zone_types=zones_for_api(),
+        zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
     )
+
+
+@app.route("/review-queue")
+@auth.role_required("enforcer")
+def review_queue():
+    videos = _video_name_map()
+    rows, _total = db.list_review_queue(status="pending", page=1, per_page=200)
+    return render_template(
+        "review_queue.html",
+        review_items=[_review_to_ui(r, videos) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video + annotation APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/videos", methods=["GET"])
+@auth.login_required
+def api_list_videos():
+    return jsonify({"success": True, "videos": [_db_video_to_ui(row) for row in db.list_videos()]})
+
+
+@app.route("/api/zone-types", methods=["GET"])
+@auth.login_required
+def api_zone_types():
+    return jsonify({"success": True, "zone_types": zones_for_api()})
+
+
+@app.route("/api/zone-templates", methods=["GET"])
+@auth.login_required
+def api_list_zone_templates():
+    templates = [_template_to_ui(row) for row in db.list_zone_templates()]
+    return jsonify({"success": True, "templates": templates})
+
+
+@app.route("/api/zone-templates", methods=["POST"])
+@auth.role_required("enforcer")
+def api_create_zone_template():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("template_name") or "").strip()
+    if not name:
+        return jsonify({"success": False, "error": "Template name is required."}), 400
+    try:
+        zones_json = dumps_zones(payload.get("zones_json") or payload.get("zones") or {})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    template_id = db.create_zone_template(
+        template_name=name,
+        zones_json=zones_json,
+        description=(payload.get("description") or "").strip() or None,
+    )
+    row = db.get_zone_template(template_id)
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["GET"])
+@auth.login_required
+def api_get_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["PUT"])
+@auth.role_required("enforcer")
+def api_update_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    zones_json = None
+    if "zones_json" in payload or "zones" in payload:
+        try:
+            zones_json = dumps_zones(payload.get("zones_json") or payload.get("zones") or {})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+
+    name = payload.get("template_name")
+    if name is not None:
+        name = name.strip()
+        if not name:
+            return jsonify({"success": False, "error": "Template name cannot be empty."}), 400
+
+    db.update_zone_template(
+        template_id,
+        template_name=name,
+        description=payload.get("description"),
+        zones_json=zones_json,
+    )
+    updated = db.get_zone_template(template_id)
+    return jsonify({"success": True, "template": _template_to_ui(updated)})
+
+
+@app.route("/api/zone-templates/<int:template_id>", methods=["DELETE"])
+@auth.role_required("enforcer")
+def api_delete_zone_template(template_id: int):
+    row = db.get_zone_template(template_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Template not found."}), 404
+    db.delete_zone_template(template_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/zone-templates/<int:template_id>/duplicate", methods=["POST"])
+@auth.role_required("enforcer")
+def api_duplicate_zone_template(template_id: int):
+    payload = request.get_json(silent=True) or {}
+    new_name = (payload.get("template_name") or "").strip()
+    if not new_name:
+        source = db.get_zone_template(template_id)
+        if source is None:
+            return jsonify({"success": False, "error": "Template not found."}), 404
+        new_name = f"{source['template_name']} (Copy)"
+    try:
+        new_id = db.duplicate_zone_template(template_id, new_name)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    row = db.get_zone_template(new_id)
+    return jsonify({"success": True, "template": _template_to_ui(row)})
+
+
+@app.route("/api/videos/<int:video_id>/frame")
+@auth.login_required
+def api_video_frame(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+
+    frame_path = frame_path_for_video(video_id)
+    if not frame_path.is_file():
+        annotation = db.get_annotation_by_video(video_id)
+        ref = annotation.get("reference_frame_path") if annotation else None
+        if ref and Path(ref).is_file():
+            frame_path = Path(ref)
+        else:
+            try:
+                extract_first_frame(row["filepath"], video_id)
+            except FrameExtractError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 500
+
+    return send_from_directory(
+        frame_path.parent,
+        frame_path.name,
+        mimetype="image/jpeg",
+    )
+
+
+@app.route("/api/videos/<int:video_id>/annotation", methods=["GET"])
+@auth.login_required
+def api_get_annotation(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    annotation = db.get_annotation_by_video(video_id)
+    if annotation is None:
+        return jsonify({"success": True, "annotation": None})
+    return jsonify({"success": True, "annotation": annotation})
+
+
+@app.route("/api/videos/<int:video_id>/annotation", methods=["POST", "PUT"])
+@auth.role_required("enforcer")
+def api_save_annotation(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    save_mode = payload.get("save_mode", "video_only")
+    source_template_id = payload.get("source_template_id")
+
+    try:
+        zones = parse_zones_json(payload.get("zones_json") or payload.get("zones") or {})
+        zones_json = dumps_zones(zones)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    if not zones_complete(zones):
+        return jsonify({
+            "success": False,
+            "error": "Draw at least one zone; each drawn zone needs at least 3 points.",
+        }), 400
+
+    frame_path = frame_path_for_video(video_id)
+    ref_path = str(frame_path) if frame_path.is_file() else None
+    annotation_id = db.upsert_annotation(video_id, zones_json, ref_path)
+
+    template_id = row.get("template_id")
+    template_row = None
+
+    if save_mode == "new_template":
+        name = (payload.get("template_name") or "").strip()
+        if not name:
+            return jsonify({"success": False, "error": "Template name is required."}), 400
+        template_id = db.create_zone_template(
+            template_name=name,
+            zones_json=zones_json,
+            description=(payload.get("template_description") or "").strip() or None,
+        )
+        db.update_video(video_id, template_id=template_id)
+        template_row = db.get_zone_template(template_id)
+    elif save_mode == "update_template":
+        update_id = payload.get("template_id") or source_template_id or template_id
+        if not update_id:
+            return jsonify({"success": False, "error": "No template selected to update."}), 400
+        db.update_zone_template(int(update_id), zones_json=zones_json)
+        db.record_template_usage(int(update_id))
+        db.update_video(video_id, template_id=int(update_id))
+        template_row = db.get_zone_template(int(update_id))
+    else:
+        if source_template_id:
+            db.record_template_usage(int(source_template_id))
+            db.update_video(video_id, template_id=int(source_template_id))
+        else:
+            db.update_video(video_id, clear_template=True)
+
+    annotation = db.get_annotation(annotation_id)
+    video = _db_video_to_ui(db.get_video(video_id))
+    response = {
+        "success": True,
+        "message": "Annotation saved successfully.",
+        "annotation": annotation,
+        "video": video,
+    }
+    if template_row:
+        response["template"] = _template_to_ui(template_row)
+    return jsonify(response)
+
+
+@app.route("/api/upload-video", methods=["POST"])
+@auth.role_required("enforcer")
+def api_upload_video():
+    file = request.files.get("video")
+    condition = request.form.get("condition", "peak")
+    if condition not in CONDITIONS:
+        condition = "peak"
+
+    try:
+        validate_upload(file, request.content_length)
+        filename, filepath = save_video_file(file)
+        file_size = 0
+        if file.content_length:
+            file_size = file.content_length
+        else:
+            try:
+                file_size = os.path.getsize(filepath)
+            except OSError:
+                file_size = 0
+
+        video_id = db.insert_video(
+            filename=filename,
+            filepath=filepath,
+            recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            condition=condition,
+            status="uploaded",
+        )
+
+        frame_error = None
+        try:
+            frame_path = extract_first_frame(filepath, video_id)
+            db.update_video(video_id, status="annotating")
+        except FrameExtractError as exc:
+            frame_path = None
+            frame_error = str(exc)
+
+        row = db.get_video(video_id)
+        video = _db_video_to_ui(row)
+        templates = [_template_to_ui(t) for t in db.list_zone_templates()]
+
+        return jsonify({
+            "success": True,
+            "message": "Video uploaded. Configure zone annotations to continue.",
+            "video": video,
+            "size": format_file_size(file_size),
+            "frame_url": f"/api/videos/{video_id}/frame",
+            "frame_ready": frame_path is not None,
+            "frame_error": frame_error,
+            "templates": templates,
+            "zone_types": zones_for_api(),
+            "requires_annotation": True,
+        })
+    except UploadError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception:
+        return jsonify({"success": False, "error": "Upload failed. Please try again."}), 500
+
+
+# ---------------------------------------------------------------------------
+# Detection pipeline APIs
+# ---------------------------------------------------------------------------
+
+def _run_processing(video_id: int) -> None:
+    try:
+        process_video(video_id)
+        _processing_jobs[video_id] = {"state": "done", "error": None}
+    except Exception as exc:  # surface pipeline failures to the UI
+        _processing_jobs[video_id] = {"state": "error", "error": str(exc)}
+        db.update_video(video_id, status="ready")
+
+
+@app.route("/api/videos/<int:video_id>/process", methods=["POST"])
+@auth.role_required("enforcer")
+def api_process_video(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    if _processing_jobs.get(video_id, {}).get("state") == "processing":
+        return jsonify({"success": False, "error": "Video is already being processed."}), 409
+    if not row.get("annotation_id"):
+        return jsonify({
+            "success": False,
+            "error": "Annotate traffic zones before processing this video.",
+        }), 400
+
+    _processing_jobs[video_id] = {"state": "processing", "error": None}
+    thread = threading.Thread(target=_run_processing, args=(video_id,), daemon=True)
+    thread.start()
+    return jsonify({"success": True, "message": "Processing started."})
+
+
+@app.route("/api/videos/<int:video_id>/process-status", methods=["GET"])
+@auth.login_required
+def api_process_status(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    job = _processing_jobs.get(video_id, {})
+    return jsonify({
+        "success": True,
+        "video_status": row.get("status"),
+        "job_state": job.get("state"),
+        "job_error": job.get("error"),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Review queue APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/review-queue", methods=["GET"])
+@auth.login_required
+def api_review_queue():
+    status = request.args.get("status", "pending")
+    videos = _video_name_map()
+    rows, total = db.list_review_queue(status=status, page=1, per_page=200)
+    return jsonify({
+        "success": True,
+        "items": [_review_to_ui(r, videos) for r in rows],
+        "total": total,
+    })
+
+
+@app.route("/api/review-queue/<int:review_id>/confirm", methods=["POST"])
+@auth.role_required("enforcer")
+def api_confirm_review(review_id: int):
+    user = auth.current_user()
+    try:
+        violation_id = db.confirm_review_item(review_id, reviewed_by=user["id"])
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    return jsonify({"success": True, "violation_id": violation_id})
+
+
+@app.route("/api/review-queue/<int:review_id>/dismiss", methods=["POST"])
+@auth.role_required("enforcer")
+def api_dismiss_review(review_id: int):
+    user = auth.current_user()
+    if db.get_review_item(review_id) is None:
+        return jsonify({"success": False, "error": "Review item not found."}), 404
+    db.dismiss_review_item(review_id, reviewed_by=user["id"])
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Report APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/reports", methods=["GET"])
+@auth.role_required("enforcer")
+def api_list_reports():
+    return jsonify({"success": True, "reports": [_report_to_ui(r) for r in db.list_reports()]})
+
+
+@app.route("/api/reports", methods=["POST"])
+@auth.role_required("enforcer")
+def api_generate_report():
+    payload = request.get_json(silent=True) or {}
+    report_format = (payload.get("format") or "pdf").lower()
+    filters = {
+        key: payload.get(key)
+        for key in ("date_from", "date_to", "violation_type", "status", "video_id")
+        if payload.get(key)
+    }
+    user = auth.current_user()
+    try:
+        row = reports_core.generate_report(
+            report_format=report_format,
+            filters=filters,
+            title=(payload.get("title") or "").strip() or None,
+            generated_by=user["id"],
+        )
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "report": _report_to_ui(row)})
+
+
+@app.route("/api/reports/<int:report_id>/download", methods=["GET"])
+@auth.role_required("enforcer")
+def api_download_report(report_id: int):
+    row = db.get_report(report_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Report not found."}), 404
+    file_path = Path(config.BASE_DIR) / row["file_path"]
+    if not file_path.is_file():
+        return jsonify({"success": False, "error": "Report file is missing."}), 404
+    return send_file(file_path, as_attachment=True)
+
+
+# ---------------------------------------------------------------------------
+# Settings + user management APIs (admin)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/settings", methods=["GET"])
+@auth.role_required("admin")
+def api_get_settings():
+    from core.video_processor import load_rule_parameters
+
+    return jsonify({"success": True, "settings": load_rule_parameters()})
+
+
+@app.route("/api/settings", methods=["POST"])
+@auth.role_required("admin")
+def api_save_settings():
+    from core.detection_config import DEFAULT_RULE_PARAMETERS
+
+    payload = request.get_json(silent=True) or {}
+    values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
+    if not values:
+        return jsonify({"success": False, "error": "No recognized settings provided."}), 400
+    db.set_settings(values)
+    return jsonify({"success": True, "message": "Settings saved."})
+
+
+@app.route("/api/users", methods=["GET"])
+@auth.role_required("admin")
+def api_list_users():
+    return jsonify({"success": True, "users": [_user_to_ui(u) for u in db.list_users()]})
+
+
+@app.route("/api/users", methods=["POST"])
+@auth.role_required("admin")
+def api_create_user():
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    role = payload.get("role") or "enforcer"
+    if not username or not password:
+        return jsonify({"success": False, "error": "Username and password are required."}), 400
+    if role not in auth.ROLES:
+        return jsonify({"success": False, "error": f"Role must be one of: {', '.join(auth.ROLES)}."}), 400
+    if db.get_user_by_username(username):
+        return jsonify({"success": False, "error": "Username already exists."}), 400
+    user_id = db.create_user(
+        username,
+        auth.hash_password(password),
+        role=role,
+        full_name=(payload.get("full_name") or "").strip() or None,
+    )
+    return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
+
+
+@app.route("/api/users/<int:user_id>", methods=["PUT"])
+@auth.role_required("admin")
+def api_update_user(user_id: int):
+    if db.get_user(user_id) is None:
+        return jsonify({"success": False, "error": "User not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role")
+    if role is not None and role not in auth.ROLES:
+        return jsonify({"success": False, "error": f"Role must be one of: {', '.join(auth.ROLES)}."}), 400
+    password = payload.get("password")
+    db.update_user(
+        user_id,
+        full_name=payload.get("full_name"),
+        role=role,
+        password_hash=auth.hash_password(password) if password else None,
+        is_active=payload.get("is_active"),
+    )
+    return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
+
+
+# ---------------------------------------------------------------------------
+# Camera (RTSP live stream) APIs
+# ---------------------------------------------------------------------------
+
+@app.route("/api/cameras", methods=["GET"])
+@auth.login_required
+def api_list_cameras():
+    return jsonify({"success": True, "cameras": [_camera_to_ui(c) for c in db.list_cameras()]})
+
+
+@app.route("/api/cameras", methods=["POST"])
+@auth.role_required("admin")
+def api_create_camera():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    rtsp_url = (payload.get("rtsp_url") or "").strip()
+    if not name or not rtsp_url:
+        return jsonify({"success": False, "error": "Camera name and RTSP URL are required."}), 400
+    try:
+        zones_json = dumps_zones(payload.get("zones_json") or {})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    camera_id = db.create_camera(
+        name=name,
+        rtsp_url=rtsp_url,
+        location=(payload.get("location") or "").strip() or None,
+        zones_json=zones_json,
+    )
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+
+
+@app.route("/api/cameras/<int:camera_id>", methods=["PUT"])
+@auth.role_required("admin")
+def api_update_camera(camera_id: int):
+    if db.get_camera(camera_id) is None:
+        return jsonify({"success": False, "error": "Camera not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    zones_json = None
+    if "zones_json" in payload:
+        try:
+            zones_json = dumps_zones(payload.get("zones_json") or {})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+    db.update_camera(
+        camera_id,
+        name=payload.get("name"),
+        location=payload.get("location"),
+        rtsp_url=payload.get("rtsp_url"),
+        zones_json=zones_json,
+        is_active=payload.get("is_active"),
+    )
+    stream_manager.stop(camera_id)  # restart picks up the new configuration
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+
+
+@app.route("/api/cameras/<int:camera_id>", methods=["DELETE"])
+@auth.role_required("admin")
+def api_delete_camera(camera_id: int):
+    if db.get_camera(camera_id) is None:
+        return jsonify({"success": False, "error": "Camera not found."}), 404
+    stream_manager.stop(camera_id)
+    db.delete_camera(camera_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/cameras/<int:camera_id>/stream")
+@auth.login_required
+def api_camera_stream(camera_id: int):
+    try:
+        worker = stream_manager.start(camera_id)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    return Response(
+        mjpeg_generator(worker),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/api/cameras/<int:camera_id>/stream-status")
+@auth.login_required
+def api_camera_stream_status(camera_id: int):
+    return jsonify({"success": True, **stream_manager.status(camera_id)})
+
+
+@app.route("/api/cameras/<int:camera_id>/stop", methods=["POST"])
+@auth.role_required("enforcer")
+def api_camera_stop(camera_id: int):
+    stream_manager.stop(camera_id)
+    return jsonify({"success": True})
+
+
+# ===========================================================================
+# Hermosa Connect expansion — traffic management views
+# Reuses existing TAVIDM: auth, cameras (multi-camera RTSP), analytics, reports.
+# Congestion/hotspot data come from core.congestion (DEMO generator by default).
+# ===========================================================================
+
+
+@app.route("/traffic-map")
+@auth.login_required
+def traffic_map():
+    cameras = [_camera_to_ui(c) for c in db.list_cameras()]
+    return render_template("traffic_map.html", cameras=cameras)
+
+
+@app.route("/congestion")
+@auth.login_required
+def congestion():
+    events = db.list_congestion_events(limit=100)
+    return render_template(
+        "congestion.html",
+        events=events,
+        demo_note=_congestion_data_note(),
+    )
+
+
+@app.route("/hotspots")
+@auth.login_required
+def hotspots():
+    spots = db.list_hotspots(limit=50)
+    return render_template(
+        "hotspots.html",
+        hotspots=spots,
+        demo_note=_congestion_data_note(),
+    )
+
+
+@app.route("/traffic-history")
+@auth.login_required
+def traffic_history():
+    events = db.list_congestion_events(limit=200)
+    return render_template(
+        "traffic_history.html",
+        events=events,
+        demo_note=_congestion_data_note(),
+    )
+
+
+def _congestion_data_note() -> str:
+    """Return a clear DEMO label; avoids implying real CCTV integration."""
+    count = db.count_congestion_rows() if hasattr(db, "count_congestion_rows") else 0
+    if count == 0:
+        return (
+            "No congestion data computed yet. Run the DEMO analysis to populate "
+            "illustrative congestion events and hotspots (not real CCTV data)."
+        )
+    return "Showing stored congestion analysis (DEMO/illustrative data unless fed real observations)."
+
+
+@app.route("/api/congestion/analyze", methods=["POST"])
+@auth.login_required
+def api_congestion_analyze():
+    """Run the DEMO congestion analysis and persist results.
+
+    PROPOSED: in production this would ingest real per-camera observations
+    instead of the demo generator.
+    """
+    cameras = db.list_cameras()
+    if not cameras:
+        return jsonify({"success": False, "error": "No cameras configured."}), 400
+    summary = congestion_core.persist_demo_analysis(cameras)
+    return jsonify({"success": True, **summary})
+
+
+@app.route("/api/congestion/events")
+@auth.login_required
+def api_congestion_events():
+    camera_id = request.args.get("camera_id", type=int)
+    events = db.list_congestion_events(limit=200, camera_id=camera_id)
+    return jsonify({"success": True, "events": events})
+
+
+@app.route("/api/hotspots")
+@auth.login_required
+def api_hotspots():
+    spots = db.list_hotspots(limit=50)
+    return jsonify({"success": True, "hotspots": spots})
 
 
 if __name__ == "__main__":

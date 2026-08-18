@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Congestion{% endblock %}
+{% block page_title %}Congestion Monitoring{% endblock %}
+{% block page_subtitle %}Persistent traffic conditions over time — Hermosa Connect {% endblock %}
+
+{% block content %}
+<div class="alert alert-warning d-flex align-items-center gap-2 mb-3">
+  <i class="bi bi-exclamation-triangle"></i>
+  <span>{{ demo_note }}</span>
+</div>
+
+<div class="card card-panel">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="card-title mb-0"><i class="bi bi-sign-merge-left me-2"></i>Congestion Events</h5>
+    <a href="{{ url_for('traffic_history') }}" class="btn btn-sm btn-outline-secondary">View History</a>
+  </div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+      <table class="table mb-0">
+        <thead>
+          <tr><th>Started</th><th>Location</th><th>Severity</th><th>State</th><th>Duration (min)</th><th>Peak Vehicles</th></tr>
+        </thead>
+        <tbody>
+          {% for ev in events %}
+          <tr>
+            <td>{{ ev.started_at }}</td>
+            <td>{{ ev.location or ('Camera ' ~ ev.camera_id) }}</td>
+            <td><span class="status-badge status-{{ 'confirmed' if ev.severity in ('heavy','severe') else 'pending' }}">{{ ev.severity }}</span></td>
+            <td>{{ ev.state }}</td>
+            <td>{{ ev.duration_minutes }}</td>
+            <td>{{ ev.peak_vehicle_count }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="text-muted text-center py-4">No congestion events yet. Run the DEMO analysis from the Traffic Map.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Traffic Map{% endblock %}
+{% block page_title %}Traffic Map{% endblock %}
+{% block page_subtitle %}Multi-camera congestion overview — Hermosa Connect (DEMO data) {% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  #tavidm-map { height: 540px; width: 100%; border-radius: 12px; background: #e2e8f0; z-index: 1; }
+  .state-dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 6px rgba(0,0,0,.3); }
+  .cam-state-normal { background: #22c55e; }
+  .cam-state-building { background: #eab308; }
+  .cam-state-congested { background: #dc2626; }
+  .cam-state-improving { background: #0891b2; }
+  .hermosa-demo-badge { background: rgba(230,57,70,.12); color: var(--primary); font-size:.7rem; font-weight:700; padding:3px 10px; border-radius:20px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="disclaimer-banner">
+  <i class="bi bi-info-circle me-2"></i>
+  <strong>Hermosa Connect — DEMO.</strong> Camera positions are illustrative. Not connected to actual Zamboanga City CCTV. Congestion states shown are computed from demo observations until real feeds are integrated.
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-12 col-xl-9">
+    <div class="card card-panel h-100">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="card-title mb-0"><i class="bi bi-geo-alt me-2"></i>Zamboanga City — Camera Map</h5>
+        <span class="hermosa-demo-badge">DEMO DATA</span>
+      </div>
+      <div class="card-body p-2">
+        <div id="tavidm-map"></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-xl-3">
+    <div class="card card-panel h-100">
+      <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-camera-video me-2"></i>Cameras</h5></div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table mb-0">
+            <thead><tr><th>Name</th><th>Location</th></tr></thead>
+            <tbody>
+              {% for cam in cameras %}
+              <tr><td>{{ cam.name }}</td><td class="text-secondary small">{{ cam.location or '—' }}</td></tr>
+              {% else %}
+              <tr><td colspan="2" class="text-muted">No cameras configured.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card card-panel">
+  <div class="card-body d-flex gap-2">
+    <button id="run-analysis" class="btn btn-danger"><i class="bi bi-play-fill me-1"></i>Run DEMO Congestion Analysis</button>
+    <span id="analysis-status" class="align-self-center text-secondary small"></span>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const CAMERAS = {{ cameras | tojson }};
+  // Illustrative Zamboanga City center; positions are DEMO offsets, not real CCTV.
+  const CENTER = [6.9214, 122.0790];
+  const map = L.map('tavidm-map').setView(CENTER, 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
+  }).addTo(map);
+
+  // Place cameras at small deterministic DEMO offsets around the center.
+  CAMERAS.forEach((cam, i) => {
+    const angle = (i / Math.max(1, CAMERAS.length)) * 2 * Math.PI;
+    const r = 0.012;
+    const lat = CENTER[0] + Math.cos(angle) * r;
+    const lng = CENTER[1] + Math.sin(angle) * r;
+    const m = L.marker([lat, lng]).addTo(map);
+    m.bindPopup(`<strong>${cam.name}</strong><br>${cam.location || ''}<br><span class="text-muted small">DEMO position</span>`);
+  });
+
+  document.getElementById('run-analysis')?.addEventListener('click', async () => {
+    const status = document.getElementById('analysis-status');
+    status.textContent = 'Analyzing (DEMO)...';
+    const res = await fetch('/api/congestion/analyze', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      status.textContent = `Done: ${data.observations} obs, ${data.events} events, ${data.hotspots} hotspots.`;
+    } else {
+      status.textContent = 'Error: ' + (data.error || 'unknown');
+    }
+  });
+</script>
+{% endblock %}

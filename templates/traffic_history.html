@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Traffic History{% endblock %}
+{% block page_title %}Traffic History{% endblock %}
+{% block page_subtitle %}Congestion event timeline — Hermosa Connect {% endblock %}
+
+{% block content %}
+<div class="alert alert-warning d-flex align-items-center gap-2 mb-3">
+  <i class="bi bi-exclamation-triangle"></i>
+  <span>{{ demo_note }}</span>
+</div>
+
+<div class="card card-panel">
+  <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Congestion Event History</h5></div>
+  <div class="card-body p-0">
+    <div class="table-responsive">
+      <table class="table mb-0">
+        <thead>
+          <tr><th>#</th><th>Started</th><th>Ended</th><th>Location</th><th>Severity</th><th>State</th><th>Duration (min)</th><th>Avg Density</th></tr>
+        </thead>
+        <tbody>
+          {% for ev in events %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ ev.started_at }}</td>
+            <td>{{ ev.ended_at or '—' }}</td>
+            <td>{{ ev.location or ('Camera ' ~ ev.camera_id) }}</td>
+            <td>{{ ev.severity }}</td>
+            <td>{{ ev.state }}</td>
+            <td>{{ ev.duration_minutes }}</td>
+            <td>{{ ev.avg_density_score }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="8" class="text-muted text-center py-4">No history yet. Run the DEMO analysis from the Traffic Map.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
