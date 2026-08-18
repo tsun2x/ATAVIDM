@@ -213,6 +213,11 @@ def _camera_to_ui(row: dict) -> dict:
         "created_at": row.get("created_at"),
         "stream_url": f"/api/cameras/{row['id']}/stream",
         "stream_status": stream_manager.status(row["id"]),
+        # Demo/simulation feed metadata expected by live_monitor.html.
+        # The cameras table has no fps/feed_image columns yet; default to a
+        # simulated feed so the Live Monitor page renders.
+        "fps": row.get("fps") or 30,
+        "feed_image": row.get("feed_image") or "cctv_feed.svg",
     }
 
 
@@ -329,10 +334,18 @@ def dashboard():
 def live_monitor():
     videos = [_db_video_to_ui(row) for row in db.list_videos()]
     cameras = [_camera_to_ui(row) for row in db.list_cameras()]
+    # live_monitor.html expects a single default_camera object. Use the first
+    # camera, or a safe placeholder when no cameras are configured.
+    default_camera = (
+        cameras[0]
+        if cameras
+        else {"id": None, "name": "No camera", "fps": 0, "feed_image": "cctv_feed.svg"}
+    )
     return render_template(
         "live_monitor.html",
         videos=videos,
         cameras=cameras,
+        default_camera=default_camera,
         conditions=CONDITIONS,
         zone_types=zones_for_api(),
         zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
@@ -1063,4 +1076,5 @@ def api_hotspots():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # Side-quest dev port: 5001 to avoid colliding with the main TAVIDM (port 5000).
+    app.run(debug=True, port=5001)

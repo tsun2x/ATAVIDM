@@ -23,15 +23,27 @@ def violation_summary() -> list[dict[str, Any]]:
     """Per-type counts with share of total (non-dismissed violations)."""
     rows = db.count_violations_by_type()
     total = sum(row["count"] for row in rows) or 1
-    return [
-        {
-            "type": row["violation_type"],
-            "count": row["count"],
-            "color": type_color(i),
-            "share": round(row["count"] * 100 / total, 1),
-        }
-        for i, row in enumerate(rows)
-    ]
+    yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+    yesterday_by_type = db.count_violations_by_type_on(yesterday)
+    summary = []
+    for i, row in enumerate(rows):
+        today_count = row["count"]
+        yest_count = yesterday_by_type.get(row["violation_type"], 0)
+        change = (
+            round((today_count - yest_count) / yest_count * 100, 1)
+            if yest_count > 0
+            else 0.0
+        )
+        summary.append(
+            {
+                "type": row["violation_type"],
+                "count": today_count,
+                "color": type_color(i),
+                "share": round(today_count * 100 / total, 1),
+                "change": change,
+            }
+        )
+    return summary
 
 
 def _avg_confidence() -> float:
@@ -56,14 +68,19 @@ def dashboard_stats() -> dict[str, Any]:
     prev7 = sum(counts[-14:-7]) if len(counts) >= 14 else 0
     trend_today = round((today_count - prev_day) / prev_day * 100, 1) if prev_day > 0 else 0.0
     trend_week = round((last7 - prev7) / prev7 * 100, 1) if prev7 > 0 else 0.0
+    cameras = db.list_cameras()
     return {
         "total_today": db.count_violations_today(),
+        "total_week": last7,
         "total_all": db.count_all_violations(),
         "trend_today": trend_today,
         "trend_week": trend_week,
+        "active_cameras": sum(1 for c in cameras if c.get("is_active")),
+        "total_cameras": len(cameras),
         "counterflow": today_by_type.get("Counterflow Driving", 0),
         "illegal_parking": today_by_type.get("Illegal Parking", 0),
         "review_queue": db.count_review_pending(),
+        "pending_review": db.count_review_pending(),
         "videos_processed": sum(1 for v in videos if v.get("processed")),
         "total_videos": len(videos),
         "avg_confidence": _avg_confidence(),
