@@ -21,6 +21,7 @@ from core.detector import Detector
 from core.evidence import save_evidence_snapshot
 from core.tracker import TrackState
 from core.violation_engine import RuleEngineState, ViolationEvent, evaluate_detection_rules
+from core.violation_config import load_enabled_violations
 from core.zone_config import parse_zones_json
 from database import db
 
@@ -137,6 +138,7 @@ def process_video(
     """
     ctx = get_processing_context(video_id)
     params = load_rule_parameters()
+    enabled_violations = load_enabled_violations()
     base_dt = _base_datetime(ctx["recorded_at"])
 
     cap = cv2.VideoCapture(ctx["video_path"])
@@ -198,6 +200,7 @@ def process_video(
                 zones=ctx["zones"],
                 params=params,
                 now_time=_scene_time(base_dt, timestamp_sec),
+                enabled_violations=enabled_violations,
             )
             by_track = {int(d["track_id"]): d for d in tracked}
             for event in frame_events:

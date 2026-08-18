@@ -30,7 +30,13 @@ import config
 from core import analytics as analytics_core
 from core import auth
 from core import reports as reports_core
-from core.detection_config import IMPLEMENTED_VIOLATIONS, MODEL_FAMILY
+from core.detection_config import CANONICAL_VIOLATIONS, MODEL_FAMILY
+from core.violation_config import (
+    ViolationConfigError,
+    load_enabled_violations,
+    save_enabled_violations,
+    violation_catalog_for_ui,
+)
 from core.detector import resolve_weights_path
 from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
 from core.live_stream import mjpeg_generator, stream_manager
@@ -343,7 +349,7 @@ def violations():
     return render_template(
         "violations.html",
         violations=[_violation_to_ui(r, videos) for r in rows],
-        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        violation_types=list(CANONICAL_VIOLATIONS),
         videos=[_db_video_to_ui(row) for row in db.list_videos()],
         statuses=STATUSES,
     )
@@ -365,7 +371,7 @@ def reports():
     return render_template(
         "reports.html",
         report_history=[_report_to_ui(r) for r in db.list_reports()],
-        violation_types=list(IMPLEMENTED_VIOLATIONS),
+        violation_types=list(CANONICAL_VIOLATIONS),
         videos=[_db_video_to_ui(row) for row in db.list_videos()],
         statuses=STATUSES,
     )
@@ -380,6 +386,8 @@ def settings():
         "settings.html",
         users=[_user_to_ui(u) for u in db.list_users()],
         settings=load_rule_parameters(),
+        violation_catalog=violation_catalog_for_ui(),
+        enabled_violations=list(load_enabled_violations()),
         cameras=[_camera_to_ui(c) for c in db.list_cameras()],
         roles=auth.ROLE_LABELS,
         zone_types=zones_for_api(),
@@ -815,7 +823,14 @@ def api_download_report(report_id: int):
 def api_get_settings():
     from core.video_processor import load_rule_parameters
 
-    return jsonify({"success": True, "settings": load_rule_parameters()})
+    return jsonify(
+        {
+            "success": True,
+            "settings": load_rule_parameters(),
+            "enabled_violations": list(load_enabled_violations()),
+            "violation_catalog": violation_catalog_for_ui(),
+        }
+    )
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -825,10 +840,28 @@ def api_save_settings():
 
     payload = request.get_json(silent=True) or {}
     values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
-    if not values:
+    if "enabled_violations" in payload:
+        raw = payload.get("enabled_violations")
+        if not isinstance(raw, list):
+            return jsonify({"success": False, "error": "enabled_violations must be a list."}), 400
+        try:
+            enabled = save_enabled_violations(raw)
+        except ViolationConfigError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+    else:
+        enabled = load_enabled_violations()
+
+    if not values and "enabled_violations" not in payload:
         return jsonify({"success": False, "error": "No recognized settings provided."}), 400
-    db.set_settings(values)
-    return jsonify({"success": True, "message": "Settings saved."})
+    if values:
+        db.set_settings(values)
+    return jsonify(
+        {
+            "success": True,
+            "message": "Settings saved.",
+            "enabled_violations": list(enabled),
+        }
+    )
 
 
 @app.route("/api/users", methods=["GET"])

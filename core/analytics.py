@@ -6,7 +6,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from core.detection_config import IMPLEMENTED_VIOLATIONS
+from core.detection_config import (
+    CANONICAL_VIOLATIONS,
+    VIOLATION_COUNTERFLOW,
+    VIOLATION_ILLEGAL_PARKING,
+    canonicalize_violation,
+)
 from database import db
 
 _TYPE_COLORS = (
@@ -19,18 +24,36 @@ def type_color(index: int) -> str:
     return _TYPE_COLORS[index % len(_TYPE_COLORS)]
 
 
+def _canonical_counts_from_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        canon = canonicalize_violation(row["violation_type"])
+        counts[canon] = counts.get(canon, 0) + row["count"]
+    return counts
+
+
+def _canonical_counts_from_map(type_counts: dict[str, int]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for viol_type, count in type_counts.items():
+        canon = canonicalize_violation(viol_type)
+        counts[canon] = counts.get(canon, 0) + count
+    return counts
+
+
 def violation_summary() -> list[dict[str, Any]]:
     """Per-type counts with share of total (non-dismissed violations)."""
     rows = db.count_violations_by_type()
-    total = sum(row["count"] for row in rows) or 1
+    canonical = _canonical_counts_from_rows(rows)
+    ordered = sorted(canonical.items(), key=lambda item: item[1], reverse=True)
+    total = sum(count for _, count in ordered) or 1
     return [
         {
-            "type": row["violation_type"],
-            "count": row["count"],
+            "type": viol_type,
+            "count": count,
             "color": type_color(i),
-            "share": round(row["count"] * 100 / total, 1),
+            "share": round(count * 100 / total, 1),
         }
-        for i, row in enumerate(rows)
+        for i, (viol_type, count) in enumerate(ordered)
     ]
 
 
@@ -45,12 +68,12 @@ def _avg_confidence() -> float:
 def dashboard_stats() -> dict[str, Any]:
     videos = db.list_videos()
     today = datetime.now().date()
-    today_by_type = db.count_violations_by_type_on(today.isoformat())
+    today_by_type = _canonical_counts_from_map(db.count_violations_by_type_on(today.isoformat()))
     return {
         "total_today": db.count_violations_today(),
         "total_all": db.count_all_violations(),
-        "counterflow": today_by_type.get("Counterflow Driving", 0),
-        "illegal_parking": today_by_type.get("Illegal Parking", 0),
+        "counterflow": today_by_type.get(VIOLATION_COUNTERFLOW, 0),
+        "illegal_parking": today_by_type.get(VIOLATION_ILLEGAL_PARKING, 0),
         "review_queue": db.count_review_pending(),
         "videos_processed": sum(1 for v in videos if v.get("processed")),
         "total_videos": len(videos),
@@ -90,7 +113,12 @@ def analytics_data() -> dict[str, Any]:
     monthly_labels, monthly_values = _daily_series(30)
     hourly_labels, hourly_values = _hourly_series()
 
-    breakdown = db.count_violations_by_type()
+    breakdown_raw = db.count_violations_by_type()
+    breakdown_map = _canonical_counts_from_rows(breakdown_raw)
+    breakdown = [
+        {"violation_type": viol_type, "count": count}
+        for viol_type, count in sorted(breakdown_map.items(), key=lambda x: x[1], reverse=True)
+    ]
     vehicle_rows = db.violations_by_vehicle_class()
 
     # Confidence bands follow the manuscript's manual-review policy thresholds.
@@ -128,5 +156,5 @@ def analytics_data() -> dict[str, Any]:
             "most_common": most_common,
             "avg_confidence": _avg_confidence(),
         },
-        "violation_types": list(IMPLEMENTED_VIOLATIONS),
+        "violation_types": list(CANONICAL_VIOLATIONS),
     }

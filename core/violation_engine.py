@@ -17,13 +17,14 @@ from typing import Any
 from core.detection_config import (
     VIOLATION_OBSTRUCTION,
     VIOLATION_COUNTERFLOW,
-    VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    VIOLATION_ILLEGAL_PARKING,
+    VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_NO_HELMET,
     VIOLATION_PAVEMENT_MARKINGS,
     VIOLATION_MOTORCYCLE_OVERLOADING,
     VIOLATION_TRUCK_BAN,
     DEFAULT_RULE_PARAMETERS,
-    IMPLEMENTED_VIOLATIONS,
+    DEFAULT_ENABLED_VIOLATIONS,
     RIDER_ASSOCIATION_PADDING,
     VIOLATION_PERSISTENCE_SEC,
     VEHICLE_CLASSES,
@@ -296,37 +297,52 @@ def _check_zone_dwell(
     return events
 
 
-def check_illegal_parking_terminal(
+def check_illegal_parking(
     vehicles: list[dict[str, Any]],
     polygon: list[list[float]],
     state: RuleEngineState,
     frame_number: int,
     params: dict[str, Any],
 ) -> list[ViolationEvent]:
-    """
-    Illegal Parking / Illegal Terminal zone violations.
-    Fuses stopping and parking violations into one canonical type.
-    """
+    """Zone-dwell parking rule in a No Parking zone (partial implementation)."""
     events: list[ViolationEvent] = []
     events.extend(
         _check_zone_dwell(
             vehicles, polygon, state, frame_number, params,
-            rule_key="illegal_parking_terminal_stop",
-            violation_type=VIOLATION_ILLEGAL_PARKING_TERMINAL,
+            rule_key="illegal_parking_stop",
+            violation_type=VIOLATION_ILLEGAL_PARKING,
             dwell_sec=float(params.get("stopping_dwell_sec", 10.0)),
-            reason_template="Vehicle track #{track_id} stopped in No Parking/Terminal Zone for >={dwell}s.",
+            reason_template="Vehicle track #{track_id} stopped in No Parking Zone for >={dwell}s.",
         )
     )
     events.extend(
         _check_zone_dwell(
             vehicles, polygon, state, frame_number, params,
-            rule_key="illegal_parking_terminal_park",
-            violation_type=VIOLATION_ILLEGAL_PARKING_TERMINAL,
+            rule_key="illegal_parking_park",
+            violation_type=VIOLATION_ILLEGAL_PARKING,
             dwell_sec=float(params.get("parking_dwell_sec", 30.0)),
-            reason_template="Vehicle track #{track_id} parked in No Parking/Terminal Zone for >={dwell}s.",
+            reason_template="Vehicle track #{track_id} parked in No Parking Zone for >={dwell}s.",
         )
     )
     return events
+
+
+def check_illegal_terminal(
+    vehicles: list[dict[str, Any]],
+    polygon: list[list[float]],
+    state: RuleEngineState,
+    frame_number: int,
+    params: dict[str, Any],
+) -> list[ViolationEvent]:
+    """PUV zone-dwell in No Loading/Unloading zone (partial; not full terminal logic)."""
+    return _check_zone_dwell(
+        vehicles, polygon, state, frame_number, params,
+        rule_key="illegal_terminal",
+        violation_type=VIOLATION_ILLEGAL_TERMINAL,
+        dwell_sec=float(params.get("loading_dwell_sec", 8.0)),
+        reason_template="PUV track #{track_id} stationary in No Loading/Unloading Zone for >={dwell}s.",
+        class_filter=PUV_CLASSES,
+    )
 
 
 def check_obstruction(
@@ -478,16 +494,15 @@ def evaluate_detection_rules(
     ``tracked`` must be the output of TrackState.update() (motion-annotated).
     ``zones`` maps zone keys to pixel polygons (see core.zone_config).
     ``params`` overrides DEFAULT_RULE_PARAMETERS (from system settings).
-    ``enabled_violations`` filters which violations to evaluate (batch-level config).
-    If None, only IMPLEMENTED_VIOLATIONS are evaluated.
+    ``enabled_violations`` filters which violations to evaluate.
+    If None, ``DEFAULT_ENABLED_VIOLATIONS`` is used (global toggle default).
     """
     merged = dict(DEFAULT_RULE_PARAMETERS)
     if params:
         merged.update(params)
     zones = zones or {}
-    
-    # Only evaluate implemented violations unless explicitly enabled
-    enabled_set = set(enabled_violations) if enabled_violations is not None else set(IMPLEMENTED_VIOLATIONS)
+
+    enabled_set = set(enabled_violations) if enabled_violations is not None else set(DEFAULT_ENABLED_VIOLATIONS)
     
     vehicles = [d for d in tracked if d.get("class_label") in VEHICLE_CLASSES]
 
@@ -500,8 +515,8 @@ def evaluate_detection_rules(
         events.extend(check_motorcycle_overloading(tracked, state, frame_number))
 
     # Run zone-based rules
-    if zones.get("no_parking") and VIOLATION_ILLEGAL_PARKING_TERMINAL in enabled_set:
-        events.extend(check_illegal_parking_terminal(vehicles, zones["no_parking"], state, frame_number, merged))
+    if zones.get("no_parking") and VIOLATION_ILLEGAL_PARKING in enabled_set:
+        events.extend(check_illegal_parking(vehicles, zones["no_parking"], state, frame_number, merged))
     if zones.get("active_lane"):
         if VIOLATION_OBSTRUCTION in enabled_set:
             events.extend(check_obstruction(vehicles, zones["active_lane"], state, frame_number, merged))
@@ -511,8 +526,8 @@ def evaluate_detection_rules(
         events.extend(check_blocking_pedestrian(vehicles, zones["pedestrian_crossing"], state, frame_number, merged))
     if zones.get("truck_ban_zone") and VIOLATION_TRUCK_BAN in enabled_set:
         events.extend(check_truck_ban(vehicles, zones["truck_ban_zone"], state, frame_number, merged, now_time))
-    if zones.get("loading_unloading") and VIOLATION_ILLEGAL_PARKING_TERMINAL in enabled_set:
-        events.extend(check_illegal_parking_terminal(vehicles, zones["loading_unloading"], state, frame_number, merged))
+    if zones.get("loading_unloading") and VIOLATION_ILLEGAL_TERMINAL in enabled_set:
+        events.extend(check_illegal_terminal(vehicles, zones["loading_unloading"], state, frame_number, merged))
     if zones.get("restricted_lane") and VIOLATION_PAVEMENT_MARKINGS in enabled_set:
         events.extend(check_restricted_lane(vehicles, zones["restricted_lane"], state, frame_number, merged))
 

@@ -18,6 +18,7 @@ from core.detector import Detector, DetectorError
 from core.evidence import save_evidence_snapshot
 from core.tracker import TrackState
 from core.video_processor import load_rule_parameters
+from core.violation_config import load_enabled_violations
 from core.violation_engine import RuleEngineState, evaluate_detection_rules
 from core.zone_config import parse_zones_json
 from database import db
@@ -68,6 +69,7 @@ class LiveStreamWorker(threading.Thread):
 
     def run(self) -> None:  # noqa: C901 — single sequential pipeline loop
         params = load_rule_parameters()
+        enabled_violations = load_enabled_violations()
         try:
             detector = Detector()
             detector.load()
@@ -114,6 +116,7 @@ class LiveStreamWorker(threading.Thread):
                 events = evaluate_detection_rules(
                     tracked, rule_state, frame_number,
                     zones=self.zones, params=params,
+                    enabled_violations=enabled_violations,
                 )
                 by_track = {int(d["track_id"]): d for d in tracked}
                 for event in events:

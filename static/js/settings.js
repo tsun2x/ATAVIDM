@@ -14,6 +14,12 @@
     });
 
     document.getElementById("btnSaveSettings")?.addEventListener("click", function () {
+        const enabledViolations = [];
+        document.querySelectorAll(".violation-toggle:checked").forEach(function (el) {
+            if (el.dataset.toggleable === "true") {
+                enabledViolations.push(el.value);
+            }
+        });
         const body = {
             confidence_threshold: (parseFloat(confidenceInput?.value || "60") / 100).toFixed(2),
             truck_ban_start: document.getElementById("truckBanStart")?.value,
@@ -26,6 +32,7 @@
             crossing_block_sec: document.getElementById("crossingBlock")?.value,
             lane_flow_degrees: document.getElementById("laneFlow")?.value,
             flow_tolerance_degrees: document.getElementById("flowTolerance")?.value,
+            enabled_violations: enabledViolations,
         };
         fetch("/api/settings", {
             method: "POST",
@@ -35,7 +42,7 @@
             .then(function (r) { return r.json(); })
             .then(function (payload) {
                 if (payload.success) {
-                    showToast("Settings Saved", "Rule parameters updated. New processing runs will use them.", "success");
+                    showToast("Settings Saved", "Rule parameters and violation toggles updated.", "success");
                 } else {
                     showToast("Error", payload.error || "Save failed.", "danger");
                 }

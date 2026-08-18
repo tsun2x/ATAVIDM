@@ -129,30 +129,33 @@ DEFAULT_RULE_PARAMETERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Violation registry (Canonical 11)
+# Violation registry (Canonical 12 — frozen project scope)
 # ---------------------------------------------------------------------------
-# These are the FINAL canonical violation types for TAVIDM.
-# IMPLEMENTED violations are those with working detection logic.
-# FUTURE violations are stubs requiring new model classes or researcher input.
+# CANONICAL_VIOLATIONS = intended project coverage (12 types).
+# IMPLEMENTED_VIOLATIONS = rules with complete executable logic in this codebase.
+# PARTIAL_VIOLATIONS = zone-dwell proxy rules; not full spec behavior.
+# PLANNED_VIOLATIONS = canonical scope without executable rule functions yet.
+# TOGGLEABLE_VIOLATIONS = may be enabled/disabled (implemented + partial + model-dependent).
 
-# ---- IMPLEMENTED (currently executable) ----
+# ---- Canonical identifiers -------------------------------------------------
 VIOLATION_OBSTRUCTION = "Obstruction"
-VIOLATION_NO_HELMET = "No Helmet"
-VIOLATION_COUNTERFLOW = "Counterflow"
-VIOLATION_TRUCK_BAN = "Truck-Ban Violation"
-VIOLATION_MOTORCYCLE_OVERLOADING = "Motorcycle Overloading"
-
-# ---- FUTURE/STUB (do not appear in analytics/reports until implemented) ----
 VIOLATION_SUBSTANDARD_HELMET = "Substandard Helmet"
 VIOLATION_DISREGARDING_SIGN = "Disregarding Traffic Sign"
+VIOLATION_NO_HELMET = "No Helmet"
 VIOLATION_NO_SIDE_MIRROR = "No Side Mirror"
-VIOLATION_ILLEGAL_PARKING_TERMINAL = "Illegal Parking / Illegal Terminal"
+VIOLATION_ILLEGAL_PARKING = "Illegal Parking"
+VIOLATION_ILLEGAL_TERMINAL = "Illegal Terminal"
+VIOLATION_COUNTERFLOW = "Counterflow"
+VIOLATION_TRUCK_BAN = "Truck-Ban Violation"
 VIOLATION_PAVEMENT_MARKINGS = "Failure to Follow Road/Pavement Markings"
+VIOLATION_MOTORCYCLE_OVERLOADING = "Motorcycle Overloading"
 VIOLATION_CARGO_PASSENGERS = "Unauthorized Passengers in Pickup/Truck Cargo Area"
 
+# Legacy fused label (not canonical — compatibility only)
+LEGACY_FUSED_PARKING_TERMINAL = "Illegal Parking / Illegal Terminal"
+VIOLATION_ILLEGAL_PARKING_TERMINAL = LEGACY_FUSED_PARKING_TERMINAL
 
-# Legacy names for backward compatibility with existing data
-# These DO NOT map to canonical names - they preserve existing DB values
+# ---- Legacy names (DB / historical records; not canonical) -----------------
 LEGACY_ILLEGAL_PARKING = "Illegal Parking"
 LEGACY_ILLEGAL_STOPPING = "Illegal Stopping"
 LEGACY_BLOCKING_PEDESTRIAN = "Blocking Pedestrian Crossing"
@@ -164,15 +167,14 @@ LEGACY_TRUCK_BAN = "Truck Ban Violation"
 LEGACY_OBSTRUCTION = "Obstruction"
 LEGACY_COUNTERFLOW = "Counterflow Driving"
 
-
-# All canonical violation types (must be exactly 11)
 CANONICAL_VIOLATIONS = (
     VIOLATION_OBSTRUCTION,
     VIOLATION_SUBSTANDARD_HELMET,
     VIOLATION_DISREGARDING_SIGN,
     VIOLATION_NO_HELMET,
     VIOLATION_NO_SIDE_MIRROR,
-    VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    VIOLATION_ILLEGAL_PARKING,
+    VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_COUNTERFLOW,
     VIOLATION_TRUCK_BAN,
     VIOLATION_PAVEMENT_MARKINGS,
@@ -180,7 +182,7 @@ CANONICAL_VIOLATIONS = (
     VIOLATION_CARGO_PASSENGERS,
 )
 
-# Currently implemented/active violation types (have working detection)
+# Core rules with working detection logic in the current engine
 IMPLEMENTED_VIOLATIONS = (
     VIOLATION_OBSTRUCTION,
     VIOLATION_NO_HELMET,
@@ -189,9 +191,35 @@ IMPLEMENTED_VIOLATIONS = (
     VIOLATION_MOTORCYCLE_OVERLOADING,
 )
 
-# All known violation types (canonical + legacy)
+# Zone-dwell proxy rules — partial, not full contextual/spec behavior
+PARTIAL_VIOLATIONS = (
+    VIOLATION_ILLEGAL_PARKING,
+    VIOLATION_ILLEGAL_TERMINAL,
+    VIOLATION_PAVEMENT_MARKINGS,
+)
+
+# Requires custom model classes (e.g. helmet) to trigger in production
+MODEL_DEPENDENT_VIOLATIONS = (
+    VIOLATION_NO_HELMET,
+)
+
+# Canonical scope without executable rule functions
+PLANNED_VIOLATIONS = (
+    VIOLATION_SUBSTANDARD_HELMET,
+    VIOLATION_DISREGARDING_SIGN,
+    VIOLATION_NO_SIDE_MIRROR,
+    VIOLATION_CARGO_PASSENGERS,
+)
+
+TOGGLEABLE_VIOLATIONS = IMPLEMENTED_VIOLATIONS + PARTIAL_VIOLATIONS
+
+ENABLED_VIOLATIONS_SETTING_KEY = "enabled_violations"
+
+# Default runtime enablement preserves prior behavior (5 core rules)
+DEFAULT_ENABLED_VIOLATIONS = IMPLEMENTED_VIOLATIONS
+
 ALL_VIOLATION_TYPES = CANONICAL_VIOLATIONS + (
-    LEGACY_ILLEGAL_PARKING,
+    LEGACY_FUSED_PARKING_TERMINAL,
     LEGACY_ILLEGAL_STOPPING,
     LEGACY_BLOCKING_PEDESTRIAN,
     LEGACY_LOADING_UNLOADING,
@@ -201,45 +229,53 @@ ALL_VIOLATION_TYPES = CANONICAL_VIOLATIONS + (
 )
 
 
+def violation_execution_status(viol_type: str) -> str:
+    """Return UI/engine status: implemented | model_dependent | partial | planned."""
+    if viol_type in PLANNED_VIOLATIONS:
+        return "planned"
+    if viol_type in PARTIAL_VIOLATIONS:
+        return "partial"
+    if viol_type in MODEL_DEPENDENT_VIOLATIONS:
+        return "model_dependent"
+    if viol_type in IMPLEMENTED_VIOLATIONS:
+        return "implemented"
+    return "unknown"
+
+
 def is_implemented_violation(viol_type: str) -> bool:
-    """Check if a violation type is active/can be detected."""
+    """True when the violation has complete executable rule logic."""
     return viol_type in IMPLEMENTED_VIOLATIONS
 
 
+def is_toggleable_violation(viol_type: str) -> bool:
+    return viol_type in TOGGLEABLE_VIOLATIONS
+
+
 def is_canonical_violation(viol_type: str) -> bool:
-    """Check if a violation type is in the canonical set."""
     return viol_type in CANONICAL_VIOLATIONS
 
 
 def legacy_to_canonical(viol_type: str) -> str | None:
-    """Convert legacy violation names to canonical names.
-    Returns None if no mapping exists (e.g., already canonical or unmapped).
-    """
+    """Map legacy DB/display names to canonical identifiers."""
     mapping = {
-        # Legacy maps to canonical
         LEGACY_OBSTRUCTION: VIOLATION_OBSTRUCTION,
         LEGACY_COUNTERFLOW: VIOLATION_COUNTERFLOW,
         LEGACY_TRUCK_BAN: VIOLATION_TRUCK_BAN,
         LEGACY_NO_HELMET_VIOLATION: VIOLATION_NO_HELMET,
         LEGACY_OVERLOADING: VIOLATION_MOTORCYCLE_OVERLOADING,
-        # Legacy parking variants -> fused terminal/parking
-        LEGACY_ILLEGAL_PARKING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
-        LEGACY_ILLEGAL_STOPPING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
-        # Legacy pedestrian crossing -> Obstruction (blocking)
+        LEGACY_ILLEGAL_PARKING: VIOLATION_ILLEGAL_PARKING,
+        LEGACY_ILLEGAL_STOPPING: VIOLATION_ILLEGAL_PARKING,
+        LEGACY_LOADING_UNLOADING: VIOLATION_ILLEGAL_TERMINAL,
         LEGACY_BLOCKING_PEDESTRIAN: VIOLATION_OBSTRUCTION,
-        # Legacy restricted lane -> pavement markings
         LEGACY_RESTRICTED_LANE: VIOLATION_PAVEMENT_MARKINGS,
-        LEGACY_LOADING_UNLOADING: VIOLATION_ILLEGAL_PARKING_TERMINAL,
+        LEGACY_FUSED_PARKING_TERMINAL: VIOLATION_ILLEGAL_PARKING,
     }
     return mapping.get(viol_type)
 
 
 def canonicalize_violation(viol_type: str) -> str:
-    """Convert any violation name to its canonical form.
-    For unknown names, returns as-is.
-    """
-    result = legacy_to_canonical(viol_type)
-    if result is None:
-        # Already canonical or unknown
+    """Convert any known violation name to its canonical form."""
+    if viol_type in CANONICAL_VIOLATIONS:
         return viol_type
-    return result
+    mapped = legacy_to_canonical(viol_type)
+    return mapped if mapped is not None else viol_type

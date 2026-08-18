@@ -55,6 +55,46 @@
         </div>
 
         <div class="card card-panel mt-4">
+            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-shield-check me-2"></i>Violation Rules</h5></div>
+            <div class="card-body">
+                <p class="text-muted small mb-3">
+                    Enable or disable violation rules for video processing and live streams.
+                    Planned rules cannot be enabled until their detection logic is implemented.
+                </p>
+                <div class="list-group list-group-flush" id="violationToggleList">
+                    {% for item in violation_catalog %}
+                    <label class="list-group-item d-flex align-items-start gap-3 {% if not item.toggleable %}opacity-75{% endif %}">
+                        <input class="form-check-input mt-1 violation-toggle" type="checkbox"
+                               value="{{ item.name }}"
+                               data-toggleable="{{ 'true' if item.toggleable else 'false' }}"
+                               {% if item.enabled %}checked{% endif %}
+                               {% if not item.toggleable %}disabled{% endif %}>
+                        <span class="flex-grow-1">
+                            <span class="fw-semibold">{{ item.name }}</span>
+                            {% if item.status == 'implemented' %}
+                            <span class="badge bg-success-subtle text-success ms-1">Implemented</span>
+                            {% elif item.status == 'model_dependent' %}
+                            <span class="badge bg-warning-subtle text-warning ms-1">Model-dependent</span>
+                            {% elif item.status == 'partial' %}
+                            <span class="badge bg-info-subtle text-info ms-1">Partial</span>
+                            {% elif item.status == 'planned' %}
+                            <span class="badge bg-secondary-subtle text-secondary ms-1">Planned</span>
+                            {% endif %}
+                            {% if item.status == 'model_dependent' %}
+                            <small class="d-block text-muted">Requires custom YOLO weights with helmet class.</small>
+                            {% elif item.status == 'partial' %}
+                            <small class="d-block text-muted">Zone-dwell proxy only; full contextual logic not yet implemented.</small>
+                            {% elif item.status == 'planned' %}
+                            <small class="d-block text-muted">No executable rule in the current engine.</small>
+                            {% endif %}
+                        </span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card card-panel mt-4">
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection &amp; Rule Parameters</h5></div>
             <div class="card-body">
                 <div class="mb-4">

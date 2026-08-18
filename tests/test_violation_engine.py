@@ -11,7 +11,8 @@ from core.detection_config import (
     IMPLEMENTED_VIOLATIONS,
     VIOLATION_OBSTRUCTION,
     VIOLATION_COUNTERFLOW,
-    VIOLATION_ILLEGAL_PARKING_TERMINAL,
+    VIOLATION_ILLEGAL_PARKING,
+    VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_NO_HELMET,
     VIOLATION_PAVEMENT_MARKINGS,
     VIOLATION_MOTORCYCLE_OVERLOADING,
@@ -21,6 +22,8 @@ from core.detection_config import (
     VIOLATION_DISREGARDING_SIGN,
     VIOLATION_NO_SIDE_MIRROR,
     CANONICAL_VIOLATIONS,
+    PARTIAL_VIOLATIONS,
+    PLANNED_VIOLATIONS,
 )
 
 
@@ -127,43 +130,39 @@ class TestViolationRegistry:
     """Tests for violation registry configuration."""
 
     def test_canonical_violations_count(self):
-        """Verify we have exactly 11 canonical violations."""
-        assert len(CANONICAL_VIOLATIONS) == 11, f"Expected 11 canonical violations, got {len(CANONICAL_VIOLATIONS)}"
+        assert len(CANONICAL_VIOLATIONS) == 12
 
-    def test_canonical_violations_contains_all_ten(self):
-        """Verify all 11 canonical violations are present."""
+    def test_canonical_violations_contains_all_twelve(self):
         expected = {
             VIOLATION_OBSTRUCTION,
             VIOLATION_SUBSTANDARD_HELMET,
             VIOLATION_DISREGARDING_SIGN,
             VIOLATION_NO_HELMET,
             VIOLATION_NO_SIDE_MIRROR,
-            VIOLATION_ILLEGAL_PARKING_TERMINAL,
+            VIOLATION_ILLEGAL_PARKING,
+            VIOLATION_ILLEGAL_TERMINAL,
             VIOLATION_COUNTERFLOW,
             VIOLATION_TRUCK_BAN,
             VIOLATION_PAVEMENT_MARKINGS,
             VIOLATION_MOTORCYCLE_OVERLOADING,
             VIOLATION_CARGO_PASSENGERS,
         }
-        assert set(CANONICAL_VIOLATIONS) == expected, \
-            f"Canonical violations mismatch. Expected: {expected}, Got: {set(CANONICAL_VIOLATIONS)}"
+        assert set(CANONICAL_VIOLATIONS) == expected
 
     def test_implemented_violations_is_subset(self):
-        """Verify IMPLEMENTED_VIOLATIONS is a subset of CANONICAL_VIOLATIONS."""
         for v in IMPLEMENTED_VIOLATIONS:
             assert v in CANONICAL_VIOLATIONS, f"{v} in IMPLEMENTED but not in CANONICAL"
 
     def test_implemented_count(self):
-        """Verify we have exactly 5 implemented violations (core rules)."""
-        assert len(IMPLEMENTED_VIOLATIONS) == 5, f"Expected 5 implemented violations, got {len(IMPLEMENTED_VIOLATIONS)}"
+        assert len(IMPLEMENTED_VIOLATIONS) == 5
 
-    def test_stub_violations_not_in_implemented(self):
-        """Verify stub violations are NOT in IMPLEMENTED_VIOLATIONS."""
-        stubs = {VIOLATION_SUBSTANDARD_HELMET, VIOLATION_DISREGARDING_SIGN, 
-                 VIOLATION_NO_SIDE_MIRROR, VIOLATION_CARGO_PASSENGERS,
-                 VIOLATION_ILLEGAL_PARKING_TERMINAL, VIOLATION_PAVEMENT_MARKINGS}
-        for stub in stubs:
-            assert stub not in IMPLEMENTED_VIOLATIONS, f"{stub} should be stub, not implemented"
+    def test_planned_violations_not_in_implemented(self):
+        for stub in PLANNED_VIOLATIONS:
+            assert stub not in IMPLEMENTED_VIOLATIONS, f"{stub} should be planned, not implemented"
+
+    def test_partial_violations_not_in_implemented(self):
+        for partial in PARTIAL_VIOLATIONS:
+            assert partial not in IMPLEMENTED_VIOLATIONS, f"{partial} should be partial, not fully implemented"
 
 
 class TestObstruction:
@@ -211,16 +210,11 @@ class TestCounterflow:
             f"Expected Counterflow event, got {events}"
 
 
-class TestParkingTerminal:
-    """Tests for Illegal Parking / Illegal Terminal fusion."""
+class TestIllegalParking:
+    def test_illegal_parking_fires_for_dwell(self, rule_params, no_parking_zone, sample_vehicle):
+        from core.violation_engine import RuleEngineState, check_illegal_parking
 
-    def test_parking_terminal_fires_for_dwell(self, rule_params, no_parking_zone, sample_vehicle):
-        """Parking/Terminal violation should fire for dwell in no-parking zone."""
-        from core.violation_engine import RuleEngineState, check_illegal_parking_terminal
-        
         state = RuleEngineState()
-        
-        # Create vehicle in no-parking zone
         vehicle = {
             "class_label": "car",
             "track_id": 1,
@@ -229,20 +223,61 @@ class TestParkingTerminal:
             "bbox_w": 40,
             "bbox_h": 20,
             "confidence": 0.95,
-            "speed_px_per_sec": 0.0,  # Stationary
+            "speed_px_per_sec": 0.0,
             "direction_degrees": 90,
         }
-        # bottom_center = (140, 120) - inside no_parking_zone [[100,100], [200,100], [200,150], [100,150]]
-        
         events = []
         for frame in range(0, 10):
             vehicle["timestamp_sec"] = 5.0 + frame * 0.6
-            events.extend(
-                check_illegal_parking_terminal([vehicle], no_parking_zone, state, frame, rule_params)
-            )
+            events.extend(check_illegal_parking([vehicle], no_parking_zone, state, frame, rule_params))
 
-        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING_TERMINAL for e in events), \
-            f"Expected Illegal Parking/Terminal event, got {events}"
+        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
+
+
+class TestIllegalTerminal:
+    def test_illegal_terminal_requires_puv(self, rule_params, no_parking_zone):
+        from core.violation_engine import RuleEngineState, check_illegal_terminal
+
+        state = RuleEngineState()
+        car = {
+            "class_label": "car",
+            "track_id": 1,
+            "bbox_x": 120,
+            "bbox_y": 110,
+            "bbox_w": 40,
+            "bbox_h": 20,
+            "confidence": 0.95,
+            "speed_px_per_sec": 0.0,
+            "direction_degrees": 90,
+        }
+        events = []
+        for frame in range(0, 10):
+            car["timestamp_sec"] = 5.0 + frame * 0.6
+            events.extend(check_illegal_terminal([car], no_parking_zone, state, frame, rule_params))
+        assert len(events) == 0
+
+    def test_illegal_terminal_fires_for_puv_dwell(self, rule_params, no_parking_zone):
+        from core.violation_engine import RuleEngineState, check_illegal_terminal
+
+        params = dict(rule_params)
+        params["loading_dwell_sec"] = 0.5
+        state = RuleEngineState()
+        jeepney = {
+            "class_label": "jeepney",
+            "track_id": 2,
+            "bbox_x": 120,
+            "bbox_y": 110,
+            "bbox_w": 40,
+            "bbox_h": 20,
+            "confidence": 0.95,
+            "speed_px_per_sec": 0.0,
+            "direction_degrees": 90,
+        }
+        events = []
+        for frame in range(0, 10):
+            jeepney["timestamp_sec"] = 5.0 + frame * 0.6
+            events.extend(check_illegal_terminal([jeepney], no_parking_zone, state, frame, params))
+        assert any(e.violation_type == VIOLATION_ILLEGAL_TERMINAL for e in events)
 
 
 class TestNoHelmet:
@@ -357,20 +392,30 @@ class TestViolationDetection:
             assert event.violation_type == VIOLATION_OBSTRUCTION
 
     def test_enabled_violations_filter_suppresses_disabled(self, tracked_detections, rule_params):
-        """Disabled violations should produce no events."""
         from core.violation_engine import RuleEngineState, evaluate_detection_rules
-        
+
         state = RuleEngineState()
         zones = {"active_lane": [[50, 50], [250, 50], [250, 120], [50, 120], [50, 50]]}
-        
-        enabled = ()  # Empty tuple = no violations enabled
-        
+
         events = evaluate_detection_rules(
-            tracked_detections, state, 1, zones=zones, 
-            params=rule_params, enabled_violations=enabled
+            tracked_detections, state, 1, zones=zones,
+            params=rule_params, enabled_violations=(),
         )
-        
-        assert len(events) == 0, f"Expected no events with disabled violations, got {events}"
+        assert len(events) == 0
+
+    def test_partial_parking_runs_when_enabled(self, tracked_detections, rule_params, no_parking_zone):
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+
+        state = RuleEngineState()
+        zones = {"no_parking": no_parking_zone}
+        enabled = (VIOLATION_ILLEGAL_PARKING,)
+
+        events = evaluate_detection_rules(
+            tracked_detections, state, 1, zones=zones,
+            params=rule_params, enabled_violations=enabled,
+        )
+        for event in events:
+            assert event.violation_type == VIOLATION_ILLEGAL_PARKING
 
 
 @pytest.fixture
