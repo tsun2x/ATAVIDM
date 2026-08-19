@@ -18,7 +18,7 @@ import cv2
 
 from core.detection_config import DEFAULT_RULE_PARAMETERS, confidence_band
 from core.detector import Detector
-from core.evidence import save_evidence_snapshot
+from core.evidence import save_evidence_snapshot, save_vehicle_crop
 from core.tracker import TrackState
 from core.violation_engine import RuleEngineState, ViolationEvent, evaluate_detection_rules
 from core.violation_config import load_enabled_violations
@@ -104,11 +104,21 @@ def _persist_event(
 ) -> None:
     """Save the evidence snapshot and queue the event for manual review."""
     evidence_path = None
+    vehicle_evidence_path = None
     if detection is not None:
         evidence_path = save_evidence_snapshot(
             frame,
             detection,
             event.violation_type,
+            source_key=f"video_{video_id}",
+            frame_number=event.frame_number,
+        )
+        # Always capture a vehicle/object crop when a bbox exists — richer
+        # evidence for the review queue. Plate fields stay 'not_attempted':
+        # no ALPR/OCR is performed here.
+        vehicle_evidence_path = save_vehicle_crop(
+            frame,
+            detection,
             source_key=f"video_{video_id}",
             frame_number=event.frame_number,
         )
@@ -123,22 +133,29 @@ def _persist_event(
         reason_log=f"[{band}] {event.reason_log}",
         vehicle_class=event.vehicle_class,
         timestamp_sec=event.timestamp_sec,
+        vehicle_evidence_path=vehicle_evidence_path,
+        plate_status="not_attempted",
     )
 
 
 def process_video(
     video_id: int,
     progress_callback: Callable[[int, int], None] | None = None,
+    enabled_violations: tuple[str, ...] | None = None,
 ) -> list[ViolationEvent]:
     """
     Run the full YOLOv8m -> ByteTrack -> rule engine pipeline on one video.
 
     Detections are persisted per processed frame; every violation event is
     snapshotted and queued for manual review. Returns the violation events.
+
+    ``enabled_violations`` is the per-run snapshot. ``None`` (the default)
+    means "use the current global enabled set"; an explicit (possibly empty)
+    tuple is honored as-is so a run can disable every violation type.
     """
     ctx = get_processing_context(video_id)
     params = load_rule_parameters()
-    enabled_violations = load_enabled_violations()
+    enabled_violations = load_enabled_violations() if enabled_violations is None else enabled_violations
     base_dt = _base_datetime(ctx["recorded_at"])
 
     cap = cv2.VideoCapture(ctx["video_path"])

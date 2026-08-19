@@ -33,6 +33,40 @@ def test_db(test_db_path: str) -> Any:
 
 
 @pytest.fixture
+def client(test_db_path: str):
+    """Flask test client with a fresh DB and the default admin seeded."""
+    from core import auth
+    from database import sqlite_adapter
+
+    sqlite_adapter.init_db(force=True)
+    auth.ensure_default_admin()
+    import app as flask_app
+
+    flask_app.app.config["TESTING"] = True
+    flask_app.app.config["WTF_CSRF_ENABLED"] = False
+    with flask_app.app.test_client() as client:
+        yield client
+    flask_app.stop_processing_worker()
+
+
+@pytest.fixture
+def enforcer_client(client):
+    """Logged-in enforcer test client (authenticates via the real /login route)."""
+    import bcrypt
+    from core import auth
+
+    hash_pw = bcrypt.hashpw(b"enforcer123", bcrypt.gensalt()).decode("utf-8")
+    from database import db
+
+    db.create_user("enforcer_test", hash_pw, role="enforcer", full_name="Enforcer")
+    # Log in through the actual route so the session is set inside a request
+    # context (login_user() touches flask.session and must not be called from
+    # the test body).
+    client.post("/login", data={"username": "enforcer_test", "password": "enforcer123"})
+    return client
+
+
+@pytest.fixture
 def auth_db(test_db: Any) -> Any:
     """Database with test users (admin, enforcer, viewer)."""
     import bcrypt

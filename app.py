@@ -8,6 +8,7 @@ Decision-support tool only — violations are confirmed by human reviewers.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import datetime
@@ -26,6 +27,8 @@ from flask import (
     url_for,
 )
 
+logger = logging.getLogger(__name__)
+
 import config
 from core import analytics as analytics_core
 from core import auth
@@ -35,6 +38,7 @@ from core.violation_config import (
     ViolationConfigError,
     load_enabled_violations,
     save_enabled_violations,
+    validate_enabled_violations,
     violation_catalog_for_ui,
 )
 from core.detector import resolve_weights_path
@@ -57,12 +61,35 @@ app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 ensure_upload_dir()
 db.init_db()
 auth.ensure_default_admin()
+# Reset any video left in 'processing' by a previous unclean shutdown so the
+# sequential queue can pick it up cleanly on the next process request.
+try:
+    db.recover_orphaned_processing()
+except Exception:  # pragma: no cover - defensive; never block startup
+    pass
 
 CONDITIONS = ["morning", "peak", "nighttime"]
 STATUSES = ["confirmed", "dismissed", "pending"]
 
 # video_id -> {"state": "processing"|"done"|"error", "error": str|None}
 _processing_jobs: dict[int, dict] = {}
+
+# Sequential processing queue: at most ONE process_video thread at a time
+# (RTX 3050 6GB — a single YOLOv8m + ByteTrack inference job). Each queue
+# entry carries the validated violation snapshot + its processing_runs id so a
+# run uses the exact list submitted at enqueue time.
+# Entry shape: (video_id, enabled_violations_tuple, run_id)
+_process_queue: list[tuple[int, tuple[str, ...], int]] = []
+_queue_lock = threading.Lock()
+_queue_cv = threading.Condition(_queue_lock)
+# id of the video currently being processed by the single worker (None if idle).
+# Distinct from "in _process_queue": the worker pops before running, so a
+# waiting job can be the only queue item while another video occupies the slot.
+_running_video_id: int | None = None
+_worker_shutdown = threading.Event()
+_worker_thread: threading.Thread | None = None
+_worker_started = False
+_worker_start_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +126,7 @@ def _db_video_to_ui(row: dict) -> dict:
         "template_id": row.get("template_id"),
         "filepath": row["filepath"],
         "created_at": row.get("created_at"),
+        "file_size_bytes": row.get("file_size_bytes"),
         "frame_url": f"/api/videos/{db_id}/frame",
         "processing": _processing_jobs.get(db_id, {}).get("state") == "processing",
     }
@@ -153,6 +181,9 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "condition": (video or {}).get("condition") or "—",
         "vehicle_class": row.get("vehicle_class") or "—",
         "evidence_url": _evidence_url(row.get("evidence_path")),
+        "vehicle_evidence_url": _evidence_url(row.get("vehicle_evidence_path")),
+        "plate_text": row.get("plate_text") or None,
+        "plate_status": row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
         "frame_number": row.get("frame_number"),
     }
@@ -171,6 +202,9 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "frame_number": row.get("frame_number"),
         "vehicle_class": row.get("vehicle_class") or "—",
         "evidence_url": _evidence_url(row.get("evidence_path")),
+        "vehicle_evidence_url": _evidence_url(row.get("vehicle_evidence_path")),
+        "plate_text": row.get("plate_text") or None,
+        "plate_status": row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
         "queued_at": row.get("queued_at"),
         "status": row.get("status"),
@@ -338,6 +372,9 @@ def live_monitor():
         conditions=CONDITIONS,
         zone_types=zones_for_api(),
         zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
+        violation_catalog=violation_catalog_for_ui(),
+        enabled_violations=list(load_enabled_violations()),
+        max_upload_mb=config.MAX_UPLOAD_MB,
     )
 
 
@@ -651,6 +688,7 @@ def api_upload_video():
             recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             condition=condition,
             status="uploaded",
+            file_size_bytes=file_size or None,
         )
 
         frame_error = None
@@ -687,13 +725,118 @@ def api_upload_video():
 # Detection pipeline APIs
 # ---------------------------------------------------------------------------
 
-def _run_processing(video_id: int) -> None:
-    try:
-        process_video(video_id)
-        _processing_jobs[video_id] = {"state": "done", "error": None}
-    except Exception as exc:  # surface pipeline failures to the UI
-        _processing_jobs[video_id] = {"state": "error", "error": str(exc)}
-        db.update_video(video_id, status="ready")
+def _is_processing_or_queued(video_id: int) -> bool:
+    """True if this video is currently running or waiting in the queue."""
+    if _processing_jobs.get(video_id, {}).get("state") == "processing":
+        return True
+    with _queue_lock:
+        if _running_video_id == video_id:
+            return True
+        return any(entry[0] == video_id for entry in _process_queue)
+
+
+def _processing_worker() -> None:
+    """Single worker: drain the queue one job at a time.
+
+    Exactly one inference job (YOLOv8m + ByteTrack) runs at any moment
+    because this is the only thread that ever calls ``process_video``. The
+    worker stays alive across jobs; tests may stop it via
+    ``stop_processing_worker()`` so SQLite file locks are released.
+    """
+    global _running_video_id
+    while not _worker_shutdown.is_set():
+        with _queue_cv:
+            while not _process_queue and not _worker_shutdown.is_set():
+                _queue_cv.wait(timeout=0.5)
+            if _worker_shutdown.is_set():
+                _running_video_id = None
+                return
+            if not _process_queue:
+                continue
+            video_id, enabled_violations, run_id = _process_queue.pop(0)
+            _running_video_id = video_id
+        # Transition this run from 'queued' to 'running' now that it occupies
+        # the single inference slot (status persists into processing_runs).
+        try:
+            db.start_processing_run(run_id)
+        except Exception:
+            logger.exception(
+                "Failed to mark processing run %d as running; "
+                "inference will proceed but the run row may stay 'queued'.",
+                run_id,
+            )
+        _processing_jobs[video_id] = {"state": "processing", "error": None}
+        try:
+            process_video(video_id, enabled_violations=enabled_violations)
+            _processing_jobs[video_id] = {"state": "done", "error": None}
+            db.finish_processing_run(run_id, status="completed")
+        except Exception as exc:  # surface pipeline failures to the UI
+            _processing_jobs[video_id] = {"state": "error", "error": str(exc)}
+            try:
+                db.finish_processing_run(run_id, status="failed", error_message=str(exc))
+            except Exception:
+                pass
+            try:
+                db.update_video(video_id, status="ready")
+            except Exception:
+                pass
+        finally:
+            with _queue_cv:
+                if _running_video_id == video_id:
+                    _running_video_id = None
+
+
+def _ensure_worker() -> None:
+    """Start the sequential worker if it is not already alive."""
+    global _worker_started, _worker_thread
+    with _worker_start_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            return
+        _worker_shutdown.clear()
+        _worker_thread = threading.Thread(
+            target=_processing_worker,
+            daemon=True,
+            name="tavidm-process-worker",
+        )
+        _worker_thread.start()
+        _worker_started = True
+
+
+def stop_processing_worker(timeout: float = 3.0) -> None:
+    """Stop the background worker and join it.
+
+    Production never needs this. Tests call it so the worker releases any
+    SQLite handle before the temporary database directory is deleted.
+    """
+    global _worker_started, _worker_thread, _running_video_id
+    _worker_shutdown.set()
+    with _queue_cv:
+        _queue_cv.notify_all()
+    thread = _worker_thread
+    if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+        thread.join(timeout=timeout)
+    with _worker_start_lock:
+        _worker_started = False
+        _worker_thread = None
+    _running_video_id = None
+
+
+def _enqueue_processing(video_id: int, enabled_violations: tuple[str, ...], run_id: int) -> bool:
+    """Append a job. Returns True if it must wait behind another video."""
+    with _queue_cv:
+        _process_queue.append((video_id, enabled_violations, run_id))
+        try:
+            position = [entry[0] for entry in _process_queue].index(video_id) + 1
+        except ValueError:
+            position = 0
+        slot_busy = any(
+            vid != video_id and v.get("state") == "processing"
+            for vid, v in _processing_jobs.items()
+        )
+        queued = slot_busy or position > 1
+        _queue_cv.notify_all()
+    _ensure_worker()
+    return queued
 
 
 @app.route("/api/videos/<int:video_id>/process", methods=["POST"])
@@ -702,18 +845,49 @@ def api_process_video(video_id: int):
     row = db.get_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
-    if _processing_jobs.get(video_id, {}).get("state") == "processing":
-        return jsonify({"success": False, "error": "Video is already being processed."}), 409
+    if _is_processing_or_queued(video_id):
+        queued = video_id in [e[0] for e in _process_queue]
+        return jsonify({
+            "success": False,
+            "error": "Video is already queued for processing." if queued
+            else "Video is already being processed.",
+            "queued": queued,
+        }), 409
     if not row.get("annotation_id"):
         return jsonify({
             "success": False,
             "error": "Annotate traffic zones before processing this video.",
         }), 400
 
+    # Accept an explicit violation list for this run; default to the current
+    # global enabled set. Validate against the canonical/toggleable registry.
+    payload = request.get_json(silent=True) or {}
+    requested = payload.get("enabled_violations")
+    try:
+        if requested is None:
+            enabled = load_enabled_violations()
+        else:
+            enabled = validate_enabled_violations(requested)
+    except ViolationConfigError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    import json as _json
+    run_id = db.create_processing_run(video_id, _json.dumps(list(enabled)))
+
     _processing_jobs[video_id] = {"state": "processing", "error": None}
-    thread = threading.Thread(target=_run_processing, args=(video_id,), daemon=True)
-    thread.start()
-    return jsonify({"success": True, "message": "Processing started."})
+    queued = _enqueue_processing(video_id, enabled, run_id)
+
+    if queued:
+        message = "Processing queued. Runs sequentially after the current job."
+    else:
+        message = "Processing started."
+    return jsonify({
+        "success": True,
+        "message": message,
+        "queued": queued,
+        "enabled_violations": list(enabled),
+        "run_id": run_id,
+    })
 
 
 @app.route("/api/videos/<int:video_id>/process-status", methods=["GET"])
@@ -728,6 +902,7 @@ def api_process_status(video_id: int):
         "video_status": row.get("status"),
         "job_state": job.get("state"),
         "job_error": job.get("error"),
+        "queued": _is_processing_or_queued(video_id),
     })
 
 

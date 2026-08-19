@@ -89,6 +89,8 @@
                         <th class="sortable" data-sort="timestamp">Date / Time</th>
                         <th class="sortable" data-sort="confidence">Confidence</th>
                         <th class="sortable" data-sort="status">Status</th>
+                        <th>Vehicle</th>
+                        <th>Plate</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -105,6 +107,16 @@
                             </span>
                         </td>
                         <td><span class="badge status-badge status-{{ v.status }}">{{ v.status }}</span></td>
+                        <td class="small">{{ v.vehicle_class if v.vehicle_class and v.vehicle_class != '—' else '—' }}</td>
+                        <td>
+                            {% if v.plate_status == 'recognized' and v.plate_text %}
+                            <span class="badge bg-info text-dark" title="Plate recognized">{{ v.plate_text }}</span>
+                            {% elif v.plate_status == 'unreadable' %}
+                            <span class="badge bg-warning text-dark">Unreadable</span>
+                            {% else %}
+                            <span class="badge bg-secondary">N/A</span>
+                            {% endif %}
+                        </td>
                         <td>
                             <div class="btn-group btn-group-sm">
                                 <button class="btn btn-outline-danger btn-view-detail" title="View Details"><i class="bi bi-eye"></i></button>

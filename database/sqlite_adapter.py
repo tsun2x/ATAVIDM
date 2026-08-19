@@ -111,6 +111,14 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     if migration_path.is_file():
         conn.executescript(migration_path.read_text(encoding="utf-8"))
 
+    migration_002 = Path(__file__).parent / "migrations" / "002_processing_and_evidence.sql"
+    if migration_002.is_file():
+        # Apply 002 additively and idempotently: schema.sql (the fresh schema)
+        # already contains these columns, so blind ALTERs would fail on a
+        # from-scratch DB. Guard each change with an existence check; the raw
+        # script remains the canonical reference for manual/outside migrations.
+        _apply_migration_002(conn)
+
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
             _rebuild_users_table(conn)
@@ -158,6 +166,45 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);
         """
     )
+
+
+def _apply_migration_002(conn: sqlite3.Connection) -> None:
+    """Idempotently apply the processing + evidence schema changes.
+
+    Mirrors migrations/002_processing_and_evidence.sql but guards each ALTER
+    so it is safe to run on a DB already built from the current schema.sql.
+    """
+    if _table_exists(conn, "videos"):
+        if not _column_exists(conn, "videos", "file_size_bytes"):
+            conn.execute("ALTER TABLE videos ADD COLUMN file_size_bytes INTEGER")
+
+    for table in ("review_queue", "violations"):
+        for col, col_type in (
+            ("vehicle_evidence_path", "TEXT"),
+            ("plate_evidence_path", "TEXT"),
+            ("plate_text", "TEXT"),
+            ("plate_status", "TEXT CHECK(plate_status IN ('not_attempted','unreadable','recognized')) DEFAULT 'not_attempted'"),
+        ):
+            if _table_exists(conn, table) and not _column_exists(conn, table, col):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+    if not _table_exists(conn, "processing_runs"):
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS processing_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+              started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              finished_at DATETIME,
+              status TEXT CHECK(status IN ('queued','running','completed','failed')) DEFAULT 'queued',
+              enabled_violations_json TEXT NOT NULL DEFAULT '[]',
+              error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_processing_runs_video_id ON processing_runs(video_id);
+            CREATE INDEX IF NOT EXISTS idx_processing_runs_status ON processing_runs(status);
+            """
+        )
+
 
     if _table_exists(conn, "videos"):
         if not _column_exists(conn, "videos", "status"):
@@ -292,14 +339,17 @@ def insert_video(
     recorded_at: str | None = None,
     condition: str | None = None,
     status: str = "uploaded",
+    file_size_bytes: int | None = None,
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO videos (filename, filepath, duration_sec, recorded_at, condition, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO videos (
+                filename, filepath, duration_sec, recorded_at, condition, status, file_size_bytes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (filename, filepath, duration_sec, recorded_at, condition, status),
+            (filename, filepath, duration_sec, recorded_at, condition, status, file_size_bytes),
         )
         return cursor.lastrowid
 
@@ -371,6 +421,120 @@ def mark_video_processed(video_id: int) -> None:
             "UPDATE videos SET processed = 1, status = 'processed' WHERE id = ?",
             (video_id,),
         )
+
+
+# --- Processing runs (per-run metadata + sequential queue) ---
+
+
+def create_processing_run(video_id: int, enabled_violations_json: str) -> int:
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO processing_runs (
+                video_id, status, enabled_violations_json, started_at, finished_at
+            ) VALUES (?, 'queued', ?, NULL, NULL)
+            """,
+            (video_id, enabled_violations_json),
+        )
+        return cursor.lastrowid
+
+
+def start_processing_run(run_id: int) -> None:
+    """Mark a queued run as running (called by the worker when it pops the job)."""
+    with db_session() as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """
+            UPDATE processing_runs
+            SET status = 'running', started_at = COALESCE(started_at, ?)
+            WHERE id = ?
+            """,
+            (now, run_id),
+        )
+
+
+def finish_processing_run(run_id: int, *, status: str = "completed", error_message: str | None = None) -> None:
+    with db_session() as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """
+            UPDATE processing_runs
+            SET status = ?, error_message = ?, finished_at = ?
+            WHERE id = ?
+            """,
+            (status, error_message, now, run_id),
+        )
+
+
+def get_processing_run(run_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM processing_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_processing_runs(video_id: int) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM processing_runs
+            WHERE video_id = ?
+            ORDER BY started_at DESC, id DESC
+            """,
+            (video_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def recover_orphaned_processing() -> int:
+    """Reset videos and runs left mid-flight after an unclean shutdown.
+
+    On startup there is no worker process, so any run left in 'queued' or
+    'running' is orphaned: mark it 'failed', fail its 'queued' siblings too,
+    and reset the stuck video back to 'ready' so it can be reprocessed.
+    Returns the number of videos reset.
+    """
+    recovered = 0
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT id FROM videos WHERE status = 'processing'"
+        ).fetchall()
+        for row in rows:
+            video_id = row["id"]
+            conn.execute(
+                "UPDATE videos SET status = 'ready' WHERE id = ?",
+                (video_id,),
+            )
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                UPDATE processing_runs
+                SET status = 'failed', finished_at = ?,
+                    error_message = COALESCE(error_message, 'Recovered on startup: process not running.')
+                WHERE video_id = ? AND status IN ('queued', 'running')
+                """,
+                (now, video_id),
+            )
+            recovered += 1
+    # Second pass: a job waiting in the in-memory FIFO queue can leave
+    # processing_runs.status = 'queued' (with videos.status = 'ready') if the
+    # app crashed before the worker popped it. The video is already 'ready' so
+    # the first pass never sees it; fail any stale queued/running runs here.
+    with db_session() as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """
+            UPDATE processing_runs
+            SET status = 'failed', finished_at = ?,
+                error_message = COALESCE(error_message, 'Recovered on startup: worker not running.')
+            WHERE status IN ('queued', 'running')
+            """,
+            (now,),
+        )
+    return recovered
+
 
 
 # --- Zone Templates ---
@@ -639,14 +803,19 @@ def insert_violation(
     status: str = "confirmed",
     reviewed_by: int | None = None,
     vehicle_class: str | None = None,
+    vehicle_evidence_path: str | None = None,
+    plate_evidence_path: str | None = None,
+    plate_text: str | None = None,
+    plate_status: str = "not_attempted",
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO violations (
                 video_id, track_id, violation_type, vehicle_class, confidence,
-                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by,
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
@@ -660,6 +829,10 @@ def insert_violation(
                 reason_log,
                 status,
                 reviewed_by,
+                vehicle_evidence_path,
+                plate_evidence_path,
+                plate_text,
+                plate_status,
             ),
         )
         return cursor.lastrowid
@@ -804,14 +977,19 @@ def insert_review_queue(
     status: str = "pending",
     vehicle_class: str | None = None,
     timestamp_sec: float | None = None,
+    vehicle_evidence_path: str | None = None,
+    plate_evidence_path: str | None = None,
+    plate_text: str | None = None,
+    plate_status: str = "not_attempted",
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO review_queue (
                 video_id, track_id, violation_type, vehicle_class, confidence,
-                frame_number, timestamp_sec, evidence_path, reason_log, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                frame_number, timestamp_sec, evidence_path, reason_log, status,
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
@@ -824,6 +1002,10 @@ def insert_review_queue(
                 evidence_path,
                 reason_log,
                 status,
+                vehicle_evidence_path,
+                plate_evidence_path,
+                plate_text,
+                plate_status,
             ),
         )
         return cursor.lastrowid
@@ -875,24 +1057,33 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
             if "timestamp_sec" in row_keys and row["timestamp_sec"] is not None
             else (row["frame_number"] or 0) / 30.0
         )
+
+        def _pick(col):
+            return row[col] if col in row_keys else None
+
         cursor = conn.execute(
             """
             INSERT INTO violations (
                 video_id, track_id, violation_type, vehicle_class, confidence,
-                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
+                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by,
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)
             """,
             (
                 row["video_id"],
                 row["track_id"],
                 row["violation_type"],
-                row["vehicle_class"] if "vehicle_class" in row_keys else None,
+                _pick("vehicle_class"),
                 row["confidence"],
                 row["frame_number"],
                 timestamp_sec,
-                row["evidence_path"],
-                row["reason_log"],
+                _pick("evidence_path"),
+                _pick("reason_log"),
                 reviewed_by,
+                _pick("vehicle_evidence_path"),
+                _pick("plate_evidence_path"),
+                _pick("plate_text"),
+                _pick("plate_status"),
             ),
         )
         violation_id = cursor.lastrowid

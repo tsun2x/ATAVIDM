@@ -64,3 +64,60 @@ def save_evidence_snapshot(
         return str(out_path.resolve().relative_to(base)).replace("\\", "/")
     except ValueError:
         return str(out_path)
+
+
+def _crop_bbox(frame: Any, detection: dict[str, Any]) -> Any | None:
+    """Return the cropped region for a detection's bbox, or None if invalid."""
+    h_img, w_img = frame.shape[:2]
+    x = int(round(float(detection["bbox_x"])))
+    y = int(round(float(detection["bbox_y"])))
+    w = int(round(float(detection["bbox_w"])))
+    hh = int(round(float(detection["bbox_h"])))
+    if w <= 0 or hh <= 0:
+        return None
+    # Clamp to frame bounds (detections are occasionally slightly out of frame).
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(w_img, x + w)
+    y2 = min(h_img, y + hh)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2]
+
+
+def save_vehicle_crop(
+    frame: Any,
+    detection: dict[str, Any],
+    source_key: str,
+    frame_number: int,
+) -> str | None:
+    """
+    Save a tight crop of the detected vehicle/object (no annotation overlay).
+
+    Returns the project-relative path (``static/evidence/<source>/vehicle_*.jpg``)
+    or ``None`` if the bbox is missing or empty. This is the vehicle evidence
+    image surfaced in the violations/review detail + evidence modals.
+
+    NOTE: This is NOT license-plate recognition. No OCR or plate text is
+    generated here; plate fields are managed separately and intentionally left
+    as 'not_attempted' until an ALPR module is added.
+    """
+    crop = _crop_bbox(frame, detection)
+    if crop is None:
+        return None
+
+    out_dir = Path(EVIDENCE_FOLDER) / _slug(source_key)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    track_id = int(detection.get("track_id", -1))
+    filename = f"vehicle_f{frame_number:06d}_t{track_id:03d}.jpg"
+    out_path = out_dir / filename
+    ok = cv2.imwrite(str(out_path), crop)
+    if not ok:
+        return None
+
+    base = Path(EVIDENCE_FOLDER).resolve().parent.parent  # project root
+    try:
+        return str(out_path.resolve().relative_to(base)).replace("\\", "/")
+    except ValueError:
+        return str(out_path)

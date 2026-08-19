@@ -145,22 +145,104 @@
         }, 3000);
     }
 
-    btnProcess?.addEventListener("click", function () {
-        if (!activeVideo) return;
-        const videoId = activeVideo.db_id;
-        btnProcess.classList.add("d-none");
-        fetch("/api/videos/" + videoId + "/process", { method: "POST" })
+    const processConfirmModal = document.getElementById("processConfirmModal");
+    const pcViolationList = document.getElementById("pcViolationList");
+    let pendingProcessVideo = null;
+
+    function templateNameFor(video) {
+        if (!video || !video.template_id) return "—";
+        const tpls = window.TAVIDM_ZONE_TEMPLATES || [];
+        const tpl = tpls.find(function (t) { return t.id === video.template_id; });
+        return tpl ? tpl.template_name : "—";
+    }
+
+    function humanFileSize(bytes) {
+        if (!bytes) return "—";
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+        return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    function buildProcessChecklist(video) {
+        const catalog = window.TAVIDM_VIOLATION_CATALOG || [];
+        const enabled = new Set(window.TAVIDM_ENABLED_VIOLATIONS || []);
+        if (!pcViolationList) return;
+        if (!catalog.length) {
+            pcViolationList.innerHTML = '<div class="text-muted small">No violation types available.</div>';
+            return;
+        }
+        pcViolationList.innerHTML = catalog.map(function (v) {
+            const checked = enabled.has(v.name);
+            const badge = !v.toggleable
+                ? '<span class="badge bg-secondary-subtle text-secondary ms-2">planned</span>'
+                : (v.implemented
+                    ? '<span class="badge bg-success-subtle text-success ms-2">implemented</span>'
+                    : '<span class="badge bg-warning-subtle text-warning ms-2">partial</span>');
+            const disabled = v.toggleable ? "" : " disabled";
+            const help = v.toggleable ? "" : ' <small class="text-muted">(planned — cannot be enabled yet)</small>';
+            return (
+                '<div class="form-check py-1">' +
+                '<input class="form-check-input pc-violation-toggle" type="checkbox" ' +
+                'id="pcv-' + v.name.replace(/[^a-z0-9]/gi, "_") + '" value="' + v.name + '"' +
+                (checked ? " checked" : "") + disabled + ">" +
+                '<label class="form-check-label ms-1" for="pcv-' + v.name.replace(/[^a-z0-9]/gi, "_") + '">' +
+                v.name + badge + help + "</label>" +
+                "</div>"
+            );
+        }).join("");
+    }
+
+    function openProcessConfirm(video) {
+        if (!video) return;
+        pendingProcessVideo = video;
+        const fn = document.getElementById("pcFilename");
+        const cond = document.getElementById("pcCondition");
+        const fs = document.getElementById("pcFilesize");
+        const tpl = document.getElementById("pcTemplate");
+        if (fn) fn.textContent = video.filename || "—";
+        if (cond) cond.textContent = (video.condition || "peak").charAt(0).toUpperCase() + (video.condition || "peak").slice(1);
+        if (fs) fs.textContent = humanFileSize(video.file_size_bytes);
+        if (tpl) tpl.textContent = templateNameFor(video);
+        buildProcessChecklist(video);
+        const modal = processConfirmModal ? bootstrap.Modal.getOrCreateInstance(processConfirmModal) : null;
+        if (modal) modal.show();
+    }
+
+    function collectEnabledViolations() {
+        return Array.from(document.querySelectorAll(".pc-violation-toggle:checked"))
+            .map(function (el) { return el.value; });
+    }
+
+    document.getElementById("btnConfirmProcess")?.addEventListener("click", function () {
+        if (!pendingProcessVideo) return;
+        const videoId = pendingProcessVideo.db_id;
+        const enabled = collectEnabledViolations();
+        const modal = processConfirmModal ? bootstrap.Modal.getOrCreateInstance(processConfirmModal) : null;
+        if (modal) modal.hide();
+        btnProcess?.classList.add("d-none");
+        fetch("/api/videos/" + videoId + "/process", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled_violations: enabled }),
+        })
             .then(function (r) { return r.json(); })
             .then(function (payload) {
                 if (payload.success) {
-                    feedStatus.textContent = "Processing with YOLOv8m + ByteTrack…";
-                    showToast("Processing Started", activeVideo.filename, "info");
+                    feedStatus.textContent = payload.queued
+                        ? (payload.message || "Processing queued.")
+                        : "Processing with YOLOv8m + ByteTrack…";
+                    showToast("Processing Started", activeVideo.filename + (payload.queued ? " (queued)" : ""), "info");
                     pollProcessing(videoId);
                 } else {
                     showToast("Error", payload.error || "Could not start processing.", "danger");
-                    btnProcess.classList.remove("d-none");
+                    btnProcess?.classList.remove("d-none");
                 }
             });
+    });
+
+    btnProcess?.addEventListener("click", function () {
+        if (!activeVideo) return;
+        openProcessConfirm(activeVideo);
     });
 
     // --- Violation alerts (pending review queue items) ---------------------------

@@ -231,12 +231,52 @@
         </div>
     </div>
 </div>
+
+<!-- Pre-processing confirmation modal -->
+<div class="modal fade" id="processConfirmModal" tabindex="-1" aria-labelledby="processConfirmLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="processConfirmLabel"><i class="bi bi-cpu me-2"></i>Confirm Processing Run</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info small mb-3">
+                    <i class="bi bi-info-circle me-1"></i>
+                    These rules apply to <strong>this processing run only</strong>. Global defaults
+                    remain in <strong>Settings</strong> and still drive live streams.
+                </div>
+                <div class="mb-3">
+                    <div class="row g-2 small">
+                        <div class="col-sm-6"><span class="text-muted">Video:</span> <strong id="pcFilename">—</strong></div>
+                        <div class="col-sm-3"><span class="text-muted">Condition:</span> <strong id="pcCondition">—</strong></div>
+                        <div class="col-sm-3"><span class="text-muted">File size:</span> <strong id="pcFilesize">—</strong></div>
+                    </div>
+                    <div class="text-muted small mt-1">
+                        Annotation template: <span id="pcTemplate">—</span>
+                    </div>
+                </div>
+                <label class="form-label small fw-semibold">Violation rules for this run</label>
+                <div id="pcViolationList" class="pc-violation-list border rounded p-2" style="max-height: 280px; overflow: auto;">
+                    <!-- populated by live_monitor.js -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btnConfirmProcess"><i class="bi bi-cpu me-1"></i> Start Processing</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
     window.TAVIDM_ZONE_TYPES = {{ zone_types | tojson }};
     window.TAVIDM_ZONE_TEMPLATES = {{ zone_templates | tojson }};
+    window.TAVIDM_VIOLATION_CATALOG = {{ violation_catalog | tojson }};
+    window.TAVIDM_ENABLED_VIOLATIONS = {{ enabled_violations | tojson }};
+    window.TAVIDM_MAX_UPLOAD_MB = {{ max_upload_mb }};
 </script>
 <script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>

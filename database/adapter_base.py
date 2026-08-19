@@ -43,6 +43,7 @@ class DatabaseAdapter(Protocol):
         recorded_at: str | None = None,
         condition: str | None = None,
         status: str = "uploaded",
+        file_size_bytes: int | None = None,
     ) -> int: ...
     def update_video(
         self,
@@ -126,7 +127,19 @@ class DatabaseAdapter(Protocol):
         status: str = "confirmed",
         reviewed_by: int | None = None,
         vehicle_class: str | None = None,
+        vehicle_evidence_path: str | None = None,
+        plate_evidence_path: str | None = None,
+        plate_text: str | None = None,
+        plate_status: str | None = None,
     ) -> int: ...
+    def create_processing_run(self, video_id: int, enabled_violations_json: str) -> int: ...
+    def start_processing_run(self, run_id: int) -> None: ...
+    def finish_processing_run(
+        self, run_id: int, *, status: str = "completed", error_message: str | None = None
+    ) -> None: ...
+    def get_processing_run(self, run_id: int) -> dict[str, Any] | None: ...
+    def list_processing_runs(self, video_id: int) -> list[dict[str, Any]]: ...
+    def recover_orphaned_processing(self) -> int: ...
     def get_violation(self, violation_id: int) -> dict[str, Any] | None: ...
     def list_violations(
         self,
@@ -157,6 +170,10 @@ class DatabaseAdapter(Protocol):
         status: str = "pending",
         vehicle_class: str | None = None,
         timestamp_sec: float | None = None,
+        vehicle_evidence_path: str | None = None,
+        plate_evidence_path: str | None = None,
+        plate_text: str | None = None,
+        plate_status: str | None = None,
     ) -> int: ...
     def list_review_queue(
         self,

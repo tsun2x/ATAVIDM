@@ -15,7 +15,7 @@ import cv2
 
 from core.detection_config import confidence_band
 from core.detector import Detector, DetectorError
-from core.evidence import save_evidence_snapshot
+from core.evidence import save_evidence_snapshot, save_vehicle_crop
 from core.tracker import TrackState
 from core.video_processor import load_rule_parameters
 from core.violation_config import load_enabled_violations
@@ -122,9 +122,15 @@ class LiveStreamWorker(threading.Thread):
                 for event in events:
                     det = by_track.get(event.track_id)
                     evidence_path = None
+                    vehicle_evidence_path = None
                     if det is not None:
                         evidence_path = save_evidence_snapshot(
                             frame, det, event.violation_type,
+                            source_key=f"camera_{self.camera['id']}",
+                            frame_number=event.frame_number,
+                        )
+                        vehicle_evidence_path = save_vehicle_crop(
+                            frame, det,
                             source_key=f"camera_{self.camera['id']}",
                             frame_number=event.frame_number,
                         )
@@ -135,6 +141,8 @@ class LiveStreamWorker(threading.Thread):
                         confidence=event.confidence,
                         frame_number=event.frame_number,
                         evidence_path=evidence_path,
+                        vehicle_evidence_path=vehicle_evidence_path,
+                        plate_status="not_attempted",
                         reason_log=(
                             f"[{confidence_band(event.confidence)}] "
                             f"[camera:{self.camera['name']}] {event.reason_log}"

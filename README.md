@@ -131,9 +131,41 @@ Edit `.env` if needed:
 | `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
 | `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
 | `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
-| `MAX_UPLOAD_MB` | `500` | Max upload size in MB |
+| `MAX_UPLOAD_MB` | `500` | Max single upload size in MB (env-driven; UI shows it on the upload panel) |
+| `UPLOAD_DISK_HEADROOM_MB` | `500` | Free-disk headroom (MB) required *in addition to* the file size before an upload is accepted |
 
 The app runs without a `.env` file — defaults are used. `.env` is gitignored.
+
+### Recorded-footage uploads (large files)
+
+Uploaded MP4s are saved **in full** to `dataset/raw`, so multi-GB footage is
+not "free". Two guards protect the host:
+
+- **Size limit** — `MAX_UPLOAD_MB` (default `500`) enforces the hard cap and
+  returns a clear `413`/`400` when exceeded. Raise it only after confirming
+  there is enough free disk for the file plus headroom.
+- **Disk-space pre-check** — before saving, the upload path is checked with
+  `shutil.disk_usage`. The request must leave at least `UPLOAD_DISK_HEADROOM_MB`
+  (default `500` MB) free; otherwise it is rejected with a clear error instead
+  of filling the volume mid-write.
+
+### Sequential processing queue
+
+Only **one** video is processed at a time (a single YOLOv8m + ByteTrack
+inference job — the RTX 3050 6 GB cannot run two). Each `POST
+/api/videos/<id>/process` request:
+
+1. Opens a **pre-processing confirmation modal** listing the 12 canonical
+   violation types as toggles (defaults = current global enabled set from
+   Settings). The submitted list is the **run's frozen snapshot** — later
+   changes to global Settings do not affect an in-flight run.
+2. On submit, validates the list via `validate_enabled_violations()` and
+   persists it in the `processing_runs` table (`enabled_violations_json`).
+3. Enqueues the job. A second video is **auto-queued** (response
+   `queued: true`) and runs after the first; requesting the *same* video again
+   returns `409`.
+4. On restart, any video left in `processing` is reset to `ready` and its
+   `processing_runs` row marked `failed` (orphan recovery).
 
 ---
 

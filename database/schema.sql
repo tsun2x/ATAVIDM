@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS videos (
   status TEXT CHECK(status IN ('uploaded','annotating','ready','processing','processed')) DEFAULT 'uploaded',
   annotation_id INTEGER,
   template_id INTEGER REFERENCES zone_templates(id),
+  file_size_bytes INTEGER,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -73,7 +74,11 @@ CREATE TABLE IF NOT EXISTS violations (
   evidence_path TEXT,
   reason_log TEXT,
   status TEXT CHECK(status IN ('confirmed','dismissed','pending')) DEFAULT 'confirmed',
-  reviewed_by INTEGER REFERENCES users(id)
+  reviewed_by INTEGER REFERENCES users(id),
+  vehicle_evidence_path TEXT,
+  plate_evidence_path TEXT,
+  plate_text TEXT,
+  plate_status TEXT CHECK(plate_status IN ('not_attempted','unreadable','recognized')) DEFAULT 'not_attempted'
 );
 
 CREATE TABLE IF NOT EXISTS review_queue (
@@ -90,7 +95,11 @@ CREATE TABLE IF NOT EXISTS review_queue (
   status TEXT CHECK(status IN ('pending','confirmed','dismissed')) DEFAULT 'pending',
   queued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   reviewed_by INTEGER REFERENCES users(id),
-  reviewed_at DATETIME
+  reviewed_at DATETIME,
+  vehicle_evidence_path TEXT,
+  plate_evidence_path TEXT,
+  plate_text TEXT,
+  plate_status TEXT CHECK(plate_status IN ('not_attempted','unreadable','recognized')) DEFAULT 'not_attempted'
 );
 
 -- RTSP-supported live CCTV camera streams (manuscript Ch1 Scope, Ch3 Data Source).
@@ -133,3 +142,17 @@ CREATE INDEX IF NOT EXISTS idx_violations_detected_at ON violations(detected_at)
 CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
 CREATE INDEX IF NOT EXISTS idx_detections_video_frame ON detections(video_id, frame_number);
 CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);
+
+-- Per-run processing metadata: a run freezes the violation snapshot it used.
+CREATE TABLE IF NOT EXISTS processing_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  status TEXT CHECK(status IN ('queued','running','completed','failed')) DEFAULT 'queued',
+  enabled_violations_json TEXT NOT NULL DEFAULT '[]',
+  error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_runs_video_id ON processing_runs(video_id);
+CREATE INDEX IF NOT EXISTS idx_processing_runs_status ON processing_runs(status);

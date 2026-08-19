@@ -12,13 +12,28 @@
     function showEvidence(item) {
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
-        const image = item.evidence_url
-            ? '<img src="' + item.evidence_url + '" alt="Evidence" class="evidence-preview">'
+        const sceneImg = item.evidence_url
+            ? '<img src="' + item.evidence_url + '" alt="Evidence" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
+        const vehicleImg = item.vehicle_evidence_url
+            ? '<img src="' + item.vehicle_evidence_url + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
+            : '<div class="text-muted py-4"><i class="bi bi-car-front fs-1 d-block mb-2"></i>No vehicle crop captured.</div>';
+        const plateStatus = item.plate_status || "not_attempted";
+        const plateLine = plateStatus === "recognized" && item.plate_text
+            ? "Plate: " + item.plate_text
+            : (plateStatus === "unreadable" ? "Plate: unreadable" : "Plate: not recognized (no ALPR in this build)");
         body.innerHTML =
-            image +
+            '<ul class="nav nav-tabs mb-3" role="tablist">' +
+            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">Scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqVehicle" type="button" role="tab">Vehicle</button></li>' +
+            "</ul>" +
+            '<div class="tab-content">' +
+            '<div class="tab-pane fade show active" id="rqScene" role="tabpanel">' + sceneImg + "</div>" +
+            '<div class="tab-pane fade" id="rqVehicle" role="tabpanel">' + vehicleImg + "</div>" +
+            "</div>" +
             "<p class=\"mt-3 text-muted\">" + item.display_id + " · " + item.violation_type + " · Track #" + item.track_id + "</p>" +
-            "<p class=\"small text-muted\">" + item.reason_log + "</p>";
+            "<p class=\"small text-muted\">" + item.reason_log + "</p>" +
+            "<p class=\"small text-muted\">" + plateLine + "</p>";
         evidenceModal.show();
     }
 

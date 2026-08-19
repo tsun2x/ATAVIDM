@@ -34,6 +34,32 @@
         return "low";
     }
 
+    function escapeHtml(s) {
+        return String(s == null ? "" : s)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function plateBadge(v) {
+        const status = v.plate_status || "not_attempted";
+        if (status === "recognized" && v.plate_text) {
+            return '<span class="badge bg-success-subtle text-success" title="Plate recognized">' +
+                escapeHtml(v.plate_text) + "</span>";
+        }
+        if (status === "unreadable") {
+            return '<span class="badge bg-warning-subtle text-warning" title="Plate present but unreadable">Unreadable</span>';
+        }
+        return '<span class="badge bg-secondary-subtle text-secondary" title="No plate recognition attempted">N/A</span>';
+    }
+
+    function evidenceImage(url, caption) {
+        if (!url) {
+            return '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>' +
+                (caption || "No evidence snapshot available.") + "</div>";
+        }
+        return '<img src="' + url + '" alt="' + (caption || "Evidence") +
+            '" class="evidence-preview img-fluid rounded">';
+    }
+
     function applyFilters() {
         const query = (searchInput?.value || "").toLowerCase().trim();
         const type = filterType?.value || "";
@@ -85,6 +111,7 @@
 
         if (tbody) {
             tbody.innerHTML = page.map(function (v) {
+                const plate = plateBadge(v);
                 return (
                     "<tr data-violation='" + JSON.stringify(v).replace(/'/g, "&#39;") + "'>" +
                     "<td><code>" + v.id + "</code></td>" +
@@ -94,6 +121,8 @@
                     '<td><span class="confidence-badge confidence-' + getConfidenceClass(v.confidence) + '">' +
                     Math.round(v.confidence * 100) + "%</span></td>" +
                     '<td><span class="badge status-badge status-' + v.status + '">' + v.status + "</span></td>" +
+                    '<td class="small">' + (v.vehicle_class && v.vehicle_class !== "—" ? escapeHtml(v.vehicle_class) : "—") + "</td>" +
+                    "<td>" + plate + "</td>" +
                     '<td><div class="btn-group btn-group-sm">' +
                     '<button class="btn btn-outline-danger btn-view-detail"><i class="bi bi-eye"></i></button>' +
                     '<button class="btn btn-outline-secondary btn-view-evidence"><i class="bi bi-image"></i></button>' +
@@ -138,6 +167,13 @@
             detailField("Track ID", "#" + v.track_id) +
             detailField("Video Source", v.video_name) +
             detailField("Condition", v.condition) +
+            detailField("Vehicle Class", v.vehicle_class && v.vehicle_class !== "—" ? escapeHtml(v.vehicle_class) : "—") +
+            detailField("Plate", (function () {
+                const ps = v.plate_status || "not_attempted";
+                if (ps === "recognized" && v.plate_text) return escapeHtml(v.plate_text);
+                if (ps === "unreadable") return "Unreadable";
+                return "—";
+            })()) +
             detailField("Frame", v.frame_number) +
             detailField("Timestamp", v.timestamp) +
             detailField("Confidence", Math.round(v.confidence * 100) + "%") +
@@ -155,12 +191,19 @@
         selectedViolation = v;
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
-        const image = v.evidence_url
-            ? '<img src="' + v.evidence_url + '" alt="Evidence" class="evidence-preview">'
-            : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
+        const sceneImg = evidenceImage(v.evidence_url, "No scene evidence snapshot available.");
+        const vehicleImg = evidenceImage(v.vehicle_evidence_url, "No vehicle crop captured for this detection.");
         body.innerHTML =
-            image +
-            "<p class=\"mt-3 text-muted\">" + v.id + " · " + v.type + " · Track #" + v.track_id + " · " + v.timestamp + "</p>";
+            '<ul class="nav nav-tabs mb-3" role="tablist">' +
+            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#paneScene" type="button" role="tab">Scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneVehicle" type="button" role="tab">Vehicle</button></li>' +
+            "</ul>" +
+            '<div class="tab-content">' +
+            '<div class="tab-pane fade show active" id="paneScene" role="tabpanel">' + sceneImg +
+            "<p class=\"mt-2 text-muted small\">" + v.id + " · " + v.type + " · Track #" + v.track_id + " · " + v.timestamp + "</p></div>" +
+            '<div class="tab-pane fade" id="paneVehicle" role="tabpanel">' + vehicleImg +
+            "<p class=\"mt-2 text-muted small\">Vehicle/object crop. Plate recognition is not performed in this build.</p></div>" +
+            "</div>";
         evidenceModal.show();
     }
 
