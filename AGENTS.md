@@ -23,11 +23,12 @@ You are **Hermes — Primary Autonomous Developer / Implementer** for this compu
 - **Purpose**: AI-assisted traffic violation detection and monitoring system
 - **Tech Stack**: Python 3.10+, Flask, OpenCV, YOLOv8m + ByteTrack, SQLite, Bootstrap 5
 - **Architecture**: Server-side rendered Flask monolith with modular `core/` processing pipeline
-- **Current Status**: Production-ready system with a frozen 12-type canonical violation roster (implemented, partial, and planned rules)
+- **Current Status**: Production-ready system with a frozen 12-type canonical violation roster and a frozen 12-class vehicle detector roster (includes separate `pickup_truck`)
 
 **Preserve these requirements:**
 - Always use YOLOv8m model unless authoritatively changed to custom weights
 - Maintain all 12 canonical violation types without removing existing detection classes
+- Maintain the frozen 12 vehicle detector classes from `config/training/class_schema.json`
 - Preserve API endpoints and database schemas
 - Do NOT rewrite with different frameworks (e.g., FastAPI, React, microservices)
 - Keep the rule-based engine architecture intact

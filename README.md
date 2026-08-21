@@ -21,6 +21,8 @@ TAVIDM is a **Flask web application** that detects traffic violations in recorde
 
 Custom-trained YOLOv8m weights (with helmet/rider classes) are loaded from `models/` when present; otherwise the pretrained COCO YOLOv8m checkpoint is downloaded automatically on first processing run. Helmet-based rules stay inactive until custom weights are provided.
 
+Phase 2 full training is currently blocked pending dataset and governance evidence. See `docs/PHASE_2_AI_TRAINING_READINESS.md`, `docs/SYSTEM_TRUTH_INDEX.md`, and run `.\venv\Scripts\python.exe -m core.phase2_readiness` to view the machine-enforced entry-gate findings. The frozen pilot label contract is `config/training/class_schema.json` (12 vehicle detector classes including `pickup_truck`; 26 total pilot labels).
+
 ---
 
 ## Requirements

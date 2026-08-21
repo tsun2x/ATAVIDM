@@ -31,52 +31,147 @@ PRETRAINED_WEIGHTS = "yolov8m.pt"
 # ---------------------------------------------------------------------------
 # Detection classes
 # ---------------------------------------------------------------------------
-# NOTE: The manuscript states thirteen (13) detection classes but never
-# enumerates the full list. The registry below is the union of the concrete
-# class lists that appear in Chapter 3 (Phase 3 annotation list, Functional
-# Requirements, and Software Requirements sections).
+# Frozen Phase 2 vehicle detector roster (owner-approved): exactly 12 vehicle
+# labels. Machine-readable contract: config/training/class_schema.json.
+# Attribute / person labels remain separate from the vehicle roster.
+# Broad hierarchy keys (passenger_vehicle, etc.) are NOT detector labels.
+
 YOLO_CLASS_CAR = "car"
-YOLO_CLASS_SUV = "suv"
+YOLO_CLASS_SUV_CROSSOVER = "suv_crossover"
+YOLO_CLASS_VAN = "van"
 YOLO_CLASS_JEEPNEY = "jeepney"
+YOLO_CLASS_UV_EXPRESS_VAN = "uv_express_van"
+YOLO_CLASS_TRICYCLE = "tricycle"
+YOLO_CLASS_PIAGGIO = "piaggio"
 YOLO_CLASS_BUS = "bus"
 YOLO_CLASS_TRUCK = "truck"
+YOLO_CLASS_PICKUP_TRUCK = "pickup_truck"
 YOLO_CLASS_MOTORCYCLE = "motorcycle"
 YOLO_CLASS_BICYCLE = "bicycle"
 YOLO_CLASS_RIDER = "rider"
 YOLO_CLASS_PERSON = "person"
-YOLO_CLASS_HELMET = "helmet"
+YOLO_CLASS_HELMET_ACCEPTABLE = "helmet_acceptable"
+YOLO_CLASS_HELMET_NUT_SHELL = "helmet_nut_shell"
+YOLO_CLASS_SIDE_MIRROR = "side_mirror"
 
-DETECTION_CLASSES = (
+# Legacy aliases accepted from older models / manuscript wording.
+YOLO_CLASS_SUV = "suv"  # legacy alias for suv_crossover
+YOLO_CLASS_HELMET = "helmet"  # legacy generic helmet class
+
+FROZEN_VEHICLE_DETECTOR_CLASSES = (
     YOLO_CLASS_CAR,
-    YOLO_CLASS_SUV,
+    YOLO_CLASS_SUV_CROSSOVER,
+    YOLO_CLASS_VAN,
     YOLO_CLASS_JEEPNEY,
+    YOLO_CLASS_UV_EXPRESS_VAN,
+    YOLO_CLASS_TRICYCLE,
+    YOLO_CLASS_PIAGGIO,
     YOLO_CLASS_BUS,
     YOLO_CLASS_TRUCK,
+    YOLO_CLASS_PICKUP_TRUCK,
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_BICYCLE,
+)
+
+# Derived hierarchy (not detector labels). Keys match class_schema.json.
+VEHICLE_HIERARCHY: dict[str, tuple[str, ...]] = {
+    "passenger_vehicle": (
+        YOLO_CLASS_CAR,
+        YOLO_CLASS_SUV_CROSSOVER,
+        YOLO_CLASS_VAN,
+    ),
+    "public_utility_vehicle": (
+        YOLO_CLASS_JEEPNEY,
+        YOLO_CLASS_UV_EXPRESS_VAN,
+        YOLO_CLASS_TRICYCLE,
+        YOLO_CLASS_PIAGGIO,
+        YOLO_CLASS_BUS,
+    ),
+    "commercial_vehicle": (
+        YOLO_CLASS_TRUCK,
+        YOLO_CLASS_PICKUP_TRUCK,
+    ),
+    "two_or_three_wheeled": (
+        YOLO_CLASS_MOTORCYCLE,
+        YOLO_CLASS_TRICYCLE,
+        YOLO_CLASS_PIAGGIO,
+        YOLO_CLASS_BICYCLE,
+    ),
+}
+
+# Display categories used by analytics UI (derived; not detector labels).
+VEHICLE_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "Passenger Vehicle": VEHICLE_HIERARCHY["passenger_vehicle"],
+    "Public Utility Vehicle": VEHICLE_HIERARCHY["public_utility_vehicle"],
+    "Commercial Vehicle": VEHICLE_HIERARCHY["commercial_vehicle"],
+    "Two- or Three-Wheeled Vehicle": VEHICLE_HIERARCHY["two_or_three_wheeled"],
+}
+
+# Runtime vehicle set used by the rule engine (frozen + legacy suv alias).
+VEHICLE_CLASSES = FROZEN_VEHICLE_DETECTOR_CLASSES + (YOLO_CLASS_SUV,)
+
+# Full detector allow-list: frozen vehicles + attributes + legacy aliases.
+DETECTION_CLASSES = VEHICLE_CLASSES + (
     YOLO_CLASS_RIDER,
     YOLO_CLASS_PERSON,
+    YOLO_CLASS_HELMET_ACCEPTABLE,
+    YOLO_CLASS_HELMET_NUT_SHELL,
+    YOLO_CLASS_SIDE_MIRROR,
     YOLO_CLASS_HELMET,
 )
 
-# Manuscript vehicle classifications (Ch1 Scope): four categories.
-VEHICLE_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "Private Vehicle": (YOLO_CLASS_CAR, YOLO_CLASS_SUV),
-    "Public Utility Vehicle": (YOLO_CLASS_JEEPNEY, YOLO_CLASS_BUS),
-    "Commercial Vehicle": (YOLO_CLASS_TRUCK,),
-    "Two-Wheeled Vehicle": (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_BICYCLE),
+# Truck-ban applicability is explicit and configurable. Default: truck only.
+# pickup_truck is NOT automatically covered by truck-ban rules.
+DEFAULT_TRUCK_BAN_CLASSES = (YOLO_CLASS_TRUCK,)
+
+# Cargo-area passenger rule applicability (planned rule; registry only).
+CARGO_PASSENGER_APPLICABLE_CLASSES = (
+    YOLO_CLASS_TRUCK,
+    YOLO_CLASS_PICKUP_TRUCK,
+)
+
+LEGACY_VEHICLE_CLASS_ALIASES = {
+    YOLO_CLASS_SUV: YOLO_CLASS_SUV_CROSSOVER,
 }
 
-VEHICLE_CLASSES = tuple(
-    cls for classes in VEHICLE_CATEGORIES.values() for cls in classes
-)
+
+def normalize_vehicle_class(class_label: str) -> str:
+    """Map legacy vehicle labels onto the frozen detector roster when known."""
+    return LEGACY_VEHICLE_CLASS_ALIASES.get(class_label, class_label)
+
+
+def vehicle_hierarchy_key(class_label: str) -> str | None:
+    """Return the derived hierarchy key for a detector class, if any."""
+    canon = normalize_vehicle_class(class_label)
+    for key, members in VEHICLE_HIERARCHY.items():
+        if canon in members:
+            return key
+    return None
 
 
 def vehicle_category(class_label: str) -> str | None:
+    """Return the display category for analytics (derived; not a detector label)."""
+    canon = normalize_vehicle_class(class_label)
     for category, classes in VEHICLE_CATEGORIES.items():
-        if class_label in classes:
+        if canon in classes or class_label in classes:
             return category
     return None
+
+
+def is_cargo_passenger_applicable(class_label: str) -> bool:
+    """True when the vehicle type is in scope for the cargo-passenger rule."""
+    return normalize_vehicle_class(class_label) in CARGO_PASSENGER_APPLICABLE_CLASSES
+
+
+def is_truck_ban_applicable(
+    class_label: str,
+    ban_classes: tuple[str, ...] | list[str] | None = None,
+) -> bool:
+    """True when the vehicle type is covered by the configured truck-ban set."""
+    allowed = tuple(ban_classes) if ban_classes is not None else DEFAULT_TRUCK_BAN_CLASSES
+    return normalize_vehicle_class(class_label) in {
+        normalize_vehicle_class(name) for name in allowed
+    }
 
 
 # Classes required before helmet-based rules may run (custom weights only).
@@ -123,6 +218,7 @@ DEFAULT_RULE_PARAMETERS = {
     "loading_dwell_sec": 8.0,         # PUV stationary in no-loading zone
     "truck_ban_start": "06:00",
     "truck_ban_end": "09:00",
+    "truck_ban_classes": list(DEFAULT_TRUCK_BAN_CLASSES),
     "lane_flow_degrees": 90.0,        # allowed travel direction in active lane
     "flow_tolerance_degrees": 60.0,   # deviation from opposite dir = counterflow
     "min_direction_px": 40.0,         # min displacement before direction is valid

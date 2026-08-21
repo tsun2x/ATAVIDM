@@ -25,6 +25,7 @@ from core.detection_config import (
     VIOLATION_TRUCK_BAN,
     DEFAULT_RULE_PARAMETERS,
     DEFAULT_ENABLED_VIOLATIONS,
+    DEFAULT_TRUCK_BAN_CLASSES,
     RIDER_ASSOCIATION_PADDING,
     VIOLATION_PERSISTENCE_SEC,
     VEHICLE_CLASSES,
@@ -33,13 +34,24 @@ from core.detection_config import (
     YOLO_CLASS_JEEPNEY,
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_PERSON,
-    YOLO_CLASS_TRUCK,
+    YOLO_CLASS_PIAGGIO,
+    YOLO_CLASS_TRICYCLE,
+    YOLO_CLASS_UV_EXPRESS_VAN,
+    is_truck_ban_applicable,
     vehicle_category,
 )
 from core.tracker import angle_difference, point_in_polygon
 
-# Public Utility Vehicles subject to loading/unloading restrictions
-PUV_CLASSES = (YOLO_CLASS_JEEPNEY, YOLO_CLASS_BUS)
+# Public Utility Vehicles subject to loading/unloading / illegal-terminal proxy.
+# Spec terminal types: Jeepney, UV Express / Van, Tricycle, Piaggio.
+# Bus remains included to preserve existing loading-zone behavior.
+PUV_CLASSES = (
+    YOLO_CLASS_JEEPNEY,
+    YOLO_CLASS_UV_EXPRESS_VAN,
+    YOLO_CLASS_TRICYCLE,
+    YOLO_CLASS_PIAGGIO,
+    YOLO_CLASS_BUS,
+)
 DEFAULT_RESTRICTED_LANE_CLASSES = (YOLO_CLASS_MOTORCYCLE, "bicycle")
 
 
@@ -426,14 +438,23 @@ def check_truck_ban(
     params: dict[str, Any],
     now_time: dtime | None = None,
 ) -> list[ViolationEvent]:
-    """Truck inside a Truck Ban Zone during the configured ban window."""
+    """Applicable commercial vehicle inside a Truck Ban Zone during the ban window.
+
+    Applicability is controlled by ``params['truck_ban_classes']`` (default: truck
+    only). ``pickup_truck`` is not automatically included.
+    """
     now = now_time or datetime.now().time()
     if not _within_time_window(now, str(params.get("truck_ban_start", "06:00")), str(params.get("truck_ban_end", "09:00"))):
         return []
 
+    ban_classes = params.get("truck_ban_classes", DEFAULT_TRUCK_BAN_CLASSES)
+    if isinstance(ban_classes, str):
+        ban_classes = (ban_classes,)
+
     events: list[ViolationEvent] = []
     for det in vehicles:
-        if det.get("class_label") != YOLO_CLASS_TRUCK:
+        label = str(det.get("class_label") or "")
+        if not is_truck_ban_applicable(label, ban_classes):
             continue
         track_id = int(det["track_id"])
         ts = float(det.get("timestamp_sec", 0))
@@ -441,7 +462,7 @@ def check_truck_ban(
         if tracker.update(_in_zone(det, polygon), ts):
             _emit(
                 state, events, VIOLATION_TRUCK_BAN, det, frame_number,
-                f"Truck track #{track_id} inside Truck Ban Zone during ban window "
+                f"{label.title()} track #{track_id} inside Truck Ban Zone during ban window "
                 f"({params['truck_ban_start']}-{params['truck_ban_end']}).",
             )
     return events

@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.1.0",
+  "status": "frozen_for_phase2_pilot",
+  "model_family": "YOLOv8m",
+  "tracker": "ByteTrack",
+  "principle": "Annotations describe observable objects or attributes; violations are rule-engine outputs.",
+  "object_classes": [
+    "car",
+    "suv_crossover",
+    "van",
+    "jeepney",
+    "uv_express_van",
+    "tricycle",
+    "piaggio",
+    "bus",
+    "truck",
+    "pickup_truck",
+    "motorcycle",
+    "bicycle",
+    "person",
+    "rider",
+    "helmet_acceptable",
+    "helmet_nut_shell",
+    "side_mirror"
+  ],
+  "scene_classes": [
+    "sign_no_entry",
+    "sign_no_overtaking",
+    "sign_no_left_turn",
+    "sign_no_u_turn",
+    "sign_no_parking",
+    "sign_no_stopping",
+    "marking_double_solid",
+    "marking_single_solid",
+    "marking_solid_broken"
+  ],
+  "excluded_classes": [
+    "violation",
+    "stop_sign",
+    "speed_limit_sign",
+    "license_plate_text",
+    "collision_vehicle",
+    "private_vehicle",
+    "public_utility_vehicle",
+    "unknown"
+  ],
+  "unknown_policy": "Do not force a class when the object or attribute is not visually observable; record the review state as unknown or uncertain. UNKNOWN and UNCERTAIN are review states, not detector labels.",
+  "hierarchy": {
+    "passenger_vehicle": ["car", "suv_crossover", "van"],
+    "public_utility_vehicle": ["jeepney", "uv_express_van", "tricycle", "piaggio", "bus"],
+    "commercial_vehicle": ["truck", "pickup_truck"],
+    "two_or_three_wheeled": ["motorcycle", "tricycle", "piaggio", "bicycle"]
+  },
+  "vehicle_detector_classes": [
+    "car",
+    "suv_crossover",
+    "van",
+    "jeepney",
+    "uv_express_van",
+    "tricycle",
+    "piaggio",
+    "bus",
+    "truck",
+    "pickup_truck",
+    "motorcycle",
+    "bicycle"
+  ],
+  "notes": {
+    "pickup_truck": "Separate detector class from truck. Applicable to Unauthorized Passenger in Applicable Truck/Pickup Cargo Area. Not automatically included in truck-ban applicability.",
+    "broad_categories": "Hierarchy keys are derived broad classes for rule applicability; they are not detector labels."
+  }
+}

@@ -2,8 +2,9 @@
 
 **Project:** TAVIDM — Traffic Violation Detection and Monitoring System
 **Specification:** Vehicle Classification
-**Status:** DESIGN IN PROGRESS — CURRENT DECISIONS ARE AUTHORITATIVE; ADDITIONAL RULE DETAILS WILL BE ADDED LATER
-**IMPORTANT:** This specification is subject to revision based on feedback, corrections, or requirements provided by the thesis adviser/panel/professor. When such feedback is explicitly provided by the user, treat the newer approved decision as superseding the previous specification. Do not assume the current specification is permanently final.
+**Status:** ACTIVE — 12 vehicle detector classes FROZEN for Phase 2 (owner-approved); additional rule-applicability details may still be refined
+**Machine-readable contract:** `config/training/class_schema.json` (schema_version 1.1.0)
+**IMPORTANT:** This specification is subject to revision based on feedback, corrections, or requirements provided by the thesis adviser/panel/professor. When such feedback is explicitly provided by the user, treat the newer approved decision as superseding the previous specification. Frozen detector-class names must not be silently renamed.
 **Purpose:** Define how TAVIDM classifies vehicles and how vehicle classification is consumed by the Violation Engine.
 
 ---
@@ -48,14 +49,17 @@ Example:
 
 ```text
 Vehicle
- ├── Broad Class: Motorcycle
- │    └── Specific Type: Motorcycle
+ ├── Broad Class: passenger_vehicle   (derived; not a detector label)
+ │    └── Detector: car | suv_crossover | van
  │
- ├── Broad Class: PUV
- │    └── Specific Type: Jeepney
+ ├── Broad Class: public_utility_vehicle
+ │    └── Detector: jeepney | uv_express_van | tricycle | piaggio | bus
  │
- └── Broad Class: PUV
-      └── Specific Type: UV Express / Van
+ ├── Broad Class: commercial_vehicle
+ │    └── Detector: truck | pickup_truck
+ │
+ └── Broad Class: two_or_three_wheeled
+      └── Detector: motorcycle | tricycle | piaggio | bicycle
 ```
 
 The purpose is to allow the violation engine to ask questions such as:
@@ -64,17 +68,56 @@ The purpose is to allow the violation engine to ask questions such as:
 
 or:
 
-> "Is this vehicle a PUV?"
+> "Is this vehicle a commercial vehicle?"
 
-without requiring every rule to understand every possible detailed vehicle type.
+without treating broad groups themselves as YOLO detector labels.
 
 ---
 
-# 3. Required Vehicle Classes
+# 3. Frozen Vehicle Detector Classes
 
-TAVIDM must support, at minimum, the following operational vehicle categories.
+TAVIDM freezes exactly **12** vehicle detector classes for Phase 2 annotation and training.
 
-## 3.1 Motorcycle
+These strings are detector labels. They must not be merged, collapsed, or replaced by broad category names.
+
+### Canonical vehicle detector roster (count = 12)
+
+1. `car`
+2. `suv_crossover`
+3. `van`
+4. `jeepney`
+5. `uv_express_van`
+6. `tricycle`
+7. `piaggio`
+8. `bus`
+9. `truck`
+10. `pickup_truck`
+11. `motorcycle`
+12. `bicycle`
+
+### Required distinctions
+
+* `pickup_truck` is a **separate detector class**, not merely a subtype attribute of `truck`.
+* `van` and `uv_express_van` are separate.
+* `tricycle` and `piaggio` are separate from each other and from `motorcycle`.
+* `bus` and `jeepney` are separate.
+* Broad keys such as `passenger_vehicle`, `public_utility_vehicle`, and `commercial_vehicle` are **derived hierarchy values**, not detector labels.
+* `UNKNOWN` / `UNCERTAIN` are review states, not detector classes.
+* `Private Vehicle` is a display/manuscript phrase only; it is not a detector label.
+* Vehicle collision / `collision_vehicle` is out of scope for this roster and must not be added as an object class here.
+
+### Derived hierarchy (from `class_schema.json`)
+
+```text
+passenger_vehicle        → car, suv_crossover, van
+public_utility_vehicle   → jeepney, uv_express_van, tricycle, piaggio, bus
+commercial_vehicle       → truck, pickup_truck
+two_or_three_wheeled     → motorcycle, tricycle, piaggio, bicycle
+```
+
+---
+
+## 3.1 Motorcycle (`motorcycle`)
 
 Includes ordinary motorcycles relevant to traffic-violation detection.
 
@@ -89,66 +132,64 @@ The exact applicable rules are defined by the Violation Engine specification.
 
 ---
 
-## 3.2 Car / Passenger Vehicle
+## 3.2 Car (`car`)
 
 General passenger vehicles such as ordinary cars and sedans.
 
-Example:
-
-```text
-Car
-Sedan
-Passenger vehicle
-```
-
-This category may be expanded later if needed.
+Broad class: `passenger_vehicle`.
 
 ---
 
-## 3.3 SUV / Crossover
+## 3.3 SUV / Crossover (`suv_crossover`)
 
-SUVs and similar passenger vehicles may be classified separately when useful to the system.
+SUVs and similar passenger vehicles are classified separately when visual evidence supports it.
 
-They should still belong to an appropriate broader passenger-vehicle category for rule applicability.
-
----
-
-## 3.4 Van
-
-General vans should be distinguishable from ordinary cars when practical.
-
-A van may additionally be classified as:
-
-```text
-UV Express / Van
-```
-
-when the available visual/contextual evidence supports the PUV classification.
-
-Do not automatically assume every van is a UV Express vehicle.
+Broad class: `passenger_vehicle`.
 
 ---
 
-## 3.5 Truck
+## 3.4 Van (`van`)
 
-Truck is a dedicated vehicle class.
+General vans are distinguishable from ordinary cars and from UV Express vehicles.
 
-This classification is particularly important for:
+Do **not** automatically assume every van is `uv_express_van`.
 
-* Truck-Ban Violation
+Broad class: `passenger_vehicle`.
+
+---
+
+## 3.5 Truck (`truck`)
+
+Dedicated large cargo / commercial truck class, distinct from `pickup_truck`.
+
+Relevant to:
+
+* Truck-Ban Violation (default truck-ban applicability includes `truck`)
 * Unauthorized passengers in applicable cargo areas
 * Obstruction
 * Illegal Parking
 
-The truck class must remain distinguishable from ordinary passenger vehicles.
+Broad class: `commercial_vehicle`.
 
 ---
 
-## 3.6 Bus
+## 3.6 Pickup Truck (`pickup_truck`)
 
-Bus is a dedicated vehicle class.
+Dedicated detector class for conventional pickups with an open or covered cargo bed.
 
-It should remain distinguishable from trucks and ordinary passenger vehicles.
+* Separate from `truck`.
+* Broad class: `commercial_vehicle`.
+* **Applicable** to Unauthorized Passenger in Applicable Truck/Pickup Cargo Area.
+* **Not** automatically covered by Truck-Ban Violation; truck-ban class membership is explicit/configurable and defaults to `truck` only.
+* Do not invent cargo-area geometry thresholds here; the cargo bed is contextual evidence for a future rule evaluation, not automatic proof of a violation.
+
+---
+
+## 3.7 Bus (`bus`)
+
+Dedicated vehicle class, distinct from trucks, pickups, and jeepneys.
+
+Broad class: `public_utility_vehicle`.
 
 ---
 
@@ -159,12 +200,15 @@ TAVIDM must explicitly support **PUV classification** because some violation rul
 At minimum, the system should recognize the following operational PUV categories:
 
 ```text
-PUV
-├── Jeepney
-├── UV Express / Van
-├── Tricycle
-└── Piaggio
+PUV (derived broad class: public_utility_vehicle)
+├── jeepney
+├── uv_express_van
+├── tricycle
+├── piaggio
+└── bus
 ```
+
+Operational display names such as “UV Express / Van” may appear in UI text, but the detector label is `uv_express_van`.
 
 ### Important terminology note
 
@@ -202,20 +246,18 @@ This distinction is necessary because certain violation rules may apply specific
 
 ---
 
-# 6. UV Express / Van
+# 6. UV Express Van (`uv_express_van`)
 
-UV Express / Van should be represented as a distinct operational type when sufficient evidence exists.
+`uv_express_van` is a distinct detector class from ordinary `van`.
 
 Example:
 
 ```text
-broad_class = PUV
-vehicle_type = UV Express / Van
+broad_class = public_utility_vehicle
+vehicle_type = uv_express_van
 ```
 
 Do not classify every ordinary van as UV Express solely because it is a van.
-
-PUV classification should rely on the available visual/contextual evidence and the confidence framework.
 
 ---
 
@@ -692,8 +734,9 @@ Both specifications should be loaded before implementing or modifying the TAVIDM
 
 **Current status:**
 
-> Vehicle Classification Specification — ACTIVE / DESIGN IN PROGRESS
+> Vehicle Classification Specification — ACTIVE; **12 vehicle detector classes FROZEN** (includes separate `pickup_truck`)
+> Machine-readable contract: `config/training/class_schema.json` schema_version **1.1.0** (17 object + 9 scene = 26 pilot labels)
 > Violation Engine Specification — ACTIVE / DESIGN IN PROGRESS
 > Design update: `docs/VIOLATION_ENGINE_DESIGN_UPDATE_2026-08-16.md`
-> Canonical roster: 12 types; Illegal Parking and Illegal Terminal are separate
-> Additional specification updates are expected.
+> Canonical violation roster: 12 types; Illegal Parking and Illegal Terminal are separate
+> System-truth index: `docs/SYSTEM_TRUTH_INDEX.md`

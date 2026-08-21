@@ -281,6 +281,62 @@ class TestIllegalTerminal:
         assert any(e.violation_type == VIOLATION_ILLEGAL_TERMINAL for e in events)
 
 
+class TestTruckBanApplicability:
+    def test_truck_ban_fires_for_truck(self, rule_params):
+        from datetime import time as dtime
+        from core.violation_engine import RuleEngineState, check_truck_ban
+
+        state = RuleEngineState()
+        zone = [[50, 50], [250, 50], [250, 200], [50, 200], [50, 50]]
+        truck = {
+            "class_label": "truck",
+            "track_id": 9,
+            "bbox_x": 100,
+            "bbox_y": 100,
+            "bbox_w": 80,
+            "bbox_h": 30,
+            "confidence": 0.92,
+            "speed_px_per_sec": 1.0,
+            "direction_degrees": 0,
+        }
+        events = []
+        for frame in range(0, 10):
+            truck["timestamp_sec"] = frame * 0.3
+            events.extend(
+                check_truck_ban(
+                    [truck], zone, state, frame, rule_params, now_time=dtime(7, 0)
+                )
+            )
+        assert any(e.violation_type == VIOLATION_TRUCK_BAN for e in events)
+
+    def test_truck_ban_does_not_auto_include_pickup(self, rule_params):
+        from datetime import time as dtime
+        from core.violation_engine import RuleEngineState, check_truck_ban
+
+        state = RuleEngineState()
+        zone = [[50, 50], [250, 50], [250, 200], [50, 200], [50, 50]]
+        pickup = {
+            "class_label": "pickup_truck",
+            "track_id": 10,
+            "bbox_x": 100,
+            "bbox_y": 100,
+            "bbox_w": 60,
+            "bbox_h": 25,
+            "confidence": 0.9,
+            "speed_px_per_sec": 1.0,
+            "direction_degrees": 0,
+        }
+        events = []
+        for frame in range(0, 10):
+            pickup["timestamp_sec"] = frame * 0.3
+            events.extend(
+                check_truck_ban(
+                    [pickup], zone, state, frame, rule_params, now_time=dtime(7, 0)
+                )
+            )
+        assert events == []
+
+
 class TestNoHelmet:
     """Tests for No Helmet violation."""
 

@@ -188,13 +188,11 @@ This update: double-solid crossing is a candidate; single-solid crossing is not 
 
 Treat the new double/single/broken working rules as filling the prior “taxonomy TBD” **only for those three families**. Other markings remain unspecified. Do not encode a generic “any solid line” automatic violation.
 
-### B.5 Classification coverage vs cargo / pickup types — omission
+### B.5 Classification coverage vs cargo / pickup types — resolved for pickup
 
-Classification spec requires Truck as a dedicated class and does not yet define operational types **pickup**, **dump truck**, or **flatbed**.
+**Owner decision (2026-08-21):** `pickup_truck` is a separate frozen vehicle detector class, distinct from `truck`. Both map under the derived `commercial_vehicle` hierarchy. Cargo-area passenger applicability includes both `truck` and `pickup_truck`. Truck-ban applicability remains explicit/configurable and defaults to `truck` only.
 
-Cargo-area passenger applicability now names those exposed-cargo types.
-
-**Owner decision needed:** whether pickup/dump/flatbed are specific types under Truck, attributes of Truck, or additional operational labels. Do not invent the mapping.
+Dump / flatbed subtypes beyond `truck` vs `pickup_truck` remain unspecified; do not invent additional detector labels without an owner decision.
 
 ### B.6 Sign list still partly unspecified
 
