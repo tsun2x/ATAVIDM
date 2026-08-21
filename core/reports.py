@@ -16,7 +16,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
 from config import REPORTS_FOLDER
+from core.detection_config import canonicalize_violation, violation_type_query_names
 from database import db
+
 
 _COLUMNS = (
     ("id", "ID", 12),
@@ -29,8 +31,17 @@ _COLUMNS = (
 _MAX_ROWS = 5000
 
 
+def _expand_filters(filters: dict[str, Any]) -> dict[str, Any]:
+    """Expand violation_type filters to include legacy aliases for DB reads."""
+    expanded = dict(filters)
+    vtype = expanded.get("violation_type")
+    if isinstance(vtype, str) and vtype:
+        expanded["violation_type"] = list(violation_type_query_names(vtype))
+    return expanded
+
+
 def _fetch_rows(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    rows, _total = db.list_violations(filters=filters, page=1, per_page=_MAX_ROWS)
+    rows, _total = db.list_violations(filters=_expand_filters(filters), page=1, per_page=_MAX_ROWS)
     return rows
 
 
@@ -58,7 +69,8 @@ def _cell_value(row: dict[str, Any], key: str) -> str:
 def _summary_counts(rows: list[dict[str, Any]]) -> list[tuple[str, int]]:
     counts: dict[str, int] = {}
     for row in rows:
-        counts[row["violation_type"]] = counts.get(row["violation_type"], 0) + 1
+        canon = canonicalize_violation(row["violation_type"])
+        counts[canon] = counts.get(canon, 0) + 1
     return sorted(counts.items(), key=lambda item: item[1], reverse=True)
 
 

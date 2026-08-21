@@ -283,15 +283,25 @@ body {
     display: inline-block; padding: 4px 10px; border-radius: 6px;
     font-size: 0.75rem; font-weight: 600;
 }
-.vtype-counterflowing { background: rgba(230, 57, 70, 0.12); color: #b91c1c; }
 .vtype-illegal-parking { background: rgba(245, 158, 11, 0.15); color: #b45309; }
 .vtype-obstruction { background: rgba(249, 115, 22, 0.15); color: #c2410c; }
+.vtype-counterflow { background: rgba(230, 57, 70, 0.12); color: #b91c1c; }
+.vtype-counterflowing { background: rgba(230, 57, 70, 0.12); color: #b91c1c; }
+.vtype-truck-ban-violation { background: rgba(139, 92, 246, 0.15); color: #6d28d9; }
+.vtype-truck-ban { background: rgba(139, 92, 246, 0.15); color: #6d28d9; }
+.vtype-no-helmet { background: rgba(6, 182, 212, 0.15); color: #0e7490; }
+.vtype-no-helmet-violation { background: rgba(6, 182, 212, 0.15); color: #0e7490; }
+.vtype-no-side-mirror { background: rgba(20, 184, 166, 0.15); color: #0f766e; }
+.vtype-motorcycle-overloading { background: rgba(236, 72, 153, 0.15); color: #be185d; }
+.vtype-disregarding-traffic-sign { background: rgba(234, 179, 8, 0.18); color: #a16207; }
+.vtype-failure-to-follow-road-pavement-markings { background: rgba(59, 130, 246, 0.15); color: #1d4ed8; }
+.vtype-illegal-terminal { background: rgba(34, 197, 94, 0.15); color: #15803d; }
+.vtype-unauthorized-passenger-in-applicable-truck-pickup-cargo-area { background: rgba(168, 85, 247, 0.15); color: #7e22ce; }
+.vtype-substandard-nut-shell-helmet { background: rgba(100, 116, 139, 0.18); color: #334155; }
 .vtype-illegal-loading-unloading { background: rgba(34, 197, 94, 0.15); color: #15803d; }
 .vtype-blocking-pedestrian-crossing { background: rgba(59, 130, 246, 0.15); color: #1d4ed8; }
-.vtype-truck-ban { background: rgba(139, 92, 246, 0.15); color: #6d28d9; }
 .vtype-reckless-driving { background: rgba(185, 28, 28, 0.15); color: #7f1d1d; }
-.vtype-no-helmet-violation { background: rgba(6, 182, 212, 0.15); color: #0e7490; }
-.vtype-motorcycle-overloading { background: rgba(236, 72, 153, 0.15); color: #be185d; }
+.vtype-illegal-parking-illegal-terminal { background: rgba(245, 158, 11, 0.15); color: #b45309; }
 
 .confidence-badge {
     display: inline-block; padding: 3px 10px; border-radius: 20px;

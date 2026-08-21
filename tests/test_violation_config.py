@@ -56,6 +56,20 @@ class TestLegacyCanonicalization:
     def test_fused_legacy_maps_to_illegal_parking(self):
         assert canonicalize_violation(LEGACY_FUSED_PARKING_TERMINAL) == VIOLATION_ILLEGAL_PARKING
 
+    def test_legacy_spellings_map_to_approved_names(self):
+        from core.detection_config import (
+            LEGACY_CARGO_PASSENGERS,
+            LEGACY_SUBSTANDARD_HELMET,
+            VIOLATION_CARGO_PASSENGERS,
+            VIOLATION_SUBSTANDARD_HELMET,
+        )
+
+        assert canonicalize_violation(LEGACY_SUBSTANDARD_HELMET) == VIOLATION_SUBSTANDARD_HELMET
+        assert canonicalize_violation(LEGACY_CARGO_PASSENGERS) == VIOLATION_CARGO_PASSENGERS
+        assert VIOLATION_SUBSTANDARD_HELMET == "Substandard / Nut-Shell Helmet"
+        assert "Nut-Shell" in VIOLATION_SUBSTANDARD_HELMET
+        assert "Applicable" in VIOLATION_CARGO_PASSENGERS
+
 
 class TestEnabledViolationsPersistence:
     def test_default_when_unset(self, monkeypatch):

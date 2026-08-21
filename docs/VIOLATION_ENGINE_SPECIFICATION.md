@@ -1383,7 +1383,7 @@ It should report the dependency and request/await the project's explicit decisio
 
 **Design update (2026-08-16):** `docs/VIOLATION_ENGINE_DESIGN_UPDATE_2026-08-16.md` — current design direction for filled TBD items.
 
-**Roster (owner-confirmed 2026-08-16):** **12** canonical types. Illegal Parking and Illegal Terminal are **separate**. Do not merge them into `Illegal Parking / Illegal Terminal`. Production code may still use a fused label until implementation is authorized.
+**Roster (owner-confirmed 2026-08-16):** **12** canonical types. Illegal Parking and Illegal Terminal are **separate**. Do not merge them into `Illegal Parking / Illegal Terminal`. Production registry in `core/detection_config.py` must match this roster exactly; the fused label is legacy-only.
 
 **Implementation status:** Specifications are being established before full violation-engine implementation. Production code must not be changed from a specification drop unless implementation is explicitly requested.
 

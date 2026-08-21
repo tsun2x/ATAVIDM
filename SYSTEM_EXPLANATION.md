@@ -28,10 +28,15 @@ Operators may miss violations because they must watch videos continuously. TAVID
 - Upload MP4 videos and store metadata in SQLite; RTSP live camera streams.
 - Annotate zones per video and save reusable templates (6 zone types).
 - Full frame-by-frame inference loop (`core/video_processor.py`): OpenCV → YOLOv8m → ByteTrack → Rule Engine → evidence snapshots → review queue.
-- Rule Engine implementation for 10 violations:
-  Illegal Parking, Illegal Stopping, Obstruction, Counterflow Driving,
-  Blocking Pedestrian Crossing, Truck Ban Violation, Illegal Loading/Unloading,
-  Restricted Lane Violation, No Helmet Violation, Motorcycle Overloading.
+- Canonical violation roster of **12** types (authoritative registry in `core/detection_config.py`):
+  Illegal Parking; Obstruction; Counterflow; Truck-Ban Violation; No Helmet;
+  No Side Mirror; Motorcycle Overloading; Disregarding Traffic Sign;
+  Failure to Follow Road/Pavement Markings; Illegal Terminal;
+  Unauthorized Passenger in Applicable Truck/Pickup Cargo Area;
+  Substandard / Nut-Shell Helmet.
+  Illegal Parking and Illegal Terminal are separate. Five core rules are fully
+  implemented; parking/terminal/pavement-markings are partial zone proxies;
+  four types remain planned stubs and cannot be enabled as working detections.
 - Authentication (bcrypt) with admin / enforcer / viewer roles.
 - Analytics from database aggregations; PDF/Excel report generation.
 

@@ -137,19 +137,21 @@ DEFAULT_RULE_PARAMETERS = {
 # PLANNED_VIOLATIONS = canonical scope without executable rule functions yet.
 # TOGGLEABLE_VIOLATIONS = may be enabled/disabled (implemented + partial + model-dependent).
 
-# ---- Canonical identifiers -------------------------------------------------
-VIOLATION_OBSTRUCTION = "Obstruction"
-VIOLATION_SUBSTANDARD_HELMET = "Substandard Helmet"
-VIOLATION_DISREGARDING_SIGN = "Disregarding Traffic Sign"
-VIOLATION_NO_HELMET = "No Helmet"
-VIOLATION_NO_SIDE_MIRROR = "No Side Mirror"
+# ---- Canonical identifiers (exact owner-approved roster strings) ----------
 VIOLATION_ILLEGAL_PARKING = "Illegal Parking"
-VIOLATION_ILLEGAL_TERMINAL = "Illegal Terminal"
+VIOLATION_OBSTRUCTION = "Obstruction"
 VIOLATION_COUNTERFLOW = "Counterflow"
 VIOLATION_TRUCK_BAN = "Truck-Ban Violation"
-VIOLATION_PAVEMENT_MARKINGS = "Failure to Follow Road/Pavement Markings"
+VIOLATION_NO_HELMET = "No Helmet"
+VIOLATION_NO_SIDE_MIRROR = "No Side Mirror"
 VIOLATION_MOTORCYCLE_OVERLOADING = "Motorcycle Overloading"
-VIOLATION_CARGO_PASSENGERS = "Unauthorized Passengers in Pickup/Truck Cargo Area"
+VIOLATION_DISREGARDING_SIGN = "Disregarding Traffic Sign"
+VIOLATION_PAVEMENT_MARKINGS = "Failure to Follow Road/Pavement Markings"
+VIOLATION_ILLEGAL_TERMINAL = "Illegal Terminal"
+VIOLATION_CARGO_PASSENGERS = (
+    "Unauthorized Passenger in Applicable Truck/Pickup Cargo Area"
+)
+VIOLATION_SUBSTANDARD_HELMET = "Substandard / Nut-Shell Helmet"
 
 # Legacy fused label (not canonical — compatibility only)
 LEGACY_FUSED_PARKING_TERMINAL = "Illegal Parking / Illegal Terminal"
@@ -166,20 +168,23 @@ LEGACY_OVERLOADING = "Motorcycle Overloading"
 LEGACY_TRUCK_BAN = "Truck Ban Violation"
 LEGACY_OBSTRUCTION = "Obstruction"
 LEGACY_COUNTERFLOW = "Counterflow Driving"
+LEGACY_SUBSTANDARD_HELMET = "Substandard Helmet"
+LEGACY_CARGO_PASSENGERS = "Unauthorized Passengers in Pickup/Truck Cargo Area"
 
+# Order matches docs/VIOLATION_ENGINE_SPECIFICATION.md §4.
 CANONICAL_VIOLATIONS = (
-    VIOLATION_OBSTRUCTION,
-    VIOLATION_SUBSTANDARD_HELMET,
-    VIOLATION_DISREGARDING_SIGN,
-    VIOLATION_NO_HELMET,
-    VIOLATION_NO_SIDE_MIRROR,
     VIOLATION_ILLEGAL_PARKING,
-    VIOLATION_ILLEGAL_TERMINAL,
+    VIOLATION_OBSTRUCTION,
     VIOLATION_COUNTERFLOW,
     VIOLATION_TRUCK_BAN,
-    VIOLATION_PAVEMENT_MARKINGS,
+    VIOLATION_NO_HELMET,
+    VIOLATION_NO_SIDE_MIRROR,
     VIOLATION_MOTORCYCLE_OVERLOADING,
+    VIOLATION_DISREGARDING_SIGN,
+    VIOLATION_PAVEMENT_MARKINGS,
+    VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_CARGO_PASSENGERS,
+    VIOLATION_SUBSTANDARD_HELMET,
 )
 
 # Core rules with working detection logic in the current engine
@@ -256,7 +261,12 @@ def is_canonical_violation(viol_type: str) -> bool:
 
 
 def legacy_to_canonical(viol_type: str) -> str | None:
-    """Map legacy DB/display names to canonical identifiers."""
+    """Map legacy DB/display names to canonical identifiers.
+
+    The fused parking/terminal label is ambiguous. For analytics aggregation it
+    maps to Illegal Parking (the more general rule). Historical row text is
+    never rewritten by this helper.
+    """
     mapping = {
         LEGACY_OBSTRUCTION: VIOLATION_OBSTRUCTION,
         LEGACY_COUNTERFLOW: VIOLATION_COUNTERFLOW,
@@ -269,6 +279,8 @@ def legacy_to_canonical(viol_type: str) -> str | None:
         LEGACY_BLOCKING_PEDESTRIAN: VIOLATION_OBSTRUCTION,
         LEGACY_RESTRICTED_LANE: VIOLATION_PAVEMENT_MARKINGS,
         LEGACY_FUSED_PARKING_TERMINAL: VIOLATION_ILLEGAL_PARKING,
+        LEGACY_SUBSTANDARD_HELMET: VIOLATION_SUBSTANDARD_HELMET,
+        LEGACY_CARGO_PASSENGERS: VIOLATION_CARGO_PASSENGERS,
     }
     return mapping.get(viol_type)
 
@@ -279,3 +291,34 @@ def canonicalize_violation(viol_type: str) -> str:
         return viol_type
     mapped = legacy_to_canonical(viol_type)
     return mapped if mapped is not None else viol_type
+
+
+def violation_type_query_names(viol_type: str) -> tuple[str, ...]:
+    """Return DB values that should match a filter for ``viol_type``.
+
+    Includes the requested name, its canonical form, and every known legacy
+    alias that maps to the same canonical type. Historical row text is not
+    rewritten; this only expands read-side filters.
+    """
+    canon = canonicalize_violation(viol_type)
+    names = {viol_type, canon}
+    # Rebuild the legacy map locally so this stays the single expansion point.
+    for legacy_name in (
+        LEGACY_OBSTRUCTION,
+        LEGACY_COUNTERFLOW,
+        LEGACY_TRUCK_BAN,
+        LEGACY_NO_HELMET_VIOLATION,
+        LEGACY_OVERLOADING,
+        LEGACY_ILLEGAL_PARKING,
+        LEGACY_ILLEGAL_STOPPING,
+        LEGACY_LOADING_UNLOADING,
+        LEGACY_BLOCKING_PEDESTRIAN,
+        LEGACY_RESTRICTED_LANE,
+        LEGACY_FUSED_PARKING_TERMINAL,
+        LEGACY_SUBSTANDARD_HELMET,
+        LEGACY_CARGO_PASSENGERS,
+    ):
+        mapped = legacy_to_canonical(legacy_name)
+        if mapped == canon:
+            names.add(legacy_name)
+    return tuple(sorted(names))

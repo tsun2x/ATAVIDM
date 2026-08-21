@@ -133,21 +133,22 @@ class TestViolationRegistry:
         assert len(CANONICAL_VIOLATIONS) == 12
 
     def test_canonical_violations_contains_all_twelve(self):
-        expected = {
-            VIOLATION_OBSTRUCTION,
-            VIOLATION_SUBSTANDARD_HELMET,
-            VIOLATION_DISREGARDING_SIGN,
-            VIOLATION_NO_HELMET,
-            VIOLATION_NO_SIDE_MIRROR,
+        expected = (
             VIOLATION_ILLEGAL_PARKING,
-            VIOLATION_ILLEGAL_TERMINAL,
+            VIOLATION_OBSTRUCTION,
             VIOLATION_COUNTERFLOW,
             VIOLATION_TRUCK_BAN,
-            VIOLATION_PAVEMENT_MARKINGS,
+            VIOLATION_NO_HELMET,
+            VIOLATION_NO_SIDE_MIRROR,
             VIOLATION_MOTORCYCLE_OVERLOADING,
+            VIOLATION_DISREGARDING_SIGN,
+            VIOLATION_PAVEMENT_MARKINGS,
+            VIOLATION_ILLEGAL_TERMINAL,
             VIOLATION_CARGO_PASSENGERS,
-        }
-        assert set(CANONICAL_VIOLATIONS) == expected
+            VIOLATION_SUBSTANDARD_HELMET,
+        )
+        assert CANONICAL_VIOLATIONS == expected
+        assert len(set(CANONICAL_VIOLATIONS)) == 12
 
     def test_implemented_violations_is_subset(self):
         for v in IMPLEMENTED_VIOLATIONS:

@@ -97,7 +97,8 @@ _worker_start_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _vtype_slug(vtype: str) -> str:
-    return vtype.lower().replace(" ", "-").replace("/", "-")
+    slug = vtype.lower().replace("/", " ").replace("-", " ")
+    return "-".join(part for part in slug.split() if part)
 
 
 def _format_duration(duration_sec: float | None) -> str:

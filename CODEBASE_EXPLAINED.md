@@ -139,22 +139,33 @@ A list of Python dictionaries representing the two CCTV cameras in the system.
 - `fps` — frames per second, displayed as a badge on the live feed header.
 - `feed_image` — filename of the SVG in `static/images/` used as the camera's placeholder feed image.
 
-### VIOLATION_TYPES, PLATE_PREFIXES, STATUSES
+### VIOLATION_TYPES / CANONICAL_VIOLATIONS
+
+Canonical violation names live in `core/detection_config.CANONICAL_VIOLATIONS`
+(exactly 12 types). Flask routes pass `list(CANONICAL_VIOLATIONS)` into the
+violations and reports templates for filter dropdowns. Do not hard-code a
+separate list in `app.py`.
 
 ```python
-VIOLATION_TYPES = [
-    "Illegal Parking", "Counterflowing", "Obstruction",
-    "Illegal Loading/Unloading", "Blocking Pedestrian Crossing",
-    "Truck Ban", "Reckless Driving",
-    "No Helmet Violation", "Motorcycle Overloading",
-]
+# Authoritative registry — core/detection_config.py
+CANONICAL_VIOLATIONS = (
+    "Illegal Parking",
+    "Obstruction",
+    "Counterflow",
+    "Truck-Ban Violation",
+    "No Helmet",
+    "No Side Mirror",
+    "Motorcycle Overloading",
+    "Disregarding Traffic Sign",
+    "Failure to Follow Road/Pavement Markings",
+    "Illegal Terminal",
+    "Unauthorized Passenger in Applicable Truck/Pickup Cargo Area",
+    "Substandard / Nut-Shell Helmet",
+)
 ```
 
-These three lists are used as the population pools for `random.choice()` inside `generate_violations()`.
-
-- `VIOLATION_TYPES` — also passed to the violations and reports templates to populate the filter `<select>` dropdowns, so the options always match the mock data.
-- `PLATE_PREFIXES` — simulates Philippine-style plate numbers (prefix + digits + two letters).
-- `STATUSES` — the workflow states a violation record can be in.
+Historical mock-data lists in older docs are obsolete. UI filters, analytics,
+and settings consume the registry above.
 
 ### _random_plate() helper
 

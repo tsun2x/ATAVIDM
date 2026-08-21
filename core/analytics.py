@@ -17,6 +17,7 @@ from database import db
 _TYPE_COLORS = (
     "#e63946", "#f59e0b", "#f97316", "#8b5cf6", "#06b6d4",
     "#ec4899", "#22c55e", "#3b82f6", "#eab308", "#64748b",
+    "#14b8a6", "#a855f7",
 )
 
 

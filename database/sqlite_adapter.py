@@ -861,8 +861,15 @@ def _build_violation_filters(filters: dict[str, Any]) -> tuple[str, list[Any]]:
 
     violation_type = filters.get("violation_type")
     if violation_type:
-        clauses.append("violation_type = ?")
-        params.append(violation_type)
+        if isinstance(violation_type, (list, tuple, set)):
+            values = [v for v in violation_type if v]
+            if values:
+                placeholders = ", ".join("?" for _ in values)
+                clauses.append(f"violation_type IN ({placeholders})")
+                params.extend(values)
+        else:
+            clauses.append("violation_type = ?")
+            params.append(violation_type)
 
     video_id = filters.get("video_id")
     if video_id is not None:

@@ -228,7 +228,7 @@ Those remain unfrozen heuristics from the base VE spec. This update emphasizes c
 
 ### B.10 Codebase vs all specs (unchanged; not resolved by this addendum)
 
-Existing `core/detection_config.py` still uses an 11-type fused parking/terminal registry. Existing `core/violation_engine.py` is still largely zone/dwell-based. This addendum does not authorize aligning that code.
+Existing `core/detection_config.py` must use the 12-type roster with separate Illegal Parking and Illegal Terminal identifiers. The fused parking/terminal string is legacy-only. Existing `core/violation_engine.py` remains largely zone/dwell-based for several rules; this addendum does not invent unfinished thresholds.
 
 ---
 
