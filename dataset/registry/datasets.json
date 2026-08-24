@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "id": "tt100k", "name": "Tsinghua-Tencent 100K", "status": "candidate", "domain": "foreign", "purposes": ["generic_pretraining"], "official_url": "https://cg.cs.tsinghua.edu.cn/traffic-sign/",
+      "license": {"status": "verified", "name": "CC BY-NC"}, "acquisition": {"status": "link_only", "checksum_manifest": null}, "inspection": {"status": "pending", "sample_count": 0}, "annotations": {"status": "pending", "format": "bounding_boxes_and_masks", "class_counts_recorded": false}, "split": {"status": "pending", "grouped_by": []}, "coverage": {"philippine_signs": false, "philippine_markings": false}, "notes": "Official page reports 100,000 Tencent Street View images and about 30,000 sign instances. Supplementary non-commercial feature learning only; must not define Philippine sign classes."
+    },
+    {
+      "id": "bdd100k", "name": "BDD100K", "status": "candidate", "domain": "foreign", "purposes": ["generic_pretraining"], "official_url": "https://www.bdd100k.com/",
+      "license": {"status": "unverified", "name": null}, "acquisition": {"status": "link_only", "checksum_manifest": null}, "inspection": {"status": "pending", "sample_count": 0}, "annotations": {"status": "pending", "format": null, "class_counts_recorded": false}, "split": {"status": "pending", "grouped_by": []}, "coverage": {"philippine_signs": false, "philippine_markings": false}, "notes": "Supplementary road-scene feature learning only."
+    },
+    {
+      "id": "idd", "name": "India Driving Dataset", "status": "candidate", "domain": "foreign", "purposes": ["generic_pretraining"], "official_url": "https://idd.insaan.iiit.ac.in/",
+      "license": {"status": "unverified", "name": null}, "acquisition": {"status": "link_only", "checksum_manifest": null}, "inspection": {"status": "pending", "sample_count": 0}, "annotations": {"status": "pending", "format": null, "class_counts_recorded": false}, "split": {"status": "pending", "grouped_by": []}, "coverage": {"philippine_signs": false, "philippine_markings": false}, "notes": "Potentially useful for heterogeneous traffic; not Philippine-domain authority."
+    },
+    {
+      "id": "mapillary-vistas", "name": "Mapillary Vistas", "status": "candidate", "domain": "foreign", "purposes": ["generic_pretraining"], "official_url": "https://www.mapillary.com/dataset/vistas",
+      "license": {"status": "unverified", "name": null}, "acquisition": {"status": "link_only", "checksum_manifest": null}, "inspection": {"status": "pending", "sample_count": 0}, "annotations": {"status": "pending", "format": null, "class_counts_recorded": false}, "split": {"status": "pending", "grouped_by": []}, "coverage": {"philippine_signs": false, "philippine_markings": false}, "notes": "Use only after license and label review; not a substitute for local CCTV."
+    }
+  ]
+}

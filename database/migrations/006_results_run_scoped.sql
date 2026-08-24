@@ -1,0 +1,19 @@
+-- Migration 006: explicit run-scoped result ownership
+-- Forward-only / additive. Applied idempotently by sqlite_adapter._apply_migration_006.
+--
+-- results_run_scoped = 0 → legacy / pre-flag run (may share era with NULL-attributed rows)
+-- results_run_scoped = 1 → run owns its result population even when zero detections
+--
+-- Backfill (idempotent): ONLY attributed child rows
+--   (detections / review_queue / violations.processing_run_id = run.id)
+--   → results_run_scoped = 1.
+--
+-- Do NOT infer ownership from queued_at, stage, diagnostics_json, geometry_snapshot_json,
+-- progress, annotated media, or COUNT(*) of detections. Those signals are ambiguous for
+-- pre-attribution runs. Migration 007 records provenance and repairs false positives.
+--
+-- Current-result queries:
+--   Prefer latest completed run with results_run_scoped = 1 (authoritative, may be empty).
+--   Legacy NULL rows are used only when no such authoritative completed run exists.
+
+-- ALTER TABLE processing_runs ADD COLUMN results_run_scoped INTEGER NOT NULL DEFAULT 0;

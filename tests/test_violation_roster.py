@@ -88,8 +88,14 @@ class TestStubViolationsCannotEmit:
         for name in PLANNED_VIOLATIONS:
             assert not is_implemented_violation(name)
 
-    def test_evaluate_does_not_emit_planned_even_if_listed_enabled(self):
-        """Planned stubs have no rule functions; enabling them must not invent events."""
+    def test_partial_rules_do_not_claim_implemented(self):
+        for name in PARTIAL_VIOLATIONS:
+            assert not is_implemented_violation(name)
+
+    def test_evaluate_without_prerequisites_emits_nothing_for_sign_rule(self):
+        """Disregarding Traffic Sign fail-closes without supported sign annotations."""
+        from core.detection_config import VIOLATION_DISREGARDING_SIGN
+
         tracked = [
             {
                 "class_label": "motorcycle",
@@ -111,7 +117,7 @@ class TestStubViolationsCannotEmit:
             frame_number=1,
             zones={},
             params={"confidence_threshold": 0.5},
-            enabled_violations=tuple(PLANNED_VIOLATIONS),
+            enabled_violations=(VIOLATION_DISREGARDING_SIGN,),
+            model_classes=("motorcycle", "person", "car"),
         )
-        emitted = {e.violation_type for e in events}
-        assert emitted.isdisjoint(set(PLANNED_VIOLATIONS))
+        assert all(e.violation_type != VIOLATION_DISREGARDING_SIGN for e in events)

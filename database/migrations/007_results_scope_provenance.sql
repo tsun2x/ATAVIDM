@@ -1,0 +1,18 @@
+-- Migration 007: explicit result-scope provenance + repair false-scoped legacy runs
+-- Forward-only / additive. Applied idempotently by sqlite_adapter._apply_migration_007.
+--
+-- results_scope_explicit = 0 → ambiguous / legacy (do not treat as authoritative solely
+--   because diagnostics, geometry, stage, queued_at, or progress exist)
+-- results_scope_explicit = 1 → ownership proven at create time or by attributed children
+--
+-- results_scope_origin:
+--   'create'               → set by create_processing_run() for new runs
+--   'attributed_children'  → backfilled because child rows carry processing_run_id
+--   NULL                   → legacy / unrepaired ambiguous
+--
+-- Repair: results_run_scoped=1 without explicit provenance and without attributed
+-- children is reset to results_run_scoped=0. Result rows are never deleted or rewritten.
+-- Explicit zero-result runs (results_scope_explicit=1) remain scoped on re-application.
+
+-- ALTER TABLE processing_runs ADD COLUMN results_scope_explicit INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE processing_runs ADD COLUMN results_scope_origin TEXT;

@@ -71,6 +71,23 @@ The fundamental principle is:
 
 A violation candidate requires the rule-specific combination of observations, behavior, context, and temporal evidence.
 
+## 2.1 Dataset and Rule-Engine Boundary
+
+The behavioral violations in this specification are **rule-engine outputs**. TAVIDM must not create YOLO classes such as `illegal_parking`, `counterflow_vehicle`, `illegal_terminal`, or `cargo_passenger_violation`, and it does not require a separate learned behavior classifier for those rules.
+
+The engine derives behavioral candidates from observable inputs, including:
+
+* object and attribute detections,
+* ByteTrack identity and track history,
+* vehicle state and trajectory,
+* operator-saved camera zones and templates,
+* spatial association,
+* temporal persistence,
+* context and exceptions,
+* and rule-specific confidence.
+
+This does **not** remove the need for representative annotated validation and test clips. Each behavioral rule requires positive cases, legitimate exceptions, ambiguous cases, and hard negatives so the project can tune non-frozen thresholds, measure false positives and false negatives, and demonstrate thesis-system performance. These clips validate the rule engine; they are not YOLO violation-class training data.
+
 ---
 
 # 3. Relationship With Vehicle Classification
@@ -137,7 +154,7 @@ General vehicle parking behavior. Applicability is based on parking-like behavio
 
 ### Illegal Terminal (distinct)
 
-Specifically concerns PUV terminal-like behavior. Applies to applicable PUV types such as Jeepney, UV Express / Van, Tricycle, and Piaggio. Consider prolonged stopping, passenger boarding/alighting, repeated passenger activity, location, traffic interference, and terminal-like behavior. Do not invent numerical thresholds for this rule.
+Specifically concerns PUV terminal-like behavior. Applicable visual vehicle types include Jeepney, Van, Tricycle, and Autorickshaw. A Van is not visually classified as `uv_express_van`; apparent public/for-hire operation is contextual metadata derived from available plate appearance/OCR, route board or livery, passenger activity, source context, confidence, and human review. Plate appearance alone must not be treated as conclusive proof of current authorization. Consider prolonged stopping, passenger boarding/alighting, repeated passenger activity, location, traffic interference, and terminal-like behavior. Do not invent numerical thresholds for this rule.
 
 ### Canonical list (count = 12)
 
@@ -693,11 +710,13 @@ Illegal Terminal is specifically dependent on applicable **PUV classification**.
 Relevant operational PUV types include:
 
 * Jeepney,
-* UV Express / Van,
+* Van with sufficient contextual evidence of apparent public/for-hire operation,
 * Tricycle,
-* Piaggio,
+* Autorickshaw,
 
 subject to the final applicability matrix.
+
+`autorickshaw` is the visual detector type. Piaggio may be retained as optional brand/local-type metadata; it is not a separate detector class. When Van operational status is uncertain, preserve `UNKNOWN` and route the case according to confidence/manual-review policy.
 
 A PUV merely being stationary is not sufficient.
 
@@ -914,16 +933,14 @@ violation.
 
 The intended approach is to classify the **helmet form/type**, rather than attempting to inspect tiny certification stickers in the video.
 
-The system should distinguish the relevant nut-shell/substandard helmet appearance from compliant helmet forms.
+The system classifies visible helmet **shape/form**, not certification. The current observation states are:
 
-Potential helmet categories may include visual forms such as:
+* `NO_HELMET`,
+* `NUT_SHELL`,
+* `ACCEPTABLE_SHAPE`,
+* `UNKNOWN`.
 
-* nut-shell/substandard helmet,
-* full-face helmet,
-* full-face with visor,
-* other supported helmet types.
-
-The exact dataset/class taxonomy and final classification model remain subject to further specification and validation.
+`ACCEPTABLE_SHAPE` means only that the visible form is not classified as nut-shell under the project's reviewed visual taxonomy. It must not be represented as proof of legal certification. Caps, hats, hoods, bare heads, construction headgear, carried helmets, and unclear observations must not be forced into `ACCEPTABLE_SHAPE`.
 
 Do not invent certification rules or legal definitions based solely on visual helmet appearance.
 
@@ -953,6 +970,8 @@ UNKNOWN / INSUFFICIENT EVIDENCE
 
 rather than automatically declaring that the mirror is absent.
 
+For the current design, the detected applicable vehicle bounding box defines a region of interest, and annotated `side_mirror` detections are evaluated inside the expected mirror-mount area. The rule uses `PRESENT`, `ABSENT`, and `UNKNOWN` visibility states and should corroborate absence across usable frames where practical. Failure to detect a mirror is not by itself proof that the mirror is absent. This approach is approved for the current pilot and may be revised after validation.
+
 ---
 
 # 28. Motorcycle Overloading
@@ -973,7 +992,9 @@ Compare with applicable rule
 Violation candidate
 ```
 
-The exact allowed occupant configuration and edge-case interpretation require the applicable project/legal specification and must not be invented.
+The current project trigger is more than two occupants actually riding on the motorcycle. Nearby pedestrians and people associated with another motorcycle are not occupants.
+
+Association should use available evidence across the track, including spatial relationship to the motorcycle, shared motion and trajectory, stable relative position, persistence across frames, and the configuration visible when the motorcycle enters the frame. Occlusion or uncertain association must result in manual review or no candidate rather than an invented count.
 
 ---
 
@@ -1038,16 +1059,20 @@ The complete list of supported signs and their individual behavioral triggers is
 
 Do not invent the final list or individual sign logic.
 
+Official LTO/DPWH materials define the sign designs and class meaning. They are reference specifications, not by themselves diverse computer-vision datasets. If automatic sign recognition is enabled, TAVIDM still requires licensed Philippine street/CCTV sign imagery covering the deployment conditions. Sign recognition supplies an observation; the tracked conflicting behavior remains a rule-engine decision.
+
 ---
 
 # 30. Failure to Follow Road / Pavement Markings
 
+For the fixed-camera MVP, pavement markings are configured through operator-saved camera templates rather than automatically detected by YOLO. The operator records the marking geometry, marking type, applicable roadway area, prohibited/permitted side where relevant, and associated lane direction.
+
 The current architecture is:
 
 ```text
-Pavement marking detected
+Operator-saved pavement-marking template loaded
         ↓
-Identify marking
+Read configured marking type and permitted/prohibited side
         ↓
 Determine applicable roadway area
         ↓
@@ -1059,6 +1084,8 @@ Check legitimate maneuver/context
         ↓
 Violation candidate / review / ignore
 ```
+
+Accordingly, the fixed-camera MVP does not require pavement-marking detector classes or a pavement-marking recognition training dataset. It still requires representative validation/test clips of permitted crossings, prohibited crossings, legitimate exceptions, ambiguous trajectories, and hard negatives. Automatic marking recognition for new or unconfigured cameras is deferred and would require a future dataset/model decision.
 
 The system must not implement:
 
@@ -1105,6 +1132,8 @@ Violation candidate
 ```
 
 The exact vehicle applicability, cargo-area geometry, and exception handling remain subject to further specification.
+
+The current engineering approach estimates a rear cargo region for the tracked `truck` or `pickup_truck`, then combines person-to-region geometry with shared vehicle/person motion, temporal persistence, and vehicle state. A single person/vehicle bounding-box overlap must not trigger the rule. Cabin occupants, nearby pedestrians, and brief loading/unloading activity are hard negatives or contextual exceptions. Unusable orientation, a covered cargo area, or insufficient visibility must preserve `UNKNOWN` rather than invent cargo occupancy.
 
 ---
 
@@ -1385,8 +1414,88 @@ It should report the dependency and request/await the project's explicit decisio
 
 **Roster (owner-confirmed 2026-08-16):** **12** canonical types. Illegal Parking and Illegal Terminal are **separate**. Do not merge them into `Illegal Parking / Illegal Terminal`. Production registry in `core/detection_config.py` must match this roster exactly; the fused label is legacy-only.
 
-**Implementation status:** Specifications are being established before full violation-engine implementation. Production code must not be changed from a specification drop unless implementation is explicitly requested.
+**Implementation remediation (2026-08-24):** The rule engine was remediated for dual confidence, track/rule state expiry, footprint zone membership, per-source geometry profiles, temporal evidence (prerecorded CCTV), model capability gating, and truthful fail-closed evaluators for all 12 rules. See §43.
 
 Additional specification updates are expected.
 
 The current specification must therefore be treated as the **current source of truth**, not as an immutable final legal or academic definition.
+
+---
+
+# 43. Engine Remediation Status Matrix (2026-08-24)
+
+## 43.1 Confidence semantics
+
+* `detection_confidence` — raw detector/model confidence for the associated detection.
+* `violation_confidence` — rule-engine score from named factors (persistence, geometry stability, association quality, contextual availability, detection reliability). **Not** a legal probability of guilt.
+* Legacy DB/API field `confidence` maps to `violation_confidence` (compatibility). Detection confidence is never copied wholesale into it.
+
+## 43.2 State lifecycle
+
+* `RuleEngineState` tracks `last_seen` and prunes persistence, fired episodes, contextual history, associations, and membership hysteresis using `TRACK_EXPIRY_SEC` (5s).
+* Missing observations interrupt consecutive persistence.
+* Re-arm after a configured clear period or after track expiry + new episode.
+* Track-ID reuse must not inherit prior violation history.
+
+## 43.3 Evidence lifecycle (prerecorded CCTV only)
+
+* Bounded JPEG ring buffer: 6s pre + episode + 3s post.
+* Retains annotated still + vehicle crop.
+* Finalize at end-of-video; abort cleans partial temporal dirs.
+* Not used for live RTSP analysis.
+
+## 43.4 Geometry profile
+
+* Per-source frame-normalized thresholds (`core/geometry_profile.py`).
+* Modes: `calibrated` | `normalized` | `legacy_fallback`.
+* Physical speed/distance only when genuinely calibrated.
+* Snapshot stored for run reproducibility.
+
+## 43.5 Zone membership
+
+* Footprint/overlap + anchor (`core/zone_membership.py`).
+* States: `INSIDE` | `OUTSIDE` | `BOUNDARY_UNKNOWN`.
+* Enter/exit hysteresis; stationary rules prefer stable membership.
+
+## 43.6 Fail-closed / capability gate
+
+At processing start, loaded model class names are compared to each enabled rule’s required classes. Missing classes disable automatic evaluation and surface diagnostics. Fallback COCO `yolov8m.pt` must not run helmet/mirror rules that need custom TAVIDM labels.
+
+## 43.7 Rule status matrix
+
+| # | Canonical name | Status | Required classes | Required context | Fail-closed when | Tests |
+|---|----------------|--------|------------------|------------------|------------------|-------|
+| 1 | Illegal Parking | partial | — | `no_parking` zone; parking-like context | stop-only without parking context (review proxy only) | remediation + engine |
+| 2 | Obstruction | implemented | — | active lane / crossing zone | zone missing | engine + remediation |
+| 3 | Counterflow | implemented | — | active lane + flow degrees | heading unknown | engine |
+| 4 | Truck-Ban Violation | implemented | `truck` (configurable) | truck_ban zone + **recording datetime** | recording time UNKNOWN; pickup not auto-included | remediation + engine |
+| 5 | No Helmet | implemented (model-dependent) | motorcycle, person/rider, helmet_acceptable, helmet_nut_shell (or legacy helmet set) | usable rider visibility | missing classes; UNKNOWN visibility | remediation |
+| 6 | No Side Mirror | partial (NEEDS DECISION) | `side_mirror` | affirmative absence + genuine visibility/orientation | non-detection alone; size/confidence heuristics | remediation |
+| 7 | Motorcycle Overloading | implemented | motorcycle, person/rider | rider association | uncertain association | engine |
+| 8 | Disregarding Traffic Sign | partial | — | supported sign annotations (STOP/speed-limit excluded) | no signs configured | roster + remediation |
+| 9 | Failure to Follow Road/Pavement Markings | partial | — | operator marking geometry (restricted_lane proxy) | no geometry | engine |
+| 10 | Illegal Terminal | partial | PUV types | loading zone + passenger-activity / for-hire context | stop alone; Van without for-hire context | remediation + engine |
+| 11 | Unauthorized Passenger in Applicable Truck/Pickup Cargo Area | partial | person, truck, pickup_truck | cargo ROI + shared motion persistence | one-frame overlap only | remediation |
+| 12 | Substandard / Nut-Shell Helmet | partial | motorcycle, person, helmet_acceptable, helmet_nut_shell | rider association | missing classes; ACCEPTABLE ≠ certification | remediation |
+
+Statuses: **implemented** = automatic candidates with working logic under stated prerequisites. **partial** = explicit evaluator exists but is review/fail-closed or incomplete vs full legal/spec behavior. A fail-closed evaluator is **not** production-complete.
+
+## 43.9 Vehicle detector roster (aligned 2026-08-24)
+
+The violation engine consumes the **11-class** vehicle detector roster from `config/training/class_schema.json` schema_version **1.2.0**. This does **not** change the **12** canonical violation rules.
+
+* `van` is the only visual van class; UV Express / for-hire is contextual metadata (never a YOLO class).
+* `autorickshaw` is the integrated three-wheel detector class; `piaggio` is brand metadata only.
+* Legacy `uv_express_van` may normalize to `van`. Ambiguous legacy `piaggio` is UNCERTAIN until body-form review.
+* A trained seven-class baseline **label set** is a valid subset of the 11-class roster; missing `suv_crossover`, `van`, `autorickshaw`, `pickup_truck` must fail-close related automatic evaluation. The trained seven-class `best.pt` remains external (not integrated into `D:\tavidm\models`; do not claim `models/best.pt` exists).
+
+1. Exact Illegal Parking / Illegal Terminal numerical dwell and parking-like / terminal-like evidence thresholds (frozen legal policy).
+2. Obstruction legitimate-exception detectors (enforcer, queue, incident) — currently not automatic.
+3. Cargo-area ROI geometry beyond the rear-bbox heuristic.
+4. Per-sign behavioral triggers beyond the supported-sign architecture.
+5. Pavement-marking side/exception rules for solid+broken and Philippine-specific edge cases.
+6. Side-mirror ABSENT affirmative evidence standard for automatic (non-review) confirmation.
+7. Whether Van/`bus` remain in terminal applicability without stronger for-hire annotations.
+8. Counterflow “already opposing on entry” 2-second edge case as a separate configured path.
+9. UI surfaces for dual confidence, capability diagnostics, and temporal clip playback.
+10. Homography / meters-per-norm calibration capture workflow per camera.

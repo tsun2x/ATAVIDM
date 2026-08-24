@@ -513,6 +513,87 @@ body {
 
 .sidebar-overlay.show { display: block; }
 
+/* Accessible violation sliding switches */
+.tavidm-switch-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 4px;
+    border-bottom: 1px solid var(--border-color);
+}
+.tavidm-switch-row:last-child { border-bottom: 0; }
+.tavidm-switch-row.is-disabled { opacity: 0.72; }
+.tavidm-switch-title { font-weight: 600; margin-bottom: 0; cursor: pointer; }
+.tavidm-switch-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+.tavidm-switch-state {
+    font-size: 0.75rem;
+    font-weight: 700;
+    min-width: 3.5rem;
+    text-align: right;
+}
+.tavidm-switch-state.is-active { color: #15803d; }
+.tavidm-switch-state.is-inactive { color: #b91c1c; }
+.tavidm-switch {
+    position: relative;
+    display: inline-flex;
+    width: 48px;
+    height: 28px;
+    margin: 0;
+    cursor: pointer;
+}
+.tavidm-switch input {
+    position: absolute;
+    opacity: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    cursor: pointer;
+    z-index: 2;
+}
+.tavidm-switch-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: #dc2626;
+    transition: background 0.15s ease;
+    border: 2px solid transparent;
+}
+.tavidm-switch.switch-on .tavidm-switch-track { background: #16a34a; }
+.tavidm-switch.switch-off .tavidm-switch-track { background: #dc2626; }
+.tavidm-switch-thumb {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 0.15s ease;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+}
+.tavidm-switch.switch-on .tavidm-switch-thumb { transform: translateX(20px); }
+.tavidm-switch input:focus-visible + .tavidm-switch-track {
+    outline: 3px solid #2563eb;
+    outline-offset: 2px;
+}
+.tavidm-switch.switch-disabled { cursor: not-allowed; }
+.tavidm-switch.switch-disabled input { cursor: not-allowed; }
+
+.media-mode-btn.active {
+    background: var(--brand-accent);
+    border-color: var(--brand-accent);
+    color: #fff;
+}
+#processProgressPanel { background: #f8fafc; }
+.bulk-check-wrap { border-right: 1px solid var(--border-color); }
+.camera-item-row .camera-item { border-left: 0; }
+
 @media (max-width: 991.98px) {
     .sidebar { transform: translateX(-100%); }
     .sidebar.show { transform: translateX(0); }

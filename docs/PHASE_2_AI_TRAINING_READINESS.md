@@ -4,7 +4,7 @@
 
 ## Frozen pilot contract
 
-The Phase 2 pilot uses YOLOv8m with ByteTrack on the RTX 3050 6 GB target. `config/training/class_schema.json` (schema_version **1.1.0**) is the versioned annotation contract. It freezes observable labels for the pilot without freezing unfinished legal or rule-engine details. A detection label is never itself a violation.
+The Phase 2 pilot uses YOLOv8m with ByteTrack on the RTX 3050 6 GB target. `config/training/class_schema.json` (schema_version **1.2.0**) is the versioned annotation contract. It freezes observable labels for the pilot without freezing unfinished legal or rule-engine details. A detection label is never itself a violation. The vehicle detector roster has **11** classes (`autorickshaw`; single `van`; no canonical `uv_express_van` / `piaggio`).
 
 The schema freezes **12** vehicle detector classes (including separate `pickup_truck`), **17** object classes, and **9** scene classes (**26** pilot labels total). Philippine PUV types remain distinct. Helmet presence/type and mirror observability are separate attribute labels. STOP and speed-limit signs are excluded from the current scope. Unknown or occluded attributes must remain unknown rather than receiving forced negative labels. See `docs/SYSTEM_TRUTH_INDEX.md` for the source hierarchy.
 

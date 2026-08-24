@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -19,6 +20,10 @@ VIOLATION_SORT_OPTIONS = {
     "confidence_asc": "confidence ASC",
     "type": "violation_type ASC, detected_at DESC",
 }
+
+
+class TemporalEvidenceNotReady(ValueError):
+    """Review confirmation blocked until temporal evidence is finalized."""
 
 
 def get_db_path() -> str:
@@ -118,6 +123,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # from-scratch DB. Guard each change with an existence check; the raw
         # script remains the canonical reference for manual/outside migrations.
         _apply_migration_002(conn)
+
+    _apply_migration_003(conn)
+    _apply_migration_004(conn)
+    _apply_migration_005(conn)
+    _apply_migration_006(conn)
+    _apply_migration_007(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -232,11 +243,239 @@ def _apply_migration_002(conn: sqlite3.Connection) -> None:
         )
 
 
+def _apply_migration_003(conn: sqlite3.Connection) -> None:
+    """Additive dual-confidence + temporal evidence columns (migration 003)."""
+    dual_cols = (
+        ("detection_confidence", "REAL"),
+        ("violation_confidence", "REAL"),
+        ("evidence_sufficiency", "REAL"),
+        ("evidence_clip_path", "TEXT"),
+        ("evidence_sequence_dir", "TEXT"),
+        ("evidence_pre_sec", "REAL"),
+        ("evidence_post_sec", "REAL"),
+        ("episode_start_sec", "REAL"),
+        ("episode_end_sec", "REAL"),
+        ("contributing_factors_json", "TEXT"),
+        ("unavailable_factors_json", "TEXT"),
+    )
+    for table in ("review_queue", "violations"):
+        if not _table_exists(conn, table):
+            continue
+        for col, col_type in dual_cols:
+            if not _column_exists(conn, table, col):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+    if _table_exists(conn, "processing_runs"):
+        if not _column_exists(conn, "processing_runs", "diagnostics_json"):
+            conn.execute("ALTER TABLE processing_runs ADD COLUMN diagnostics_json TEXT")
+        if not _column_exists(conn, "processing_runs", "geometry_snapshot_json"):
+            conn.execute(
+                "ALTER TABLE processing_runs ADD COLUMN geometry_snapshot_json TEXT"
+            )
+
+
+def _apply_migration_004(conn: sqlite3.Connection) -> None:
+    """Upload/processing UX: progress, artifacts, history, uploaded_by."""
+    if _table_exists(conn, "videos") and not _column_exists(conn, "videos", "uploaded_by"):
+        conn.execute("ALTER TABLE videos ADD COLUMN uploaded_by INTEGER")
+
+    run_cols = (
+        ("stage", "TEXT"),
+        ("viewer_mode", "TEXT DEFAULT 'background'"),
+        ("queued_at", "DATETIME"),
+        ("frames_processed", "INTEGER DEFAULT 0"),
+        ("total_frames", "INTEGER"),
+        ("progress_percent", "REAL DEFAULT 0"),
+        ("elapsed_sec", "REAL"),
+        ("processing_fps", "REAL"),
+        ("detection_records", "INTEGER DEFAULT 0"),
+        ("unique_tracks", "INTEGER"),
+        ("class_counts_json", "TEXT DEFAULT '{}'"),
+        ("violation_candidates", "INTEGER DEFAULT 0"),
+        ("annotated_video_path", "TEXT"),
+        ("annotated_video_ready", "INTEGER DEFAULT 0"),
+        ("model_identifier", "TEXT"),
+        ("source_duration_sec", "REAL"),
+        ("results_removed_at", "DATETIME"),
+        ("effective_output_fps", "REAL"),
+    )
+    if _table_exists(conn, "processing_runs"):
+        for col, col_type in run_cols:
+            if not _column_exists(conn, "processing_runs", col):
+                conn.execute(f"ALTER TABLE processing_runs ADD COLUMN {col} {col_type}")
+
+    if not _table_exists(conn, "video_history_events"):
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS video_history_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+              run_id INTEGER REFERENCES processing_runs(id) ON DELETE SET NULL,
+              event_type TEXT NOT NULL,
+              detail_json TEXT NOT NULL DEFAULT '{}',
+              actor_user_id INTEGER REFERENCES users(id),
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_video_history_video_id
+              ON video_history_events(video_id);
+            CREATE INDEX IF NOT EXISTS idx_video_history_created_at
+              ON video_history_events(created_at);
+            """
+        )
+
+    if not _table_exists(conn, "system_audit_events"):
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS system_audit_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_type TEXT NOT NULL,
+              detail_json TEXT NOT NULL DEFAULT '{}',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+
+def _apply_migration_005(conn: sqlite3.Connection) -> None:
+    """Add processing_run_id attribution to detections and dependent result tables."""
+    for table in ("detections", "review_queue", "violations"):
+        if not _table_exists(conn, table):
+            continue
+        if not _column_exists(conn, table, "processing_run_id"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN processing_run_id INTEGER")
+
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_detections_run_id
+          ON detections(processing_run_id);
+        CREATE INDEX IF NOT EXISTS idx_detections_video_run
+          ON detections(video_id, processing_run_id);
+        CREATE INDEX IF NOT EXISTS idx_review_queue_run_id
+          ON review_queue(processing_run_id);
+        CREATE INDEX IF NOT EXISTS idx_violations_run_id
+          ON violations(processing_run_id);
+        """
+    )
+
+
+def _attributed_child_exists_clauses(conn: sqlite3.Connection) -> list[str]:
+    """SQL EXISTS clauses proving a run owns attributed result rows."""
+    clauses: list[str] = []
+    if _table_exists(conn, "detections") and _column_exists(
+        conn, "detections", "processing_run_id"
+    ):
+        clauses.append(
+            "EXISTS (SELECT 1 FROM detections d WHERE d.processing_run_id = processing_runs.id)"
+        )
+    if _table_exists(conn, "review_queue") and _column_exists(
+        conn, "review_queue", "processing_run_id"
+    ):
+        clauses.append(
+            "EXISTS (SELECT 1 FROM review_queue rq WHERE rq.processing_run_id = processing_runs.id)"
+        )
+    if _table_exists(conn, "violations") and _column_exists(
+        conn, "violations", "processing_run_id"
+    ):
+        clauses.append(
+            "EXISTS (SELECT 1 FROM violations v WHERE v.processing_run_id = processing_runs.id)"
+        )
+    return clauses
+
+
+def _apply_migration_006(conn: sqlite3.Connection) -> None:
+    """Mark processing runs as run-scoped vs legacy for authoritative current results.
+
+    results_run_scoped=1 means the run owns its result population even when empty.
+    Fresh/backfill ownership is proven only by attributed child rows
+    (processing_run_id). Progress, stage, diagnostics, and geometry are NOT
+    provenance — migration 007 repairs earlier false positives from those signals.
+    """
+    if not _table_exists(conn, "processing_runs"):
+        return
+    if not _column_exists(conn, "processing_runs", "results_run_scoped"):
+        conn.execute(
+            "ALTER TABLE processing_runs "
+            "ADD COLUMN results_run_scoped INTEGER NOT NULL DEFAULT 0"
+        )
+
+    child_exists = _attributed_child_exists_clauses(conn)
+    if not child_exists:
+        return
+    where_bits = " OR ".join(child_exists)
+    conn.execute(
+        f"""
+        UPDATE processing_runs
+        SET results_run_scoped = 1
+        WHERE COALESCE(results_run_scoped, 0) = 0
+          AND ({where_bits})
+        """
+    )
+
+
+def _apply_migration_007(conn: sqlite3.Connection) -> None:
+    """Record explicit result-scope provenance and repair false-scoped legacy runs.
+
+    results_scope_explicit=1 means ownership was recorded at create time or proven
+    by attributed child rows. Ambiguous completed runs (diagnostics/geometry/stage
+    only, zero attributed children) must remain legacy so NULL-attributed rows stay
+    visible. Never deletes or rewrites detections/review/violations.
+    """
+    if not _table_exists(conn, "processing_runs"):
+        return
+    # Ensure 006 column exists before provenance repair.
+    if not _column_exists(conn, "processing_runs", "results_run_scoped"):
+        _apply_migration_006(conn)
+
+    if not _column_exists(conn, "processing_runs", "results_scope_explicit"):
+        conn.execute(
+            "ALTER TABLE processing_runs "
+            "ADD COLUMN results_scope_explicit INTEGER NOT NULL DEFAULT 0"
+        )
+    if not _column_exists(conn, "processing_runs", "results_scope_origin"):
+        conn.execute(
+            "ALTER TABLE processing_runs ADD COLUMN results_scope_origin TEXT"
+        )
+
+    child_exists = _attributed_child_exists_clauses(conn)
+    attributed_sql = " OR ".join(child_exists) if child_exists else "0"
+
+    # Historical runs with real attributed children: mark scoped + explicit.
+    if child_exists:
+        conn.execute(
+            f"""
+            UPDATE processing_runs
+            SET results_run_scoped = 1,
+                results_scope_explicit = 1,
+                results_scope_origin = COALESCE(
+                    NULLIF(results_scope_origin, ''),
+                    'attributed_children'
+                )
+            WHERE COALESCE(results_scope_explicit, 0) = 0
+              AND ({attributed_sql})
+            """
+        )
+
+    # Repair false positives from migration 006 metadata backfill: scoped without
+    # explicit provenance and without attributed children → legacy again.
+    conn.execute(
+        f"""
+        UPDATE processing_runs
+        SET results_run_scoped = 0
+        WHERE COALESCE(results_run_scoped, 0) = 1
+          AND COALESCE(results_scope_explicit, 0) = 0
+          AND NOT ({attributed_sql})
+        """
+    )
+
+
 def init_db(force: bool = False) -> None:
     with db_session() as conn:
         if force:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS system_audit_events;
+                DROP TABLE IF EXISTS video_history_events;
+                DROP TABLE IF EXISTS processing_runs;
                 DROP TABLE IF EXISTS reports;
                 DROP TABLE IF EXISTS system_settings;
                 DROP TABLE IF EXISTS cameras;
@@ -340,16 +579,36 @@ def insert_video(
     condition: str | None = None,
     status: str = "uploaded",
     file_size_bytes: int | None = None,
+    uploaded_by: int | None = None,
 ) -> int:
     with db_session() as conn:
+        if uploaded_by is not None:
+            row = conn.execute(
+                "SELECT id FROM users WHERE id = ?",
+                (uploaded_by,),
+            ).fetchone()
+            if row is None:
+                uploaded_by = None
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor = conn.execute(
             """
             INSERT INTO videos (
-                filename, filepath, duration_sec, recorded_at, condition, status, file_size_bytes
+                filename, filepath, duration_sec, recorded_at, condition,
+                status, file_size_bytes, uploaded_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (filename, filepath, duration_sec, recorded_at, condition, status, file_size_bytes),
+            (
+                filename,
+                filepath,
+                duration_sec,
+                recorded_at,
+                condition,
+                status,
+                file_size_bytes,
+                uploaded_by,
+                now,
+            ),
         )
         return cursor.lastrowid
 
@@ -426,16 +685,59 @@ def mark_video_processed(video_id: int) -> None:
 # --- Processing runs (per-run metadata + sequential queue) ---
 
 
-def create_processing_run(video_id: int, enabled_violations_json: str) -> int:
+def create_processing_run(
+    video_id: int,
+    enabled_violations_json: str,
+    *,
+    viewer_mode: str = "background",
+) -> int:
     with db_session() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO processing_runs (
-                video_id, status, enabled_violations_json, started_at, finished_at
-            ) VALUES (?, 'queued', ?, NULL, NULL)
-            """,
-            (video_id, enabled_violations_json),
-        )
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        has_scoped = _column_exists(conn, "processing_runs", "results_run_scoped")
+        has_explicit = _column_exists(conn, "processing_runs", "results_scope_explicit")
+        has_origin = _column_exists(conn, "processing_runs", "results_scope_origin")
+        if has_scoped and has_explicit and has_origin:
+            cursor = conn.execute(
+                """
+                INSERT INTO processing_runs (
+                    video_id, status, enabled_violations_json, started_at, finished_at,
+                    stage, viewer_mode, queued_at,
+                    results_run_scoped, results_scope_explicit, results_scope_origin
+                ) VALUES (?, 'queued', ?, NULL, NULL, 'queued', ?, ?, 1, 1, 'create')
+                """,
+                (video_id, enabled_violations_json, viewer_mode, now),
+            )
+        elif has_scoped and has_explicit:
+            cursor = conn.execute(
+                """
+                INSERT INTO processing_runs (
+                    video_id, status, enabled_violations_json, started_at, finished_at,
+                    stage, viewer_mode, queued_at,
+                    results_run_scoped, results_scope_explicit
+                ) VALUES (?, 'queued', ?, NULL, NULL, 'queued', ?, ?, 1, 1)
+                """,
+                (video_id, enabled_violations_json, viewer_mode, now),
+            )
+        elif has_scoped:
+            cursor = conn.execute(
+                """
+                INSERT INTO processing_runs (
+                    video_id, status, enabled_violations_json, started_at, finished_at,
+                    stage, viewer_mode, queued_at, results_run_scoped
+                ) VALUES (?, 'queued', ?, NULL, NULL, 'queued', ?, ?, 1)
+                """,
+                (video_id, enabled_violations_json, viewer_mode, now),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO processing_runs (
+                    video_id, status, enabled_violations_json, started_at, finished_at,
+                    stage, viewer_mode, queued_at
+                ) VALUES (?, 'queued', ?, NULL, NULL, 'queued', ?, ?)
+                """,
+                (video_id, enabled_violations_json, viewer_mode, now),
+            )
         return cursor.lastrowid
 
 
@@ -446,23 +748,124 @@ def start_processing_run(run_id: int) -> None:
         conn.execute(
             """
             UPDATE processing_runs
-            SET status = 'running', started_at = COALESCE(started_at, ?)
+            SET status = 'running',
+                stage = COALESCE(NULLIF(stage, 'queued'), 'loading_model'),
+                started_at = COALESCE(started_at, ?)
             WHERE id = ?
             """,
             (now, run_id),
         )
 
 
-def finish_processing_run(run_id: int, *, status: str = "completed", error_message: str | None = None) -> None:
+def update_processing_run_progress(run_id: int, progress: dict[str, Any]) -> None:
+    """Persist a progress snapshot (called periodically from the worker)."""
+    fields = []
+    params: list[Any] = []
+    mapping = {
+        "stage": "stage",
+        "frames_processed": "frames_processed",
+        "total_frames": "total_frames",
+        "progress_percent": "progress_percent",
+        "elapsed_sec": "elapsed_sec",
+        "processing_fps": "processing_fps",
+        "detection_records": "detection_records",
+        "unique_tracks": "unique_tracks",
+        "violation_candidates": "violation_candidates",
+        "model_identifier": "model_identifier",
+        "source_duration_sec": "source_duration_sec",
+        "effective_output_fps": "effective_output_fps",
+        "annotated_video_path": "annotated_video_path",
+        "annotated_video_ready": "annotated_video_ready",
+        "error_message": "error_message",
+    }
+    for src, col in mapping.items():
+        if src in progress and progress[src] is not None:
+            fields.append(f"{col} = ?")
+            val = progress[src]
+            if src == "annotated_video_ready":
+                val = int(bool(val))
+            params.append(val)
+    if "class_counts" in progress and progress["class_counts"] is not None:
+        fields.append("class_counts_json = ?")
+        params.append(json.dumps(progress["class_counts"]))
+    if not fields:
+        return
+    params.append(run_id)
+    with db_session() as conn:
+        conn.execute(
+            f"UPDATE processing_runs SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+
+
+def finish_processing_run(
+    run_id: int,
+    *,
+    status: str = "completed",
+    error_message: str | None = None,
+    diagnostics_json: str | None = None,
+    geometry_snapshot_json: str | None = None,
+    progress: dict[str, Any] | None = None,
+) -> None:
     with db_session() as conn:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stage = "completed" if status == "completed" else "failed"
+        ann_path = None
+        ann_ready = 0
+        class_counts_json = None
+        extra_sets = ""
+        extra_params: list[Any] = []
+        if progress:
+            if progress.get("stage"):
+                stage = progress["stage"]
+            ann_path = progress.get("annotated_video_path")
+            ann_ready = int(bool(progress.get("annotated_video_ready")))
+            if progress.get("class_counts") is not None:
+                class_counts_json = json.dumps(progress["class_counts"])
+            for key, col in (
+                ("frames_processed", "frames_processed"),
+                ("total_frames", "total_frames"),
+                ("progress_percent", "progress_percent"),
+                ("elapsed_sec", "elapsed_sec"),
+                ("processing_fps", "processing_fps"),
+                ("detection_records", "detection_records"),
+                ("unique_tracks", "unique_tracks"),
+                ("violation_candidates", "violation_candidates"),
+                ("model_identifier", "model_identifier"),
+                ("source_duration_sec", "source_duration_sec"),
+                ("effective_output_fps", "effective_output_fps"),
+            ):
+                if progress.get(key) is not None:
+                    extra_sets += f", {col} = ?"
+                    extra_params.append(progress[key])
+            if class_counts_json is not None:
+                extra_sets += ", class_counts_json = ?"
+                extra_params.append(class_counts_json)
+            if ann_path is not None:
+                extra_sets += ", annotated_video_path = ?"
+                extra_params.append(ann_path)
+            extra_sets += ", annotated_video_ready = ?"
+            extra_params.append(ann_ready)
+
         conn.execute(
-            """
+            f"""
             UPDATE processing_runs
-            SET status = ?, error_message = ?, finished_at = ?
+            SET status = ?, error_message = ?, finished_at = ?, stage = ?,
+                diagnostics_json = COALESCE(?, diagnostics_json),
+                geometry_snapshot_json = COALESCE(?, geometry_snapshot_json)
+                {extra_sets}
             WHERE id = ?
             """,
-            (status, error_message, now, run_id),
+            (
+                status,
+                error_message,
+                now,
+                stage,
+                diagnostics_json,
+                geometry_snapshot_json,
+                *extra_params,
+                run_id,
+            ),
         )
 
 
@@ -475,17 +878,560 @@ def get_processing_run(run_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
+def get_latest_processing_run(video_id: int) -> dict[str, Any] | None:
+    """Latest processing attempt (any status) — activity / failure surface."""
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM processing_runs
+            WHERE video_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (video_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_authoritative_completed_run(video_id: int) -> dict[str, Any] | None:
+    """Latest completed run-scoped result (authoritative even with zero detections)."""
+    with db_session() as conn:
+        if not _column_exists(conn, "processing_runs", "results_run_scoped"):
+            return None
+        row = conn.execute(
+            """
+            SELECT * FROM processing_runs
+            WHERE video_id = ?
+              AND status = 'completed'
+              AND COALESCE(results_run_scoped, 0) = 1
+            ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (video_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_latest_completed_processing_run(video_id: int) -> dict[str, Any] | None:
+    """Latest successfully completed run (any scoping) — artifact fallback."""
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM processing_runs
+            WHERE video_id = ? AND status = 'completed'
+            ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (video_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_current_completed_result_run(video_id: int) -> dict[str, Any] | None:
+    """Completed run whose artifacts/results are current for UI.
+
+    Prefer an authoritative run-scoped completed run. If none exists, fall back
+    to the latest completed run (legacy / pre-flag era annotated replay).
+    """
+    authoritative = get_authoritative_completed_run(video_id)
+    if authoritative is not None:
+        return authoritative
+    return get_latest_completed_processing_run(video_id)
+
+
+def resolve_current_detection_scope(video_id: int) -> tuple[str, int | None]:
+    """Return ('run', run_id) for authoritative scoped results, else ('legacy', None).
+
+    Authority is never inferred from detection row counts.
+    """
+    run = get_authoritative_completed_run(video_id)
+    if run is not None:
+        return "run", int(run["id"])
+    return "legacy", None
+
+
 def list_processing_runs(video_id: int) -> list[dict[str, Any]]:
     with db_session() as conn:
         rows = conn.execute(
             """
             SELECT * FROM processing_runs
             WHERE video_id = ?
-            ORDER BY started_at DESC, id DESC
+            ORDER BY COALESCE(queued_at, started_at) DESC, id DESC
             """,
             (video_id,),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+
+def clear_processing_run_artifact(run_id: int) -> None:
+    with db_session() as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """
+            UPDATE processing_runs
+            SET annotated_video_path = NULL,
+                annotated_video_ready = 0,
+                results_removed_at = ?
+            WHERE id = ?
+            """,
+            (now, run_id),
+        )
+
+
+def insert_video_history_event(
+    video_id: int,
+    event_type: str,
+    *,
+    detail: dict[str, Any] | None = None,
+    run_id: int | None = None,
+    actor_user_id: int | None = None,
+) -> int:
+    with db_session() as conn:
+        # Drop actor if it would violate FK (stale session / deleted user).
+        if actor_user_id is not None:
+            row = conn.execute(
+                "SELECT id FROM users WHERE id = ?",
+                (actor_user_id,),
+            ).fetchone()
+            if row is None:
+                actor_user_id = None
+        cursor = conn.execute(
+            """
+            INSERT INTO video_history_events (
+                video_id, run_id, event_type, detail_json, actor_user_id
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                video_id,
+                run_id,
+                event_type,
+                json.dumps(detail or {}),
+                actor_user_id,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def list_video_history_events(video_id: int) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM video_history_events
+            WHERE video_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (video_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def insert_system_audit_event(event_type: str, *, detail: dict[str, Any] | None = None) -> int:
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO system_audit_events (event_type, detail_json)
+            VALUES (?, ?)
+            """,
+            (event_type, json.dumps(detail or {})),
+        )
+        return cursor.lastrowid
+
+
+def list_system_audit_events(
+    *,
+    event_type: str | None = None,
+) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        if event_type:
+            rows = conn.execute(
+                """
+                SELECT * FROM system_audit_events
+                WHERE event_type = ?
+                ORDER BY id ASC
+                """,
+                (event_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM system_audit_events ORDER BY id ASC"
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def count_confirmed_violations_for_video(video_id: int) -> int:
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM violations
+            WHERE video_id = ? AND status = 'confirmed'
+            """,
+            (video_id,),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+
+def count_reports_referencing_video(video_id: int) -> int:
+    """Best-effort: reports store filters_json which may mention video_id."""
+    needle = f'"video_id": {int(video_id)}'
+    alt = f'"video_id":{int(video_id)}'
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM reports
+            WHERE filters_json LIKE ? OR filters_json LIKE ?
+            """,
+            (f"%{needle}%", f"%{alt}%"),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+
+def list_review_items_for_video(
+    video_id: int,
+    *,
+    status: str | None = "pending",
+) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        if status is None:
+            rows = conn.execute(
+                "SELECT * FROM review_queue WHERE video_id = ?",
+                (video_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM review_queue WHERE video_id = ? AND status = ?",
+                (video_id, status),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def list_violation_rows_for_video(video_id: int) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM violations WHERE video_id = ?",
+            (video_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def delete_unconfirmed_results_for_video(video_id: int) -> None:
+    """Remove detections and pending/dismissed review rows; keep confirmed violations."""
+    with db_session() as conn:
+        conn.execute("DELETE FROM detections WHERE video_id = ?", (video_id,))
+        conn.execute(
+            """
+            DELETE FROM review_queue
+            WHERE video_id = ? AND status IN ('pending', 'dismissed')
+            """,
+            (video_id,),
+        )
+
+
+def delete_video_cascade_unprotected(video_id: int) -> None:
+    """Delete video row and unprotected dependents (no confirmed violations expected)."""
+    with db_session() as conn:
+        _cascade_delete_video_rows(conn, video_id)
+
+
+def _cascade_delete_video_rows(conn: sqlite3.Connection, video_id: int) -> None:
+    conn.execute("DELETE FROM detections WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM review_queue WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM violations WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM annotations WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM processing_runs WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM video_history_events WHERE video_id = ?", (video_id,))
+    conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+
+
+def delete_video_cascade_with_audit(
+    video_id: int,
+    *,
+    event_type: str,
+    detail: dict[str, Any] | None = None,
+) -> int:
+    """Atomically cascade-delete a video and insert a durable system audit event.
+
+    Uses one SQLite transaction: either both succeed or neither commits.
+    """
+    with db_session() as conn:
+        _cascade_delete_video_rows(conn, video_id)
+        cursor = conn.execute(
+            """
+            INSERT INTO system_audit_events (event_type, detail_json)
+            VALUES (?, ?)
+            """,
+            (event_type, json.dumps(detail or {})),
+        )
+        return int(cursor.lastrowid)
+
+
+def detection_summary_for_video(video_id: int) -> dict[str, Any]:
+    """Current detection summary for a video.
+
+    Authoritative run-scoped completed runs own the current population even when
+    they contain zero detections. Legacy NULL rows are used only when no such
+    authoritative completed run exists. Failed/queued/running attempts never
+    replace a prior completed result.
+    """
+    mode, run_id = resolve_current_detection_scope(video_id)
+
+    with db_session() as conn:
+        if mode == "run" and run_id is not None:
+            where = "video_id = ? AND processing_run_id = ?"
+            params: tuple[Any, ...] = (video_id, run_id)
+            cand_where = "video_id = ? AND processing_run_id = ?"
+            cand_params: tuple[Any, ...] = (video_id, run_id)
+        else:
+            where = "video_id = ? AND processing_run_id IS NULL"
+            params = (video_id,)
+            cand_where = "video_id = ? AND processing_run_id IS NULL"
+            cand_params = (video_id,)
+
+        total = conn.execute(
+            f"SELECT COUNT(*) AS n FROM detections WHERE {where}",
+            params,
+        ).fetchone()["n"]
+        tracks = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT track_id) AS n FROM detections
+            WHERE {where} AND track_id IS NOT NULL
+            """,
+            params,
+        ).fetchone()["n"]
+        class_rows = conn.execute(
+            f"""
+            SELECT class_label, COUNT(*) AS n FROM detections
+            WHERE {where}
+            GROUP BY class_label
+            ORDER BY n DESC
+            """,
+            params,
+        ).fetchall()
+        candidates = conn.execute(
+            f"SELECT COUNT(*) AS n FROM review_queue WHERE {cand_where}",
+            cand_params,
+        ).fetchone()["n"]
+    return {
+        "detection_records": int(total or 0),
+        "unique_tracks": int(tracks or 0),
+        "class_counts": {r["class_label"]: int(r["n"]) for r in class_rows},
+        "violation_candidates": int(candidates or 0),
+        "processing_run_id": run_id,
+        "result_scope": mode,
+    }
+
+
+def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day") -> dict[str, Any]:
+    """Aggregate upload + processing metrics. Upload counts use videos.created_at only."""
+    with db_session() as conn:
+        unique_uploads = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM videos
+            WHERE created_at >= ? AND created_at < ?
+            """,
+            (start_s, end_s),
+        ).fetchone()["n"]
+
+        status_rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS n FROM videos
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY status
+            """,
+            (start_s, end_s),
+        ).fetchall()
+        by_status = {r["status"]: int(r["n"]) for r in status_rows}
+
+        # Current inventory (not limited to period) for operational queues
+        inv = conn.execute(
+            """
+            SELECT status, COUNT(*) AS n FROM videos GROUP BY status
+            """
+        ).fetchall()
+        inventory = {r["status"]: int(r["n"]) for r in inv}
+
+        run_stats = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS total_runs,
+              SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS successful_runs,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_runs,
+              AVG(
+                CASE
+                  WHEN status = 'completed' AND started_at IS NOT NULL AND finished_at IS NOT NULL
+                  THEN (julianday(finished_at) - julianday(started_at)) * 86400.0
+                  ELSE NULL
+                END
+              ) AS avg_duration_sec,
+              SUM(COALESCE(detection_records, 0)) AS detection_records,
+              SUM(COALESCE(violation_candidates, 0)) AS violation_candidates
+            FROM processing_runs
+            WHERE COALESCE(queued_at, started_at, finished_at) >= ?
+              AND COALESCE(queued_at, started_at, finished_at) < ?
+            """,
+            (start_s, end_s),
+        ).fetchone()
+
+        class_rows = conn.execute(
+            """
+            SELECT d.class_label, COUNT(*) AS n
+            FROM detections d
+            JOIN processing_runs pr ON pr.id = d.processing_run_id
+            WHERE pr.status = 'completed'
+              AND COALESCE(pr.results_run_scoped, 0) = 1
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
+            GROUP BY d.class_label
+            """,
+            (start_s, end_s),
+        ).fetchall()
+        # Legacy NULL-attributed detections only for in-period uploads that still
+        # have no authoritative run-scoped completed result.
+        legacy_rows = conn.execute(
+            """
+            SELECT d.class_label, COUNT(*) AS n
+            FROM detections d
+            JOIN videos v ON v.id = d.video_id
+            WHERE d.processing_run_id IS NULL
+              AND v.created_at >= ? AND v.created_at < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM processing_runs pr
+                WHERE pr.video_id = d.video_id
+                  AND pr.status = 'completed'
+                  AND COALESCE(pr.results_run_scoped, 0) = 1
+              )
+            GROUP BY d.class_label
+            """,
+            (start_s, end_s),
+        ).fetchall()
+        class_counts: dict[str, int] = {}
+        for r in class_rows:
+            if r["class_label"]:
+                class_counts[r["class_label"]] = class_counts.get(r["class_label"], 0) + int(r["n"])
+        for r in legacy_rows:
+            if r["class_label"]:
+                class_counts[r["class_label"]] = class_counts.get(r["class_label"], 0) + int(r["n"])
+
+        # Keep detection_records aligned with the same population as class_counts
+        # (run counters for scoped completed runs + legacy NULL counts).
+        scoped_det = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM detections d
+            JOIN processing_runs pr ON pr.id = d.processing_run_id
+            WHERE pr.status = 'completed'
+              AND COALESCE(pr.results_run_scoped, 0) = 1
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
+            """,
+            (start_s, end_s),
+        ).fetchone()["n"]
+        legacy_det = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM detections d
+            JOIN videos v ON v.id = d.video_id
+            WHERE d.processing_run_id IS NULL
+              AND v.created_at >= ? AND v.created_at < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM processing_runs pr
+                WHERE pr.video_id = d.video_id
+                  AND pr.status = 'completed'
+                  AND COALESCE(pr.results_run_scoped, 0) = 1
+              )
+            """,
+            (start_s, end_s),
+        ).fetchone()["n"]
+        aligned_detection_records = int(scoped_det or 0) + int(legacy_det or 0)
+
+        scoped_cand = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM review_queue rq
+            JOIN processing_runs pr ON pr.id = rq.processing_run_id
+            WHERE pr.status = 'completed'
+              AND COALESCE(pr.results_run_scoped, 0) = 1
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
+              AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
+            """,
+            (start_s, end_s),
+        ).fetchone()["n"]
+        legacy_cand = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM review_queue rq
+            JOIN videos v ON v.id = rq.video_id
+            WHERE rq.processing_run_id IS NULL
+              AND v.created_at >= ? AND v.created_at < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM processing_runs pr
+                WHERE pr.video_id = rq.video_id
+                  AND pr.status = 'completed'
+                  AND COALESCE(pr.results_run_scoped, 0) = 1
+              )
+            """,
+            (start_s, end_s),
+        ).fetchone()["n"]
+        aligned_candidates = int(scoped_cand or 0) + int(legacy_cand or 0)
+
+        if grain == "month":
+            trunc = "strftime('%Y-%m', created_at)"
+            run_trunc = "strftime('%Y-%m', COALESCE(queued_at, started_at, finished_at))"
+        elif grain == "week":
+            trunc = "strftime('%Y-%W', created_at)"
+            run_trunc = "strftime('%Y-%W', COALESCE(queued_at, started_at, finished_at))"
+        else:
+            trunc = "date(created_at)"
+            run_trunc = "date(COALESCE(queued_at, started_at, finished_at))"
+
+        upload_trend = conn.execute(
+            f"""
+            SELECT {trunc} AS bucket, COUNT(*) AS n
+            FROM videos
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (start_s, end_s),
+        ).fetchall()
+        run_trend = conn.execute(
+            f"""
+            SELECT {run_trunc} AS bucket, COUNT(*) AS n
+            FROM processing_runs
+            WHERE COALESCE(queued_at, started_at, finished_at) >= ?
+              AND COALESCE(queued_at, started_at, finished_at) < ?
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (start_s, end_s),
+        ).fetchall()
+
+    return {
+        "unique_videos_uploaded": int(unique_uploads or 0),
+        "videos_awaiting_annotation": int(inventory.get("annotating", 0) + inventory.get("uploaded", 0)),
+        "ready_videos": int(inventory.get("ready", 0)),
+        "queued_videos": int(inventory.get("processing", 0)),  # in-flight inventory; queue detail from API
+        "processed_videos": int(inventory.get("processed", 0)),
+        "failed_runs": int(run_stats["failed_runs"] or 0),
+        "total_processing_runs": int(run_stats["total_runs"] or 0),
+        "successful_runs": int(run_stats["successful_runs"] or 0),
+        "average_processing_duration_sec": (
+            float(run_stats["avg_duration_sec"])
+            if run_stats["avg_duration_sec"] is not None
+            else None
+        ),
+        "detection_records": aligned_detection_records,
+        "violation_candidates": aligned_candidates,
+        "class_counts": class_counts,
+        "uploads_by_status_in_period": by_status,
+        "trend": {
+            "uploads": [{"bucket": r["bucket"], "count": int(r["n"])} for r in upload_trend],
+            "processing_runs": [{"bucket": r["bucket"], "count": int(r["n"])} for r in run_trend],
+        },
+        "labels": {
+            "unique_videos_uploaded": "Unique videos uploaded (by upload time)",
+            "total_processing_runs": "Processing runs (includes reprocessing)",
+        },
+    }
 
 
 def recover_orphaned_processing() -> int:
@@ -511,7 +1457,7 @@ def recover_orphaned_processing() -> int:
             conn.execute(
                 """
                 UPDATE processing_runs
-                SET status = 'failed', finished_at = ?,
+                SET status = 'failed', stage = 'failed', finished_at = ?,
                     error_message = COALESCE(error_message, 'Recovered on startup: process not running.')
                 WHERE video_id = ? AND status IN ('queued', 'running')
                 """,
@@ -527,7 +1473,7 @@ def recover_orphaned_processing() -> int:
         conn.execute(
             """
             UPDATE processing_runs
-            SET status = 'failed', finished_at = ?,
+            SET status = 'failed', stage = 'failed', finished_at = ?,
                 error_message = COALESCE(error_message, 'Recovered on startup: worker not running.')
             WHERE status IN ('queued', 'running')
             """,
@@ -723,14 +1669,15 @@ def insert_detection(
     bbox_y: float,
     bbox_w: float,
     bbox_h: float,
+    processing_run_id: int | None = None,
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO detections (
                 video_id, frame_number, timestamp_sec, track_id, class_label,
-                confidence, bbox_x, bbox_y, bbox_w, bbox_h
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, bbox_x, bbox_y, bbox_w, bbox_h, processing_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
@@ -743,6 +1690,7 @@ def insert_detection(
                 bbox_y,
                 bbox_w,
                 bbox_h,
+                processing_run_id,
             ),
         )
         return cursor.lastrowid
@@ -756,13 +1704,19 @@ def bulk_insert_detections(rows: list[dict[str, Any]]) -> None:
             """
             INSERT INTO detections (
                 video_id, frame_number, timestamp_sec, track_id, class_label,
-                confidence, bbox_x, bbox_y, bbox_w, bbox_h
+                confidence, bbox_x, bbox_y, bbox_w, bbox_h, processing_run_id
             ) VALUES (
                 :video_id, :frame_number, :timestamp_sec, :track_id, :class_label,
-                :confidence, :bbox_x, :bbox_y, :bbox_w, :bbox_h
+                :confidence, :bbox_x, :bbox_y, :bbox_w, :bbox_h, :processing_run_id
             )
             """,
-            rows,
+            [
+                {
+                    **row,
+                    "processing_run_id": row.get("processing_run_id"),
+                }
+                for row in rows
+            ],
         )
 
 
@@ -770,9 +1724,29 @@ def get_detections_by_video(
     video_id: int,
     frame_start: int | None = None,
     frame_end: int | None = None,
+    *,
+    processing_run_id: int | None = None,
+    current_only: bool = False,
 ) -> list[dict[str, Any]]:
-    query = "SELECT * FROM detections WHERE video_id = ?"
+    """Return detections for a video.
+
+    When ``current_only`` is True, scope to the authoritative run-scoped completed
+    run (including empty zero-detection runs), or legacy NULL rows when no such
+    run exists. Authority is never inferred from detection counts.
+    """
     params: list[Any] = [video_id]
+    query = "SELECT * FROM detections WHERE video_id = ?"
+
+    if processing_run_id is not None:
+        query += " AND processing_run_id = ?"
+        params.append(processing_run_id)
+    elif current_only:
+        mode, run_id = resolve_current_detection_scope(video_id)
+        if mode == "run" and run_id is not None:
+            query += " AND processing_run_id = ?"
+            params.append(run_id)
+        else:
+            query += " AND processing_run_id IS NULL"
 
     if frame_start is not None:
         query += " AND frame_number >= ?"
@@ -807,22 +1781,43 @@ def insert_violation(
     plate_evidence_path: str | None = None,
     plate_text: str | None = None,
     plate_status: str = "not_attempted",
+    detection_confidence: float | None = None,
+    violation_confidence: float | None = None,
+    evidence_sufficiency: float | None = None,
+    evidence_clip_path: str | None = None,
+    evidence_sequence_dir: str | None = None,
+    evidence_pre_sec: float | None = None,
+    evidence_post_sec: float | None = None,
+    episode_start_sec: float | None = None,
+    episode_end_sec: float | None = None,
+    contributing_factors_json: str | None = None,
+    unavailable_factors_json: str | None = None,
 ) -> int:
+    viol_conf = (
+        float(violation_confidence)
+        if violation_confidence is not None
+        else float(confidence)
+    )
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO violations (
                 video_id, track_id, violation_type, vehicle_class, confidence,
                 frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by,
-                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status,
+                detection_confidence, violation_confidence, evidence_sufficiency,
+                evidence_clip_path, evidence_sequence_dir,
+                evidence_pre_sec, evidence_post_sec,
+                episode_start_sec, episode_end_sec,
+                contributing_factors_json, unavailable_factors_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
                 track_id,
                 violation_type,
                 vehicle_class,
-                confidence,
+                viol_conf,
                 frame_number,
                 timestamp_sec,
                 evidence_path,
@@ -833,6 +1828,17 @@ def insert_violation(
                 plate_evidence_path,
                 plate_text,
                 plate_status,
+                detection_confidence,
+                viol_conf,
+                evidence_sufficiency,
+                evidence_clip_path,
+                evidence_sequence_dir,
+                evidence_pre_sec,
+                evidence_post_sec,
+                episode_start_sec,
+                episode_end_sec,
+                contributing_factors_json,
+                unavailable_factors_json,
             ),
         )
         return cursor.lastrowid
@@ -988,22 +1994,47 @@ def insert_review_queue(
     plate_evidence_path: str | None = None,
     plate_text: str | None = None,
     plate_status: str = "not_attempted",
+    detection_confidence: float | None = None,
+    violation_confidence: float | None = None,
+    evidence_sufficiency: float | None = None,
+    evidence_clip_path: str | None = None,
+    evidence_sequence_dir: str | None = None,
+    evidence_pre_sec: float | None = None,
+    evidence_post_sec: float | None = None,
+    episode_start_sec: float | None = None,
+    episode_end_sec: float | None = None,
+    contributing_factors_json: str | None = None,
+    unavailable_factors_json: str | None = None,
+    processing_run_id: int | None = None,
 ) -> int:
+    # Compatibility: legacy ``confidence`` stores violation_confidence when provided.
+    viol_conf = (
+        float(violation_confidence)
+        if violation_confidence is not None
+        else float(confidence)
+    )
+    det_conf = detection_confidence
     with db_session() as conn:
         cursor = conn.execute(
             """
             INSERT INTO review_queue (
                 video_id, track_id, violation_type, vehicle_class, confidence,
                 frame_number, timestamp_sec, evidence_path, reason_log, status,
-                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status,
+                detection_confidence, violation_confidence, evidence_sufficiency,
+                evidence_clip_path, evidence_sequence_dir,
+                evidence_pre_sec, evidence_post_sec,
+                episode_start_sec, episode_end_sec,
+                contributing_factors_json, unavailable_factors_json,
+                processing_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
                 track_id,
                 violation_type,
                 vehicle_class,
-                confidence,
+                viol_conf,
                 frame_number,
                 timestamp_sec,
                 evidence_path,
@@ -1013,6 +2044,18 @@ def insert_review_queue(
                 plate_evidence_path,
                 plate_text,
                 plate_status,
+                det_conf,
+                viol_conf,
+                evidence_sufficiency,
+                evidence_clip_path,
+                evidence_sequence_dir,
+                evidence_pre_sec,
+                evidence_post_sec,
+                episode_start_sec,
+                episode_end_sec,
+                contributing_factors_json,
+                unavailable_factors_json,
+                processing_run_id,
             ),
         )
         return cursor.lastrowid
@@ -1057,6 +2100,20 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
         if row_status != "pending":
             raise ValueError(f"Review item {review_id} is not pending (status: {row_status})")
 
+        row_keys = row.keys()
+
+        def _early(col):
+            return row[col] if col in row_keys else None
+
+        temporal_tagged = _early("evidence_pre_sec") is not None
+        has_clip = bool(_early("evidence_clip_path") or _early("evidence_sequence_dir"))
+        episode_closed = _early("episode_end_sec") is not None
+        if temporal_tagged and (not has_clip or not episode_closed):
+            raise TemporalEvidenceNotReady(
+                "Temporal evidence is still being finalized; confirmation is blocked "
+                "until the post-roll clip/sequence is written."
+            )
+
         reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
         row_keys = row.keys()
         timestamp_sec = (
@@ -1073,8 +2130,14 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
             INSERT INTO violations (
                 video_id, track_id, violation_type, vehicle_class, confidence,
                 frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by,
-                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status,
+                detection_confidence, violation_confidence, evidence_sufficiency,
+                evidence_clip_path, evidence_sequence_dir,
+                evidence_pre_sec, evidence_post_sec,
+                episode_start_sec, episode_end_sec,
+                contributing_factors_json, unavailable_factors_json,
+                processing_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["video_id"],
@@ -1090,7 +2153,19 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
                 _pick("vehicle_evidence_path"),
                 _pick("plate_evidence_path"),
                 _pick("plate_text"),
-                _pick("plate_status"),
+                _pick("plate_status") or "not_attempted",
+                _pick("detection_confidence"),
+                _pick("violation_confidence"),
+                _pick("evidence_sufficiency"),
+                _pick("evidence_clip_path"),
+                _pick("evidence_sequence_dir"),
+                _pick("evidence_pre_sec"),
+                _pick("evidence_post_sec"),
+                _pick("episode_start_sec"),
+                _pick("episode_end_sec"),
+                _pick("contributing_factors_json"),
+                _pick("unavailable_factors_json"),
+                _pick("processing_run_id"),
             ),
         )
         violation_id = cursor.lastrowid
@@ -1117,6 +2192,86 @@ def dismiss_review_item(review_id: int, reviewed_by: int) -> None:
             WHERE id = ?
             """,
             (reviewed_by, reviewed_at, review_id),
+        )
+
+
+def update_review_temporal_evidence(
+    review_id: int,
+    *,
+    evidence_clip_path: str | None = None,
+    evidence_sequence_dir: str | None = None,
+    episode_start_sec: float | None = None,
+    episode_end_sec: float | None = None,
+    evidence_pre_sec: float | None = None,
+    evidence_post_sec: float | None = None,
+) -> None:
+    """Write finalized temporal evidence paths/timing back onto a review row."""
+    fields: list[str] = []
+    params: list[Any] = []
+    if evidence_clip_path is not None:
+        fields.append("evidence_clip_path = ?")
+        params.append(evidence_clip_path)
+    if evidence_sequence_dir is not None:
+        fields.append("evidence_sequence_dir = ?")
+        params.append(evidence_sequence_dir)
+    if episode_start_sec is not None:
+        fields.append("episode_start_sec = ?")
+        params.append(episode_start_sec)
+    if episode_end_sec is not None:
+        fields.append("episode_end_sec = ?")
+        params.append(episode_end_sec)
+    if evidence_pre_sec is not None:
+        fields.append("evidence_pre_sec = ?")
+        params.append(evidence_pre_sec)
+    if evidence_post_sec is not None:
+        fields.append("evidence_post_sec = ?")
+        params.append(evidence_post_sec)
+    if not fields:
+        return
+    params.append(review_id)
+    with db_session() as conn:
+        conn.execute(
+            f"UPDATE review_queue SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        review = conn.execute(
+            "SELECT * FROM review_queue WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        if review is None:
+            return
+        review_keys = review.keys()
+        status = review["status"] if "status" in review_keys else None
+        if status != "confirmed":
+            return
+        viol_fields: list[str] = []
+        viol_params: list[Any] = []
+        mapping = (
+            ("evidence_clip_path", evidence_clip_path),
+            ("evidence_sequence_dir", evidence_sequence_dir),
+            ("episode_start_sec", episode_start_sec),
+            ("episode_end_sec", episode_end_sec),
+            ("evidence_pre_sec", evidence_pre_sec),
+            ("evidence_post_sec", evidence_post_sec),
+        )
+        for col, value in mapping:
+            if value is not None:
+                viol_fields.append(f"{col} = ?")
+                viol_params.append(value)
+        if not viol_fields:
+            return
+        video_id = review["video_id"] if "video_id" in review_keys else None
+        track_id = review["track_id"] if "track_id" in review_keys else None
+        vtype = review["violation_type"] if "violation_type" in review_keys else None
+        frame_number = review["frame_number"] if "frame_number" in review_keys else None
+        viol_params.extend([video_id, track_id, vtype, frame_number])
+        conn.execute(
+            f"""
+            UPDATE violations
+            SET {', '.join(viol_fields)}
+            WHERE video_id = ? AND track_id = ? AND violation_type = ? AND frame_number = ?
+            """,
+            viol_params,
         )
 
 

@@ -201,11 +201,14 @@ class TestCounterflow:
         # Create a fresh vehicle copy
         vehicle = dict(sample_vehicle)
         vehicle["direction_degrees"] = 270  # Opposite of 90
-        
+        # Test uses a short persistence window; production default is 4s (design).
+        params = dict(rule_params)
+        params["counterflow_persist_sec"] = 1.0
+
         events = []
         for frame in range(0, 10):
             vehicle["timestamp_sec"] = 5.0 + frame * 0.3
-            events.extend(check_counterflow([vehicle], active_lane_zone, state, frame, rule_params))
+            events.extend(check_counterflow([vehicle], active_lane_zone, state, frame, params))
 
         assert any(e.violation_type == VIOLATION_COUNTERFLOW for e in events), \
             f"Expected Counterflow event, got {events}"
@@ -273,6 +276,8 @@ class TestIllegalTerminal:
             "confidence": 0.95,
             "speed_px_per_sec": 0.0,
             "direction_degrees": 90,
+            # Terminal rule requires passenger-activity evidence; stop alone is insufficient.
+            "terminal_passenger_activity": True,
         }
         events = []
         for frame in range(0, 10):

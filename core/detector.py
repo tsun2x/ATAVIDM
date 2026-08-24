@@ -19,13 +19,30 @@ from typing import Any
 from core.detection_config import (
     CUSTOM_WEIGHTS_CANDIDATES,
     DETECTION_CLASSES,
+    LEGACY_ACCEPTED_MODEL_LABELS,
     MODELS_DIR,
     MODEL_FAMILY,
     PRETRAINED_WEIGHTS,
     REQUIRED_MODEL_CLASSES,
+    resolve_vehicle_label,
 )
 
-_ALLOWED = set(DETECTION_CLASSES)
+_ALLOWED = set(DETECTION_CLASSES) | set(LEGACY_ACCEPTED_MODEL_LABELS)
+
+
+def _is_numeric_class_key(key: Any) -> bool:
+    if isinstance(key, bool):
+        return False
+    if isinstance(key, int):
+        return True
+    if isinstance(key, str):
+        text = key.strip()
+        if not text:
+            return False
+        if text[0] in "+-":
+            text = text[1:]
+        return text.isdigit()
+    return False
 
 
 class DetectorError(RuntimeError):
@@ -76,8 +93,26 @@ class Detector:
 
     @property
     def class_names(self) -> set[str]:
-        self.load()
-        return {str(name) for name in self._model.names.values()}
+        """Public class-name contract. Malformed mappings fail closed as empty."""
+        try:
+            self.load()
+            raw = getattr(self._model, "names", None)
+            if isinstance(raw, dict):
+                if any(not _is_numeric_class_key(k) for k in raw):
+                    return set()
+                values = raw.values()
+            elif isinstance(raw, (list, tuple, set)):
+                values = raw
+            else:
+                return set()
+            out: set[str] = set()
+            for name in values:
+                text = str(name).strip()
+                if text:
+                    out.add(text)
+            return out
+        except Exception:
+            return set()
 
     def description(self) -> str:
         self.load()
@@ -125,10 +160,21 @@ class Detector:
             conf_val = float(box.conf[0]) if box.conf is not None else 0.0
             xyxy = box.xyxy[0].tolist() if box.xyxy is not None else [0.0, 0.0, 0.0, 0.0]
             x1, y1, x2, y2 = (float(v) for v in xyxy)
+            resolved = resolve_vehicle_label(class_label)
+            # Pipeline class_label is canonical when known; ambiguous piaggio keeps
+            # raw label and is marked UNCERTAIN (fail-closed for vehicle rules).
+            pipeline_label = (
+                resolved.canonical_class
+                if resolved.canonical_class is not None
+                else resolved.raw_class
+            )
             detections.append(
                 {
                     "track_id": track_id,
-                    "class_label": class_label,
+                    "class_label": pipeline_label,
+                    "raw_class": resolved.raw_class,
+                    "canonical_class": resolved.canonical_class,
+                    "class_review_state": resolved.review_state,
                     "confidence": conf_val,
                     "bbox_x": x1,
                     "bbox_y": y1,

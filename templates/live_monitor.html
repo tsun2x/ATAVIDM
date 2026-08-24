@@ -19,17 +19,65 @@
             </div>
             <div class="card-body p-0">
                 <div class="cctv-feed-container" id="videoFeed">
-                    <img src="" alt="Feed" class="cctv-feed-image d-none" id="feedImage">
+                    <!-- Live camera MJPEG / processing preview still use img -->
+                    <img src="" alt="Live Processing Preview" class="cctv-feed-image d-none" id="feedImage">
+                    <!-- Source video playback -->
+                    <video class="cctv-feed-image d-none" id="sourceVideo" controls preload="metadata" playsinline></video>
+                    <!-- Annotated result playback -->
+                    <video class="cctv-feed-image d-none" id="annotatedVideo" controls preload="metadata" playsinline></video>
                     <div class="text-center text-muted py-5" id="feedPlaceholder">
                         <i class="bi bi-camera-video-off fs-1 d-block mb-2"></i>
                         Select a live camera or an uploaded video from the right panel.
                     </div>
                 </div>
+                <div class="px-3 py-2 border-top d-none" id="mediaModeBar">
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Media view mode">
+                        <button type="button" class="btn btn-outline-secondary media-mode-btn" data-mode="source">Source Video</button>
+                        <button type="button" class="btn btn-outline-secondary media-mode-btn" data-mode="reference">Reference Frame</button>
+                        <button type="button" class="btn btn-outline-secondary media-mode-btn d-none" data-mode="live_preview" id="btnModeLivePreview">Live Processing Preview</button>
+                        <button type="button" class="btn btn-outline-secondary media-mode-btn d-none" data-mode="annotated" id="btnModeAnnotated">Annotated Result</button>
+                    </div>
+                </div>
+                <div class="px-3 py-2 border-top d-none" id="processProgressPanel">
+                    <div class="d-flex justify-content-between small mb-1">
+                        <span id="ppStage">—</span>
+                        <span id="ppPercent">0%</span>
+                    </div>
+                    <div class="progress mb-2" style="height: 8px;">
+                        <div class="progress-bar bg-danger" id="ppBar" style="width: 0%;" role="progressbar" aria-valuemin="0" aria-valuemax="100"></div>
+                    </div>
+                    <div class="row g-1 small text-muted" id="ppStats">
+                        <div class="col-6 col-md-3">Frames: <span id="ppFrames">—</span></div>
+                        <div class="col-6 col-md-3">Elapsed: <span id="ppElapsed">—</span></div>
+                        <div class="col-6 col-md-3">FPS: <span id="ppFps">—</span></div>
+                        <div class="col-6 col-md-3">ETA: <span id="ppEta">—</span></div>
+                        <div class="col-6 col-md-3">Detections: <span id="ppDetections">—</span></div>
+                        <div class="col-6 col-md-3">Candidates: <span id="ppCandidates">—</span></div>
+                        <div class="col-12">Classes: <span id="ppClasses">—</span></div>
+                    </div>
+                    <div class="mt-2 d-none" id="ppCompletionSummary"></div>
+                </div>
             </div>
             <div class="card-footer">
                 <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
                     <span class="text-muted small" id="feedStatus">No source selected</span>
-                    <div class="d-flex gap-2">
+                    <div class="d-flex flex-wrap gap-2">
+                        <div class="dropdown d-none" id="videoActionsDropdown">
+                            <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                                Actions
+                            </button>
+                            <ul class="dropdown-menu dropdown-menu-end" id="videoActionsMenu">
+                                <li><button class="dropdown-item" type="button" data-action="preview_source">Preview Source</button></li>
+                                <li><button class="dropdown-item d-none" type="button" data-action="watch_live">Watch Live Processing</button></li>
+                                <li><button class="dropdown-item d-none" type="button" data-action="preview_annotated">Preview Annotated Result</button></li>
+                                <li><button class="dropdown-item d-none" type="button" data-action="download_annotated">Download Annotated Result</button></li>
+                                <li><button class="dropdown-item" type="button" data-action="history">View History</button></li>
+                                <li><hr class="dropdown-divider"></li>
+                                <li><button class="dropdown-item" type="button" data-action="reprocess">Reprocess</button></li>
+                                <li><button class="dropdown-item" type="button" data-action="remove_results">Remove Processing Results</button></li>
+                                <li><button class="dropdown-item text-danger" type="button" data-action="delete_video">Delete Video Permanently</button></li>
+                            </ul>
+                        </div>
                         <button class="btn btn-sm btn-danger d-none" id="btnProcessVideo">
                             <i class="bi bi-cpu me-1"></i> Process Video
                         </button>
@@ -71,6 +119,17 @@
                             <option value="{{ c }}">{{ c|title }}</option>
                             {% endfor %}
                         </select>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small mb-1" for="uploadRecordedAt">
+                            Recording date/time <span class="text-muted fw-normal">(optional)</span>
+                        </label>
+                        <input type="datetime-local" class="form-control form-control-sm" id="uploadRecordedAt"
+                               step="1" autocomplete="off">
+                        <div class="form-text">
+                            Scene recording time only — not upload time. Leave blank if unknown
+                            (truck-ban stays fail-closed until known).
+                        </div>
                     </div>
                     <div class="progress mb-2 d-none" id="uploadProgressWrap" style="height: 8px;">
                         <div class="progress-bar bg-danger" id="uploadProgressBar" style="width: 0%;"></div>
@@ -114,23 +173,39 @@
         </div>
 
         <div class="card card-panel mb-4">
-            <div class="card-header">
+            <div class="card-header d-flex justify-content-between align-items-center gap-2">
                 <h5 class="card-title mb-0"><i class="bi bi-collection-play me-2"></i>Uploaded Videos</h5>
+                <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnProcessSelected">Process Selected</button>
             </div>
             <div class="card-body p-0">
+                <div class="px-3 py-2 border-bottom small">
+                    <label class="d-flex align-items-center gap-2 mb-0">
+                        <input type="checkbox" id="bulkSelectAll" class="form-check-input">
+                        <span>Select ready videos for bulk processing</span>
+                    </label>
+                </div>
                 <div class="camera-list" id="videoList">
                     {% for vid in videos %}
-                    <button class="camera-item" data-video='{{ vid | tojson }}'>
-                        <div class="camera-thumb">
-                            <img src="{{ url_for('static', filename='images/camera_thumb.svg') }}" alt="">
-                            <span class="cam-status-dot {% if vid.processed %}online{% else %}offline{% endif %}"></span>
-                        </div>
-                        <div class="camera-info">
-                            <span class="camera-name">{{ vid.filename }}</span>
-                            <span class="camera-location">{{ vid.condition|title }} · {{ vid.status|title }}</span>
-                        </div>
-                        <i class="bi bi-chevron-right"></i>
-                    </button>
+                    <div class="camera-item-row d-flex align-items-stretch">
+                        <label class="bulk-check-wrap px-2 d-flex align-items-center mb-0">
+                            <input type="checkbox" class="form-check-input bulk-video-check"
+                                   value="{{ vid.db_id }}"
+                                   data-ready="{{ '1' if vid.has_annotation and vid.status in ['ready','processed'] else '0' }}"
+                                   {% if not (vid.has_annotation and vid.status in ['ready','processed']) %}disabled{% endif %}
+                                   aria-label="Select {{ vid.filename }}">
+                        </label>
+                        <button class="camera-item flex-grow-1" data-video='{{ vid | tojson }}'>
+                            <div class="camera-thumb">
+                                <img src="{{ url_for('static', filename='images/camera_thumb.svg') }}" alt="">
+                                <span class="cam-status-dot {% if vid.processed %}online{% else %}offline{% endif %}"></span>
+                            </div>
+                            <div class="camera-info">
+                                <span class="camera-name">{{ vid.filename }}</span>
+                                <span class="camera-location video-status-label" data-db-id="{{ vid.db_id }}">{{ vid.condition|title }} · {{ vid.status|title }}</span>
+                            </div>
+                            <i class="bi bi-chevron-right"></i>
+                        </button>
+                    </div>
                     {% else %}
                     <div class="text-center text-muted small py-4">No videos uploaded yet.</div>
                     {% endfor %}
@@ -260,10 +335,59 @@
                 <div id="pcViolationList" class="pc-violation-list border rounded p-2" style="max-height: 280px; overflow: auto;">
                     <!-- populated by live_monitor.js -->
                 </div>
+                <div class="mt-3">
+                    <label class="form-label small fw-semibold">Processing mode</label>
+                    <div class="d-flex flex-wrap gap-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="pcViewerMode" id="pcModeBackground" value="background" checked>
+                            <label class="form-check-label" for="pcModeBackground">Process in Background</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="pcViewerMode" id="pcModeWatch" value="watch_live">
+                            <label class="form-check-label" for="pcModeWatch">Process and Watch Live</label>
+                        </div>
+                    </div>
+                    <div class="form-text">Same job either way — watching only changes what you see, not detections or results.</div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-danger" id="btnConfirmProcess"><i class="bi bi-cpu me-1"></i> Start Processing</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- History modal -->
+<div class="modal fade" id="videoHistoryModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Upload &amp; Processing History</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="videoHistoryBody"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Delete confirmation modal -->
+<div class="modal fade" id="deleteVideoModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title text-danger">Delete Video Permanently</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p>This permanently deletes the source video, reference frame, annotated outputs, and eligible unconfirmed results.</p>
+                <p class="mb-2">Type the filename to confirm:</p>
+                <p class="fw-semibold" id="deleteVideoFilename">—</p>
+                <input type="text" class="form-control" id="deleteVideoConfirmInput" autocomplete="off" aria-label="Confirm filename">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="btnConfirmDeleteVideo">Delete Permanently</button>
             </div>
         </div>
     </div>
@@ -277,7 +401,9 @@
     window.TAVIDM_VIOLATION_CATALOG = {{ violation_catalog | tojson }};
     window.TAVIDM_ENABLED_VIOLATIONS = {{ enabled_violations | tojson }};
     window.TAVIDM_MAX_UPLOAD_MB = {{ max_upload_mb }};
+    window.TAVIDM_USER_ROLE = {{ user_role | tojson }};
 </script>
+<script src="{{ url_for('static', filename='js/violation_switch.js') }}"></script>
 <script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>

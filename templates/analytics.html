@@ -102,10 +102,145 @@
         </div>
     </div>
 </div>
+
+<div class="card card-panel mb-4">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h5 class="card-title mb-0"><i class="bi bi-cloud-upload me-2"></i>Upload &amp; Processing Analytics</h5>
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <select class="form-select form-select-sm" id="upaPeriod" style="width: auto;">
+                <option value="today">Today</option>
+                <option value="week">This Week</option>
+                <option value="month">This Month</option>
+                <option value="custom">Custom range</option>
+            </select>
+            <input type="date" class="form-control form-control-sm d-none" id="upaStart">
+            <input type="date" class="form-control form-control-sm d-none" id="upaEnd">
+            <button type="button" class="btn btn-sm btn-outline-danger" id="upaRefresh">Refresh</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="small text-muted mb-3">
+            Unique uploaded videos use <code>videos.created_at</code> (upload time), never recording time.
+            Reprocessing increases processing-run counts only.
+        </p>
+        <div class="row g-3" id="upaKpis">
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Unique videos uploaded</div><div class="fs-4" id="upaUploads">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Processing runs</div><div class="fs-4" id="upaRuns">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Successful / Failed runs</div><div class="fs-5" id="upaRunSplit">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Avg processing duration</div><div class="fs-5" id="upaAvgDur">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Awaiting annotation</div><div class="fs-5" id="upaAwait">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Ready / Processed</div><div class="fs-5" id="upaReady">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Detection records</div><div class="fs-5" id="upaDets">—</div></div></div>
+            <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Violation candidates</div><div class="fs-5" id="upaCands">—</div></div></div>
+        </div>
+        <div class="mt-3 small" id="upaClasses">Class counts: —</div>
+        <div class="mt-3">
+            <canvas id="upaTrendChart" height="120" aria-label="Upload and processing trends"></canvas>
+            <div class="small text-muted mt-2 d-none" id="upaTrendEmpty">No upload or processing activity in this period.</div>
+        </div>
+        <div class="mt-2 small text-muted" id="upaMeta"></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script>window.TAVIDM_ANALYTICS = {{ analytics | tojson }};</script>
 <script src="{{ url_for('static', filename='js/analytics.js') }}"></script>
+<script>
+(function () {
+    const periodEl = document.getElementById("upaPeriod");
+    const startEl = document.getElementById("upaStart");
+    const endEl = document.getElementById("upaEnd");
+    let trendChart = null;
+    periodEl?.addEventListener("change", function () {
+        const custom = periodEl.value === "custom";
+        startEl?.classList.toggle("d-none", !custom);
+        endEl?.classList.toggle("d-none", !custom);
+    });
+    function renderTrend(a) {
+        const canvas = document.getElementById("upaTrendChart");
+        const empty = document.getElementById("upaTrendEmpty");
+        if (!canvas) return;
+        const uploads = (a.trend && a.trend.uploads) || [];
+        const runs = (a.trend && a.trend.processing_runs) || [];
+        const labels = Array.from(new Set(
+            uploads.map(function (x) { return x.bucket; }).concat(runs.map(function (x) { return x.bucket; }))
+        )).sort();
+        const uploadMap = {};
+        uploads.forEach(function (x) { uploadMap[x.bucket] = x.count; });
+        const runMap = {};
+        runs.forEach(function (x) { runMap[x.bucket] = x.count; });
+        const hasData = labels.length > 0 && labels.some(function (b) {
+            return (uploadMap[b] || 0) + (runMap[b] || 0) > 0;
+        });
+        empty?.classList.toggle("d-none", hasData);
+        canvas.classList.toggle("d-none", !hasData);
+        if (!hasData) {
+            if (trendChart) { trendChart.destroy(); trendChart = null; }
+            return;
+        }
+        const cfg = {
+            type: "line",
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: "Unique videos uploaded",
+                        data: labels.map(function (b) { return uploadMap[b] || 0; }),
+                        borderColor: "#c0392b",
+                        backgroundColor: "rgba(192,57,43,0.15)",
+                        tension: 0.2,
+                    },
+                    {
+                        label: "Processing runs",
+                        data: labels.map(function (b) { return runMap[b] || 0; }),
+                        borderColor: "#1f618d",
+                        backgroundColor: "rgba(31,97,141,0.15)",
+                        tension: 0.2,
+                    },
+                ],
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { position: "bottom" } },
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+            },
+        };
+        if (trendChart) {
+            trendChart.data = cfg.data;
+            trendChart.update();
+        } else {
+            trendChart = new Chart(canvas, cfg);
+        }
+    }
+    function loadUpa() {
+        let url = "/api/upload-processing-analytics?period=" + encodeURIComponent(periodEl.value || "today");
+        if (periodEl.value === "custom") {
+            url += "&start=" + encodeURIComponent(startEl.value || "") + "&end=" + encodeURIComponent(endEl.value || "");
+        }
+        fetch(url).then(function (r) { return r.json(); }).then(function (payload) {
+            if (!payload.success) return;
+            const a = payload.analytics || {};
+            document.getElementById("upaUploads").textContent = a.unique_videos_uploaded;
+            document.getElementById("upaRuns").textContent = a.total_processing_runs;
+            document.getElementById("upaRunSplit").textContent = (a.successful_runs || 0) + " / " + (a.failed_runs || 0);
+            document.getElementById("upaAvgDur").textContent = a.average_processing_duration_sec != null
+                ? Number(a.average_processing_duration_sec).toFixed(1) + "s" : "—";
+            document.getElementById("upaAwait").textContent = a.videos_awaiting_annotation;
+            document.getElementById("upaReady").textContent = (a.ready_videos || 0) + " / " + (a.processed_videos || 0);
+            document.getElementById("upaDets").textContent = a.detection_records;
+            document.getElementById("upaCands").textContent = a.violation_candidates;
+            const cc = a.class_counts || {};
+            document.getElementById("upaClasses").textContent = "Class counts: " +
+                (Object.keys(cc).length ? Object.keys(cc).map(function (k) { return k + "=" + cc[k]; }).join(", ") : "—");
+            document.getElementById("upaMeta").textContent =
+                "Timezone " + (a.timezone || "") + " · " + (a.start || "") + " → " + (a.end || "");
+            renderTrend(a);
+        });
+    }
+    document.getElementById("upaRefresh")?.addEventListener("click", loadUpa);
+    loadUpa();
+})();
+</script>
 {% endblock %}

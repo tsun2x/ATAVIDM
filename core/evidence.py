@@ -29,6 +29,9 @@ def save_evidence_snapshot(
     violation_type: str,
     source_key: str,
     frame_number: int,
+    *,
+    violation_confidence: float | None = None,
+    detection_confidence: float | None = None,
 ) -> str:
     """
     Draw the offending detection on a copy of the frame and save it.
@@ -36,6 +39,8 @@ def save_evidence_snapshot(
     Returns the saved path relative to the project root (e.g.
     ``static/evidence/video_3/illegal_parking_f001234_t007.jpg``) so it can be
     stored in the database and served by Flask.
+
+    Label shows violation_confidence when provided (not raw detector score).
     """
     out_dir = Path(EVIDENCE_FOLDER) / _slug(source_key)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -44,19 +49,30 @@ def save_evidence_snapshot(
     y = int(detection["bbox_y"])
     w = int(detection["bbox_w"])
     h = int(detection["bbox_h"])
-    confidence = float(detection.get("confidence", 0))
+    if violation_confidence is not None:
+        confidence = float(violation_confidence)
+    else:
+        confidence = float(detection.get("confidence", 0))
     track_id = int(detection.get("track_id", -1))
 
     annotated = frame.copy()
     cv2.rectangle(annotated, (x, y), (x + w, y + h), _BOX_COLOR, 2)
     label = f"{violation_type} {confidence * 100:.0f}%"
-    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    if detection_confidence is not None:
+        label = f"{violation_type} v{confidence * 100:.0f}% d{float(detection_confidence) * 100:.0f}%"
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     ty = max(y - 8, th + baseline)
     cv2.rectangle(annotated, (x, ty - th - baseline), (x + tw, ty + baseline), _BOX_COLOR, -1)
-    cv2.putText(annotated, label, (x, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _TEXT_COLOR, 2)
+    cv2.putText(annotated, label, (x, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _TEXT_COLOR, 2)
 
     filename = f"{_slug(violation_type)}_f{frame_number:06d}_t{track_id:03d}.jpg"
+    # Reject traversal in filename components.
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise ValueError("Unsafe evidence filename rejected.")
     out_path = out_dir / filename
+    # Ensure resolved path stays under evidence root.
+    if not str(out_path.resolve()).startswith(str(Path(EVIDENCE_FOLDER).resolve())):
+        raise ValueError("Unsafe evidence path rejected (directory traversal).")
     cv2.imwrite(str(out_path), annotated)
 
     base = Path(EVIDENCE_FOLDER).resolve().parent.parent  # project root

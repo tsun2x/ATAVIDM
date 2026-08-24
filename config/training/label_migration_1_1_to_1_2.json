@@ -1,0 +1,52 @@
+{
+  "manifest_version": "1.0",
+  "from_schema_version": "1.1.0",
+  "to_schema_version": "1.2.0",
+  "purpose": "Name-based label migration guidance for the owner-approved 11-class vehicle detector roster. Does not rewrite datasets.",
+  "safe_consolidations": [
+    {
+      "from": "uv_express_van",
+      "to": "van",
+      "action": "safe_rename",
+      "notes": "Van is the only visual van detector class. UV Express / for-hire status becomes contextual metadata, not a detector label."
+    }
+  ],
+  "requires_image_review": [
+    {
+      "from": "piaggio",
+      "candidates": ["tricycle", "autorickshaw"],
+      "action": "manual_body_form_review",
+      "notes": "Piaggio is a manufacturer/brand. Conventional motorcycle-with-sidecar → tricycle; integrated three-wheel body → autorickshaw. Do not bulk-rewrite. Ambiguous cases stay UNCERTAIN."
+    }
+  ],
+  "added_canonical_classes": ["autorickshaw"],
+  "removed_canonical_classes": ["uv_express_van", "piaggio"],
+  "unchanged_canonical_classes": [
+    "car",
+    "suv_crossover",
+    "van",
+    "jeepney",
+    "tricycle",
+    "bus",
+    "truck",
+    "pickup_truck",
+    "motorcycle",
+    "bicycle"
+  ],
+  "numeric_yolo_class_id_policy": {
+    "warning": "YOLO class IDs are embedded in each weights file's names map. Never rewrite YOLO label files by assuming fixed numeric IDs from an older roster without validating the loaded model's class-name mapping.",
+    "safe_approach": "Migrate by class name string only after confirming the source annotation names. Re-export or rematch IDs only with a verified names map from the target training recipe."
+  },
+  "seven_class_baseline_weights": {
+    "status": "external_training_output_not_integrated",
+    "repo_models_path": "models/best.pt",
+    "repo_models_present": false,
+    "classes": ["bicycle", "bus", "car", "jeepney", "motorcycle", "tricycle", "truck"],
+    "missing_canonical": ["suv_crossover", "van", "autorickshaw", "pickup_truck"],
+    "notes": "The trained seven-class best.pt remains in the external training output directory. It has NOT been copied into D:/tavidm/models. Do not claim models/best.pt exists. Do not auto-copy or overwrite weights. As a label set it is a valid subset of the 11-class roster; capability gate must fail-close rules that require unavailable classes."
+  },
+  "dry_run": {
+    "utility": "python -m core.label_migration_audit",
+    "behavior": "Reports counts of legacy names in a provided labels directory without rewriting files."
+  }
+}

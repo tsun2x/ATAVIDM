@@ -10,9 +10,14 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
 
 # Database
 *.db
+*.db-wal
+*.db-shm
+*-wal
+*-shm
 
 # Generated evidence snapshots
 static/evidence/
@@ -22,18 +27,51 @@ static/reports/
 exports/*
 !exports/.gitkeep
 
-# Model weights
+# Model weights / exported engines
 models/*.pt
 *.pt
+*.pth
+*.onnx
+*.engine
 
-# Raw footage
+# Training / Ultralytics run outputs
+runs/
+ultralytics_runs/
+**/train/weights/
+**/weights/best.pt
+**/weights/last.pt
+
+# Raw footage / uploaded media
 dataset/raw/*.mp4
 dataset/raw/*.avi
 dataset/raw/*.mov
+dataset/raw/*.webm
+dataset/raw/*.mkv
 
-# IDE
+# Extracted runtime frames
+dataset/frames/*
+!dataset/frames/.gitkeep
+
+# Runtime annotated outputs (generated per processing run)
+dataset/annotated/*
+!dataset/annotated/.gitkeep
+
+# Quarantine / temp spool from failure-safe deletes
+**/_quarantine/
+*.partial.mp4
+*.partial.webm
+*.partial.avi
+
+# Temporary review / codec probe artifacts
+.tmp_docx_review/
+.tmp/
+tmp/
+temp/
+
+# IDE / local editor settings
 .vscode/
 .idea/
+.cursor/settings.json
 *.swp
 *.swo
 

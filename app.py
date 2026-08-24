@@ -7,6 +7,7 @@ Decision-support tool only — violations are confirmed by human reviewers.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -33,6 +34,11 @@ import config
 from core import analytics as analytics_core
 from core import auth
 from core import reports as reports_core
+from core.annotated_writer import (
+    annotated_final_path,
+    download_name_for_annotated,
+    mime_for_annotated_path,
+)
 from core.detection_config import CANONICAL_VIOLATIONS, MODEL_FAMILY
 from core.violation_config import (
     ViolationConfigError,
@@ -44,8 +50,15 @@ from core.violation_config import (
 from core.detector import resolve_weights_path
 from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
 from core.live_stream import mjpeg_generator, stream_manager
+from core.media_serve import MediaPathError, resolve_under_roots, safe_media_response
+from core.processing_preview import preview_hub
+from core.processing_progress import ProgressTracker
 from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
-from core.video_processor import process_video
+from core.upload_analytics import build_upload_processing_analytics
+from core.video_lifecycle import VideoLifecycleError, delete_video_permanently, remove_processing_results
+from core.video_processor import ProcessVideoError, ProcessVideoResult, process_video
+from database.sqlite_adapter import TemporalEvidenceNotReady
+from core.recording_time import RecordingTimeError, normalize_recorded_at
 from core.zone_config import (
     dumps_zones,
     parse_zones_json,
@@ -113,6 +126,20 @@ def _db_video_to_ui(row: dict) -> dict:
     condition = row.get("condition") or "peak"
     status = row.get("status") or ("processed" if row.get("processed") else "uploaded")
     db_id = row["id"]
+    job = _processing_jobs.get(db_id, {})
+    latest_attempt = (
+        db.get_latest_processing_run(db_id)
+        if hasattr(db, "get_latest_processing_run")
+        else None
+    )
+    current_result = None
+    if hasattr(db, "get_current_completed_result_run"):
+        current_result = db.get_current_completed_result_run(db_id)
+    elif hasattr(db, "get_latest_completed_processing_run"):
+        current_result = db.get_latest_completed_processing_run(db_id)
+    annotated_ready = bool(current_result and current_result.get("annotated_video_ready"))
+    result_run_id = current_result["id"] if current_result else None
+    latest_run_id = latest_attempt["id"] if latest_attempt else None
     return {
         "id": f"vid-db-{db_id}",
         "db_id": db_id,
@@ -121,15 +148,28 @@ def _db_video_to_ui(row: dict) -> dict:
         "location": f"Uploaded · {condition.title()}",
         "condition": condition,
         "duration": _format_duration(row.get("duration_sec")),
+        "duration_sec": row.get("duration_sec"),
         "processed": bool(row.get("processed")),
         "status": status,
         "has_annotation": bool(row.get("annotation_id")),
         "template_id": row.get("template_id"),
         "filepath": row["filepath"],
         "created_at": row.get("created_at"),
+        "recorded_at": row.get("recorded_at"),
         "file_size_bytes": row.get("file_size_bytes"),
+        "uploaded_by": row.get("uploaded_by"),
         "frame_url": f"/api/videos/{db_id}/frame",
-        "processing": _processing_jobs.get(db_id, {}).get("state") == "processing",
+        "source_video_url": f"/api/videos/{db_id}/media",
+        "processing": job.get("state") == "processing",
+        "annotated_video_ready": annotated_ready,
+        "annotated_video_url": (
+            f"/api/videos/{db_id}/annotated/{result_run_id}"
+            if annotated_ready and result_run_id
+            else None
+        ),
+        "latest_run_id": latest_run_id,
+        "current_result_run_id": result_run_id,
+        "latest_attempt_status": latest_attempt.get("status") if latest_attempt else None,
     }
 
 
@@ -376,6 +416,7 @@ def live_monitor():
         violation_catalog=violation_catalog_for_ui(),
         enabled_violations=list(load_enabled_violations()),
         max_upload_mb=config.MAX_UPLOAD_MB,
+        user_role=(auth.current_user() or {}).get("role", "viewer"),
     )
 
 
@@ -652,6 +693,17 @@ def api_save_annotation(video_id: int):
 
     annotation = db.get_annotation(annotation_id)
     video = _db_video_to_ui(db.get_video(video_id))
+    user = auth.current_user()
+    db.insert_video_history_event(
+        video_id,
+        "annotation_saved",
+        actor_user_id=user["id"] if user else None,
+        detail={
+            "save_mode": save_mode,
+            "template_id": video.get("template_id"),
+            "annotation_id": annotation_id,
+        },
+    )
     response = {
         "success": True,
         "message": "Annotation saved successfully.",
@@ -672,6 +724,11 @@ def api_upload_video():
         condition = "peak"
 
     try:
+        recorded_at = normalize_recorded_at(request.form.get("recorded_at"))
+    except RecordingTimeError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    try:
         validate_upload(file, request.content_length)
         filename, filepath = save_video_file(file)
         file_size = 0
@@ -683,19 +740,44 @@ def api_upload_video():
             except OSError:
                 file_size = 0
 
+        user = auth.current_user()
         video_id = db.insert_video(
             filename=filename,
             filepath=filepath,
-            recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            recorded_at=recorded_at,
             condition=condition,
             status="uploaded",
             file_size_bytes=file_size or None,
+            uploaded_by=user["id"] if user else None,
         )
+        try:
+            db.insert_video_history_event(
+                video_id,
+                "uploaded",
+                actor_user_id=user["id"] if user else None,
+                detail={
+                    "filename": filename,
+                    "file_size_bytes": file_size,
+                    "condition": condition,
+                    "recorded_at": recorded_at,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to record upload history for video %s", video_id)
 
         frame_error = None
         try:
             frame_path = extract_first_frame(filepath, video_id)
             db.update_video(video_id, status="annotating")
+            try:
+                db.insert_video_history_event(
+                    video_id,
+                    "reference_frame_extracted",
+                    actor_user_id=user["id"] if user else None,
+                    detail={"frame_ready": True},
+                )
+            except Exception:
+                logger.exception("Failed to record frame history for video %s", video_id)
         except FrameExtractError as exc:
             frame_path = None
             frame_error = str(exc)
@@ -715,10 +797,12 @@ def api_upload_video():
             "templates": templates,
             "zone_types": zones_for_api(),
             "requires_annotation": True,
+            "recording_time_known": recorded_at is not None,
         })
     except UploadError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
-    except Exception:
+    except Exception as exc:
+        logger.exception("Upload failed: %s", exc)
         return jsonify({"success": False, "error": "Upload failed. Please try again."}), 500
 
 
@@ -734,6 +818,76 @@ def _is_processing_or_queued(video_id: int) -> bool:
         if _running_video_id == video_id:
             return True
         return any(entry[0] == video_id for entry in _process_queue)
+
+
+def _queue_position(video_id: int) -> int | None:
+    with _queue_lock:
+        if _running_video_id == video_id:
+            return 0
+        for idx, entry in enumerate(_process_queue, start=1):
+            if entry[0] == video_id:
+                return idx
+    return None
+
+
+def _fail_processing_run(run_id: int, exc: BaseException) -> None:
+    progress = getattr(exc, "progress_snapshot", None)
+    try:
+        db.finish_processing_run(
+            run_id,
+            status="failed",
+            error_message=str(exc),
+            diagnostics_json=getattr(exc, "diagnostics_json", None),
+            geometry_snapshot_json=getattr(exc, "geometry_snapshot_json", None),
+            progress=progress,
+        )
+    except Exception:
+        logger.exception("Failed to mark processing run %d as failed", run_id)
+
+
+def _reset_video_ready(video_id: int) -> None:
+    try:
+        db.update_video(video_id, status="ready")
+    except Exception:
+        logger.exception("Failed to reset video %d to ready after pipeline error", video_id)
+
+
+def _call_process_video(video_id, *, enabled_violations, processing_run_id, progress_tracker=None):
+    """Invoke process_video, passing optional kwargs only when supported."""
+    kwargs = {"enabled_violations": enabled_violations}
+    try:
+        params = inspect.signature(process_video).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "processing_run_id" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        kwargs["processing_run_id"] = processing_run_id
+    if progress_tracker is not None and (
+        "progress_tracker" in params
+        or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    ):
+        kwargs["progress_tracker"] = progress_tracker
+
+    def _persist_progress(cur: int, tot: int) -> None:
+        # Throttled DB write via progress_tracker snapshot when available.
+        job = _processing_jobs.get(video_id)
+        tracker = job.get("tracker") if job else None
+        if tracker is None:
+            return
+        snap = tracker.snapshot()
+        # Persist every ~30 frames to keep status recoverable across refresh.
+        if cur == 1 or cur % 30 == 0 or (tot and cur >= tot):
+            try:
+                db.update_processing_run_progress(processing_run_id, snap)
+            except Exception:
+                logger.exception("Failed to persist progress for run %s", processing_run_id)
+
+    if "progress_callback" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        kwargs["progress_callback"] = _persist_progress
+    return process_video(video_id, **kwargs)
 
 
 def _processing_worker() -> None:
@@ -756,8 +910,6 @@ def _processing_worker() -> None:
                 continue
             video_id, enabled_violations, run_id = _process_queue.pop(0)
             _running_video_id = video_id
-        # Transition this run from 'queued' to 'running' now that it occupies
-        # the single inference slot (status persists into processing_runs).
         try:
             db.start_processing_run(run_id)
         except Exception:
@@ -766,22 +918,132 @@ def _processing_worker() -> None:
                 "inference will proceed but the run row may stay 'queued'.",
                 run_id,
             )
-        _processing_jobs[video_id] = {"state": "processing", "error": None}
+        job = _processing_jobs.get(video_id) or {}
+        tracker = job.get("tracker") or ProgressTracker(
+            run_id=run_id, video_id=video_id, viewer_mode=job.get("viewer_mode") or "background"
+        )
+        tracker.set_queued(False, position=0)
+        tracker.set_stage("loading_model")
+        _processing_jobs[video_id] = {
+            "state": "processing",
+            "error": None,
+            "run_id": run_id,
+            "tracker": tracker,
+            "viewer_mode": job.get("viewer_mode") or "background",
+        }
+        pipeline_ok = False
+        result = None
         try:
-            process_video(video_id, enabled_violations=enabled_violations)
-            _processing_jobs[video_id] = {"state": "done", "error": None}
-            db.finish_processing_run(run_id, status="completed")
-        except Exception as exc:  # surface pipeline failures to the UI
-            _processing_jobs[video_id] = {"state": "error", "error": str(exc)}
             try:
-                db.finish_processing_run(run_id, status="failed", error_message=str(exc))
-            except Exception:
-                pass
-            try:
-                db.update_video(video_id, status="ready")
-            except Exception:
-                pass
+                result = _call_process_video(
+                    video_id,
+                    enabled_violations=enabled_violations,
+                    processing_run_id=run_id,
+                    progress_tracker=tracker,
+                )
+                if not isinstance(result, ProcessVideoResult):
+                    result = ProcessVideoResult(events=list(result or []))
+                pipeline_ok = True
+                _processing_jobs[video_id] = {
+                    "state": "done",
+                    "error": None,
+                    "run_id": run_id,
+                    "tracker": tracker,
+                    "viewer_mode": job.get("viewer_mode") or "background",
+                    "result": result,
+                }
+            except ProcessVideoError as exc:
+                tracker.set_error(str(exc))
+                _processing_jobs[video_id] = {
+                    "state": "error",
+                    "error": str(exc),
+                    "run_id": run_id,
+                    "tracker": tracker,
+                    "viewer_mode": job.get("viewer_mode") or "background",
+                }
+                _fail_processing_run(run_id, exc)
+                _reset_video_ready(video_id)
+                db.insert_video_history_event(
+                    video_id,
+                    "processing_failed",
+                    run_id=run_id,
+                    detail={"error": str(exc)},
+                )
+            except Exception as exc:
+                tracker.set_error(str(exc))
+                _processing_jobs[video_id] = {
+                    "state": "error",
+                    "error": str(exc),
+                    "run_id": run_id,
+                    "tracker": tracker,
+                    "viewer_mode": job.get("viewer_mode") or "background",
+                }
+                _fail_processing_run(run_id, exc)
+                _reset_video_ready(video_id)
+                db.insert_video_history_event(
+                    video_id,
+                    "processing_failed",
+                    run_id=run_id,
+                    detail={"error": str(exc)},
+                )
+
+            if pipeline_ok and result is not None:
+                progress = result.progress_snapshot or tracker.snapshot()
+                progress.update(
+                    {
+                        "annotated_video_path": result.annotated_video_path,
+                        "annotated_video_ready": result.annotated_video_ready,
+                        "detection_records": result.detection_records,
+                        "unique_tracks": result.unique_tracks,
+                        "class_counts": result.class_counts,
+                        "violation_candidates": result.violation_candidates,
+                        "model_identifier": result.model_identifier,
+                        "frames_processed": result.frames_processed,
+                        "total_frames": result.total_frames,
+                        "source_duration_sec": result.source_duration_sec,
+                        "effective_output_fps": result.effective_output_fps,
+                        "stage": "completed",
+                    }
+                )
+                try:
+                    db.finish_processing_run(
+                        run_id,
+                        status="completed",
+                        diagnostics_json=result.diagnostics_json,
+                        geometry_snapshot_json=result.geometry_snapshot_json,
+                        progress=progress,
+                    )
+                    db.insert_video_history_event(
+                        video_id,
+                        "processing_completed",
+                        run_id=run_id,
+                        detail={
+                            "detection_records": result.detection_records,
+                            "violation_candidates": result.violation_candidates,
+                            "annotated_video_ready": result.annotated_video_ready,
+                            "model_identifier": result.model_identifier,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Processing run %d row write failed after a successful pipeline; "
+                        "video %d stays processed.",
+                        run_id,
+                        video_id,
+                    )
+                    try:
+                        db.finish_processing_run(
+                            run_id,
+                            status="failed",
+                            error_message="Failed to write processing run row after successful pipeline.",
+                            diagnostics_json=result.diagnostics_json,
+                            geometry_snapshot_json=result.geometry_snapshot_json,
+                            progress=progress,
+                        )
+                    except Exception:
+                        pass
         finally:
+            preview_hub.clear(video_id)
             with _queue_cv:
                 if _running_video_id == video_id:
                     _running_video_id = None
@@ -834,10 +1096,251 @@ def _enqueue_processing(video_id: int, enabled_violations: tuple[str, ...], run_
             vid != video_id and v.get("state") == "processing"
             for vid, v in _processing_jobs.items()
         )
-        queued = slot_busy or position > 1
+        queued = slot_busy or position > 1 or _running_video_id is not None
         _queue_cv.notify_all()
     _ensure_worker()
     return queued
+
+
+def _try_claim_enqueue(
+    video_id: int,
+    *,
+    enabled: tuple[str, ...],
+    viewer_mode: str,
+    actor_user_id: int | None,
+) -> tuple[str, int | None, bool | None, int | None]:
+    """Atomically check duplicates and enqueue under the queue lock.
+
+    Returns (status, run_id, queued, position) where status is
+    'accepted' or 'already_busy'.
+    """
+    with _queue_cv:
+        busy = (
+            _processing_jobs.get(video_id, {}).get("state") == "processing"
+            or _running_video_id == video_id
+            or any(entry[0] == video_id for entry in _process_queue)
+        )
+        if busy:
+            return "already_busy", None, None, None
+
+        run_id = db.create_processing_run(
+            video_id,
+            json.dumps(list(enabled)),
+            viewer_mode=viewer_mode,
+        )
+        tracker = ProgressTracker(run_id=run_id, video_id=video_id, viewer_mode=viewer_mode)
+        tracker.set_queued(True, position=None)
+        _processing_jobs[video_id] = {
+            "state": "processing",
+            "error": None,
+            "run_id": run_id,
+            "tracker": tracker,
+            "viewer_mode": viewer_mode,
+        }
+        _process_queue.append((video_id, enabled, run_id))
+        try:
+            position = [entry[0] for entry in _process_queue].index(video_id) + 1
+        except ValueError:
+            position = 0
+        slot_busy = any(
+            vid != video_id and v.get("state") == "processing"
+            for vid, v in _processing_jobs.items()
+        )
+        queued = slot_busy or position > 1 or _running_video_id is not None
+        tracker.set_queued(queued, position=position)
+        _queue_cv.notify_all()
+
+    _ensure_worker()
+    db.insert_video_history_event(
+        video_id,
+        "processing_queued",
+        run_id=run_id,
+        actor_user_id=actor_user_id,
+        detail={
+            "viewer_mode": viewer_mode,
+            "enabled_violations": list(enabled),
+            "queued": queued,
+            "queue_position": position,
+        },
+    )
+    return "accepted", run_id, queued, position
+
+
+def _build_status_payload(video_id: int, row: dict) -> dict:
+    job = _processing_jobs.get(video_id, {})
+    tracker: ProgressTracker | None = job.get("tracker")
+    run_id = job.get("run_id")
+    latest = None
+    if run_id:
+        latest = db.get_processing_run(run_id)
+    if latest is None:
+        latest = db.get_latest_processing_run(video_id)
+        if latest:
+            run_id = latest["id"]
+
+    current_result = None
+    if hasattr(db, "get_current_completed_result_run"):
+        current_result = db.get_current_completed_result_run(video_id)
+    elif hasattr(db, "get_latest_completed_processing_run"):
+        current_result = db.get_latest_completed_processing_run(video_id)
+
+    # Annotated replay always follows the current completed result, never a
+    # failed/queued/running later attempt.
+    result_for_annotated = current_result
+    annotated_ready = bool(result_for_annotated and result_for_annotated.get("annotated_video_ready"))
+    annotated_url = (
+        f"/api/videos/{video_id}/annotated/{result_for_annotated['id']}"
+        if annotated_ready and result_for_annotated
+        else None
+    )
+
+    if tracker is not None:
+        payload = tracker.snapshot()
+        payload["annotated_video_ready"] = annotated_ready or bool(payload.get("annotated_video_ready"))
+        if annotated_url:
+            payload["annotated_video_url"] = annotated_url
+        elif not payload.get("annotated_video_url"):
+            payload["annotated_video_url"] = None
+        payload["current_result_run_id"] = current_result["id"] if current_result else None
+        payload["latest_attempt_status"] = latest.get("status") if latest else None
+    elif latest:
+        class_counts = {}
+        raw_cc = latest.get("class_counts_json")
+        if raw_cc:
+            try:
+                class_counts = json.loads(raw_cc)
+            except (TypeError, json.JSONDecodeError):
+                class_counts = {}
+        # When the latest attempt is not the current completed result, surface
+        # attempt progress/error separately from completed-result annotations.
+        attempt_is_current_completed = bool(
+            current_result
+            and latest
+            and int(current_result["id"]) == int(latest["id"])
+            and latest.get("status") == "completed"
+        )
+        if attempt_is_current_completed:
+            display_counts = class_counts
+            display_det = latest.get("detection_records") or 0
+            display_tracks = latest.get("unique_tracks")
+            display_cands = latest.get("violation_candidates") or 0
+        elif current_result and latest.get("status") in ("failed", "queued", "running"):
+            display_counts = {}
+            raw_crc = current_result.get("class_counts_json")
+            if raw_crc:
+                try:
+                    display_counts = json.loads(raw_crc)
+                except (TypeError, json.JSONDecodeError):
+                    display_counts = {}
+            display_det = current_result.get("detection_records") or 0
+            display_tracks = current_result.get("unique_tracks")
+            display_cands = current_result.get("violation_candidates") or 0
+        else:
+            display_counts = class_counts
+            display_det = latest.get("detection_records") or 0
+            display_tracks = latest.get("unique_tracks")
+            display_cands = latest.get("violation_candidates") or 0
+        payload = {
+            "run_id": latest.get("id"),
+            "video_id": video_id,
+            "state": job.get("state") or (
+                "done" if latest.get("status") == "completed"
+                else "error" if latest.get("status") == "failed"
+                else "processing" if latest.get("status") in ("queued", "running")
+                else None
+            ),
+            "stage": latest.get("stage") or (
+                "completed" if latest.get("status") == "completed"
+                else "failed" if latest.get("status") == "failed"
+                else "queued" if latest.get("status") == "queued"
+                else "processing"
+            ),
+            "queued": latest.get("status") == "queued",
+            "queue_position": None,
+            "frames_processed": latest.get("frames_processed") or 0,
+            "total_frames": latest.get("total_frames"),
+            "progress_percent": float(latest.get("progress_percent") or 0),
+            "elapsed_sec": latest.get("elapsed_sec"),
+            "processing_fps": latest.get("processing_fps"),
+            "eta_sec": None,
+            "detection_records": display_det,
+            "unique_tracks": display_tracks,
+            "class_counts": display_counts,
+            "violation_candidates": display_cands,
+            "annotated_video_ready": annotated_ready,
+            "annotated_video_url": annotated_url,
+            "error": latest.get("error_message") or job.get("error"),
+            "model_identifier": latest.get("model_identifier"),
+            "viewer_mode": latest.get("viewer_mode"),
+            "source_duration_sec": latest.get("source_duration_sec"),
+            "started_at": latest.get("started_at"),
+            "finished_at": latest.get("finished_at"),
+            "diagnostics": [],
+            "current_result_run_id": current_result["id"] if current_result else None,
+            "latest_attempt_status": latest.get("status"),
+        }
+    else:
+        payload = {
+            "run_id": None,
+            "video_id": video_id,
+            "state": job.get("state"),
+            "stage": None,
+            "queued": False,
+            "queue_position": None,
+            "frames_processed": 0,
+            "total_frames": None,
+            "progress_percent": 0.0,
+            "elapsed_sec": None,
+            "processing_fps": None,
+            "eta_sec": None,
+            "detection_records": 0,
+            "unique_tracks": None,
+            "class_counts": {},
+            "violation_candidates": 0,
+            "annotated_video_ready": annotated_ready,
+            "annotated_video_url": annotated_url,
+            "error": job.get("error"),
+            "model_identifier": None,
+            "viewer_mode": None,
+            "source_duration_sec": row.get("duration_sec"),
+            "started_at": None,
+            "finished_at": None,
+            "diagnostics": [],
+            "current_result_run_id": current_result["id"] if current_result else None,
+            "latest_attempt_status": None,
+        }
+
+    queued = _is_processing_or_queued(video_id)
+    position = _queue_position(video_id)
+    payload["queued"] = queued and (position is None or position > 0) and job.get("state") != "done"
+    if position is not None:
+        payload["queue_position"] = position
+    payload["video_status"] = row.get("status")
+    payload["job_state"] = job.get("state") or payload.get("state")
+    payload["job_error"] = job.get("error") or payload.get("error")
+    payload["success"] = True
+    if payload.get("run_id") is None and run_id is not None:
+        payload["run_id"] = run_id
+    return payload
+
+
+def _enqueue_video_job(
+    video_id: int,
+    *,
+    enabled: tuple[str, ...],
+    viewer_mode: str = "background",
+    actor_user_id: int | None = None,
+) -> tuple[int, bool]:
+    """Create run + queue atomically. Raises ValueError if already busy."""
+    status, run_id, queued, _position = _try_claim_enqueue(
+        video_id,
+        enabled=enabled,
+        viewer_mode=viewer_mode,
+        actor_user_id=actor_user_id,
+    )
+    if status != "accepted" or run_id is None:
+        raise ValueError("Video is already queued or processing.")
+    return run_id, bool(queued)
 
 
 @app.route("/api/videos/<int:video_id>/process", methods=["POST"])
@@ -860,10 +1363,11 @@ def api_process_video(video_id: int):
             "error": "Annotate traffic zones before processing this video.",
         }), 400
 
-    # Accept an explicit violation list for this run; default to the current
-    # global enabled set. Validate against the canonical/toggleable registry.
     payload = request.get_json(silent=True) or {}
     requested = payload.get("enabled_violations")
+    viewer_mode = (payload.get("viewer_mode") or "background").strip().lower()
+    if viewer_mode not in ("background", "watch_live"):
+        viewer_mode = "background"
     try:
         if requested is None:
             enabled = load_enabled_violations()
@@ -872,11 +1376,22 @@ def api_process_video(video_id: int):
     except ViolationConfigError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
 
-    import json as _json
-    run_id = db.create_processing_run(video_id, _json.dumps(list(enabled)))
-
-    _processing_jobs[video_id] = {"state": "processing", "error": None}
-    queued = _enqueue_processing(video_id, enabled, run_id)
+    user = auth.current_user()
+    try:
+        run_id, queued = _enqueue_video_job(
+            video_id,
+            enabled=enabled,
+            viewer_mode=viewer_mode,
+            actor_user_id=user["id"] if user else None,
+        )
+    except ValueError:
+        queued = video_id in [e[0] for e in _process_queue]
+        return jsonify({
+            "success": False,
+            "error": "Video is already queued for processing." if queued
+            else "Video is already being processed.",
+            "queued": queued,
+        }), 409
 
     if queued:
         message = "Processing queued. Runs sequentially after the current job."
@@ -888,6 +1403,70 @@ def api_process_video(video_id: int):
         "queued": queued,
         "enabled_violations": list(enabled),
         "run_id": run_id,
+        "viewer_mode": viewer_mode,
+        "queue_position": _queue_position(video_id),
+        "preview_url": f"/api/videos/{video_id}/process-preview",
+    })
+
+
+@app.route("/api/videos/process-bulk", methods=["POST"])
+@auth.role_required("enforcer")
+def api_process_bulk():
+    payload = request.get_json(silent=True) or {}
+    video_ids = payload.get("video_ids") or []
+    if not isinstance(video_ids, list) or not video_ids:
+        return jsonify({"success": False, "error": "video_ids must be a non-empty list."}), 400
+    requested = payload.get("enabled_violations")
+    try:
+        if requested is None:
+            enabled = load_enabled_violations()
+        else:
+            enabled = validate_enabled_violations(requested)
+    except ViolationConfigError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    user = auth.current_user()
+    accepted = []
+    rejected = []
+    already_queued = []
+    for raw_id in video_ids:
+        try:
+            vid = int(raw_id)
+        except (TypeError, ValueError):
+            rejected.append({"video_id": raw_id, "reason": "Invalid video id."})
+            continue
+        row = db.get_video(vid)
+        if row is None:
+            rejected.append({"video_id": vid, "reason": "Video not found."})
+            continue
+        if not row.get("annotation_id"):
+            rejected.append({"video_id": vid, "reason": "Missing zone annotation."})
+            continue
+        if row.get("status") not in ("ready", "processed"):
+            rejected.append({"video_id": vid, "reason": f"Status '{row.get('status')}' is not ready."})
+            continue
+        status, run_id, queued, position = _try_claim_enqueue(
+            vid,
+            enabled=enabled,
+            viewer_mode="background",
+            actor_user_id=user["id"] if user else None,
+        )
+        if status == "already_busy":
+            already_queued.append({"video_id": vid, "reason": "Already queued or processing."})
+            continue
+        accepted.append({
+            "video_id": vid,
+            "run_id": run_id,
+            "queued": queued,
+            "queue_position": position,
+        })
+
+    return jsonify({
+        "success": True,
+        "accepted": accepted,
+        "rejected": rejected,
+        "already_queued": already_queued,
+        "enabled_violations": list(enabled),
     })
 
 
@@ -897,14 +1476,186 @@ def api_process_status(video_id: int):
     row = db.get_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
-    job = _processing_jobs.get(video_id, {})
+    return jsonify(_build_status_payload(video_id, row))
+
+
+@app.route("/api/videos/<int:video_id>/process-preview")
+@auth.login_required
+def api_process_preview(video_id: int):
+    """MJPEG of the latest annotated processing frame (same run — no extra inference)."""
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+
+    def _active() -> bool:
+        job = _processing_jobs.get(video_id, {})
+        if job.get("state") == "processing":
+            return True
+        # Keep streaming briefly after completion so the UI can show last frame.
+        return job.get("state") in ("done", "error") and preview_hub.latest(video_id) is not None
+
+    return Response(
+        preview_hub.mjpeg_generator(video_id, is_active=_active),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/api/videos/<int:video_id>/media")
+@auth.login_required
+def api_video_media(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    return safe_media_response(
+        row["filepath"],
+        roots=[config.UPLOAD_FOLDER],
+        request=request,
+        download_name=row.get("filename") or f"video_{video_id}.mp4",
+        as_attachment=False,
+        mimetype="video/mp4",
+    )
+
+
+@app.route("/api/videos/<int:video_id>/annotated/<int:run_id>")
+@auth.login_required
+def api_annotated_video(video_id: int, run_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    run = db.get_processing_run(run_id)
+    if run is None or int(run.get("video_id") or -1) != video_id:
+        return jsonify({"success": False, "error": "Annotated run not found."}), 404
+    if not run.get("annotated_video_ready"):
+        return jsonify({"success": False, "error": "Annotated video is not ready."}), 404
+    path = run.get("annotated_video_path") or str(annotated_final_path(run_id))
+    as_attachment = request.args.get("download") in ("1", "true", "yes")
+    mime = mime_for_annotated_path(path)
+    return safe_media_response(
+        path,
+        roots=[config.ANNOTATED_FOLDER],
+        request=request,
+        download_name=download_name_for_annotated(row.get("filename"), run_id, path),
+        as_attachment=as_attachment,
+        mimetype=mime,
+    )
+
+
+@app.route("/api/videos/<int:video_id>/history")
+@auth.login_required
+def api_video_history(video_id: int):
+    row = db.get_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    annotation = db.get_annotation_by_video(video_id)
+    template = db.get_zone_template(row["template_id"]) if row.get("template_id") else None
+    uploader = db.get_user(row["uploaded_by"]) if row.get("uploaded_by") else None
+    runs = db.list_processing_runs(video_id)
+    events = db.list_video_history_events(video_id)
+    summary = db.detection_summary_for_video(video_id)
+    current_run = None
+    if hasattr(db, "get_current_completed_result_run"):
+        current_run = db.get_current_completed_result_run(video_id)
+    elif hasattr(db, "get_latest_completed_processing_run"):
+        current_run = db.get_latest_completed_processing_run(video_id)
+    latest_attempt = (
+        db.get_latest_processing_run(video_id)
+        if hasattr(db, "get_latest_processing_run")
+        else None
+    )
+    enriched_runs = []
+    for run in runs:
+        enabled = []
+        raw = run.get("enabled_violations_json")
+        if raw:
+            try:
+                enabled = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                enabled = []
+        enriched_runs.append({
+            **run,
+            "enabled_violations": enabled,
+            "queued_at": run.get("queued_at"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("finished_at"),
+            "source_duration_sec": run.get("source_duration_sec"),
+            "is_current_result": bool(
+                current_run and int(current_run["id"]) == int(run["id"])
+            ),
+            "is_latest_attempt": bool(
+                latest_attempt and int(latest_attempt["id"]) == int(run["id"])
+            ),
+        })
     return jsonify({
         "success": True,
-        "video_status": row.get("status"),
-        "job_state": job.get("state"),
-        "job_error": job.get("error"),
-        "queued": _is_processing_or_queued(video_id),
+        "video": _db_video_to_ui(row),
+        "uploader": _user_to_ui(uploader) if uploader else None,
+        "recorded_at": row.get("recorded_at"),
+        "recording_time_known": bool(row.get("recorded_at")),
+        "source_duration_sec": row.get("duration_sec"),
+        "annotation": annotation,
+        "template": _template_to_ui(template) if template else None,
+        "processing_runs": enriched_runs,
+        "history_events": events,
+        "detection_summary": summary,
+        "current_result_run_id": current_run["id"] if current_run else None,
+        "latest_attempt_run_id": latest_attempt["id"] if latest_attempt else None,
+        "latest_attempt_status": latest_attempt.get("status") if latest_attempt else None,
     })
+
+
+@app.route("/api/videos/<int:video_id>/remove-results", methods=["POST"])
+@auth.role_required("enforcer")
+def api_remove_results(video_id: int):
+    user = auth.current_user()
+    try:
+        result = remove_processing_results(
+            video_id,
+            is_busy=_is_processing_or_queued,
+            actor_user_id=user["id"] if user else None,
+        )
+    except VideoLifecycleError as exc:
+        return jsonify({"success": False, "error": str(exc)}), exc.status_code
+    _processing_jobs.pop(video_id, None)
+    preview_hub.clear(video_id)
+    return jsonify(result)
+
+
+@app.route("/api/videos/<int:video_id>", methods=["DELETE"])
+@auth.role_required("admin")
+def api_delete_video(video_id: int):
+    payload = request.get_json(silent=True) or {}
+    confirm = payload.get("confirm_filename")
+    if not isinstance(confirm, str) or not confirm.strip():
+        return jsonify({
+            "success": False,
+            "error": "Filename confirmation is required for permanent deletion.",
+        }), 400
+    user = auth.current_user()
+    try:
+        result = delete_video_permanently(
+            video_id,
+            is_busy=_is_processing_or_queued,
+            actor_user_id=user["id"] if user else None,
+            expected_filename=confirm,
+        )
+    except VideoLifecycleError as exc:
+        return jsonify({"success": False, "error": str(exc)}), exc.status_code
+    _processing_jobs.pop(video_id, None)
+    preview_hub.clear(video_id)
+    return jsonify(result)
+
+
+@app.route("/api/upload-processing-analytics")
+@auth.login_required
+def api_upload_processing_analytics():
+    period = request.args.get("period", "today")
+    start = request.args.get("start")
+    end = request.args.get("end")
+    try:
+        data = build_upload_processing_analytics(period, start=start, end=end)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "analytics": data})
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1681,8 @@ def api_confirm_review(review_id: int):
     user = auth.current_user()
     try:
         violation_id = db.confirm_review_item(review_id, reviewed_by=user["id"])
+    except TemporalEvidenceNotReady as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 404
     return jsonify({"success": True, "violation_id": violation_id})

@@ -1,0 +1,21 @@
+{
+  "status": "pending",
+  "schema_version": "1.0.0",
+  "reviewers_required": 2,
+  "items": [],
+  "metrics": {
+    "missing_boxes": null,
+    "wrong_classes": null,
+    "duplicate_boxes": null,
+    "unresolved_unknowns": null,
+    "reviewer_agreement": null
+  },
+  "required_difficult_cases": [
+    "puv_subtype",
+    "rider_person_association",
+    "helmet_form",
+    "mirror_visibility",
+    "philippine_sign",
+    "philippine_pavement_marking"
+  ]
+}

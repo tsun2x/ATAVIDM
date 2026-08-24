@@ -110,13 +110,14 @@ class LiveStreamWorker(threading.Thread):
 
                 timestamp_sec = time.monotonic() - started
                 raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
-                tracked = track_state.update(raw)
+                tracked = track_state.update(raw, now=timestamp_sec)
                 self._publish(self._annotate(frame, tracked))
 
                 events = evaluate_detection_rules(
                     tracked, rule_state, frame_number,
                     zones=self.zones, params=params,
                     enabled_violations=enabled_violations,
+                    now_sec=timestamp_sec,
                 )
                 by_track = {int(d["track_id"]): d for d in tracked}
                 for event in events:

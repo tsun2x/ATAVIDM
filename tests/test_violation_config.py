@@ -46,6 +46,11 @@ class TestCanonicalRegistry:
         for name in PLANNED_VIOLATIONS:
             assert name not in TOGGLEABLE_VIOLATIONS
 
+    def test_all_canonical_are_toggleable_when_no_planned(self):
+        # After remediation every canonical rule has an evaluator and is toggleable.
+        if not PLANNED_VIOLATIONS:
+            assert set(TOGGLEABLE_VIOLATIONS) == set(CANONICAL_VIOLATIONS)
+
     def test_partial_is_toggleable_not_implemented(self):
         for name in PARTIAL_VIOLATIONS:
             assert name in TOGGLEABLE_VIOLATIONS
@@ -98,6 +103,15 @@ class TestEnabledViolationsPersistence:
         with pytest.raises(ViolationConfigError):
             validate_enabled_violations(["Not A Real Violation"])
 
-    def test_rejects_planned_violation(self):
-        with pytest.raises(ViolationConfigError):
-            validate_enabled_violations([VIOLATION_SUBSTANDARD_HELMET])
+    def test_accepts_partial_rules_that_were_formerly_planned(self):
+        # Fail-closed / partial evaluators are toggleable; enabling them must
+        # not invent automatic confirmation by itself.
+        validated = validate_enabled_violations([VIOLATION_SUBSTANDARD_HELMET])
+        assert validated == (VIOLATION_SUBSTANDARD_HELMET,)
+
+    def test_explicit_empty_persists(self, monkeypatch):
+        store: dict[str, str] = {}
+        monkeypatch.setattr("core.violation_config.db.get_setting", lambda key: store.get(key))
+        monkeypatch.setattr("core.violation_config.db.set_settings", lambda values: store.update(values))
+        save_enabled_violations([])
+        assert load_enabled_violations() == ()

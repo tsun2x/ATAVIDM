@@ -2,8 +2,8 @@
 
 **Project:** TAVIDM — Traffic Violation Detection and Monitoring System
 **Specification:** Vehicle Classification
-**Status:** ACTIVE — 12 vehicle detector classes FROZEN for Phase 2 (owner-approved); additional rule-applicability details may still be refined
-**Machine-readable contract:** `config/training/class_schema.json` (schema_version 1.1.0)
+**Status:** ACTIVE — owner-approved 2026-08-22 revision; machine-readable/runtime contract aligned at schema_version **1.2.0**
+**Machine-readable contract:** `config/training/class_schema.json` schema_version **1.2.0** (11 vehicle detector classes; 16 object + 9 scene = 25 labels)
 **IMPORTANT:** This specification is subject to revision based on feedback, corrections, or requirements provided by the thesis adviser/panel/professor. When such feedback is explicitly provided by the user, treat the newer approved decision as superseding the previous specification. Frozen detector-class names must not be silently renamed.
 **Purpose:** Define how TAVIDM classifies vehicles and how vehicle classification is consumed by the Violation Engine.
 
@@ -53,13 +53,14 @@ Vehicle
  │    └── Detector: car | suv_crossover | van
  │
  ├── Broad Class: public_utility_vehicle
- │    └── Detector: jeepney | uv_express_van | tricycle | piaggio | bus
+ │    └── Detector: jeepney | tricycle | autorickshaw | bus
+ │        Contextual type: van with apparent public/for-hire evidence
  │
  ├── Broad Class: commercial_vehicle
  │    └── Detector: truck | pickup_truck
  │
  └── Broad Class: two_or_three_wheeled
-      └── Detector: motorcycle | tricycle | piaggio | bicycle
+      └── Detector: motorcycle | tricycle | autorickshaw | bicycle
 ```
 
 The purpose is to allow the violation engine to ask questions such as:
@@ -76,30 +77,29 @@ without treating broad groups themselves as YOLO detector labels.
 
 # 3. Frozen Vehicle Detector Classes
 
-TAVIDM freezes exactly **12** vehicle detector classes for Phase 2 annotation and training.
+TAVIDM freezes exactly **11** visual vehicle detector classes under the owner-approved 2026-08-22 revision. The machine-readable contract and runtime registry are aligned at schema_version **1.2.0**.
 
 These strings are detector labels. They must not be merged, collapsed, or replaced by broad category names.
 
-### Canonical vehicle detector roster (count = 12)
+### Canonical vehicle detector roster (count = 11)
 
 1. `car`
 2. `suv_crossover`
 3. `van`
 4. `jeepney`
-5. `uv_express_van`
-6. `tricycle`
-7. `piaggio`
-8. `bus`
-9. `truck`
-10. `pickup_truck`
-11. `motorcycle`
-12. `bicycle`
+5. `tricycle`
+6. `autorickshaw`
+7. `bus`
+8. `truck`
+9. `pickup_truck`
+10. `motorcycle`
+11. `bicycle`
 
 ### Required distinctions
 
 * `pickup_truck` is a **separate detector class**, not merely a subtype attribute of `truck`.
-* `van` and `uv_express_van` are separate.
-* `tricycle` and `piaggio` are separate from each other and from `motorcycle`.
+* `van` is the only visual van detector class. Apparent public/for-hire operation is contextual metadata, not `uv_express_van` object detection.
+* `tricycle` and `autorickshaw` are separate from each other and from `motorcycle`.
 * `bus` and `jeepney` are separate.
 * Broad keys such as `passenger_vehicle`, `public_utility_vehicle`, and `commercial_vehicle` are **derived hierarchy values**, not detector labels.
 * `UNKNOWN` / `UNCERTAIN` are review states, not detector classes.
@@ -110,9 +110,9 @@ These strings are detector labels. They must not be merged, collapsed, or replac
 
 ```text
 passenger_vehicle        → car, suv_crossover, van
-public_utility_vehicle   → jeepney, uv_express_van, tricycle, piaggio, bus
+public_utility_vehicle   → jeepney, tricycle, autorickshaw, bus; van only when contextual public/for-hire evidence supports applicability
 commercial_vehicle       → truck, pickup_truck
-two_or_three_wheeled     → motorcycle, tricycle, piaggio, bicycle
+two_or_three_wheeled     → motorcycle, tricycle, autorickshaw, bicycle
 ```
 
 ---
@@ -150,9 +150,9 @@ Broad class: `passenger_vehicle`.
 
 ## 3.4 Van (`van`)
 
-General vans are distinguishable from ordinary cars and from UV Express vehicles.
+`van` covers the visual van body type. The detector must not attempt to learn UV Express authorization as a separate object class.
 
-Do **not** automatically assume every van is `uv_express_van`.
+Apparent public/for-hire operation is contextual metadata derived from available plate appearance/OCR, route board or livery, passenger activity, source context, confidence, and human review. Plate appearance alone is not conclusive proof of current authorization. Preserve `UNKNOWN` when evidence is insufficient.
 
 Broad class: `passenger_vehicle`.
 
@@ -202,21 +202,20 @@ At minimum, the system should recognize the following operational PUV categories
 ```text
 PUV (derived broad class: public_utility_vehicle)
 ├── jeepney
-├── uv_express_van
 ├── tricycle
-├── piaggio
+├── autorickshaw
 └── bus
-```
 
-Operational display names such as “UV Express / Van” may appear in UI text, but the detector label is `uv_express_van`.
+Contextual applicability: van with sufficient apparent public/for-hire evidence
+```
 
 ### Important terminology note
 
-"Piaggio" is technically a manufacturer/brand name, but the term is commonly used operationally in the local context.
+"Piaggio" is technically a manufacturer/brand name and may remain useful local metadata.
 
 For TAVIDM:
 
-> **Piaggio may be retained as an operational vehicle-type label.**
+> **The visual detector label is `autorickshaw`; Piaggio may be retained as optional brand/local-type metadata.**
 
 The system should not silently rename or remove the label simply because it is technically a brand name.
 
@@ -225,7 +224,8 @@ If a future legal classification is required, the system may maintain a separate
 Example:
 
 ```text
-operational_type = "Piaggio"
+vehicle_type = "autorickshaw"
+brand_or_local_type = "Piaggio"
 legal_category = <future classification>
 ```
 
@@ -246,18 +246,18 @@ This distinction is necessary because certain violation rules may apply specific
 
 ---
 
-# 6. UV Express Van (`uv_express_van`)
+# 6. Van Operational Context
 
-`uv_express_van` is a distinct detector class from ordinary `van`.
+There is no separate `uv_express_van` visual detector class under the 2026-08-22 revision.
 
 Example:
 
 ```text
-broad_class = public_utility_vehicle
-vehicle_type = uv_express_van
+vehicle_type = van
+apparent_operational_status = public_for_hire | private_or_ordinary | unknown
 ```
 
-Do not classify every ordinary van as UV Express solely because it is a van.
+The status may use plate appearance/OCR, visible route board or livery, passenger activity, source context, confidence, and human review. Do not classify every van as a PUV, and do not treat plate appearance alone as proof of authorization.
 
 ---
 
@@ -292,32 +292,33 @@ if required, but the original vehicle type must remain available.
 
 ---
 
-# 8. Piaggio
+# 8. Autorickshaw
 
-Piaggio must be represented as its own operational vehicle type because this terminology is relevant to the project's local operating context.
+`autorickshaw` represents the integrated three-wheeled vehicle body form. It remains distinct from a conventional motorcycle-with-sidecar `tricycle` and from `motorcycle`.
 
 Example:
 
 ```text
 broad_class = PUV
-vehicle_type = Piaggio
+vehicle_type = autorickshaw
+brand_or_local_type = Piaggio | other | unknown
 ```
 
 Do not automatically collapse:
 
 ```text
-Piaggio → Motorcycle
+Autorickshaw → Motorcycle
 ```
 
 or:
 
 ```text
-Piaggio → Tricycle
+Autorickshaw → Tricycle
 ```
 
 unless a future explicit classification decision establishes that mapping.
 
-The system should preserve the operational classification.
+The system should preserve the visual classification and may retain Piaggio as optional local/brand metadata.
 
 ---
 
@@ -701,7 +702,7 @@ When working on TAVIDM:
 1. Load this specification before beginning relevant work.
 2. Treat the frozen decisions in this document as authoritative.
 3. Do not silently reinterpret vehicle categories.
-4. Do not collapse distinct operational types such as Jeepney, UV Express/Van, Tricycle, and Piaggio into generic categories without explicit authorization.
+4. Preserve Jeepney, Van, Tricycle, and Autorickshaw according to the approved roster; determine apparent Van public/for-hire applicability from context rather than a separate visual class.
 5. Do not use vehicle classification alone to determine a violation.
 6. Do not silently change classification terminology.
 7. Preserve vehicle classification information through tracking where practical.
@@ -734,8 +735,8 @@ Both specifications should be loaded before implementing or modifying the TAVIDM
 
 **Current status:**
 
-> Vehicle Classification Specification — ACTIVE; **12 vehicle detector classes FROZEN** (includes separate `pickup_truck`)
-> Machine-readable contract: `config/training/class_schema.json` schema_version **1.1.0** (17 object + 9 scene = 26 pilot labels)
+> Vehicle Classification Specification — ACTIVE; owner-approved 2026-08-22 roster has **11 visual vehicle detector classes** (includes separate `pickup_truck`, uses `autorickshaw`, and uses one `van` class)
+> Machine-readable/runtime alignment: `config/training/class_schema.json` schema_version **1.2.0** matches `core/detection_config.FROZEN_VEHICLE_DETECTOR_CLASSES`
 > Violation Engine Specification — ACTIVE / DESIGN IN PROGRESS
 > Design update: `docs/VIOLATION_ENGINE_DESIGN_UPDATE_2026-08-16.md`
 > Canonical violation roster: 12 types; Illegal Parking and Illegal Terminal are separate

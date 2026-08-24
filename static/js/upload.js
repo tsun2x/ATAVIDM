@@ -15,6 +15,7 @@
     const progressWrap = document.getElementById("uploadProgressWrap");
     const progressBar = document.getElementById("uploadProgressBar");
     const uploadCondition = document.getElementById("uploadCondition");
+    const uploadRecordedAt = document.getElementById("uploadRecordedAt");
     const videoList = document.getElementById("videoList");
 
     const wizardModalEl = document.getElementById("annotationWizardModal");
@@ -175,27 +176,54 @@
 
     function appendVideoToList(video) {
         if (!videoList) return;
+        const empty = videoList.querySelector(".text-center.text-muted");
+        if (empty) empty.remove();
+
+        const row = document.createElement("div");
+        row.className = "camera-item-row d-flex align-items-stretch";
+        const ready = !!(video.has_annotation && (video.status === "ready" || video.status === "processed"));
+        const check = document.createElement("label");
+        check.className = "bulk-check-wrap px-2 d-flex align-items-center mb-0";
+        check.innerHTML =
+            '<input type="checkbox" class="form-check-input bulk-video-check" value="' + video.db_id + '"' +
+            ' data-ready="' + (ready ? "1" : "0") + '"' +
+            (ready ? "" : " disabled") +
+            ' aria-label="Select ' + (video.filename || "video") + '">';
+
         const btn = document.createElement("button");
-        btn.className = "camera-item";
-        btn.dataset.videoId = video.id;
-        btn.dataset.videoName = video.name;
-        btn.dataset.videoLocation = video.location;
-        btn.dataset.videoCondition = video.condition;
-        btn.dataset.videoDuration = video.duration;
-        btn.dataset.videoThumbnail = video.thumbnail;
-        btn.dataset.videoProcessed = video.processed ? "true" : "false";
-        const statusLabel = video.has_annotation ? "Annotated" : "Needs zones";
+        btn.className = "camera-item flex-grow-1";
+        btn.dataset.video = JSON.stringify(video);
+        const statusLabel = video.status || (video.has_annotation ? "ready" : "annotating");
         btn.innerHTML =
             '<div class="camera-thumb"><img src="/static/images/camera_thumb.svg" alt="">' +
-            '<span class="cam-status-dot ' + (video.has_annotation ? "online" : "offline") + '"></span></div>' +
+            '<span class="cam-status-dot ' + (video.processed ? "online" : "offline") + '"></span></div>' +
             '<div class="camera-info"><span class="camera-name">' + video.filename +
             ' <span class="upload-badge">NEW</span></span>' +
-            '<span class="camera-location">' + video.condition + " · " + statusLabel + "</span></div>" +
+            '<span class="camera-location video-status-label" data-db-id="' + video.db_id + '">' +
+            (video.condition || "peak") + " · " + statusLabel + "</span></div>" +
             '<i class="bi bi-chevron-right"></i>';
-        videoList.insertBefore(btn, videoList.firstChild);
+
+        row.appendChild(check);
+        row.appendChild(btn);
+        videoList.insertBefore(row, videoList.firstChild);
         videoList.querySelectorAll(".camera-item").forEach(function (el) { el.classList.remove("active"); });
         btn.classList.add("active");
         btn.click();
+    }
+
+    function setUploadStage(label) {
+        const statusEl = document.getElementById("uploadStageStatus");
+        if (statusEl) statusEl.textContent = label;
+        else if (progressWrap) {
+            let stage = document.getElementById("uploadStageInline");
+            if (!stage) {
+                stage = document.createElement("div");
+                stage.id = "uploadStageInline";
+                stage.className = "small text-muted mb-2";
+                progressWrap.parentNode?.insertBefore(stage, progressWrap);
+            }
+            stage.textContent = label;
+        }
     }
 
     function saveAnnotation(saveMode, extra) {
@@ -320,6 +348,11 @@
         const formData = new FormData();
         formData.append("video", selectedFile);
         formData.append("condition", uploadCondition?.value || "peak");
+        const recordedRaw = (uploadRecordedAt?.value || "").trim();
+        if (recordedRaw) {
+            // datetime-local is YYYY-MM-DDTHH:MM[:SS] — normalize to space-separated.
+            formData.append("recorded_at", recordedRaw.replace("T", " "));
+        }
 
         const xhr = new XMLHttpRequest();
         activeXhr = xhr;
@@ -328,11 +361,18 @@
         btnCancel.disabled = false;
         btnUpload.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Uploading...';
         progressWrap.classList.remove("d-none");
+        setUploadStage("Preparing");
 
         xhr.upload.addEventListener("progress", function (e) {
             if (e.lengthComputable) {
                 progressBar.style.width = Math.round((e.loaded / e.total) * 100) + "%";
             }
+            setUploadStage("Uploading / saving");
+        });
+
+        xhr.upload.addEventListener("load", function () {
+            // Bytes transferred; server is now saving/extracting before HTTP response.
+            setUploadStage("Extracting metadata");
         });
 
         xhr.addEventListener("load", function () {
@@ -346,6 +386,13 @@
                 return;
             }
             if (xhr.status >= 200 && xhr.status < 300 && payload.success) {
+                if (payload.requires_annotation) {
+                    setUploadStage(payload.frame_ready
+                        ? "Extracting reference frame · Awaiting zone annotation"
+                        : "Awaiting zone annotation");
+                } else {
+                    setUploadStage("Completed");
+                }
                 showToast("Upload Complete", payload.message, "success");
                 selectedWrap.classList.add("d-none");
                 dropzone.classList.remove("d-none");
@@ -361,6 +408,7 @@
                     appendVideoToList(payload.video);
                 }
             } else {
+                setUploadStage("Failed");
                 showToast("Upload Error", payload.error || "Upload failed.", "danger");
                 btnUpload.disabled = false;
                 btnUpload.innerHTML = '<i class="bi bi-upload me-1"></i> Upload';

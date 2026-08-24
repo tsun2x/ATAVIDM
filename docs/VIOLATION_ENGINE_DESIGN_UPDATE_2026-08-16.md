@@ -15,6 +15,8 @@ Where this update contradicts an earlier frozen decision, **the conflict is open
 
 **Exception:** Conflict B.1 (roster fusion) was **resolved** by explicit project-owner decision on 2026-08-16: Illegal Parking and Illegal Terminal remain separate. See §B.1.
 
+**Vehicle detector labels (supersession):** Any earlier wording that treated `uv_express_van` or `piaggio` as canonical YOLO vehicle detector classes is **superseded** by `config/training/class_schema.json` schema_version **1.2.0** (11-class roster: single `van`; `autorickshaw` by body form; Piaggio brand metadata only; UV Express / for-hire as contextual metadata). See `docs/VEHICLE_CLASSIFICATION_SPECIFICATION.md` and §A.3 Illegal Terminal below.
+
 ---
 
 ## A. Newly stated design direction (no roster rewrite)
@@ -66,7 +68,7 @@ Exact numeric state-transition thresholds remain unspecified.
 
 * **Obstruction:** contextual traffic-interference. Stopped/stationary is not automatically obstruction. Legitimate explanations (enforcer direction, pedestrians crossing, incident ahead, traffic queue, driver still inside, etc.) should prevent an automatic candidate.
 * **Illegal Parking:** parking-like behavior using stationarity, location, duration, apparent driver absence, driver exiting, and whether the stop is a temporary loading/unloading maneuver. A visible driver exit is strong evidence; absence of a visible driver is not automatic proof.
-* **Illegal Terminal:** PUV types Jeepney, UV Express / Van, Tricycle, Piaggio. Stop alone is insufficient. Requires context + time + passenger activity (repeated/extended boarding/alighting, terminal-like behavior).
+* **Illegal Terminal:** PUV-applicable visual types under schema **1.2.0**: Jeepney, Van (with contextual public/for-hire evidence — not a separate `uv_express_van` detector class), Tricycle, and Autorickshaw. **Superseded:** earlier “UV Express / Van” and “Piaggio” detector wording. UV Express / for-hire status is contextual metadata only; Piaggio is brand metadata — classify three-wheel vehicles by body form (`tricycle` = motorcycle+sidecar; `autorickshaw` = integrated body). Stop alone is insufficient. Requires context + time + passenger activity (repeated/extended boarding/alighting, terminal-like behavior).
 * **Truck Ban:** remains time-based and configurable. Not a general behavioral truck rule. Parked/stationary presence during ban hours must not automatically become a violation.
 * **Counterflow:** opposing movement vs established roadway direction, persisting beyond a configurable threshold. Initial **4 seconds**. Defined shorter observation **2 seconds** for the already-opposing-on-entry edge case; that is not “every 2-second opposing movement is a violation.” Ambiguous maneuvers → manual review.
 * **No Helmet / Substandard Helmet:** for each person actually on the motorcycle (rider and rear passenger): no helmet → No Helmet; helmet present → classify form; nut-shell/substandard → Substandard Helmet; other helmet → no helmet violation. Categories: NO HELMET, NUT-SHELL / SUBSTANDARD, ACCEPTABLE / OTHER HELMET. No approval-sticker recognition. Dataset/model selection is Pre-Phase 2.

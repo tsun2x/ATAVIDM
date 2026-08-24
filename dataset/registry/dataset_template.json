@@ -1,0 +1,15 @@
+{
+  "id": "unique-source-id",
+  "name": "Dataset name",
+  "status": "candidate",
+  "domain": "philippines_or_foreign",
+  "purposes": ["generic_pretraining"],
+  "official_url": "https://official-source.example",
+  "license": {"status": "unverified", "name": null},
+  "acquisition": {"status": "link_only", "checksum_manifest": null},
+  "inspection": {"status": "pending", "sample_count": 0},
+  "annotations": {"status": "pending", "format": null, "class_counts_recorded": false},
+  "split": {"status": "pending", "grouped_by": []},
+  "coverage": {"philippine_signs": false, "philippine_markings": false},
+  "notes": "Record camera viewpoint, resolution, day/night/weather, class coverage, and audit findings."
+}

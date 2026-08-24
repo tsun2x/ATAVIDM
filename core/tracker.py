@@ -91,18 +91,25 @@ class TrackState:
         self.stationary_px = stationary_px
         self.tracks: dict[int, TrackHistory] = {}
 
-    def update(self, detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def update(
+        self,
+        detections: list[dict[str, Any]],
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Fold tracked detections into per-track history and annotate each
         detection with motion attributes used by the rule engine:
         centroid_x/centroid_y, speed_px_per_sec, direction_degrees, dwell_sec.
+
+        ``now`` is the current frame timestamp and is used for expiry even
+        when ``detections`` is empty (disappeared tracks).
         """
-        now = 0.0
+        clock = 0.0 if now is None else float(now)
         annotated: list[dict[str, Any]] = []
         for det in detections:
             tid = int(det["track_id"])
             ts = float(det.get("timestamp_sec", 0.0))
-            now = max(now, ts)
+            clock = max(clock, ts)
             cx = float(det["bbox_x"]) + float(det["bbox_w"]) / 2
             cy = float(det["bbox_y"]) + float(det["bbox_h"]) / 2
 
@@ -121,7 +128,7 @@ class TrackState:
             row["dwell_sec"] = dwell
             annotated.append(row)
 
-        self._prune(now)
+        self._prune(clock)
         return annotated
 
     def _prune(self, now: float) -> None:

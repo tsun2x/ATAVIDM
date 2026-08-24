@@ -7,6 +7,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", str(BASE_DIR / "dataset" / "raw"))
 FRAMES_FOLDER = os.environ.get("FRAMES_FOLDER", str(BASE_DIR / "dataset" / "frames"))
+# Per-run annotated replay MP4s (never served as unauthenticated static files).
+ANNOTATED_FOLDER = os.environ.get(
+    "ANNOTATED_FOLDER", str(BASE_DIR / "dataset" / "annotated")
+)
 # Annotated evidence snapshots (served from static so the UI can display them).
 EVIDENCE_FOLDER = os.environ.get("EVIDENCE_FOLDER", str(BASE_DIR / "static" / "evidence"))
 # Generated PDF/Excel reports.
@@ -14,6 +18,8 @@ REPORTS_FOLDER = os.environ.get("REPORTS_FOLDER", str(BASE_DIR / "static" / "rep
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 MAX_CONTENT_LENGTH = MAX_UPLOAD_MB * 1024 * 1024
 ALLOWED_VIDEO_EXTENSIONS = {"mp4"}
+# Period boundaries for upload/processing analytics (never use recording time).
+APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Manila")
 
 DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower() or "sqlite"
 # DATABASE_URL is backend-agnostic. For sqlite, a local file path is also accepted.

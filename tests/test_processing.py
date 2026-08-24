@@ -109,7 +109,7 @@ class TestSequentialQueue:
         _lock = threading.Lock()
         _started = threading.Event()
 
-        def fake_process(video_id, enabled_violations=None):
+        def fake_process(video_id, enabled_violations=None, **kwargs):
             with _lock:
                 state["inflight"] += 1
                 state["max_inflight"] = max(state["max_inflight"], state["inflight"])
@@ -143,7 +143,7 @@ class TestSequentialQueue:
     def test_same_video_rejected_while_queued(self, enforcer_client, test_db, monkeypatch):
         started = threading.Event()
 
-        def fake_process(video_id, enabled_violations=None):
+        def fake_process(video_id, enabled_violations=None, **kwargs):
             started.set()
             threading.Event().wait(0.4)
 
@@ -158,7 +158,7 @@ class TestSequentialQueue:
 
 class TestProcessStatusReflectsError:
     def test_failed_run_reports_error(self, enforcer_client, test_db, monkeypatch):
-        def fake_process(video_id, enabled_violations=None):
+        def fake_process(video_id, enabled_violations=None, **kwargs):
             raise RuntimeError("model exploded")
 
         monkeypatch.setattr(app_module, "process_video", fake_process)
@@ -246,7 +246,7 @@ class TestProcessingRunLifecycle:
         got: list[str] = []
         started = threading.Event()
 
-        def fake_process(video_id, enabled_violations=None):
+        def fake_process(video_id, enabled_violations=None, **kwargs):
             runs = test_db.list_processing_runs(video_id)
             got.append(runs[0]["status"])
             started.set()

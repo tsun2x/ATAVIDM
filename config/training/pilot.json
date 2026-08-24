@@ -1,0 +1,14 @@
+{
+  "status": "not_run",
+  "model": "yolov8m.pt",
+  "device_target": "RTX 3050 6GB",
+  "imgsz": 640,
+  "batch": 4,
+  "amp": true,
+  "epochs": 20,
+  "patience": 5,
+  "workers": 2,
+  "checkpointing": true,
+  "evaluation": ["per_class_precision", "per_class_recall", "map50", "map50_95", "confusion_matrix", "small_object_performance", "philippine_domain_performance", "unseen_full_video_tracking"],
+  "acceptance_thresholds": "pending_baseline_review"
+}

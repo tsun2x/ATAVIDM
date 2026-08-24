@@ -14,6 +14,7 @@ implementation follows the team's chosen variant.)
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -23,16 +24,18 @@ from pathlib import Path
 MODEL_FAMILY = "YOLOv8m"
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
-# Custom fine-tuned weights (13-class traffic dataset) are looked up first;
-# the pretrained COCO YOLOv8m checkpoint is the development fallback.
+# Custom fine-tuned weights under ``models/`` are looked up first when present
+# (candidate filenames only — none of these are assumed to exist on disk).
+# The pretrained COCO YOLOv8m checkpoint is the development fallback.
 CUSTOM_WEIGHTS_CANDIDATES = ("tavidm_yolov8m.pt", "best.pt", "yolov8m_custom.pt")
 PRETRAINED_WEIGHTS = "yolov8m.pt"
 
 # ---------------------------------------------------------------------------
 # Detection classes
 # ---------------------------------------------------------------------------
-# Frozen Phase 2 vehicle detector roster (owner-approved): exactly 12 vehicle
-# labels. Machine-readable contract: config/training/class_schema.json.
+# Frozen Phase 2 vehicle detector roster (owner-approved 2026-08-22 / implemented
+# 2026-08-24): exactly **11** vehicle labels. Machine-readable contract:
+# config/training/class_schema.json (schema_version 1.2.0).
 # Attribute / person labels remain separate from the vehicle roster.
 # Broad hierarchy keys (passenger_vehicle, etc.) are NOT detector labels.
 
@@ -40,9 +43,8 @@ YOLO_CLASS_CAR = "car"
 YOLO_CLASS_SUV_CROSSOVER = "suv_crossover"
 YOLO_CLASS_VAN = "van"
 YOLO_CLASS_JEEPNEY = "jeepney"
-YOLO_CLASS_UV_EXPRESS_VAN = "uv_express_van"
 YOLO_CLASS_TRICYCLE = "tricycle"
-YOLO_CLASS_PIAGGIO = "piaggio"
+YOLO_CLASS_AUTORICKSHAW = "autorickshaw"
 YOLO_CLASS_BUS = "bus"
 YOLO_CLASS_TRUCK = "truck"
 YOLO_CLASS_PICKUP_TRUCK = "pickup_truck"
@@ -54,23 +56,48 @@ YOLO_CLASS_HELMET_ACCEPTABLE = "helmet_acceptable"
 YOLO_CLASS_HELMET_NUT_SHELL = "helmet_nut_shell"
 YOLO_CLASS_SIDE_MIRROR = "side_mirror"
 
-# Legacy aliases accepted from older models / manuscript wording.
+# Legacy / non-canonical labels (compatibility only — not in the frozen roster).
 YOLO_CLASS_SUV = "suv"  # legacy alias for suv_crossover
 YOLO_CLASS_HELMET = "helmet"  # legacy generic helmet class
+LEGACY_CLASS_UV_EXPRESS_VAN = "uv_express_van"  # consolidates to van
+LEGACY_CLASS_PIAGGIO = "piaggio"  # brand; requires body-form review
+
+# Back-compat names kept so older imports do not crash; values are legacy-only.
+YOLO_CLASS_UV_EXPRESS_VAN = LEGACY_CLASS_UV_EXPRESS_VAN
+YOLO_CLASS_PIAGGIO = LEGACY_CLASS_PIAGGIO
 
 FROZEN_VEHICLE_DETECTOR_CLASSES = (
     YOLO_CLASS_CAR,
     YOLO_CLASS_SUV_CROSSOVER,
     YOLO_CLASS_VAN,
     YOLO_CLASS_JEEPNEY,
-    YOLO_CLASS_UV_EXPRESS_VAN,
     YOLO_CLASS_TRICYCLE,
-    YOLO_CLASS_PIAGGIO,
+    YOLO_CLASS_AUTORICKSHAW,
     YOLO_CLASS_BUS,
     YOLO_CLASS_TRUCK,
     YOLO_CLASS_PICKUP_TRUCK,
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_BICYCLE,
+)
+
+# Seven-class baseline roster (label set only). A trained seven-class ``best.pt``
+# exists in an *external* training output directory and has **not** been
+# integrated into ``D:\tavidm\models``. Do not claim ``models/best.pt`` exists.
+# When such a model is loaded elsewhere, it is a valid subset of the 11-class roster.
+SEVEN_CLASS_BASELINE_VEHICLES = (
+    YOLO_CLASS_BICYCLE,
+    YOLO_CLASS_BUS,
+    YOLO_CLASS_CAR,
+    YOLO_CLASS_JEEPNEY,
+    YOLO_CLASS_MOTORCYCLE,
+    YOLO_CLASS_TRICYCLE,
+    YOLO_CLASS_TRUCK,
+)
+SEVEN_CLASS_BASELINE_MISSING = (
+    YOLO_CLASS_SUV_CROSSOVER,
+    YOLO_CLASS_VAN,
+    YOLO_CLASS_AUTORICKSHAW,
+    YOLO_CLASS_PICKUP_TRUCK,
 )
 
 # Derived hierarchy (not detector labels). Keys match class_schema.json.
@@ -80,11 +107,12 @@ VEHICLE_HIERARCHY: dict[str, tuple[str, ...]] = {
         YOLO_CLASS_SUV_CROSSOVER,
         YOLO_CLASS_VAN,
     ),
+    # van may also be treated as PUV when contextual for-hire evidence exists;
+    # that is rule/context logic, not a hierarchy detector membership.
     "public_utility_vehicle": (
         YOLO_CLASS_JEEPNEY,
-        YOLO_CLASS_UV_EXPRESS_VAN,
         YOLO_CLASS_TRICYCLE,
-        YOLO_CLASS_PIAGGIO,
+        YOLO_CLASS_AUTORICKSHAW,
         YOLO_CLASS_BUS,
     ),
     "commercial_vehicle": (
@@ -94,7 +122,7 @@ VEHICLE_HIERARCHY: dict[str, tuple[str, ...]] = {
     "two_or_three_wheeled": (
         YOLO_CLASS_MOTORCYCLE,
         YOLO_CLASS_TRICYCLE,
-        YOLO_CLASS_PIAGGIO,
+        YOLO_CLASS_AUTORICKSHAW,
         YOLO_CLASS_BICYCLE,
     ),
 }
@@ -107,8 +135,14 @@ VEHICLE_CATEGORIES: dict[str, tuple[str, ...]] = {
     "Two- or Three-Wheeled Vehicle": VEHICLE_HIERARCHY["two_or_three_wheeled"],
 }
 
-# Runtime vehicle set used by the rule engine (frozen + legacy suv alias).
+# Runtime vehicle set used by the rule engine (frozen + safe legacy suv alias).
 VEHICLE_CLASSES = FROZEN_VEHICLE_DETECTOR_CLASSES + (YOLO_CLASS_SUV,)
+
+# Labels a loaded model may still emit that we accept for compatibility processing.
+LEGACY_ACCEPTED_MODEL_LABELS = (
+    LEGACY_CLASS_UV_EXPRESS_VAN,
+    LEGACY_CLASS_PIAGGIO,
+)
 
 # Full detector allow-list: frozen vehicles + attributes + legacy aliases.
 DETECTION_CLASSES = VEHICLE_CLASSES + (
@@ -118,31 +152,152 @@ DETECTION_CLASSES = VEHICLE_CLASSES + (
     YOLO_CLASS_HELMET_NUT_SHELL,
     YOLO_CLASS_SIDE_MIRROR,
     YOLO_CLASS_HELMET,
-)
+) + LEGACY_ACCEPTED_MODEL_LABELS
 
 # Truck-ban applicability is explicit and configurable. Default: truck only.
 # pickup_truck is NOT automatically covered by truck-ban rules.
 DEFAULT_TRUCK_BAN_CLASSES = (YOLO_CLASS_TRUCK,)
 
-# Cargo-area passenger rule applicability (planned rule; registry only).
+# Cargo-area passenger rule applicability.
 CARGO_PASSENGER_APPLICABLE_CLASSES = (
     YOLO_CLASS_TRUCK,
     YOLO_CLASS_PICKUP_TRUCK,
 )
 
+# Safe legacy → canonical consolidations only (never piaggio).
 LEGACY_VEHICLE_CLASS_ALIASES = {
     YOLO_CLASS_SUV: YOLO_CLASS_SUV_CROSSOVER,
+    LEGACY_CLASS_UV_EXPRESS_VAN: YOLO_CLASS_VAN,
 }
+
+# Body-form hints for optional piaggio resolution (never invent when absent).
+PIAGGIO_BODY_FORM_TRICYCLE = "sidecar"
+PIAGGIO_BODY_FORM_AUTORICKSHAW = "integrated"
+REVIEW_STATE_UNCERTAIN = "UNCERTAIN"
+REVIEW_STATE_UNKNOWN = "UNKNOWN"
 
 
 def normalize_vehicle_class(class_label: str) -> str:
-    """Map legacy vehicle labels onto the frozen detector roster when known."""
+    """Map *safe* legacy vehicle labels onto the frozen detector roster.
+
+    ``uv_express_van`` consolidates to ``van``. ``piaggio`` is intentionally
+    **not** auto-mapped — use ``resolve_vehicle_label`` with a body-form hint
+    or accept an UNCERTAIN review state.
+    """
     return LEGACY_VEHICLE_CLASS_ALIASES.get(class_label, class_label)
+
+
+@dataclass(frozen=True)
+class VehicleLabelResolution:
+    """Result of resolving a model/annotation vehicle label to the 11-class roster."""
+
+    raw_class: str
+    canonical_class: str | None
+    review_state: str | None = None
+    notes: str = ""
+
+    @property
+    def is_canonical(self) -> bool:
+        return self.canonical_class in FROZEN_VEHICLE_DETECTOR_CLASSES
+
+    @property
+    def fail_closed(self) -> bool:
+        return self.canonical_class is None or self.review_state in (
+            REVIEW_STATE_UNCERTAIN,
+            REVIEW_STATE_UNKNOWN,
+        )
+
+
+def resolve_vehicle_label(
+    class_label: str,
+    *,
+    body_form: str | None = None,
+) -> VehicleLabelResolution:
+    """Resolve a vehicle label with raw/canonical separation.
+
+    ``body_form`` is only consulted for legacy ``piaggio``:
+    - ``sidecar`` → tricycle
+    - ``integrated`` → autorickshaw
+    - anything else / missing → UNCERTAIN (fail closed; do not invent)
+    """
+    raw = str(class_label or "").strip().lower()
+    if not raw:
+        return VehicleLabelResolution(
+            raw_class="",
+            canonical_class=None,
+            review_state=REVIEW_STATE_UNKNOWN,
+            notes="Empty class label.",
+        )
+
+    if raw == LEGACY_CLASS_PIAGGIO:
+        form = (body_form or "").strip().lower()
+        if form in (PIAGGIO_BODY_FORM_TRICYCLE, "tricycle", "sidecar_tricycle"):
+            return VehicleLabelResolution(
+                raw_class=raw,
+                canonical_class=YOLO_CLASS_TRICYCLE,
+                notes="Legacy piaggio resolved to tricycle via sidecar/conventional body form.",
+            )
+        if form in (PIAGGIO_BODY_FORM_AUTORICKSHAW, "autorickshaw", "integrated_body"):
+            return VehicleLabelResolution(
+                raw_class=raw,
+                canonical_class=YOLO_CLASS_AUTORICKSHAW,
+                notes="Legacy piaggio resolved to autorickshaw via integrated body form.",
+            )
+        return VehicleLabelResolution(
+            raw_class=raw,
+            canonical_class=None,
+            review_state=REVIEW_STATE_UNCERTAIN,
+            notes=(
+                "Legacy piaggio brand label cannot be auto-mapped without visible "
+                "body-form review (tricycle vs autorickshaw)."
+            ),
+        )
+
+    if raw in LEGACY_VEHICLE_CLASS_ALIASES:
+        canon = LEGACY_VEHICLE_CLASS_ALIASES[raw]
+        return VehicleLabelResolution(
+            raw_class=raw,
+            canonical_class=canon,
+            notes=f"Legacy label '{raw}' consolidated to canonical '{canon}'.",
+        )
+
+    if raw in FROZEN_VEHICLE_DETECTOR_CLASSES:
+        return VehicleLabelResolution(raw_class=raw, canonical_class=raw)
+
+    # Non-vehicle attribute / unknown string — leave as-is without claiming vehicle canon.
+    return VehicleLabelResolution(
+        raw_class=raw,
+        canonical_class=None if raw not in DETECTION_CLASSES else raw,
+        notes="Non-vehicle or unrecognized vehicle label.",
+    )
+
+
+def is_canonical_vehicle_class(class_label: str) -> bool:
+    return normalize_vehicle_class(class_label) in FROZEN_VEHICLE_DETECTOR_CLASSES
+
+
+def seven_class_baseline_coverage(available_classes: set[str] | tuple[str, ...] | list[str]) -> dict:
+    """Report how a loaded model covers the 11-class roster vs the 7-class baseline."""
+    available = {str(c).lower() for c in available_classes}
+    present = [c for c in FROZEN_VEHICLE_DETECTOR_CLASSES if c in available]
+    missing = [c for c in FROZEN_VEHICLE_DETECTOR_CLASSES if c not in available]
+    baseline_ok = all(c in available for c in SEVEN_CLASS_BASELINE_VEHICLES)
+    return {
+        "roster_size": len(FROZEN_VEHICLE_DETECTOR_CLASSES),
+        "present_canonical": present,
+        "missing_canonical": missing,
+        "seven_class_baseline_complete": baseline_ok,
+        "seven_class_baseline_missing_expected": list(SEVEN_CLASS_BASELINE_MISSING),
+        "is_valid_seven_class_subset": baseline_ok and set(missing) == set(SEVEN_CLASS_BASELINE_MISSING),
+    }
 
 
 def vehicle_hierarchy_key(class_label: str) -> str | None:
     """Return the derived hierarchy key for a detector class, if any."""
-    canon = normalize_vehicle_class(class_label)
+    resolved = resolve_vehicle_label(class_label)
+    canon = resolved.canonical_class
+    if canon is None:
+        return None
     for key, members in VEHICLE_HIERARCHY.items():
         if canon in members:
             return key
@@ -151,16 +306,20 @@ def vehicle_hierarchy_key(class_label: str) -> str | None:
 
 def vehicle_category(class_label: str) -> str | None:
     """Return the display category for analytics (derived; not a detector label)."""
-    canon = normalize_vehicle_class(class_label)
+    resolved = resolve_vehicle_label(class_label)
+    canon = resolved.canonical_class
+    if canon is None:
+        return None
     for category, classes in VEHICLE_CATEGORIES.items():
-        if canon in classes or class_label in classes:
+        if canon in classes:
             return category
     return None
 
 
 def is_cargo_passenger_applicable(class_label: str) -> bool:
     """True when the vehicle type is in scope for the cargo-passenger rule."""
-    return normalize_vehicle_class(class_label) in CARGO_PASSENGER_APPLICABLE_CLASSES
+    resolved = resolve_vehicle_label(class_label)
+    return resolved.canonical_class in CARGO_PASSENGER_APPLICABLE_CLASSES
 
 
 def is_truck_ban_applicable(
@@ -169,16 +328,23 @@ def is_truck_ban_applicable(
 ) -> bool:
     """True when the vehicle type is covered by the configured truck-ban set."""
     allowed = tuple(ban_classes) if ban_classes is not None else DEFAULT_TRUCK_BAN_CLASSES
-    return normalize_vehicle_class(class_label) in {
-        normalize_vehicle_class(name) for name in allowed
+    resolved = resolve_vehicle_label(class_label)
+    if resolved.canonical_class is None:
+        return False
+    allowed_canon = {
+        resolve_vehicle_label(name).canonical_class or normalize_vehicle_class(name)
+        for name in allowed
     }
+    return resolved.canonical_class in allowed_canon
 
 
 # Classes required before helmet-based rules may run (custom weights only).
+# Prefer frozen helmet taxonomy; legacy generic ``helmet`` remains an alternate.
 REQUIRED_MODEL_CLASSES = (
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_PERSON,
-    YOLO_CLASS_HELMET,
+    YOLO_CLASS_HELMET_ACCEPTABLE,
+    YOLO_CLASS_HELMET_NUT_SHELL,
 )
 
 # ---------------------------------------------------------------------------
@@ -292,25 +458,35 @@ IMPLEMENTED_VIOLATIONS = (
     VIOLATION_MOTORCYCLE_OVERLOADING,
 )
 
-# Zone-dwell proxy rules — partial, not full contextual/spec behavior
+# Partial / fail-closed evaluators exist but are not production-complete.
+# Do not label these "implemented" solely because a stub or fail-closed
+# evaluator is present.
 PARTIAL_VIOLATIONS = (
     VIOLATION_ILLEGAL_PARKING,
     VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_PAVEMENT_MARKINGS,
-)
-
-# Requires custom model classes (e.g. helmet) to trigger in production
-MODEL_DEPENDENT_VIOLATIONS = (
-    VIOLATION_NO_HELMET,
-)
-
-# Canonical scope without executable rule functions
-PLANNED_VIOLATIONS = (
-    VIOLATION_SUBSTANDARD_HELMET,
-    VIOLATION_DISREGARDING_SIGN,
     VIOLATION_NO_SIDE_MIRROR,
     VIOLATION_CARGO_PASSENGERS,
+    VIOLATION_SUBSTANDARD_HELMET,
+    VIOLATION_DISREGARDING_SIGN,
 )
+
+# Rules that remain blocked on an explicit owner decision (still PARTIAL status).
+NEEDS_DECISION_VIOLATIONS = (
+    VIOLATION_NO_SIDE_MIRROR,
+)
+
+# Requires custom model classes (e.g. helmet / side_mirror) to trigger
+MODEL_DEPENDENT_VIOLATIONS = (
+    VIOLATION_NO_HELMET,
+    VIOLATION_SUBSTANDARD_HELMET,
+    VIOLATION_NO_SIDE_MIRROR,
+)
+
+# No canonical rule remains without an explicit evaluator. Rules that still
+# lack frozen legal thresholds or annotations stay in PARTIAL (fail-closed /
+# review), not PLANNED.
+PLANNED_VIOLATIONS: tuple[str, ...] = ()
 
 TOGGLEABLE_VIOLATIONS = IMPLEMENTED_VIOLATIONS + PARTIAL_VIOLATIONS
 

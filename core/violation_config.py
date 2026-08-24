@@ -18,6 +18,7 @@ from core.detection_config import (
     ENABLED_VIOLATIONS_SETTING_KEY,
     IMPLEMENTED_VIOLATIONS,
     MODEL_DEPENDENT_VIOLATIONS,
+    NEEDS_DECISION_VIOLATIONS,
     PARTIAL_VIOLATIONS,
     PLANNED_VIOLATIONS,
     TOGGLEABLE_VIOLATIONS,
@@ -53,9 +54,14 @@ def validate_enabled_violations(names: list[str] | tuple[str, ...]) -> tuple[str
 
 
 def load_enabled_violations() -> tuple[str, ...]:
-    """Load the globally enabled violation set from ``system_settings``."""
+    """Load the globally enabled violation set from ``system_settings``.
+
+    Missing / unset configuration may use defaults. An explicitly persisted
+    empty list ``[]`` means all rules are disabled and must not be replaced
+    by defaults.
+    """
     raw = db.get_setting(ENABLED_VIOLATIONS_SETTING_KEY)
-    if not raw:
+    if raw is None or raw == "":
         return DEFAULT_ENABLED_VIOLATIONS
     try:
         parsed = json.loads(raw)
@@ -64,10 +70,9 @@ def load_enabled_violations() -> tuple[str, ...]:
     if not isinstance(parsed, list):
         return DEFAULT_ENABLED_VIOLATIONS
     try:
-        validated = validate_enabled_violations(parsed)
+        return validate_enabled_violations(parsed)
     except ViolationConfigError:
         return DEFAULT_ENABLED_VIOLATIONS
-    return validated if validated else DEFAULT_ENABLED_VIOLATIONS
 
 
 def save_enabled_violations(names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -92,6 +97,7 @@ def violation_catalog_for_ui() -> list[dict[str, Any]]:
                 "implemented": name in IMPLEMENTED_VIOLATIONS,
                 "model_dependent": name in MODEL_DEPENDENT_VIOLATIONS,
                 "partial": name in PARTIAL_VIOLATIONS,
+                "needs_decision": name in NEEDS_DECISION_VIOLATIONS,
                 "planned": name in PLANNED_VIOLATIONS,
             }
         )
