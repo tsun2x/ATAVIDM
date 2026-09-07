@@ -1,0 +1,23 @@
+<View>
+  <Header value="TAVIDM Vehicle Review" />
+  <Text name="instructions" value="Review every suggested box. Correct the class, add missing visible vehicles, and remove false boxes. SUVs/crossovers are car. Use pickup_truck only when the pickup body or cargo bed is observable." />
+  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="false" />
+  <RectangleLabels name="vehicle" toName="image" choice="single" showInline="false">
+    <Label value="car" background="#2563EB" hotkey="1" />
+    <Label value="van" background="#7C3AED" hotkey="2" />
+    <Label value="jeepney" background="#D97706" hotkey="3" />
+    <Label value="tricycle" background="#059669" hotkey="4" />
+    <Label value="autorickshaw" background="#0D9488" hotkey="5" />
+    <Label value="bus" background="#DC2626" hotkey="6" />
+    <Label value="truck" background="#9333EA" hotkey="7" />
+    <Label value="pickup_truck" background="#EA580C" hotkey="8" />
+    <Label value="motorcycle" background="#0891B2" hotkey="9" />
+    <Label value="bicycle" background="#65A30D" hotkey="0" />
+  </RectangleLabels>
+  <Header value="Frame review status" />
+  <Choices name="review_state" toName="image" choice="single-radio" showInline="true" required="true">
+    <Choice value="Review complete" />
+    <Choice value="Contains uncertain vehicle" />
+  </Choices>
+  <TextArea name="review_note" toName="image" placeholder="If uncertain, describe the vehicle and why its body type is not observable." rows="2" maxSubmissions="1" />
+</View>
