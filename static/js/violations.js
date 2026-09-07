@@ -41,12 +41,18 @@
 
     function plateBadge(v) {
         const status = v.plate_status || "not_attempted";
-        if (status === "recognized" && v.plate_text) {
-            return '<span class="badge bg-success-subtle text-success" title="Plate recognized">' +
+        if ((status === "recognized" || status === "verified_readable") && v.plate_text) {
+            return '<span class="badge bg-success-subtle text-success" title="Verified / recognized plate">' +
                 escapeHtml(v.plate_text) + "</span>";
         }
-        if (status === "unreadable") {
-            return '<span class="badge bg-warning-subtle text-warning" title="Plate present but unreadable">Unreadable</span>';
+        if (status === "candidate_awaiting_verification") {
+            return '<span class="badge bg-info-subtle text-info" title="OCR candidate awaiting review">Candidate</span>';
+        }
+        if (status === "unreadable" || status === "unclear") {
+            return '<span class="badge bg-warning-subtle text-warning" title="Plate unclear / unreadable">Unclear</span>';
+        }
+        if (status === "not_visible") {
+            return '<span class="badge bg-secondary-subtle text-secondary" title="Plate not visible">Not visible</span>';
         }
         return '<span class="badge bg-secondary-subtle text-secondary" title="No plate recognition attempted">N/A</span>';
     }
@@ -160,27 +166,103 @@
         selectedViolation = v;
         const body = document.getElementById("detailModalBody");
         if (!body) return;
+        const legalBadge = v.flag_only
+            ? '<span class="badge bg-warning text-dark">flag_only (review material)</span>'
+            : escapeHtml(v.legal_status || "—");
+        const official = v.verified_official_category
+            ? escapeHtml(v.verified_official_category) + ' <span class="badge bg-success">verified</span>'
+            : (v.proposed_official_category
+                ? escapeHtml(v.proposed_official_category) + ' <span class="badge bg-secondary">proposed</span>'
+                : "—");
         body.innerHTML =
             '<div class="detail-grid">' +
             detailField("Violation ID", v.id) +
-            detailField("Type", '<span class="vtype-badge vtype-' + v.type_slug + '">' + v.type + "</span>") +
+            detailField("Canonical Type", '<span class="vtype-badge vtype-' + v.type_slug + '">' + escapeHtml(v.type) + "</span>") +
+            detailField("Official Category", official) +
+            detailField("Legal Status", legalBadge) +
+            detailField("Contributing Behaviors", escapeHtml((v.contributing_behaviors || []).join("; ") || v.type)) +
             detailField("Track ID", "#" + v.track_id) +
-            detailField("Video Source", v.video_name) +
-            detailField("Condition", v.condition) +
+            detailField("Video Source", escapeHtml(v.video_name)) +
+            detailField("Condition", escapeHtml(v.condition)) +
             detailField("Vehicle Class", v.vehicle_class && v.vehicle_class !== "—" ? escapeHtml(v.vehicle_class) : "—") +
-            detailField("Plate", (function () {
-                const ps = v.plate_status || "not_attempted";
-                if (ps === "recognized" && v.plate_text) return escapeHtml(v.plate_text);
-                if (ps === "unreadable") return "Unreadable";
-                return "—";
-            })()) +
+            detailField("Plate", plateBadge(v)) +
+            detailField("Event Time", escapeHtml(v.event_time || "Not confirmed (timestamp OCR unavailable)")) +
+            detailField("Case Confirmed", v.case_confirmed ? "Yes" : "No") +
+            detailField("Notice Printed", v.notice_printed ? "Yes (attested)" : "No") +
             detailField("Frame", v.frame_number) +
-            detailField("Timestamp", v.timestamp) +
+            detailField("Detected At", escapeHtml(v.timestamp)) +
             detailField("Confidence", Math.round(v.confidence * 100) + "%") +
             detailField("Status", '<span class="badge status-badge status-' + v.status + '">' + v.status + "</span>") +
-            detailField("Reason Log", v.reason_log, true) +
-            "</div>";
+            detailField("Reason Log", escapeHtml(v.reason_log || ""), true) +
+            "</div>" +
+            '<hr><div class="d-flex flex-wrap gap-2" id="caseActionBar">' +
+            '<button type="button" class="btn btn-sm btn-outline-primary" id="btnVerifyPlate">Verify Plate</button>' +
+            '<button type="button" class="btn btn-sm btn-outline-primary" id="btnConfirmEventTime">Confirm Event Time</button>' +
+            '<button type="button" class="btn btn-sm btn-success" id="btnConfirmCase">Confirm Case</button>' +
+            '<button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintable">Printable Record</button>' +
+            '<button type="button" class="btn btn-sm btn-warning" id="btnAttestPrint">Attest Notice Printed</button>' +
+            "</div>" +
+            '<p class="small text-muted mt-2 mb-0">Preview/PDF/download do not establish Notice Printed. Flag-only and unverified mappings remain review material.</p>';
         detailModal.show();
+        wireCaseActions(v);
+    }
+
+    function wireCaseActions(v) {
+        const id = v.db_id;
+        document.getElementById("btnVerifyPlate")?.addEventListener("click", function () {
+            const text = window.prompt("Accepted plate text (all characters must be visibly readable). Leave blank to mark unclear.");
+            const payload = text
+                ? { plate_status: "verified_readable", accepted_plate_text: text }
+                : { plate_status: "unclear" };
+            postJson("/api/cases/" + id + "/plate", payload);
+        });
+        document.getElementById("btnConfirmEventTime")?.addEventListener("click", function () {
+            const raw = window.prompt(
+                "Event time (ISO-8601 with explicit offset, e.g. 2026-01-15T10:30:00+08:00).\nAutomatic timestamp OCR is unavailable."
+            );
+            if (!raw) return;
+            postJson("/api/cases/" + id + "/event-time", { event_time: raw });
+        });
+        document.getElementById("btnConfirmCase")?.addEventListener("click", function () {
+            postJson("/api/cases/" + id + "/confirm-case", {});
+        });
+        document.getElementById("btnPrintable")?.addEventListener("click", function () {
+            fetch("/api/cases/" + id + "/printable")
+                .then(function (r) { return r.json(); })
+                .then(function (payload) {
+                    if (!payload.success) {
+                        showToast("Error", payload.error || "Failed", "danger");
+                        return;
+                    }
+                    const kind = payload.document_kind === "official_notice_draft"
+                        ? "Official notice draft (not yet attested as printed)"
+                        : "Review material only — not an official citation";
+                    showToast("Printable Record", kind, "info");
+                });
+        });
+        document.getElementById("btnAttestPrint")?.addEventListener("click", function () {
+            if (!window.confirm("Attest that printing of this notice actually occurred?")) return;
+            postJson("/api/cases/" + id + "/notice-printed", {});
+        });
+    }
+
+    function postJson(url, body) {
+        fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body || {}),
+        })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+            .then(function (res) {
+                if (res.j.success) {
+                    showToast("Saved", "Case update recorded.", "success");
+                } else {
+                    showToast("Error", res.j.error || "Action failed.", "danger");
+                }
+            })
+            .catch(function () {
+                showToast("Error", "Request failed.", "danger");
+            });
     }
 
     function detailField(label, value, full) {

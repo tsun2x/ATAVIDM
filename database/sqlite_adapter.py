@@ -129,6 +129,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_005(conn)
     _apply_migration_006(conn)
     _apply_migration_007(conn)
+    _apply_migration_008(conn)
+    _apply_migration_009(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -468,23 +470,328 @@ def _apply_migration_007(conn: sqlite3.Connection) -> None:
     )
 
 
+_MIGRATION_008_PATH = Path(__file__).parent / "migrations" / "008_legal_policy_persistence.sql"
+
+
+def _apply_migration_008(conn: sqlite3.Connection) -> None:
+    """Apply migration 008: legal-policy persistence tables.
+
+    Additive only — idempotent via IF NOT EXISTS. Loads the canonical SQL
+    from migrations/008_legal_policy_persistence.sql so the script and the
+    fresh-schema DDL stay in sync. Existing variant tables are repaired by
+    migration 009.
+    """
+    if _MIGRATION_008_PATH.is_file():
+        try:
+            conn.executescript(_MIGRATION_008_PATH.read_text(encoding="utf-8"))
+        except sqlite3.OperationalError:
+            # Table may already exist with different CHECK constraints from
+            # schema.sql; fall through to the inline guarded DDL below.
+            _apply_migration_008_inline(conn)
+    else:
+        _apply_migration_008_inline(conn)
+
+
+def _table_create_sql(conn: sqlite3.Connection, table_name: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return (row[0] or "") if row else ""
+
+
+def _case_policy_has_multi_behavior_unique(conn: sqlite3.Connection) -> bool:
+    """True when case_policy_records uniqueness includes canonical_rule."""
+    sql = _table_create_sql(conn, "case_policy_records").upper().replace(" ", "")
+    return "UNIQUE(VIOLATION_ID,CANONICAL_RULE)" in sql
+
+
+def _case_actions_violation_id_nullable(conn: sqlite3.Connection) -> bool:
+    """True when case_action_events.violation_id allows NULL (policy audit)."""
+    sql = _table_create_sql(conn, "case_action_events").upper().replace(" ", "")
+    # NOT NULL present on violation_id means repair is required.
+    return "VIOLATION_IDINTEGERNOTNULL" not in sql and "VIOLATION_IDINTEGERREFERENCES" in sql
+
+
+def _apply_migration_009(conn: sqlite3.Connection) -> None:
+    """Repair schema variants left by earlier migration 008 drafts.
+
+    Preserves all existing rows. Safe to re-run.
+    """
+    if _table_exists(conn, "legal_behavior_mappings"):
+        if not _column_exists(conn, "legal_behavior_mappings", "source_document_id"):
+            conn.execute(
+                "ALTER TABLE legal_behavior_mappings "
+                "ADD COLUMN source_document_id TEXT"
+            )
+
+    if _table_exists(conn, "case_policy_records") and not _case_policy_has_multi_behavior_unique(
+        conn
+    ):
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE case_policy_records_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    violation_id INTEGER NOT NULL REFERENCES violations(id) ON DELETE CASCADE,
+                    review_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
+                    policy_version_id INTEGER NOT NULL REFERENCES legal_policy_versions(id),
+                    canonical_rule TEXT NOT NULL,
+                    official_category TEXT,
+                    legal_status TEXT CHECK(legal_status IN (
+                        'verified','partially_verified','unverified','flag_only'
+                    )),
+                    behavior_details_json TEXT NOT NULL DEFAULT '[]',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(violation_id, canonical_rule)
+                );
+                INSERT OR IGNORE INTO case_policy_records_new (
+                    id, violation_id, review_id, policy_version_id, canonical_rule,
+                    official_category, legal_status, behavior_details_json, created_at
+                )
+                SELECT id, violation_id, review_id, policy_version_id, canonical_rule,
+                       official_category, legal_status, behavior_details_json, created_at
+                FROM case_policy_records;
+                DROP TABLE case_policy_records;
+                ALTER TABLE case_policy_records_new RENAME TO case_policy_records;
+                CREATE INDEX IF NOT EXISTS idx_case_policy_violation
+                    ON case_policy_records(violation_id);
+                CREATE INDEX IF NOT EXISTS idx_case_policy_review
+                    ON case_policy_records(review_id);
+                CREATE INDEX IF NOT EXISTS idx_case_policy_version
+                    ON case_policy_records(policy_version_id);
+                """
+            )
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+    if _table_exists(conn, "case_action_events") and not _case_actions_violation_id_nullable(
+        conn
+    ):
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE case_action_events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    violation_id INTEGER REFERENCES violations(id) ON DELETE CASCADE,
+                    review_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
+                    action_type TEXT NOT NULL CHECK(action_type IN (
+                        'review_confirmed','case_confirmed','notice_printed',
+                        'notice_printer_attested','plate_verified','policy_proposed',
+                        'policy_approved','policy_rejected','recurrence_evaluated',
+                        'event_time_confirmed'
+                    )),
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    actor_user_id INTEGER REFERENCES users(id),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO case_action_events_new (
+                    id, violation_id, review_id, action_type, detail_json,
+                    actor_user_id, created_at
+                )
+                SELECT id,
+                       CASE WHEN violation_id = 0 THEN NULL ELSE violation_id END,
+                       review_id, action_type, detail_json, actor_user_id, created_at
+                FROM case_action_events;
+                DROP TABLE case_action_events;
+                ALTER TABLE case_action_events_new RENAME TO case_action_events;
+                CREATE INDEX IF NOT EXISTS idx_case_actions_violation
+                    ON case_action_events(violation_id);
+                CREATE INDEX IF NOT EXISTS idx_case_actions_actor
+                    ON case_action_events(actor_user_id);
+                CREATE INDEX IF NOT EXISTS idx_case_actions_created_at
+                    ON case_action_events(created_at);
+                """
+            )
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _apply_migration_008_inline(conn: sqlite3.Connection) -> None:
+    """Guarded inline DDL fallback for migration 008 (canonical shape)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS legal_policy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            created_by INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT CHECK(status IN ('proposed','approved','rejected'))
+                NOT NULL DEFAULT 'proposed',
+            lookback_days INTEGER NOT NULL DEFAULT 365,
+            schedule_json TEXT NOT NULL DEFAULT '{}',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            approved_by INTEGER,
+            approved_at DATETIME,
+            rejected_by INTEGER,
+            rejected_at DATETIME,
+            UNIQUE(version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_legal_policy_versions_status
+            ON legal_policy_versions(status);
+        CREATE INDEX IF NOT EXISTS idx_legal_policy_versions_created_at
+            ON legal_policy_versions(created_at);
+
+        CREATE TABLE IF NOT EXISTS legal_behavior_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_version_id INTEGER NOT NULL
+                REFERENCES legal_policy_versions(id) ON DELETE CASCADE,
+            canonical_rule TEXT NOT NULL,
+            official_category TEXT,
+            legal_status TEXT CHECK(legal_status IN (
+                'verified','partially_verified','unverified','flag_only'
+            )) NOT NULL DEFAULT 'unverified',
+            verified_elements_json TEXT NOT NULL DEFAULT '[]',
+            unresolved_elements_json TEXT NOT NULL DEFAULT '[]',
+            behavior_details_json TEXT NOT NULL DEFAULT '[]',
+            provision_reference TEXT,
+            penalty_schedule_json TEXT,
+            source_url TEXT,
+            source_document_id TEXT,
+            mapping_version TEXT,
+            is_grouped_with_json TEXT NOT NULL DEFAULT '[]',
+            notes TEXT,
+            UNIQUE(policy_version_id, canonical_rule)
+        );
+        CREATE INDEX IF NOT EXISTS idx_legal_mappings_version
+            ON legal_behavior_mappings(policy_version_id);
+        CREATE INDEX IF NOT EXISTS idx_legal_mappings_rule
+            ON legal_behavior_mappings(canonical_rule);
+
+        CREATE TABLE IF NOT EXISTS case_policy_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            violation_id INTEGER NOT NULL REFERENCES violations(id) ON DELETE CASCADE,
+            review_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
+            policy_version_id INTEGER NOT NULL REFERENCES legal_policy_versions(id),
+            canonical_rule TEXT NOT NULL,
+            official_category TEXT,
+            legal_status TEXT CHECK(legal_status IN (
+                'verified','partially_verified','unverified','flag_only'
+            )),
+            behavior_details_json TEXT NOT NULL DEFAULT '[]',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(violation_id, canonical_rule)
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_policy_violation
+            ON case_policy_records(violation_id);
+        CREATE INDEX IF NOT EXISTS idx_case_policy_review
+            ON case_policy_records(review_id);
+        CREATE INDEX IF NOT EXISTS idx_case_policy_version
+            ON case_policy_records(policy_version_id);
+
+        CREATE TABLE IF NOT EXISTS plate_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            violation_id INTEGER NOT NULL REFERENCES violations(id) ON DELETE CASCADE,
+            review_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
+            ocr_raw TEXT,
+            accepted_plate_text TEXT,
+            plate_status TEXT CHECK(plate_status IN (
+                'not_attempted','processing_failed','unclear','not_visible',
+                'candidate_awaiting_verification','verified_readable',
+                'migrated_unverified'
+            )) NOT NULL DEFAULT 'not_attempted',
+            alpr_model TEXT,
+            alpr_version TEXT,
+            ocr_confidence REAL,
+            processing_diagnostics_json TEXT NOT NULL DEFAULT '{}',
+            verified_by INTEGER REFERENCES users(id),
+            verified_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(violation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plate_verifications_violation
+            ON plate_verifications(violation_id);
+        CREATE INDEX IF NOT EXISTS idx_plate_verifications_status
+            ON plate_verifications(plate_status);
+
+        CREATE TABLE IF NOT EXISTS case_action_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            violation_id INTEGER REFERENCES violations(id) ON DELETE CASCADE,
+            review_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
+            action_type TEXT NOT NULL CHECK(action_type IN (
+                'review_confirmed','case_confirmed','notice_printed',
+                'notice_printer_attested','plate_verified','policy_proposed',
+                'policy_approved','policy_rejected','recurrence_evaluated',
+                'event_time_confirmed'
+            )),
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            actor_user_id INTEGER REFERENCES users(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_actions_violation
+            ON case_action_events(violation_id);
+        CREATE INDEX IF NOT EXISTS idx_case_actions_actor
+            ON case_action_events(actor_user_id);
+        CREATE INDEX IF NOT EXISTS idx_case_actions_created_at
+            ON case_action_events(created_at);
+
+        CREATE TABLE IF NOT EXISTS recurrence_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            violation_id INTEGER NOT NULL REFERENCES violations(id) ON DELETE CASCADE,
+            policy_version_id INTEGER NOT NULL REFERENCES legal_policy_versions(id),
+            lookback_days INTEGER NOT NULL DEFAULT 365,
+            matched_violation_ids_json TEXT NOT NULL DEFAULT '[]',
+            eligible_match_ids_json TEXT NOT NULL DEFAULT '[]',
+            suggested_recurrence_count INTEGER NOT NULL DEFAULT 0,
+            evaluation_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            evaluated_by INTEGER REFERENCES users(id),
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(violation_id, policy_version_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recurrence_reviews_violation
+            ON recurrence_reviews(violation_id);
+        CREATE INDEX IF NOT EXISTS idx_recurrence_reviews_version
+            ON recurrence_reviews(policy_version_id);
+
+        CREATE TABLE IF NOT EXISTS policy_permission_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            permission TEXT NOT NULL CHECK(permission IN (
+                'confirm_case','attest_print','propose_policy','approve_policy',
+                'verify_plate','confirm_event_time'
+            )),
+            granted_by INTEGER REFERENCES users(id),
+            granted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            revoked_at DATETIME,
+            reason TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_permission_unique_active
+            ON policy_permission_assignments(user_id, permission)
+            WHERE revoked_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_permission_user
+            ON policy_permission_assignments(user_id);
+        CREATE INDEX IF NOT EXISTS idx_permission_perm
+            ON policy_permission_assignments(permission);
+        """
+    )
+
+
 def init_db(force: bool = False) -> None:
     with db_session() as conn:
         if force:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS case_action_events;
+                DROP TABLE IF EXISTS recurrence_reviews;
+                DROP TABLE IF EXISTS plate_verifications;
+                DROP TABLE IF EXISTS case_policy_records;
+                DROP TABLE IF EXISTS legal_behavior_mappings;
+                DROP TABLE IF EXISTS legal_policy_versions;
+                DROP TABLE IF EXISTS policy_permission_assignments;
                 DROP TABLE IF EXISTS system_audit_events;
                 DROP TABLE IF EXISTS video_history_events;
-                DROP TABLE IF EXISTS processing_runs;
-                DROP TABLE IF EXISTS reports;
-                DROP TABLE IF EXISTS system_settings;
-                DROP TABLE IF EXISTS cameras;
                 DROP TABLE IF EXISTS review_queue;
                 DROP TABLE IF EXISTS violations;
                 DROP TABLE IF EXISTS detections;
                 DROP TABLE IF EXISTS annotations;
+                DROP TABLE IF EXISTS reports;
+                DROP TABLE IF EXISTS processing_runs;
                 DROP TABLE IF EXISTS videos;
                 DROP TABLE IF EXISTS zone_templates;
+                DROP TABLE IF EXISTS system_settings;
+                DROP TABLE IF EXISTS cameras;
                 DROP TABLE IF EXISTS users;
                 """
             )
@@ -2116,11 +2423,11 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
 
         reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
         row_keys = row.keys()
-        timestamp_sec = (
-            row["timestamp_sec"]
-            if "timestamp_sec" in row_keys and row["timestamp_sec"] is not None
-            else (row["frame_number"] or 0) / 30.0
-        )
+        # Prefer recorded timestamp_sec; do not invent identity timing from FPS.
+        if "timestamp_sec" in row_keys and row["timestamp_sec"] is not None:
+            timestamp_sec = row["timestamp_sec"]
+        else:
+            timestamp_sec = None
 
         def _pick(col):
             return row[col] if col in row_keys else None
@@ -2178,6 +2485,242 @@ def confirm_review_item(review_id: int, reviewed_by: int) -> int:
             """,
             (reviewed_by, reviewed_at, review_id),
         )
+
+        # Atomic review→case link inside the same transaction.
+        if _table_exists(conn, "case_action_events"):
+            conn.execute(
+                """
+                INSERT INTO case_action_events
+                    (violation_id, review_id, action_type, detail_json, actor_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    violation_id,
+                    review_id,
+                    ACTION_REVIEW_CONFIRMED,
+                    json.dumps({"link": "review_to_violation"}),
+                    reviewed_by,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+
+        return violation_id
+
+
+def create_case_with_materialization_intent(
+    primary_review_id: int,
+    reviewed_by: int,
+    *,
+    policy_version_id: int,
+    contributing_rules: list[str] | tuple[str, ...],
+    review_ids: list[int] | tuple[int, ...],
+    additional_link_review_ids: list[int] | tuple[int, ...] | None = None,
+    _fail_after: str | None = None,
+) -> int:
+    """Atomically create a case, confirm/link initial reviews, and record intent.
+
+    One SQLite transaction covers:
+      - violation insert from the primary pending review
+      - primary review confirmation + review→case link
+      - optional additional pending review confirmations/links
+      - materialization_intent audit carrying the selected policy version
+
+    If intent insertion fails (or ``_fail_after='intent'``), the whole boundary
+    rolls back. Later evidence/snapshot completion remains a staged recoverable
+    path outside this function.
+
+    ``_fail_after`` is a test-only fault-injection seam; production callers omit it.
+    """
+    extra_ids = [int(r) for r in (additional_link_review_ids or ()) if int(r) != int(primary_review_id)]
+    now_link = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM review_queue WHERE id = ?",
+            (primary_review_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Review item {primary_review_id} not found")
+
+        row_status = row["status"] if "status" in row.keys() else None
+        if row_status != "pending":
+            raise ValueError(
+                f"Review item {primary_review_id} is not pending (status: {row_status})"
+            )
+
+        row_keys = row.keys()
+
+        def _early(col):
+            return row[col] if col in row_keys else None
+
+        temporal_tagged = _early("evidence_pre_sec") is not None
+        has_clip = bool(_early("evidence_clip_path") or _early("evidence_sequence_dir"))
+        episode_closed = _early("episode_end_sec") is not None
+        if temporal_tagged and (not has_clip or not episode_closed):
+            raise TemporalEvidenceNotReady(
+                "Temporal evidence is still being finalized; confirmation is blocked "
+                "until the post-roll clip/sequence is written."
+            )
+
+        if "timestamp_sec" in row_keys and row["timestamp_sec"] is not None:
+            timestamp_sec = row["timestamp_sec"]
+        else:
+            timestamp_sec = None
+
+        def _pick(col):
+            return row[col] if col in row_keys else None
+
+        cursor = conn.execute(
+            """
+            INSERT INTO violations (
+                video_id, track_id, violation_type, vehicle_class, confidence,
+                frame_number, timestamp_sec, evidence_path, reason_log, status, reviewed_by,
+                vehicle_evidence_path, plate_evidence_path, plate_text, plate_status,
+                detection_confidence, violation_confidence, evidence_sufficiency,
+                evidence_clip_path, evidence_sequence_dir,
+                evidence_pre_sec, evidence_post_sec,
+                episode_start_sec, episode_end_sec,
+                contributing_factors_json, unavailable_factors_json,
+                processing_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["video_id"],
+                row["track_id"],
+                row["violation_type"],
+                _pick("vehicle_class"),
+                row["confidence"],
+                row["frame_number"],
+                timestamp_sec,
+                _pick("evidence_path"),
+                _pick("reason_log"),
+                reviewed_by,
+                _pick("vehicle_evidence_path"),
+                _pick("plate_evidence_path"),
+                _pick("plate_text"),
+                _pick("plate_status") or "not_attempted",
+                _pick("detection_confidence"),
+                _pick("violation_confidence"),
+                _pick("evidence_sufficiency"),
+                _pick("evidence_clip_path"),
+                _pick("evidence_sequence_dir"),
+                _pick("evidence_pre_sec"),
+                _pick("evidence_post_sec"),
+                _pick("episode_start_sec"),
+                _pick("episode_end_sec"),
+                _pick("contributing_factors_json"),
+                _pick("unavailable_factors_json"),
+                _pick("processing_run_id"),
+            ),
+        )
+        violation_id = int(cursor.lastrowid)
+
+        conn.execute(
+            """
+            UPDATE review_queue
+            SET status = 'confirmed', reviewed_by = ?, reviewed_at = ?
+            WHERE id = ?
+            """,
+            (reviewed_by, reviewed_at, primary_review_id),
+        )
+
+        if _table_exists(conn, "case_action_events"):
+            conn.execute(
+                """
+                INSERT INTO case_action_events
+                    (violation_id, review_id, action_type, detail_json, actor_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    violation_id,
+                    primary_review_id,
+                    ACTION_REVIEW_CONFIRMED,
+                    json.dumps({"link": "review_to_violation"}),
+                    reviewed_by,
+                    now_link,
+                ),
+            )
+
+            for extra_id in extra_ids:
+                extra = conn.execute(
+                    "SELECT status FROM review_queue WHERE id = ?",
+                    (extra_id,),
+                ).fetchone()
+                if extra is None:
+                    raise ValueError(f"Review item {extra_id} not found")
+                if extra["status"] == "pending":
+                    conn.execute(
+                        """
+                        UPDATE review_queue
+                        SET status = 'confirmed', reviewed_by = ?, reviewed_at = ?
+                        WHERE id = ?
+                        """,
+                        (reviewed_by, reviewed_at, extra_id),
+                    )
+                existing_link = conn.execute(
+                    """
+                    SELECT id FROM case_action_events
+                    WHERE violation_id = ? AND review_id = ? AND action_type = ?
+                    LIMIT 1
+                    """,
+                    (violation_id, extra_id, ACTION_REVIEW_CONFIRMED),
+                ).fetchone()
+                if existing_link is None:
+                    conn.execute(
+                        """
+                        INSERT INTO case_action_events
+                            (violation_id, review_id, action_type, detail_json,
+                             actor_user_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            violation_id,
+                            extra_id,
+                            ACTION_REVIEW_CONFIRMED,
+                            json.dumps({"link": "review_to_violation"}),
+                            reviewed_by,
+                            now_link,
+                        ),
+                    )
+
+            if _fail_after == "intent":
+                raise RuntimeError("intent boom")
+
+            # Durable selected-policy intent — same transaction as case creation.
+            actor_user_id = reviewed_by
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (actor_user_id,)
+            ).fetchone()
+            if user_row is None:
+                actor_user_id = None
+            conn.execute(
+                """
+                INSERT INTO case_action_events
+                    (violation_id, review_id, action_type, detail_json,
+                     actor_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    violation_id,
+                    None,
+                    ACTION_REVIEW_CONFIRMED,
+                    json.dumps(
+                        {
+                            "materialization_intent": True,
+                            "policy_version_id": int(policy_version_id),
+                            "contributing_rules": list(contributing_rules),
+                            "review_ids": [int(r) for r in review_ids],
+                        }
+                    ),
+                    actor_user_id,
+                    now_link,
+                ),
+            )
+        else:
+            if _fail_after == "intent":
+                raise RuntimeError("intent boom")
+            raise ValueError("case_action_events table does not exist")
 
         return violation_id
 
@@ -2531,3 +3074,1734 @@ def count_all_violations(status: str | None = None) -> int:
         else:
             row = conn.execute("SELECT COUNT(*) AS total FROM violations").fetchone()
         return row["total"] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Stage B: Legal-policy persistence, case linkage, audit, permissions
+# ---------------------------------------------------------------------------
+
+# Action-type constants for case_action_events
+ACTION_REVIEW_CONFIRMED = "review_confirmed"
+ACTION_CASE_CONFIRMED = "case_confirmed"
+ACTION_NOTICE_PRINTED = "notice_printed"
+ACTION_NOTICE_PRINTER_ATTESTED = "notice_printer_attested"
+ACTION_PLATE_VERIFIED = "plate_verified"
+ACTION_POLICY_PROPOSED = "policy_proposed"
+ACTION_POLICY_APPROVED = "policy_approved"
+ACTION_POLICY_REJECTED = "policy_rejected"
+ACTION_RECURRENCE_EVALUATED = "recurrence_evaluated"
+ACTION_EVENT_TIME_CONFIRMED = "event_time_confirmed"
+
+# Permission constants
+PERM_CONFIRM_CASE = "confirm_case"
+PERM_ATTEST_PRINT = "attest_print"
+PERM_PROPOSE_POLICY = "propose_policy"
+PERM_APPROVE_POLICY = "approve_policy"
+PERM_VERIFY_PLATE = "verify_plate"
+PERM_CONFIRM_EVENT_TIME = "confirm_event_time"
+
+# Roles that may perform case-review actions by role: confirm/materialize,
+# plate verification, event-time confirmation, and notice-print attestation.
+# Active System Administrators are included for case review. Legal-policy
+# approval is never role-aliased — only explicit approve_policy grants.
+ENFORCEMENT_ROLES = ("enforcer", "admin")
+# Policy approval is never role-aliased; only explicit approve_policy grants.
+SUPERVISOR_ROLES: tuple[str, ...] = ()
+
+
+def get_active_legal_policy_version() -> dict[str, Any] | None:
+    """Return the single active (approved) legal policy version, or None."""
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            return None
+        row = conn.execute(
+            """
+            SELECT * FROM legal_policy_versions
+            WHERE status = 'approved'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_legal_policy_version(version_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            return None
+        row = conn.execute(
+            "SELECT * FROM legal_policy_versions WHERE id = ?", (version_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def propose_legal_policy_version(
+    version: str,
+    created_by: int,
+    *,
+    lookback_days: int = 365,
+    schedule_json: str | dict = "{}",
+    detail_json: str | dict = "{}",
+) -> int:
+    """Create a proposed (not-yet-approved) legal policy version.
+
+    The proposed record does NOT overwrite the active approved policy.
+    An explicit approval step is required before activation. Requires an
+    active proposer with propose authority (admin role or explicit grant).
+    """
+    if not can_propose_policy(created_by):
+        raise PermissionError(
+            f"User {created_by} lacks propose_policy authority"
+        )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(schedule_json, dict):
+        schedule_json = json.dumps(schedule_json)
+    if isinstance(detail_json, dict):
+        detail_json = json.dumps(detail_json)
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            raise ValueError("legal_policy_versions table does not exist")
+        # Validate created_by exists (FK enforced by schema, but guard for clarity).
+        if created_by is not None:
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (created_by,)
+            ).fetchone()
+            if user_row is None:
+                raise ValueError(f"User {created_by} does not exist")
+        cursor = conn.execute(
+            """
+            INSERT INTO legal_policy_versions
+                (version, created_by, created_at, status, lookback_days,
+                 schedule_json, detail_json)
+            VALUES (?, ?, ?, 'proposed', ?, ?, ?)
+            """,
+            (version, created_by, now, lookback_days, schedule_json, detail_json),
+        )
+        pid = cursor.lastrowid
+        # Record the proposal action in the audit trail (policy-level: no case).
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (NULL, ?, ?, ?, ?)
+            """,
+            (
+                ACTION_POLICY_PROPOSED,
+                json.dumps({"version": version, "policy_version_id": pid}),
+                created_by,
+                now,
+            ),
+        )
+        return int(pid)
+
+
+def approve_legal_policy_version(version_id: int, approved_by: int) -> None:
+    """Approve a proposed policy version.
+
+    Requires an explicit ``approve_policy`` capability (CTEU Head/Supervisor
+    grant). Administrator status alone does not authorize approval. The check
+    runs inside this operation before any status or audit write.
+    """
+    if not can_approve_policy(approved_by):
+        raise PermissionError(
+            f"User {approved_by} lacks approve_policy authority"
+        )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            raise ValueError("legal_policy_versions table does not exist")
+        user_row = conn.execute(
+            "SELECT id FROM users WHERE id = ?", (approved_by,)
+        ).fetchone()
+        if user_row is None:
+            raise ValueError(f"User {approved_by} does not exist")
+        row = conn.execute(
+            "SELECT status FROM legal_policy_versions WHERE id = ?", (version_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Policy version {version_id} not found")
+        if row["status"] == "approved":
+            raise ValueError(f"Policy version {version_id} is already approved")
+        if row["status"] == "rejected":
+            raise ValueError(f"Policy version {version_id} was rejected")
+        conn.execute(
+            """
+            UPDATE legal_policy_versions
+            SET status = 'approved', approved_by = ?, approved_at = ?
+            WHERE id = ?
+            """,
+            (approved_by, now, version_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (NULL, ?, ?, ?, ?)
+            """,
+            (
+                ACTION_POLICY_APPROVED,
+                json.dumps({"version_id": version_id, "approved_by": approved_by}),
+                approved_by,
+                now,
+            ),
+        )
+
+
+def create_case_policy_record(
+    violation_id: int,
+    policy_version_id: int,
+    canonical_rule: str,
+    *,
+    official_category: str | None = None,
+    legal_status: str | None = None,
+    behavior_details: list[str] | None = None,
+) -> int:
+    """Record the legal-policy snapshot applied at review time for a case.
+
+    This preserves the policy context at the moment of confirmation so later
+    policy changes do not rewrite the case's historical mapping.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "case_policy_records"):
+            raise ValueError("case_policy_records table does not exist")
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO case_policy_records
+                (violation_id, review_id, policy_version_id, canonical_rule,
+                 official_category, legal_status, behavior_details_json, created_at)
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                policy_version_id,
+                canonical_rule,
+                official_category,
+                legal_status,
+                json.dumps(behavior_details or []),
+                now,
+            ),
+        )
+        return int(cursor.lastrowid) if cursor.lastrowid else 0
+
+
+def record_case_action(
+    violation_id: int,
+    action_type: str,
+    *,
+    detail: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+    review_id: int | None = None,
+) -> int:
+    """Insert a durable audit event for a case action.
+
+    Used for: case confirmation, print attestation, plate verification,
+    event-time confirmation, recurrence evaluation.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            raise ValueError("case_action_events table does not exist")
+        # Validate actor exists if provided.
+        if actor_user_id is not None:
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (actor_user_id,)
+            ).fetchone()
+            if user_row is None:
+                actor_user_id = None
+        cursor = conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, review_id, action_type, detail_json,
+                 actor_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                review_id,
+                action_type,
+                json.dumps(detail or {}),
+                actor_user_id,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_case_actions(violation_id: int) -> list[dict[str, Any]]:
+    """Return all audit events for a violation, ordered by time."""
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT * FROM case_action_events
+            WHERE violation_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (violation_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def user_has_permission(user_id: int, permission: str) -> bool:
+    """Check if a user has an explicitly granted (non-revoked) permission."""
+    with db_session() as conn:
+        if not _table_exists(conn, "policy_permission_assignments"):
+            return False
+        row = conn.execute(
+            """
+            SELECT 1 FROM policy_permission_assignments
+            WHERE user_id = ? AND permission = ? AND revoked_at IS NULL
+            LIMIT 1
+            """,
+            (user_id, permission),
+        ).fetchone()
+        return row is not None
+
+
+def assign_policy_permission(
+    user_id: int,
+    permission: str,
+    granted_by: int,
+    *,
+    reason: str | None = None,
+) -> int:
+    """Grant an explicit policy permission to a user.
+
+    Requires the granter to have the corresponding granting authority.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "policy_permission_assignments"):
+            raise ValueError("policy_permission_assignments table does not exist")
+        # Validate both users exist.
+        for uid in (user_id, granted_by):
+            user_row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (uid,)
+            ).fetchone()
+            if user_row is None:
+                raise ValueError(f"User {uid} does not exist")
+        cursor = conn.execute(
+            """
+            INSERT INTO policy_permission_assignments
+                (user_id, permission, granted_by, granted_at, reason)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, permission, granted_by, now, reason),
+        )
+        return int(cursor.lastrowid)
+
+
+def revoke_policy_permission(user_id: int, permission: str) -> None:
+    """Revoke a previously granted permission (soft delete)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "policy_permission_assignments"):
+            raise ValueError("policy_permission_assignments table does not exist")
+        conn.execute(
+            """
+            UPDATE policy_permission_assignments
+            SET revoked_at = ?
+            WHERE user_id = ? AND permission = ? AND revoked_at IS NULL
+            """,
+            (now, user_id, permission),
+        )
+
+
+def get_user_permissions(user_id: int) -> list[str]:
+    """Return all active (non-revoked) permission names for a user."""
+    with db_session() as conn:
+        if not _table_exists(conn, "policy_permission_assignments"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT permission FROM policy_permission_assignments
+            WHERE user_id = ? AND revoked_at IS NULL
+            """,
+            (user_id,),
+        ).fetchall()
+        return [row["permission"] for row in rows]
+
+
+def _user_account_is_active(user: dict[str, Any]) -> bool:
+    """True when the account exists and is marked active.
+
+    Matches authentication: missing ``is_active`` defaults to active (legacy
+    rows). Explicit grants never override inactivity — callers must check
+    activity before role or capability evaluation.
+    """
+    return bool(user.get("is_active", 1))
+
+
+def can_confirm_case(user_id: int) -> bool:
+    """True when an active enforcer/admin or explicit confirm_case grant."""
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    if user.get("role") in ENFORCEMENT_ROLES:
+        return True
+    return user_has_permission(user_id, PERM_CONFIRM_CASE)
+
+
+def can_attest_print(user_id: int) -> bool:
+    """True when an active enforcer/admin or explicit attest_print grant.
+
+    Inactive accounts are rejected even if explicit grants remain stored.
+    Administrator role alone still does not authorize legal-policy approval.
+    """
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    if user.get("role") in ENFORCEMENT_ROLES:
+        return True
+    return user_has_permission(user_id, PERM_ATTEST_PRINT)
+
+
+def can_approve_policy(user_id: int) -> bool:
+    """True only for an active user with explicit approve_policy grant.
+
+    Administrator status alone never confers supervisory approval authority.
+    Stored grants do not authorize inactive accounts.
+    """
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    return user_has_permission(user_id, PERM_APPROVE_POLICY)
+
+
+def can_propose_policy(user_id: int) -> bool:
+    """True when an active user can propose policy (admin or explicit grant)."""
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    if user.get("role") == "admin":
+        return True
+    return user_has_permission(user_id, PERM_PROPOSE_POLICY)
+
+
+# ---------------------------------------------------------------------------
+# Case-level confirmations (distinct from review-queue confirmation)
+# ---------------------------------------------------------------------------
+
+def reject_legal_policy_version(version_id: int, rejected_by: int,
+                                *, reason: str | None = None) -> None:
+    """Reject a proposed policy version without activating it."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            raise ValueError("legal_policy_versions table does not exist")
+        user_row = conn.execute(
+            "SELECT id FROM users WHERE id = ?", (rejected_by,)
+        ).fetchone()
+        if user_row is None:
+            raise ValueError(f"User {rejected_by} does not exist")
+        row = conn.execute(
+            "SELECT status FROM legal_policy_versions WHERE id = ?", (version_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Policy version {version_id} not found")
+        if row["status"] == "approved":
+            raise ValueError(
+                f"Policy version {version_id} is already approved; cannot reject"
+            )
+        conn.execute(
+            """
+            UPDATE legal_policy_versions
+            SET status = 'rejected',
+                rejected_by = ?,
+                rejected_at = ?
+            WHERE id = ?
+            """,
+            (rejected_by, now, version_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (NULL, ?, ?, ?, ?)
+            """,
+            (
+                ACTION_POLICY_REJECTED,
+                json.dumps({"version_id": version_id, "reason": reason}),
+                rejected_by,
+                now,
+            ),
+        )
+
+
+def link_review_to_case(review_id: int, violation_id: int) -> None:
+    """Record the stable case identity linking a review queue item to its
+    resulting violation. This preserves provenance across confirmation,
+    reporting, and recurrence.
+    """
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            return
+        existing = conn.execute(
+            """
+            SELECT id FROM case_action_events
+            WHERE violation_id = ? AND review_id = ? AND action_type = ?
+            LIMIT 1
+            """,
+            (violation_id, review_id, ACTION_REVIEW_CONFIRMED),
+        ).fetchone()
+        if existing is not None:
+            return
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, review_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                review_id,
+                ACTION_REVIEW_CONFIRMED,
+                json.dumps({"link": "review_to_violation"}),
+                None,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+
+
+def confirm_case(violation_id: int, officer_id: int) -> bool:
+    """Mark a violation as case-confirmed by an authorized officer.
+
+    Requires an active enforcer (or explicit confirm_case grant). A
+    legacy/default ``violations.status = 'confirmed'`` value alone is not
+    sufficient and is not written by this function. Dismissed cases are
+    rejected before any idempotent success path. Idempotent: repeated calls
+    on a non-dismissed case do not insert duplicate case_confirmed rows.
+
+    Returns True if the case is (already or newly) case-confirmed.
+    """
+    if not can_confirm_case(officer_id):
+        raise PermissionError(
+            f"User {officer_id} lacks confirm_case authority"
+        )
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        if not _table_exists(conn, "violations"):
+            raise ValueError("violations table does not exist")
+        row = conn.execute(
+            "SELECT status FROM violations WHERE id = ?", (violation_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Violation {violation_id} not found")
+        # Current-status gate runs before idempotent "already confirmed" return.
+        if row["status"] == "dismissed":
+            raise ValueError(
+                f"Violation {violation_id} is dismissed; cannot confirm case"
+            )
+        existing = conn.execute(
+            """
+            SELECT id FROM case_action_events
+            WHERE violation_id = ? AND action_type = ?
+            LIMIT 1
+            """,
+            (violation_id, ACTION_CASE_CONFIRMED),
+        ).fetchone()
+        if existing is not None:
+            return True
+        # Case confirmation is separate from the existing 'status' lifecycle.
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                ACTION_CASE_CONFIRMED,
+                json.dumps({"case_confirmed_at": now}),
+                officer_id,
+                now,
+            ),
+        )
+    return True
+
+
+def _attest_notice_print_action(
+    violation_id: int,
+    printer_id: int,
+    action_type: str,
+    *,
+    document_reference: str | None = None,
+) -> bool:
+    """Shared checked path for notice-print attestation actions.
+
+    Requires:
+      1. Current case status is not dismissed (checked before idempotent return).
+      2. An authenticated officer ``case_confirmed`` audit event (not merely
+         a legacy violations.status value).
+      3. Active enforcer role or explicit attest_print grant for the printer.
+    Records actor identity and timestamp. Retries are idempotent for the same
+    action_type on non-dismissed cases; deliberate reprint is not modeled.
+    """
+    if action_type not in (ACTION_NOTICE_PRINTED, ACTION_NOTICE_PRINTER_ATTESTED):
+        raise ValueError(f"Unsupported print action type: {action_type}")
+    if not can_attest_print(printer_id):
+        raise PermissionError(
+            f"User {printer_id} lacks attest_print authority"
+        )
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            raise ValueError("case_action_events table does not exist")
+        viol = conn.execute(
+            "SELECT id, status FROM violations WHERE id = ?", (violation_id,)
+        ).fetchone()
+        if viol is None:
+            raise ValueError(f"Violation {violation_id} not found")
+        # Current-status gate runs before idempotent "already printed" return.
+        if viol["status"] == "dismissed":
+            raise ValueError(
+                f"Violation {violation_id} is dismissed; cannot attest notice printing"
+            )
+        confirmed = conn.execute(
+            """
+            SELECT id FROM case_action_events
+            WHERE violation_id = ? AND action_type = ?
+            LIMIT 1
+            """,
+            (violation_id, ACTION_CASE_CONFIRMED),
+        ).fetchone()
+        if confirmed is None:
+            raise ValueError(
+                "Case must be confirmed before notice printing can be attested. "
+                "Use confirm_case() first."
+            )
+        existing = conn.execute(
+            """
+            SELECT id FROM case_action_events
+            WHERE violation_id = ? AND action_type = ?
+            LIMIT 1
+            """,
+            (violation_id, action_type),
+        ).fetchone()
+        if existing is not None:
+            return True
+        detail: dict[str, Any] = {"notice_printed_at": now}
+        if document_reference:
+            detail["document_reference"] = document_reference
+        conn.execute(
+            """
+            INSERT INTO case_action_events
+                (violation_id, action_type, detail_json, actor_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                action_type,
+                json.dumps(detail),
+                printer_id,
+                now,
+            ),
+        )
+    return True
+
+
+def confirm_notice_printed(
+    violation_id: int,
+    printer_id: int,
+    *,
+    document_reference: str | None = None,
+) -> bool:
+    """Record that an authorized officer attested to notice printing.
+
+    Requires the printer to have the attest_print capability. This is a
+    separate action from case confirmation — the same officer may perform
+    both, or different officers may act.
+
+    A case becomes Notice Printed only when BOTH:
+      1. An authorized officer has confirmed the case (case_confirmed event).
+      2. An authorized officer explicitly confirms printing (this call).
+
+    Preview, PDF generation, download, and browser print dialog do NOT
+    constitute Notice Printed — only this explicit attestation does.
+    """
+    return _attest_notice_print_action(
+        violation_id,
+        printer_id,
+        ACTION_NOTICE_PRINTED,
+        document_reference=document_reference,
+    )
+
+
+def confirm_notice_printer_attested(
+    violation_id: int,
+    printer_id: int,
+    *,
+    document_reference: str | None = None,
+) -> bool:
+    """Record the printing confirmer's attestation separately.
+
+    The printing confirmer need not be the case confirmer. Uses the same
+    prerequisite checks as confirm_notice_printed so this path cannot bypass
+    case confirmation.
+    """
+    return _attest_notice_print_action(
+        violation_id,
+        printer_id,
+        ACTION_NOTICE_PRINTER_ATTESTED,
+        document_reference=document_reference,
+    )
+
+
+def record_plate_verification(
+    violation_id: int,
+    *,
+    review_id: int | None = None,
+    processing_run_id: int | None = None,
+    ocr_raw: str | None = None,
+    accepted_plate_text: str | None = None,
+    plate_status: str,
+    alpr_model: str | None = None,
+    alpr_version: str | None = None,
+    ocr_confidence: float | None = None,
+    processing_diagnostics: dict[str, Any] | None = None,
+    verified_by: int | None = None,
+    verified_at: str | None = None,
+    evidence_crop_ref: str | None = None,
+    clear_accepted_identity: bool = False,
+) -> int:
+    """Record a plate verification event (non-atomic alone — prefer apply_*).
+
+    If a plate_verifications row already exists for this violation_id, it is
+    updated. Historical accepted values are preserved via case_action_events
+    audits written by ``apply_plate_verification``, not by ``created_at``.
+    """
+    return apply_plate_verification(
+        violation_id,
+        review_id=review_id,
+        processing_run_id=processing_run_id,
+        ocr_raw=ocr_raw,
+        accepted_plate_text=accepted_plate_text,
+        clear_accepted_identity=clear_accepted_identity,
+        plate_status=plate_status,
+        alpr_model=alpr_model,
+        alpr_version=alpr_version,
+        ocr_confidence=ocr_confidence,
+        processing_diagnostics=processing_diagnostics,
+        verified_by=verified_by,
+        verified_at=verified_at,
+        evidence_crop_ref=evidence_crop_ref,
+        legacy_plate_text=None,
+        legacy_plate_status=None,
+        audit_detail=None,
+        actor_user_id=verified_by,
+        write_audit=False,
+        write_legacy=False,
+    )
+
+
+def apply_plate_verification(
+    violation_id: int,
+    *,
+    review_id: int | None = None,
+    processing_run_id: int | None = None,
+    ocr_raw: str | None = None,
+    accepted_plate_text: str | None = None,
+    clear_accepted_identity: bool = False,
+    plate_status: str,
+    alpr_model: str | None = None,
+    alpr_version: str | None = None,
+    ocr_confidence: float | None = None,
+    processing_diagnostics: dict[str, Any] | None = None,
+    verified_by: int | None = None,
+    verified_at: str | None = None,
+    evidence_crop_ref: str | None = None,
+    legacy_plate_text: str | None = None,
+    legacy_plate_status: str | None = None,
+    audit_detail: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+    write_audit: bool = True,
+    write_legacy: bool = True,
+    _fail_after: str | None = None,
+) -> int:
+    """Atomically apply plate verification, audit, and legacy field sync.
+
+    One SQLite transaction: plate_verifications + case_action_events +
+    violations.plate_* either all commit or all roll back.
+
+    ``_fail_after`` is a test-only fault-injection seam
+    (``verification`` / ``audit`` / ``legacy``); production callers omit it.
+    """
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    diagnostics = dict(processing_diagnostics or {})
+    if processing_run_id is not None:
+        diagnostics.setdefault("processing_run_id", processing_run_id)
+    if evidence_crop_ref is not None:
+        diagnostics.setdefault("evidence_crop_ref", evidence_crop_ref)
+    diagnostics_json = json.dumps(diagnostics)
+    with db_session() as conn:
+        if not _table_exists(conn, "plate_verifications"):
+            raise ValueError("plate_verifications table does not exist")
+        existing = conn.execute(
+            "SELECT id FROM plate_verifications WHERE violation_id = ?",
+            (violation_id,),
+        ).fetchone()
+        if existing:
+            set_clause = [
+                "plate_status = ?",
+                "processing_diagnostics_json = ?",
+            ]
+            params: list[Any] = [plate_status, diagnostics_json]
+            # Distinguish omitted OCR update from intentional identity clear.
+            if ocr_raw is not None:
+                set_clause.append("ocr_raw = ?")
+                params.append(ocr_raw)
+            if clear_accepted_identity or accepted_plate_text is not None:
+                set_clause.append("accepted_plate_text = ?")
+                params.append(None if clear_accepted_identity else accepted_plate_text)
+            if review_id is not None:
+                set_clause.append("review_id = ?")
+                params.append(review_id)
+            if alpr_model is not None:
+                set_clause.append("alpr_model = ?")
+                params.append(alpr_model)
+            if alpr_version is not None:
+                set_clause.append("alpr_version = ?")
+                params.append(alpr_version)
+            if ocr_confidence is not None:
+                set_clause.append("ocr_confidence = ?")
+                params.append(ocr_confidence)
+            if verified_by is not None:
+                set_clause.append("verified_by = ?")
+                params.append(verified_by)
+            if verified_at is not None:
+                set_clause.append("verified_at = ?")
+                params.append(verified_at)
+            params.append(violation_id)
+            conn.execute(
+                f"UPDATE plate_verifications SET {', '.join(set_clause)} WHERE violation_id = ?",
+                params,
+            )
+            record_id = int(existing["id"])
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO plate_verifications
+                    (violation_id, review_id, ocr_raw,
+                     accepted_plate_text, plate_status, alpr_model, alpr_version,
+                     ocr_confidence, processing_diagnostics_json, verified_by,
+                     verified_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    violation_id,
+                    review_id,
+                    ocr_raw,
+                    None if clear_accepted_identity else accepted_plate_text,
+                    plate_status,
+                    alpr_model,
+                    alpr_version,
+                    ocr_confidence,
+                    diagnostics_json,
+                    verified_by,
+                    verified_at,
+                    now,
+                ),
+            )
+            record_id = int(cursor.lastrowid)
+
+        if _fail_after == "verification":
+            raise RuntimeError("verification boom")
+
+        if write_audit:
+            if not _table_exists(conn, "case_action_events"):
+                raise ValueError("case_action_events table does not exist")
+            detail = dict(audit_detail or {})
+            detail["plate_verification_id"] = record_id
+            actor = actor_user_id if actor_user_id is not None else verified_by
+            if actor is not None:
+                user_row = conn.execute(
+                    "SELECT id FROM users WHERE id = ?", (actor,)
+                ).fetchone()
+                if user_row is None:
+                    actor = None
+            conn.execute(
+                """
+                INSERT INTO case_action_events
+                    (violation_id, review_id, action_type, detail_json,
+                     actor_user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    violation_id,
+                    review_id,
+                    ACTION_PLATE_VERIFIED,
+                    json.dumps(detail),
+                    actor,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+
+        if _fail_after == "audit":
+            raise RuntimeError("audit boom")
+
+        if write_legacy and legacy_plate_status is not None:
+            conn.execute(
+                """
+                UPDATE violations
+                SET plate_text = ?, plate_status = ?
+                WHERE id = ?
+                """,
+                (legacy_plate_text, legacy_plate_status, violation_id),
+            )
+
+        if _fail_after == "legacy":
+            raise RuntimeError("legacy boom")
+
+        return record_id
+
+
+def get_plate_verification(violation_id: int) -> dict[str, Any] | None:
+    """Return the plate verification record for a violation, if any."""
+    with db_session() as conn:
+        if not _table_exists(conn, "plate_verifications"):
+            return None
+        row = conn.execute(
+            "SELECT * FROM plate_verifications WHERE violation_id = ?",
+            (violation_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def record_recurrence_review(
+    violation_id: int,
+    policy_version_id: int,
+    *,
+    lookback_days: int = 365,
+    matched_violation_ids: list[int] | None = None,
+    eligible_match_ids: list[int] | None = None,
+    suggested_recurrence_count: int = 0,
+    evaluation_time: str | None = None,
+    evaluated_by: int | None = None,
+    detail: dict[str, Any] | None = None,
+) -> int:
+    """Record a recurrence evaluation snapshot for a violation.
+
+    Preserves the matches, eligibility, and policy version at review time.
+    Past snapshots are preserved when policy changes — this UPSERT updates
+    the existing row rather than creating duplicates.
+    """
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        if not _table_exists(conn, "recurrence_reviews"):
+            raise ValueError("recurrence_reviews table does not exist")
+        existing = conn.execute(
+            "SELECT id FROM recurrence_reviews WHERE violation_id = ? AND policy_version_id = ?",
+            (violation_id, policy_version_id),
+        ).fetchone()
+        matched_json = json.dumps(matched_violation_ids or [])
+        eligible_json = json.dumps(eligible_match_ids or [])
+        detail_json = json.dumps(detail or {})
+        eval_time = evaluation_time or now
+        if existing:
+            conn.execute(
+                """
+                UPDATE recurrence_reviews
+                SET lookback_days = ?, matched_violation_ids_json = ?,
+                    eligible_match_ids_json = ?, suggested_recurrence_count = ?,
+                    evaluation_time = ?, evaluated_by = ?, detail_json = ?
+                WHERE violation_id = ? AND policy_version_id = ?
+                """,
+                (
+                    lookback_days,
+                    matched_json,
+                    eligible_json,
+                    suggested_recurrence_count,
+                    eval_time,
+                    evaluated_by,
+                    detail_json,
+                    violation_id,
+                    policy_version_id,
+                ),
+            )
+            return int(existing["id"])
+        cursor = conn.execute(
+            """
+            INSERT INTO recurrence_reviews
+                (violation_id, policy_version_id, lookback_days,
+                 matched_violation_ids_json, eligible_match_ids_json,
+                 suggested_recurrence_count, evaluation_time, evaluated_by,
+                 detail_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                violation_id,
+                policy_version_id,
+                lookback_days,
+                matched_json,
+                eligible_json,
+                suggested_recurrence_count,
+                eval_time,
+                evaluated_by,
+                detail_json,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def record_event_time(
+    violation_id: int,
+    event_time: str,
+    source: str,
+    *,
+    confirmed_by: int | None = None,
+    original_metadata: str | None = None,
+    video_timestamp_sec: float | None = None,
+    timezone_offset: str | None = None,
+) -> None:
+    """Record event-time provenance for a case.
+
+    Distinguishes event time from processing/upload time. Source must be one
+    of: 'cctv_timestamp', 'video_metadata', 'user_entry', 'user_confirmation'.
+    """
+    valid_sources = (
+        "cctv_timestamp",
+        "video_metadata",
+        "user_entry",
+        "user_confirmation",
+    )
+    if source not in valid_sources:
+        raise ValueError(f"Invalid event-time source: {source}")
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    detail: dict[str, Any] = {
+        "event_time": event_time,
+        "source": source,
+        "confirmed_by": confirmed_by,
+        "original_metadata": original_metadata,
+        "video_timestamp_sec": video_timestamp_sec,
+        "timezone_offset": timezone_offset or "",
+    }
+    record_case_action(
+        violation_id,
+        ACTION_EVENT_TIME_CONFIRMED,
+        detail=detail,
+        actor_user_id=confirmed_by,
+    )
+
+
+def insert_case_policy_from_mapping(
+    violation_id: int,
+    policy_version_id: int,
+    canonical_rule: str,
+) -> int:
+    """Insert a case_policy_records row from the legal_behavior_mappings config.
+
+    Looks up the mapping for the canonical rule under the given policy version
+    and persists the official category, legal status, and behavior details.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_behavior_mappings"):
+            raise ValueError("legal_behavior_mappings table does not exist")
+        mapping = conn.execute(
+            """
+            SELECT * FROM legal_behavior_mappings
+            WHERE policy_version_id = ? AND canonical_rule = ?
+            """,
+            (policy_version_id, canonical_rule),
+        ).fetchone()
+        if mapping is None:
+            # No mapping for this rule under this policy version —
+            # fail safe: record the case with null category and unverified status.
+            return create_case_policy_record(
+                violation_id=violation_id,
+                policy_version_id=policy_version_id,
+                canonical_rule=canonical_rule,
+                official_category=None,
+                legal_status=None,
+                behavior_details=[],
+            )
+        return create_case_policy_record(
+            violation_id=violation_id,
+            policy_version_id=policy_version_id,
+            canonical_rule=canonical_rule,
+            official_category=mapping["official_category"],
+            legal_status=mapping["legal_status"],
+            behavior_details=json.loads(mapping["behavior_details_json"] or "[]"),
+        )
+
+
+def record_policy_mapping(policy_version_id: int, mappings_data: list[dict[str, Any]]) -> None:
+    """Bulk-insert behavior mappings from the JSON config for a policy version.
+
+    Called when a policy version is approved to materialize the mapping rows.
+    """
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_behavior_mappings"):
+            raise ValueError("legal_behavior_mappings table does not exist")
+        rows = []
+        for m in mappings_data:
+            rows.append((
+                policy_version_id,
+                m["canonical_rule"],
+                m.get("official_category"),
+                m.get("legal_status", "unverified"),
+                json.dumps(m.get("verified_elements", [])),
+                json.dumps(m.get("unresolved_elements", [])),
+                json.dumps(m.get("behavior_details", [])),
+                m.get("provision_reference"),
+                json.dumps(m.get("penalty_schedule")),
+                m.get("source_url"),
+                m.get("source_document_id"),
+                m.get("mapping_version"),
+                json.dumps(m.get("is_grouped_with", [])),
+                m.get("notes"),
+            ))
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO legal_behavior_mappings
+                (policy_version_id, canonical_rule, official_category,
+                 legal_status, verified_elements_json, unresolved_elements_json,
+                 behavior_details_json, provision_reference, penalty_schedule_json,
+                 source_url, source_document_id, mapping_version,
+                 is_grouped_with_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def is_case_confirmed(violation_id: int) -> bool:
+    """Return True if a case_confirmed audit event exists for this violation."""
+    actions = get_case_actions(violation_id)
+    return any(a.get("action_type") == ACTION_CASE_CONFIRMED for a in actions)
+
+
+def is_notice_printed(violation_id: int) -> bool:
+    """Return True if a notice_printed audit event exists for this violation."""
+    actions = get_case_actions(violation_id)
+    return any(a.get("action_type") == ACTION_NOTICE_PRINTED for a in actions)
+
+
+def get_violation_with_policy(violation_id: int) -> dict[str, Any] | None:
+    """Return a violation joined with its case policy record and plate
+    verification, if present. This is the enriched view for the UI.
+    """
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT v.*, cpr.official_category, cpr.legal_status AS policy_legal_status,
+                   pv.plate_status AS verification_plate_status,
+                   pv.accepted_plate_text AS verified_plate_text,
+                   pv.alpr_model, pv.alpr_version
+            FROM violations v
+            LEFT JOIN case_policy_records cpr ON cpr.violation_id = v.id
+            LEFT JOIN plate_verifications pv ON pv.violation_id = v.id
+            WHERE v.id = ?
+            """,
+            (violation_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_recurrence_review(
+    violation_id: int, policy_version_id: int
+) -> dict[str, Any] | None:
+    """Return the recurrence review for a violation + policy version pair."""
+    with db_session() as conn:
+        if not _table_exists(conn, "recurrence_reviews"):
+            return None
+        row = conn.execute(
+            """
+            SELECT * FROM recurrence_reviews
+            WHERE violation_id = ? AND policy_version_id = ?
+            """,
+            (violation_id, policy_version_id),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Schema introspection helpers (used by tests)
+# ---------------------------------------------------------------------------
+
+
+def list_tables() -> list[str]:
+    """Return all user-defined table names in the current database."""
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        return [row["name"] for row in rows]
+
+
+def get_table_columns(table_name: str) -> list[str]:
+    """Return column names for a given table."""
+    with db_session() as conn:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return [row["name"] for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Stage C/D/E integration helpers (case identity, plate, event-time, print)
+# ---------------------------------------------------------------------------
+
+CONFIG_MAPPING_POLICY_VERSION = "config:violation_legal_mappings.json"
+
+
+def ensure_config_mapping_policy_version() -> int:
+    """Ensure a non-activating policy version exists for JSON-backed snapshots.
+
+    Status remains ``proposed`` so it never becomes the active lookback policy
+    and does not silently enable offense-level suggestions.
+    """
+    with db_session() as conn:
+        if not _table_exists(conn, "legal_policy_versions"):
+            raise ValueError("legal_policy_versions table does not exist")
+        row = conn.execute(
+            "SELECT id FROM legal_policy_versions WHERE version = ?",
+            (CONFIG_MAPPING_POLICY_VERSION,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        cursor = conn.execute(
+            """
+            INSERT INTO legal_policy_versions
+                (version, status, lookback_days, schedule_json, detail_json, created_at)
+            VALUES (?, 'proposed', 365, '{}', ?, ?)
+            """,
+            (
+                CONFIG_MAPPING_POLICY_VERSION,
+                json.dumps(
+                    {
+                        "source": "config/violation_legal_mappings.json",
+                        "offense_suggestions_enabled": False,
+                        "note": "Runtime snapshot only; not CTEU-activated",
+                    }
+                ),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def can_verify_plate(user_id: int) -> bool:
+    """True when an active enforcer/admin or explicit verify_plate grant may act."""
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    if user.get("role") in ENFORCEMENT_ROLES:
+        return True
+    return user_has_permission(user_id, PERM_VERIFY_PLATE)
+
+
+def can_confirm_event_time(user_id: int) -> bool:
+    """True when an active enforcer/admin or explicit confirm_event_time grant."""
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    if user.get("role") in ENFORCEMENT_ROLES:
+        return True
+    return user_has_permission(user_id, PERM_CONFIRM_EVENT_TIME)
+
+
+def list_pending_reviews_for_event(
+    *,
+    video_id: int,
+    track_id: int,
+    processing_run_id: int | None,
+) -> list[dict[str, Any]]:
+    """Pending review rows sharing source/run/track (not sufficient alone)."""
+    return [
+        r
+        for r in list_reviews_for_event(
+            video_id=video_id,
+            track_id=track_id,
+            processing_run_id=processing_run_id,
+        )
+        if r.get("status") == "pending"
+    ]
+
+
+def list_reviews_for_event(
+    *,
+    video_id: int,
+    track_id: int,
+    processing_run_id: int | None,
+) -> list[dict[str, Any]]:
+    """Pending and confirmed reviews sharing source/run/track event key.
+
+    Dismissed reviews are excluded. Callers must still apply episode overlap
+    before treating rows as the same logical case.
+    """
+    with db_session() as conn:
+        if processing_run_id is None:
+            rows = conn.execute(
+                """
+                SELECT * FROM review_queue
+                WHERE status IN ('pending', 'confirmed')
+                  AND video_id = ?
+                  AND track_id = ?
+                  AND processing_run_id IS NULL
+                ORDER BY id ASC
+                """,
+                (video_id, track_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM review_queue
+                WHERE status IN ('pending', 'confirmed')
+                  AND video_id = ?
+                  AND track_id = ?
+                  AND processing_run_id = ?
+                ORDER BY id ASC
+                """,
+                (video_id, track_id, processing_run_id),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def find_violation_linked_to_review(review_id: int) -> int | None:
+    """Return violation_id linked via review_confirmed audit, if any."""
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            return None
+        row = conn.execute(
+            """
+            SELECT violation_id FROM case_action_events
+            WHERE review_id = ? AND action_type = ? AND violation_id IS NOT NULL
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (review_id, ACTION_REVIEW_CONFIRMED),
+        ).fetchone()
+        return int(row["violation_id"]) if row else None
+
+
+def find_orphan_violation_for_review(review_id: int) -> int | None:
+    """Recover a violation created for a confirmed review when the link is missing."""
+    with db_session() as conn:
+        review = conn.execute(
+            "SELECT * FROM review_queue WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        if review is None or review["status"] != "confirmed":
+            return None
+        run_id = review["processing_run_id"] if "processing_run_id" in review.keys() else None
+        if run_id is None:
+            rows = conn.execute(
+                """
+                SELECT id FROM violations
+                WHERE video_id = ? AND track_id = ?
+                  AND processing_run_id IS NULL
+                  AND violation_type = ?
+                  AND status != 'dismissed'
+                ORDER BY id DESC
+                """,
+                (review["video_id"], review["track_id"], review["violation_type"]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id FROM violations
+                WHERE video_id = ? AND track_id = ?
+                  AND processing_run_id = ?
+                  AND violation_type = ?
+                  AND status != 'dismissed'
+                ORDER BY id DESC
+                """,
+                (
+                    review["video_id"],
+                    review["track_id"],
+                    run_id,
+                    review["violation_type"],
+                ),
+            ).fetchall()
+        for row in rows:
+            vid = int(row["id"])
+            linked = conn.execute(
+                """
+                SELECT 1 FROM case_action_events
+                WHERE violation_id = ? AND review_id = ? AND action_type = ?
+                LIMIT 1
+                """,
+                (vid, review_id, ACTION_REVIEW_CONFIRMED),
+            ).fetchone()
+            if linked:
+                return vid
+            # Prefer violations that share episode bounds when present.
+            viol = conn.execute(
+                "SELECT * FROM violations WHERE id = ?", (vid,)
+            ).fetchone()
+            if viol is None:
+                continue
+            ep_match = True
+            for col in ("episode_start_sec", "episode_end_sec", "timestamp_sec"):
+                if col in review.keys() and review[col] is not None:
+                    if col not in viol.keys() or viol[col] != review[col]:
+                        ep_match = False
+                        break
+            if ep_match:
+                return vid
+        return None
+
+
+def _episode_windows_overlap(
+    a_start: float | None,
+    a_end: float | None,
+    a_ts: float | None,
+    b_start: float | None,
+    b_end: float | None,
+    b_ts: float | None,
+) -> bool:
+    """Episode overlap without inventing proximity merges."""
+    if a_start is not None and a_end is None and a_ts is not None:
+        a_end = a_ts
+    if a_end is not None and a_start is None and a_ts is not None:
+        a_start = a_ts
+    if b_start is not None and b_end is None and b_ts is not None:
+        b_end = b_ts
+    if b_end is not None and b_start is None and b_ts is not None:
+        b_start = b_ts
+
+    if (
+        a_start is not None
+        and a_end is not None
+        and b_start is not None
+        and b_end is not None
+    ):
+        return a_start <= b_end and b_start <= a_end
+    if a_ts is not None and b_start is not None and b_end is not None:
+        return b_start <= a_ts <= b_end
+    if b_ts is not None and a_start is not None and a_end is not None:
+        return a_start <= b_ts <= a_end
+    return False
+
+
+def find_fused_case_violation(
+    *,
+    video_id: int,
+    processing_run_id: int | None,
+    track_id: int,
+    contributing_rules: tuple[str, ...] | list[str],
+    episode_start_sec: float | None = None,
+    episode_end_sec: float | None = None,
+    timestamp_sec: float | None = None,
+    require_fusion_pair: bool = False,
+) -> int | None:
+    """Find an existing non-dismissed violation for an overlapping episode.
+
+    Source/run/track alone is never sufficient — episode windows must overlap.
+    Dismissed cases are never returned.
+    """
+    from core.detection_config import (
+        VIOLATION_ILLEGAL_PARKING,
+        VIOLATION_OBSTRUCTION,
+    )
+
+    rules = set(contributing_rules)
+    fusion_pair = {VIOLATION_ILLEGAL_PARKING, VIOLATION_OBSTRUCTION}
+    with db_session() as conn:
+        if processing_run_id is None:
+            rows = conn.execute(
+                """
+                SELECT * FROM violations
+                WHERE video_id = ? AND track_id = ?
+                  AND processing_run_id IS NULL
+                  AND status != 'dismissed'
+                ORDER BY id ASC
+                """,
+                (video_id, track_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM violations
+                WHERE video_id = ? AND track_id = ?
+                  AND processing_run_id = ?
+                  AND status != 'dismissed'
+                ORDER BY id ASC
+                """,
+                (video_id, track_id, processing_run_id),
+            ).fetchall()
+        for row in rows:
+            vid = int(row["id"])
+            if not _episode_windows_overlap(
+                episode_start_sec,
+                episode_end_sec,
+                timestamp_sec,
+                row["episode_start_sec"] if "episode_start_sec" in row.keys() else None,
+                row["episode_end_sec"] if "episode_end_sec" in row.keys() else None,
+                row["timestamp_sec"] if "timestamp_sec" in row.keys() else None,
+            ):
+                continue
+            vtype = row["violation_type"]
+            stored: set[str] = set()
+            if _table_exists(conn, "case_policy_records"):
+                policy_rows = conn.execute(
+                    """
+                    SELECT canonical_rule FROM case_policy_records
+                    WHERE violation_id = ?
+                    """,
+                    (vid,),
+                ).fetchall()
+                stored = {r["canonical_rule"] for r in policy_rows}
+            if require_fusion_pair:
+                if rules.issubset(stored) or (
+                    vtype in fusion_pair and (stored & fusion_pair or vtype in rules)
+                ):
+                    return vid
+                continue
+            # Late fusion attach: parking-only or obstruction-only case that
+            # overlaps may accept the complementary fusion member.
+            if vtype in fusion_pair or (stored & fusion_pair):
+                if not rules or rules & fusion_pair or rules.issubset(stored | {vtype}):
+                    return vid
+            elif vtype in rules or rules.issubset(stored):
+                return vid
+    return None
+
+
+def mark_review_confirmed_linked(
+    review_id: int,
+    violation_id: int,
+    reviewed_by: int,
+) -> None:
+    """Mark a pending review confirmed and linked without inserting a violation."""
+    reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT status FROM review_queue WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Review item {review_id} not found")
+        if row["status"] == "pending":
+            conn.execute(
+                """
+                UPDATE review_queue
+                SET status = 'confirmed', reviewed_by = ?, reviewed_at = ?
+                WHERE id = ?
+                """,
+                (reviewed_by, reviewed_at, review_id),
+            )
+    link_review_to_case(review_id, violation_id)
+
+
+def update_violation_canonical_type(violation_id: int, violation_type: str) -> None:
+    with db_session() as conn:
+        conn.execute(
+            "UPDATE violations SET violation_type = ? WHERE id = ?",
+            (violation_type, violation_id),
+        )
+
+
+def merge_violation_evidence(violation_id: int, evidence: dict[str, Any]) -> None:
+    """Fill empty evidence fields from grouped observations; never wipe existing."""
+    allowed = (
+        "evidence_path",
+        "vehicle_evidence_path",
+        "plate_evidence_path",
+        "evidence_clip_path",
+        "reason_log",
+    )
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM violations WHERE id = ?", (violation_id,)
+        ).fetchone()
+        if row is None:
+            return
+        fields: list[str] = []
+        params: list[Any] = []
+        for key in allowed:
+            incoming = evidence.get(key)
+            if not incoming:
+                continue
+            current = row[key] if key in row.keys() else None
+            if current:
+                continue
+            fields.append(f"{key} = ?")
+            params.append(incoming)
+        if not fields:
+            return
+        params.append(violation_id)
+        conn.execute(
+            f"UPDATE violations SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+
+
+def update_violation_plate_fields(
+    violation_id: int,
+    *,
+    plate_text: str | None,
+    plate_status: str,
+) -> None:
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE violations
+            SET plate_text = ?, plate_status = ?
+            WHERE id = ?
+            """,
+            (plate_text, plate_status, violation_id),
+        )
+
+
+def get_case_policy_records(violation_id: int) -> list[dict[str, Any]]:
+    with db_session() as conn:
+        if not _table_exists(conn, "case_policy_records"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT * FROM case_policy_records
+            WHERE violation_id = ?
+            ORDER BY id ASC
+            """,
+            (violation_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def get_confirmed_event_time(violation_id: int) -> str | None:
+    """Latest effective event time from event_time_confirmed audit details."""
+    snap = get_event_time_snapshot(violation_id)
+    if snap is None:
+        return None
+    return snap.get("event_time")
+
+
+def get_event_time_snapshot(violation_id: int) -> dict[str, Any] | None:
+    """Latest persisted event-time confirmation with provenance metadata."""
+    actions = get_case_actions(violation_id)
+    latest: dict[str, Any] | None = None
+    for action in actions:
+        if action.get("action_type") != ACTION_EVENT_TIME_CONFIRMED:
+            continue
+        try:
+            detail = json.loads(action.get("detail_json") or "{}")
+        except json.JSONDecodeError:
+            continue
+        value = detail.get("event_time") or detail.get("effective_confirmed")
+        if not value and detail.get("persisted_effective") is False:
+            # Unresolved marker — keep scanning for a later effective value.
+            continue
+        if not value:
+            continue
+        meta = detail.get("original_metadata")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except json.JSONDecodeError:
+                meta = {}
+        elif not isinstance(meta, dict):
+            meta = {}
+        # When original_metadata holds the rich service detail, prefer it.
+        if meta.get("effective_confirmed") or meta.get("contributing_claims"):
+            rich = meta
+        else:
+            rich = detail
+        latest = {
+            "event_time": str(value),
+            "source": detail.get("source") or rich.get("original_source"),
+            "original_metadata": rich,
+            "confirmed_by": detail.get("confirmed_by") or rich.get("confirmed_by"),
+            "confirmed_at": (
+                action.get("created_at")
+                or rich.get("confirmed_at")
+                or rich.get("original_confirmed_at")
+            ),
+            "video_timestamp_sec": detail.get("video_timestamp_sec")
+            or rich.get("video_relative_sec"),
+            "timezone_offset": detail.get("timezone_offset"),
+            "action_id": action.get("id"),
+        }
+    return latest
+
+
+def list_recurrence_candidate_violations(
+    *,
+    plate_text: str,
+    official_category: str,
+    exclude_violation_id: int,
+) -> list[dict[str, Any]]:
+    """Candidate prior violations sharing verified plate + official category."""
+    needle = plate_text.strip().upper()
+    with db_session() as conn:
+        if not _table_exists(conn, "plate_verifications"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT DISTINCT v.*
+            FROM violations v
+            INNER JOIN plate_verifications pv ON pv.violation_id = v.id
+            INNER JOIN case_policy_records cpr ON cpr.violation_id = v.id
+            WHERE v.id != ?
+              AND v.status NOT IN ('dismissed', 'rejected')
+              AND pv.plate_status = 'verified_readable'
+              AND UPPER(TRIM(pv.accepted_plate_text)) = ?
+              AND cpr.official_category = ?
+            ORDER BY v.id ASC
+            """,
+            (exclude_violation_id, needle, official_category),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def record_print_batch(
+    violation_ids: list[int],
+    printer_id: int,
+    *,
+    document_reference: str | None = None,
+) -> dict[str, Any]:
+    """Attest notice printing for an explicit batch membership set.
+
+    Returns per-case results. Never claims full-batch success when any case
+    failed. Preview/PDF/download are not attestation.
+    """
+    membership = [int(v) for v in violation_ids]
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    failed = 0
+    for vid in membership:
+        try:
+            ok = confirm_notice_printed(
+                vid,
+                printer_id,
+                document_reference=document_reference,
+            )
+            results.append(
+                {
+                    "violation_id": vid,
+                    "success": True,
+                    "notice_printed": bool(ok),
+                }
+            )
+            succeeded += 1
+        except (PermissionError, ValueError) as exc:
+            results.append(
+                {
+                    "violation_id": vid,
+                    "success": False,
+                    "error": str(exc),
+                }
+            )
+            failed += 1
+    return {
+        "membership": membership,
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+        "all_succeeded": failed == 0 and succeeded == len(membership),
+        "document_reference": document_reference,
+        "printer_id": printer_id,
+    }
+
+
+def offense_suggestions_enabled_for_active_policy() -> bool:
+    """True only when the active approved policy explicitly enables suggestions."""
+    active = get_active_legal_policy_version()
+    if active is None:
+        return False
+    try:
+        detail = json.loads(active.get("detail_json") or "{}")
+    except json.JSONDecodeError:
+        return False
+    return bool(detail.get("offense_suggestions_enabled"))

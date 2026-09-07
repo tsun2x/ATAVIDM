@@ -46,21 +46,48 @@
         );
     }
 
+    function isMixedSwitch(input) {
+        if (!input) return false;
+        const ds = input.dataset || {};
+        // Explicit on/off after user toggle wins over a stale aria-checked.
+        if (ds.enabledState === "on" || ds.enabledState === "off") {
+            return false;
+        }
+        if (input.indeterminate) return true;
+        if (ds.enabledState === "mixed") return true;
+        if (input.getAttribute && input.getAttribute("aria-checked") === "mixed") {
+            return true;
+        }
+        return false;
+    }
+
     function syncSwitchState(input) {
         if (!input) return;
+        const mixed = isMixedSwitch(input);
         const checked = !!input.checked;
         const wrap = input.closest(".tavidm-switch");
         const state = document.querySelector('[data-state-for="' + input.id + '"]');
         if (wrap) {
-            wrap.classList.toggle("switch-on", checked);
-            wrap.classList.toggle("switch-off", !checked);
+            wrap.classList.toggle("switch-on", !mixed && checked);
+            wrap.classList.toggle("switch-off", !mixed && !checked);
+            wrap.classList.toggle("switch-mixed", mixed);
         }
         if (state) {
-            state.textContent = checked ? "Active" : "Inactive";
-            state.classList.toggle("is-active", checked);
-            state.classList.toggle("is-inactive", !checked);
+            if (mixed) {
+                state.textContent = "Mixed";
+                state.classList.add("is-mixed");
+                state.classList.remove("is-active", "is-inactive");
+            } else {
+                state.textContent = checked ? "Active" : "Inactive";
+                state.classList.toggle("is-active", checked);
+                state.classList.toggle("is-inactive", !checked);
+                state.classList.remove("is-mixed");
+            }
         }
-        input.setAttribute("aria-checked", checked ? "true" : "false");
+        input.setAttribute(
+            "aria-checked",
+            mixed ? "mixed" : checked ? "true" : "false"
+        );
     }
 
     function bindSwitchRoot(root) {

@@ -46,6 +46,7 @@ from core.violation_config import (
     save_enabled_violations,
     validate_enabled_violations,
     violation_catalog_for_ui,
+    violation_groups_for_ui,
 )
 from core.detector import resolve_weights_path
 from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
@@ -207,6 +208,45 @@ def _evidence_url(evidence_path: str | None) -> str | None:
 def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
     video = videos.get(row.get("video_id"))
     detected = row.get("detected_at") or ""
+    vid = row["id"]
+    policy_rows = []
+    try:
+        policy_rows = db.get_case_policy_records(vid)
+    except Exception:
+        policy_rows = []
+    plate_row = None
+    try:
+        plate_row = db.get_plate_verification(vid)
+    except Exception:
+        plate_row = None
+    from core.violation_policy import (
+        legal_status_for,
+        proposed_official_category_for,
+        verified_official_category_for,
+    )
+
+    proposed = None
+    verified = None
+    legal_status = None
+    contributing = []
+    if policy_rows:
+        contributing = [p.get("canonical_rule") for p in policy_rows if p.get("canonical_rule")]
+        proposed = next((p.get("official_category") for p in policy_rows if p.get("official_category")), None)
+        legal_status = next((p.get("legal_status") for p in policy_rows if p.get("legal_status")), None)
+        verified_rows = [
+            p for p in policy_rows
+            if p.get("legal_status") == "verified" and p.get("official_category")
+        ]
+        verified = verified_rows[0]["official_category"] if verified_rows else None
+    else:
+        vtype = row.get("violation_type") or ""
+        proposed = proposed_official_category_for(vtype)
+        verified = verified_official_category_for(vtype)
+        status = legal_status_for(vtype)
+        legal_status = status.value if status else None
+        contributing = [vtype] if vtype else []
+
+    flag_only = legal_status == "flag_only"
     return {
         "id": f"VIO-{row['id']:06d}",
         "db_id": row["id"],
@@ -223,14 +263,35 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "vehicle_class": row.get("vehicle_class") or "—",
         "evidence_url": _evidence_url(row.get("evidence_path")),
         "vehicle_evidence_url": _evidence_url(row.get("vehicle_evidence_path")),
-        "plate_text": row.get("plate_text") or None,
-        "plate_status": row.get("plate_status") or "not_attempted",
+        "plate_text": (plate_row or {}).get("accepted_plate_text") or row.get("plate_text") or None,
+        "plate_status": (plate_row or {}).get("plate_status") or row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
         "frame_number": row.get("frame_number"),
+        "proposed_official_category": proposed,
+        "verified_official_category": verified,
+        "legal_status": legal_status,
+        "flag_only": flag_only,
+        "contributing_behaviors": contributing,
+        "case_confirmed": bool(db.is_case_confirmed(vid)),
+        "notice_printed": bool(db.is_notice_printed(vid)),
+        "event_time": db.get_confirmed_event_time(vid),
+        "printable_as_official": bool(
+            db.is_case_confirmed(vid) and not flag_only and row.get("status") != "dismissed"
+        ),
+        "review_material_only": bool(flag_only or legal_status in ("unverified", "partially_verified")),
     }
 
 
 def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    from core.violation_policy import (
+        legal_status_for,
+        proposed_official_category_for,
+        verified_official_category_for,
+    )
+
+    vtype = row.get("violation_type") or ""
+    status = legal_status_for(vtype)
+    legal_status = status.value if status else None
     return {
         "id": row["id"],
         "display_id": f"RQ-{row['id']:05d}",
@@ -249,6 +310,14 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "reason_log": row.get("reason_log") or "",
         "queued_at": row.get("queued_at"),
         "status": row.get("status"),
+        "proposed_official_category": proposed_official_category_for(vtype),
+        "verified_official_category": verified_official_category_for(vtype),
+        "legal_status": legal_status,
+        "flag_only": legal_status == "flag_only",
+        "processing_run_id": row.get("processing_run_id"),
+        "episode_start_sec": row.get("episode_start_sec"),
+        "episode_end_sec": row.get("episode_end_sec"),
+        "timestamp_ocr_available": False,
     }
 
 
@@ -466,6 +535,7 @@ def settings():
         users=[_user_to_ui(u) for u in db.list_users()],
         settings=load_rule_parameters(),
         violation_catalog=violation_catalog_for_ui(),
+        violation_groups=violation_groups_for_ui(),
         enabled_violations=list(load_enabled_violations()),
         cameras=[_camera_to_ui(c) for c in db.list_cameras()],
         roles=auth.ROLE_LABELS,
@@ -1676,16 +1746,21 @@ def api_review_queue():
 
 
 @app.route("/api/review-queue/<int:review_id>/confirm", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.login_required
 def api_confirm_review(review_id: int):
     user = auth.current_user()
     try:
-        violation_id = db.confirm_review_item(review_id, reviewed_by=user["id"])
+        from core.case_review_service import CaseReviewError, materialize_case_from_review
+
+        # Actor always from session; service enforces can_confirm_case.
+        result = materialize_case_from_review(db, review_id, user["id"])
+        return jsonify({"success": True, **result})
     except TemporalEvidenceNotReady as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
-    except ValueError as exc:
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except (CaseReviewError, ValueError) as exc:
         return jsonify({"success": False, "error": str(exc)}), 404
-    return jsonify({"success": True, "violation_id": violation_id})
 
 
 @app.route("/api/review-queue/<int:review_id>/dismiss", methods=["POST"])
@@ -1696,6 +1771,226 @@ def api_dismiss_review(review_id: int):
         return jsonify({"success": False, "error": "Review item not found."}), 404
     db.dismiss_review_item(review_id, reviewed_by=user["id"])
     return jsonify({"success": True})
+
+
+@app.route("/api/cases/<int:violation_id>", methods=["GET"])
+@auth.login_required
+def api_get_case(violation_id: int):
+    videos = _video_name_map()
+    row = db.get_violation(violation_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Case not found."}), 404
+    ui = _violation_to_ui(row, videos)
+    ui["policy_records"] = db.get_case_policy_records(violation_id)
+    ui["plate_verification"] = db.get_plate_verification(violation_id)
+    ui["actions"] = db.get_case_actions(violation_id)
+    from core.recurrence_policy import (
+        evaluate_recurrence_eligibility,
+        load_active_recurrence_policy_context,
+        summarize_recurrence,
+    )
+
+    policy_ctx = load_active_recurrence_policy_context(db)
+    evaluation = evaluate_recurrence_eligibility(
+        db,
+        violation_id=violation_id,
+        lookback_days=policy_ctx["lookback_days"],
+        policy_version_id=policy_ctx["policy_version_id"],
+        lookback_policy_active=policy_ctx["lookback_policy_active"],
+    )
+    ui["recurrence"] = summarize_recurrence(evaluation)
+    return jsonify({"success": True, "case": ui})
+
+
+@app.route("/api/cases/<int:violation_id>/plate", methods=["POST"])
+@auth.role_required("enforcer")
+def api_verify_plate(violation_id: int):
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    # Never trust client-supplied reviewer id or verification flag.
+    try:
+        from core.case_review_service import CaseReviewError, verify_plate_identity
+
+        result = verify_plate_identity(
+            db,
+            violation_id,
+            user["id"],
+            plate_status=str(payload.get("plate_status") or ""),
+            accepted_plate_text=payload.get("accepted_plate_text"),
+            candidate_ocr_raw=payload.get("candidate_ocr_raw"),
+            candidate_reference=payload.get("candidate_reference"),
+            evidence_crop_ref=payload.get("evidence_crop_ref"),
+            ocr_confidence=payload.get("ocr_confidence"),
+            review_id=payload.get("review_id"),
+        )
+        return jsonify({"success": True, **result})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/cases/<int:violation_id>/event-time", methods=["POST"])
+@auth.role_required("enforcer")
+def api_confirm_event_time(violation_id: int):
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    try:
+        from core.case_review_service import CaseReviewError, persist_event_time_review
+
+        result = persist_event_time_review(
+            db,
+            violation_id,
+            user["id"],
+            user_entry_raw=payload.get("event_time") or payload.get("user_entry_raw"),
+            user_entry_timezone=payload.get("timezone"),
+            correction_raw=payload.get("correction"),
+            video_relative_sec=payload.get("video_relative_sec"),
+        )
+        return jsonify({"success": True, **result})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/cases/<int:violation_id>/confirm-case", methods=["POST"])
+@auth.role_required("enforcer")
+def api_confirm_case(violation_id: int):
+    user = auth.current_user()
+    try:
+        ok = db.confirm_case(violation_id, user["id"])
+        return jsonify({"success": True, "case_confirmed": ok})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/cases/<int:violation_id>/notice-printed", methods=["POST"])
+@auth.role_required("enforcer")
+def api_notice_printed(violation_id: int):
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    try:
+        ok = db.confirm_notice_printed(
+            violation_id,
+            user["id"],
+            document_reference=payload.get("document_reference"),
+        )
+        return jsonify({"success": True, "notice_printed": ok})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/cases/notice-printed/batch", methods=["POST"])
+@auth.role_required("enforcer")
+def api_notice_printed_batch():
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    membership = payload.get("violation_ids") or []
+    if not isinstance(membership, list) or not membership:
+        return jsonify({"success": False, "error": "violation_ids required"}), 400
+    result = db.record_print_batch(
+        [int(v) for v in membership],
+        user["id"],
+        document_reference=payload.get("document_reference"),
+    )
+    return jsonify({"success": result["all_succeeded"], **result})
+
+
+@app.route("/api/cases/<int:violation_id>/printable", methods=["GET"])
+@auth.role_required("enforcer")
+def api_printable_record(violation_id: int):
+    """Return a printable review/citation record. Preview does not attest printing."""
+    videos = _video_name_map()
+    row = db.get_violation(violation_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Case not found."}), 404
+    ui = _violation_to_ui(row, videos)
+    document_kind = "official_notice_draft" if ui["printable_as_official"] else "review_material"
+    return jsonify(
+        {
+            "success": True,
+            "document_kind": document_kind,
+            "notice_printed": ui["notice_printed"],
+            "attestation_required": True,
+            "preview_is_not_printed": True,
+            "record": ui,
+        }
+    )
+
+
+@app.route("/api/policy/versions", methods=["GET"])
+@auth.login_required
+def api_list_policy_versions():
+    active = db.get_active_legal_policy_version()
+    return jsonify(
+        {
+            "success": True,
+            "active": active,
+            "offense_suggestions_enabled": db.offense_suggestions_enabled_for_active_policy(),
+        }
+    )
+
+
+@app.route("/api/policy/versions", methods=["POST"])
+@auth.role_required("admin")
+def api_propose_policy_version():
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    version = str(payload.get("version") or "").strip()
+    if not version:
+        return jsonify({"success": False, "error": "version required"}), 400
+    try:
+        vid = db.propose_legal_policy_version(
+            version=version,
+            created_by=user["id"],
+            lookback_days=int(payload.get("lookback_days") or 365),
+            schedule_json=payload.get("schedule_json") or {},
+            detail_json=payload.get("detail_json") or {
+                "offense_suggestions_enabled": False,
+            },
+        )
+        return jsonify({"success": True, "policy_version_id": vid})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/policy/versions/<int:version_id>/approve", methods=["POST"])
+@auth.login_required
+def api_approve_policy_version(version_id: int):
+    user = auth.current_user()
+    try:
+        db.approve_legal_policy_version(version_id, approved_by=user["id"])
+        return jsonify({"success": True})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.route("/api/policy/versions/<int:version_id>/reject", methods=["POST"])
+@auth.login_required
+def api_reject_policy_version(version_id: int):
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    try:
+        # Rejection uses propose authority or approve grant; enforce active user.
+        if not (db.can_propose_policy(user["id"]) or db.can_approve_policy(user["id"])):
+            raise PermissionError("Lacks policy rejection authority")
+        db.reject_legal_policy_version(
+            version_id, user["id"], reason=payload.get("reason")
+        )
+        return jsonify({"success": True})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
 
 
 # ---------------------------------------------------------------------------
@@ -1758,6 +2053,7 @@ def api_get_settings():
             "settings": load_rule_parameters(),
             "enabled_violations": list(load_enabled_violations()),
             "violation_catalog": violation_catalog_for_ui(),
+            "violation_groups": violation_groups_for_ui(),
         }
     )
 

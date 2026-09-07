@@ -58,46 +58,71 @@
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-shield-check me-2"></i>Violation Rules</h5></div>
             <div class="card-body">
                 <p class="text-muted small mb-3">
-                    Enable or disable violation rules for video processing and live streams.
+                    Enable or disable violation categories for video processing and live streams.
+                    Grouped categories control their underlying detector rules together.
+                    Canonical identifiers are preserved in persistence and runtime evaluation.
+                    Detector status is separate from legal-verification status — an enabled
+                    detector is not a verified legal classification.
                     Planned rules cannot be enabled until their detection logic is implemented.
                 </p>
                 <div class="list-group list-group-flush" id="violationToggleList">
-                    {% for item in violation_catalog %}
+                    {% for group in violation_groups %}
                     <div class="list-group-item">
-                        <div class="tavidm-switch-row {% if not item.toggleable %}is-disabled{% endif %}">
+                        <div class="tavidm-switch-row {% if not group.toggleable %}is-disabled{% endif %}">
                             <div class="tavidm-switch-labels flex-grow-1">
-                                <label class="tavidm-switch-title" for="set-v-{{ loop.index }}">
-                                    {{ item.name }}
-                                    {% if item.status == 'implemented' %}
-                                    <span class="badge bg-success-subtle text-success ms-1">Implemented</span>
-                                    {% elif item.status == 'model_dependent' %}
-                                    <span class="badge bg-warning-subtle text-warning ms-1">Model-dependent</span>
-                                    {% elif item.status == 'partial' %}
-                                    <span class="badge bg-info-subtle text-info ms-1">Partial</span>
-                                    {% elif item.status == 'planned' %}
-                                    <span class="badge bg-secondary-subtle text-secondary ms-1">Planned</span>
+                                <label class="tavidm-switch-title" for="set-vg-{{ loop.index }}">
+                                    {{ group.title }}
+                                    {% if group.is_official_group %}
+                                    <span class="badge bg-primary-subtle text-primary ms-1">Grouped</span>
+                                    {% endif %}
+                                    {% if group.pending_legal_verification %}
+                                    <span class="badge bg-warning-subtle text-warning ms-1">Pending legal verification</span>
+                                    {% endif %}
+                                    {% if group.legal_status == 'flag_only' %}
+                                    <span class="badge bg-secondary-subtle text-secondary ms-1">flag_only</span>
+                                    {% elif group.legal_status == 'unverified' %}
+                                    <span class="badge bg-secondary-subtle text-secondary ms-1">unverified</span>
+                                    {% elif group.legal_status == 'verified' %}
+                                    <span class="badge bg-success-subtle text-success ms-1">verified</span>
                                     {% endif %}
                                 </label>
-                                {% if item.status == 'model_dependent' %}
-                                <div class="tavidm-switch-reason text-muted small">Requires custom YOLO weights with helmet class.</div>
-                                {% elif item.status == 'partial' %}
-                                <div class="tavidm-switch-reason text-muted small">Zone-dwell proxy only; full contextual logic not yet implemented.</div>
-                                {% elif item.status == 'planned' %}
-                                <div class="tavidm-switch-reason text-muted small">No executable rule in the current engine.</div>
+                                <div class="tavidm-switch-reason text-muted small mt-1">
+                                    Underlying behaviors:
+                                    {% for m in group.members %}
+                                    <span class="me-2"><code>{{ m.canonical_rule }}</code>
+                                        {% if m.status == 'implemented' %}<span class="badge bg-success-subtle text-success">Implemented</span>
+                                        {% elif m.status == 'model_dependent' %}<span class="badge bg-warning-subtle text-warning">Model-dependent</span>
+                                        {% elif m.status == 'partial' %}<span class="badge bg-info-subtle text-info">Partial</span>
+                                        {% elif m.status == 'planned' %}<span class="badge bg-secondary-subtle text-secondary">Planned</span>
+                                        {% endif %}
+                                        {% if not m.toggleable %}(not toggleable){% endif %}
+                                    </span>
+                                    {% endfor %}
+                                </div>
+                                {% if group.mixed %}
+                                <div class="tavidm-switch-reason text-warning small">
+                                    Mixed legacy state — underlying rules differ. Saving without changing this
+                                    control preserves the current per-rule enablement.
+                                </div>
                                 {% endif %}
                             </div>
                             <div class="tavidm-switch-control">
-                                <span class="tavidm-switch-state {% if item.enabled %}is-active{% else %}is-inactive{% endif %}" data-state-for="set-v-{{ loop.index }}">
-                                    {% if item.enabled %}Active{% else %}Inactive{% endif %}
+                                <span class="tavidm-switch-state {% if group.enabled_state == 'on' %}is-active{% elif group.enabled_state == 'mixed' %}is-mixed{% else %}is-inactive{% endif %}"
+                                      data-state-for="set-vg-{{ loop.index }}">
+                                    {% if group.enabled_state == 'on' %}Active{% elif group.enabled_state == 'mixed' %}Mixed{% else %}Inactive{% endif %}
                                 </span>
-                                <label class="tavidm-switch {% if item.enabled %}switch-on{% else %}switch-off{% endif %} {% if not item.toggleable %}switch-disabled{% endif %}" for="set-v-{{ loop.index }}">
-                                    <input class="violation-toggle" type="checkbox" role="switch"
-                                           id="set-v-{{ loop.index }}"
-                                           value="{{ item.name }}"
-                                           data-toggleable="{{ 'true' if item.toggleable else 'false' }}"
-                                           aria-checked="{{ 'true' if item.enabled else 'false' }}"
-                                           {% if item.enabled %}checked{% endif %}
-                                           {% if not item.toggleable %}disabled{% endif %}>
+                                <label class="tavidm-switch {% if group.enabled_state == 'on' %}switch-on{% elif group.enabled_state == 'mixed' %}switch-mixed{% else %}switch-off{% endif %} {% if not group.toggleable %}switch-disabled{% endif %}"
+                                       for="set-vg-{{ loop.index }}">
+                                    <input class="violation-group-toggle" type="checkbox" role="switch"
+                                           id="set-vg-{{ loop.index }}"
+                                           data-group-id="{{ group.group_id }}"
+                                           data-canonical-rules='{{ group.toggleable_canonical_rules | tojson }}'
+                                           data-member-states='{{ group.member_enabled_map | tojson }}'
+                                           data-toggleable="{{ 'true' if group.toggleable else 'false' }}"
+                                           data-enabled-state="{{ group.enabled_state }}"
+                                           aria-checked="{{ 'mixed' if group.mixed else ('true' if group.enabled else 'false') }}"
+                                           {% if group.enabled %}checked{% endif %}
+                                           {% if not group.toggleable %}disabled{% endif %}>
                                     <span class="tavidm-switch-track" aria-hidden="true"><span class="tavidm-switch-thumb"></span></span>
                                 </label>
                             </div>

@@ -41,7 +41,18 @@
                     {% for item in review_items %}
                     <tr data-item='{{ item | tojson }}'>
                         <td><code>{{ item.display_id }}</code></td>
-                        <td><span class="vtype-badge vtype-{{ item.type_slug }}">{{ item.violation_type }}</span></td>
+                        <td>
+                            {% if item.proposed_official_category %}
+                            <div class="fw-semibold">{{ item.proposed_official_category }}
+                                {% if not item.verified_official_category %}
+                                <span class="badge bg-secondary">proposed</span>
+                                {% endif %}
+                            </div>
+                            <div class="small text-muted">Behavior: {{ item.violation_type }}</div>
+                            {% else %}
+                            <span class="vtype-badge vtype-{{ item.type_slug }}">{{ item.violation_type }}</span>
+                            {% endif %}
+                        </td>
                         <td class="small">{{ item.video_name }}</td>
                         <td>#{{ item.track_id }}</td>
                         <td class="small">{{ item.vehicle_class }}</td>

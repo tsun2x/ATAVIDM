@@ -1,0 +1,16 @@
+-- TAVIDM Migration 009: Repair legal-policy schema variants from migration 008
+--
+-- Additive / preservative. Does not drop application data.
+-- Applied programmatically by _apply_migration_009 in sqlite_adapter.py because
+-- SQLite cannot ALTER UNIQUE constraints or NOT NULL in place.
+--
+-- Repairs:
+--   1. Add legal_behavior_mappings.source_document_id when missing
+--   2. Rebuild case_policy_records to UNIQUE(violation_id, canonical_rule)
+--      when an older UNIQUE(violation_id)-only variant exists
+--   3. Rebuild case_action_events so violation_id is nullable (policy-level
+--      propose/approve/reject audit rows)
+--
+-- Fresh installs that already match schema.sql are no-ops.
+--
+-- Canonical reference only. Runtime application uses the Python helper.

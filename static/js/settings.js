@@ -15,6 +15,22 @@
 
     document.getElementById("btnSaveSettings")?.addEventListener("click", function () {
         const enabledViolations = [];
+        document.querySelectorAll(".violation-group-toggle").forEach(function (el) {
+            if (el.dataset.toggleable !== "true") return;
+            let rules = [];
+            let memberStates = {};
+            try { rules = JSON.parse(el.dataset.canonicalRules || "[]"); } catch (e) { rules = []; }
+            try { memberStates = JSON.parse(el.dataset.memberStates || "{}"); } catch (e) { memberStates = {}; }
+            if (el.indeterminate || el.dataset.enabledState === "mixed") {
+                // Preserve legacy mixed per-rule states — do not silently normalize.
+                Object.keys(memberStates).forEach(function (rule) {
+                    if (memberStates[rule]) enabledViolations.push(rule);
+                });
+            } else if (el.checked) {
+                rules.forEach(function (rule) { enabledViolations.push(rule); });
+            }
+        });
+        // Backward-compatible flat toggles if present.
         document.querySelectorAll(".violation-toggle:checked").forEach(function (el) {
             if (el.dataset.toggleable === "true") {
                 enabledViolations.push(el.value);
@@ -48,6 +64,33 @@
                 }
             })
             .catch(function () { showToast("Error", "Save failed. Please try again.", "danger"); });
+    });
+
+    // Mixed (indeterminate) group switches: click resolves to on/off explicitly.
+    // Coordinate with TavidmViolationSwitch.sync so DOMContentLoaded re-sync
+    // cannot wipe Mixed into Inactive, and wrap/state classes stay consistent.
+    document.querySelectorAll(".violation-group-toggle").forEach(function (el) {
+        if (el.dataset.enabledState === "mixed") {
+            el.indeterminate = true;
+            el.checked = false;
+            el.setAttribute("aria-checked", "mixed");
+            if (window.TavidmViolationSwitch && window.TavidmViolationSwitch.sync) {
+                window.TavidmViolationSwitch.sync(el);
+            }
+        }
+        el.addEventListener("change", function () {
+            el.indeterminate = false;
+            el.dataset.enabledState = el.checked ? "on" : "off";
+            try {
+                const rules = JSON.parse(el.dataset.canonicalRules || "[]");
+                const map = {};
+                rules.forEach(function (rule) { map[rule] = !!el.checked; });
+                el.dataset.memberStates = JSON.stringify(map);
+            } catch (e) { /* ignore */ }
+            if (window.TavidmViolationSwitch && window.TavidmViolationSwitch.sync) {
+                window.TavidmViolationSwitch.sync(el);
+            }
+        });
     });
 
     // --- User management -----------------------------------------------------

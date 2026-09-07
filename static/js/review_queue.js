@@ -33,7 +33,12 @@
             "</div>" +
             "<p class=\"mt-3 text-muted\">" + item.display_id + " · " + item.violation_type + " · Track #" + item.track_id + "</p>" +
             "<p class=\"small text-muted\">" + item.reason_log + "</p>" +
-            "<p class=\"small text-muted\">" + plateLine + "</p>";
+            "<p class=\"small text-muted\">" + plateLine + "</p>" +
+            "<p class=\"small\">Legal status: <strong>" + (item.legal_status || "—") + "</strong>" +
+            (item.flag_only ? " · <span class=\"badge bg-warning text-dark\">flag_only review material</span>" : "") + "</p>" +
+            "<p class=\"small text-muted\">Proposed official: " + (item.proposed_official_category || "—") +
+            (item.verified_official_category ? " · Verified: " + item.verified_official_category : " · Verified: none") + "</p>" +
+            "<p class=\"small text-muted\">Timestamp OCR: unavailable — confirm event time after case materialization.</p>";
         evidenceModal.show();
     }
 

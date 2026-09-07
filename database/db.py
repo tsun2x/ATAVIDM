@@ -88,6 +88,23 @@ violations_by_vehicle_class = _adapter.violations_by_vehicle_class
 violations_by_video = _adapter.violations_by_video
 count_all_violations = _adapter.count_all_violations
 
+# Stage B: Legal-policy persistence, case linkage, audit, permissions
+get_active_legal_policy_version = _adapter.get_active_legal_policy_version
+get_legal_policy_version = _adapter.get_legal_policy_version
+propose_legal_policy_version = _adapter.propose_legal_policy_version
+approve_legal_policy_version = _adapter.approve_legal_policy_version
+create_case_policy_record = _adapter.create_case_policy_record
+record_case_action = _adapter.record_case_action
+get_case_actions = _adapter.get_case_actions
+user_has_permission = _adapter.user_has_permission
+assign_policy_permission = _adapter.assign_policy_permission
+revoke_policy_permission = _adapter.revoke_policy_permission
+get_user_permissions = _adapter.get_user_permissions
+can_confirm_case = _adapter.can_confirm_case
+can_attest_print = _adapter.can_attest_print
+can_approve_policy = _adapter.can_approve_policy
+can_propose_policy = _adapter.can_propose_policy
+
 
 def active_backend() -> str:
     return os.environ.get("DB_BACKEND", "sqlite").strip().lower() or "sqlite"

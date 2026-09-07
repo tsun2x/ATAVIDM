@@ -255,8 +255,11 @@ class TestToggleSnapshots:
         html = Path("templates/settings.html").read_text(encoding="utf-8")
         assert 'role="switch"' in html
         assert "Active" in html and "Inactive" in html
+        assert "violation-group-toggle" in html
         js = Path("static/js/violation_switch.js").read_text(encoding="utf-8")
         assert "aria-checked" in js
+        settings_js = Path("static/js/settings.js").read_text(encoding="utf-8")
+        assert "violation-group-toggle" in settings_js
 
 
 class TestBulkFifo:

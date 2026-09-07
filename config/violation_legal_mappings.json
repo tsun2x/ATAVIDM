@@ -1,0 +1,303 @@
+{
+  "version": "1.0.0",
+  "effective_from": "2026-09-06",
+  "last_review_date": "2026-09-07",
+  "verifier": "TAVIDM project owner (contract review)",
+  "sources": {
+    "city_regulatory_register": {
+      "url": "https://zamboangacity.gov.ph/regulatory/",
+      "note": "Authoritative register identity verified 2026-09-07: Ordinance No. 248 titled REVISED TRAFFIC CODE FOR ZAMBOANGA CITY (Enacted 10 Dec 2002 / Approved 19 Dec 2002); Ordinance No. 944 titled AN ORDINANCE AMENDING CERTAIN PROVISIONS OF ORDINANCE NO. 248 OTHERWISE KNOWN AS THE REVISED TRAFFIC CODE FOR ZAMBOANGA CITY, AS AMENDED (Enacted 24 Jun 2026 / Approved 29 Jun 2026). Full ordinance body text was not extracted from the register page during this pass.",
+      "accessed": "2026-09-07",
+      "status": "register_identity_verified_text_incomplete"
+    },
+    "co944_poster": {
+      "url": "https://drive.google.com/file/d/1ZTJezpWrtTU92JqUEWNAqUe__8YLCENl/view",
+      "note": "Google Drive source still inaccessible for automated extraction. Register confirms CO944 identity/amendment context vs CO248. CTEU poster / City Facebook remain supporting copies only — not substitutes for authoritative text. Behavior-to-penalty mappings not activated.",
+      "accessed": "2026-09-07",
+      "status": "inaccessible"
+    },
+    "co248_amendment": {
+      "url": "https://drive.google.com/file/d/1O_nFw40SiBdZTV41pVnTbrRMOdQkEV9t/view",
+      "note": "Google Drive source still inaccessible for automated extraction. Register confirms CO248 as the Revised Traffic Code baseline amended by later ordinances including CO944. Full text not verified.",
+      "accessed": "2026-09-07",
+      "status": "inaccessible"
+    },
+    "fast_alpr_docs": {
+      "url": "https://github.com/ankandrew/fast-alpr",
+      "note": "Upstream documentation for FastALPR integration. API/model validation not performed during contract review.",
+      "accessed": "2026-09-06",
+      "status": "inaccessible"
+    }
+  },
+  "legal_status_meanings": {
+    "verified": "The behavior-to-category mapping, applicable provision, and reference penalty have been checked against authoritative sources and are approved for active use.",
+    "partially_verified": "Some elements are established but others remain unresolved. The 'verified_elements' and 'unresolved_elements' fields identify which are which.",
+    "unverified": "Legal applicability is not established. Mapping is collected for review only; no penalty or offense-level implications.",
+    "flag_only": "Evidence collection and authorized review only. No official legal classification or reference penalty is enabled."
+  },
+  "proposed_co944_schedule": {
+    "first_offense": "1500",
+    "second_offense": "3000",
+    "third_and_succeeding": "5000",
+    "note": "Proposed schedule from the CO944 poster. NOT applied by default. Must be verified per violation against exact provision and schedule before display as an approved legal reference."
+  },
+  "lookback_policy": {
+    "default_days": 365,
+    "note": "Default recurrence lookback in days. System Administrator may propose changes; CTEU Head/Supervisor must approve before activation."
+  },
+  "mappings": {
+    "Illegal Parking": {
+      "canonical_rule": "Illegal Parking",
+      "official_category_proposed": "Obstruction of Traffic Flow",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Applicable provision (ordinance article/section) not verified against authoritative source.",
+        "Reference penalty schedule not verified.",
+        "Fusion with Obstruction behavior not verified against ordinance text.",
+        "Effective date not established."
+      ],
+      "behavior_details": [
+        "Vehicle stationary in no-parking zone for >= parking_dwell_sec (default 30s).",
+        "Stationary dwell alone is not proof of parking intent — remains review/partial status."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": ["Obstruction"],
+      "notes": "Illegal Parking and Obstruction are fully grouped under the proposed official category Obstruction of Traffic Flow. Either behavior alone belongs to this group; overlapping parking+obstruction observations in the same vehicle episode produce one case retaining both contributing canonical rules and evidence. Canonical identifiers are never renamed. Distinct episodes remain distinct. Legal verification of the category wording remains pending."
+    },
+    "Obstruction": {
+      "canonical_rule": "Obstruction",
+      "official_category_proposed": "Obstruction of Traffic Flow",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Applicable provision not verified against authoritative source.",
+        "Reference penalty schedule not verified.",
+        "Effective date not established."
+      ],
+      "behavior_details": [
+        "Vehicle stationary in active lane for >= obstruction_dwell_sec (default 10s).",
+        "Vehicle stationary on pedestrian crossing for >= crossing_block_sec (default 3s)."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": ["Illegal Parking"],
+      "notes": "Grouped with Illegal Parking under Obstruction of Traffic Flow. Grouping uses existing run, source, track, and episode lifecycle. Unrelated events sharing a plate or occurring in the same video are never grouped. Proposed wording pending legal verification."
+    },
+    "Counterflow": {
+      "canonical_rule": "Counterflow",
+      "official_category_proposed": "Disregarding Traffic Signals",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Applicability of counterflow to entering a one-way street not verified — road direction, geometry, and applicable restrictions must support the observation.",
+        "Applicable provision not verified.",
+        "Reference penalty schedule not verified."
+      ],
+      "behavior_details": [
+        "Vehicle traveling opposite to configured lane flow direction (>= flow_tolerance_degrees deviation) inside active_lane zone, persisting >= counterflow_persist_sec (design default 4s).",
+        "Requires recording datetime context."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": ["Disregarding Traffic Sign", "Failure to Follow Road/Pavement Markings"],
+      "notes": "Proposed grouping is Disregarding Traffic Signals subject to authoritative verification. Do not assume counterflow establishes entering a one-way street."
+    },
+    "Truck-Ban Violation": {
+      "canonical_rule": "Truck-Ban Violation",
+      "official_category_proposed": "Violation of Truck Ban",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Applicable provision not verified against authoritative source.",
+        "Reference penalty schedule not verified.",
+        "Ban window hours not verified against ordinance.",
+        "pickup_truck is NOT automatically covered by truck-ban rules."
+      ],
+      "behavior_details": [
+        "Commercial vehicle (truck only by default) inside truck_ban_zone during configured ban window.",
+        "Requires recording datetime for time-window check."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Proposed official wording 'Violation of Truck Ban'. Verify applicable provision and reference schedule before enabling final mapping."
+    },
+    "No Helmet": {
+      "canonical_rule": "No Helmet",
+      "official_category_proposed": "Unauthorized or Non-Use of Helmet by Motorcycle Riders",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Applicable scope not verified — verify whether the category legally covers all rider scenarios.",
+        "Do NOT extend verified coverage to unfastened or noncompliant helmets merely because the same broad label appears relevant."
+      ],
+      "behavior_details": [
+        "Motorcycle with an associated rider (person within RIDER_ASSOCIATION_PADDING of motorcycle bbox) with no helmet of any kind detected.",
+        "Requires model classes: motorcycle, person, helmet_acceptible, helmet_nut_shell (or alternate acceptable set)."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Detector-only behavior; legal verification pending. Separate from Substandard/Nut-Shell Helmet."
+    },
+    "No Side Mirror": {
+      "canonical_rule": "No Side Mirror",
+      "official_category_proposed": "Incomplete Accessories",
+      "legal_status": "flag_only",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "CTEU proposed 200 PHP per occurrence — treated as UNVERIFIED reference claim until exact legal authority and schedule are established.",
+        "Do NOT attach CO944 tiered schedule or automatically apply 200 PHP.",
+        "Failure to detect a mirror is NOT proof that the mirror is absent."
+      ],
+      "behavior_details": [
+        "Vehicle detected without an associated side_mirror class overlap in the upper portion of the vehicle bbox.",
+        "Non-detection alone is never proof of absence — remains review/partial."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Initial legal status: flag_only. CTEU-supplied 200 PHP is an unverified reference claim."
+    },
+    "Motorcycle Overloading": {
+      "canonical_rule": "Motorcycle Overloading",
+      "official_category_proposed": null,
+      "legal_status": "flag_only",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Do NOT broaden to general passenger or vehicle overloading.",
+        "Do NOT attach CO944 tiered local penalty without a verified applicable provision.",
+        "If a national rule applies, store its citation and schedule separately from local CO944 authority."
+      ],
+      "behavior_details": [
+        "More than two persons associated with a motorcycle (within padded bbox, shared motion) for >= persistence threshold."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Initial legal status: flag_only. Preserves exact canonical scope — not general overloading."
+    },
+    "Disregarding Traffic Sign": {
+      "canonical_rule": "Disregarding Traffic Sign",
+      "official_category_proposed": "Disregarding Traffic Signals",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Behavior-specific applicability not verified.",
+        "Do NOT add red-light detection through this mapping. A display-name change must not imply newly implemented traffic-light recognition."
+      ],
+      "behavior_details": [
+        "Vehicle conflicting with a configured supported sign annotation (no_entry, no_overtaking, no_left_turn, no_u_turn, no_parking, no_stopping).",
+        "STOP and speed_limit signs are explicitly excluded."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": ["Counterflow", "Failure to Follow Road/Pavement Markings"],
+      "notes": "Proposed official category is Disregarding Traffic Signals. Verify behavior-specific applicability before activation."
+    },
+    "Failure to Follow Road/Pavement Markings": {
+      "canonical_rule": "Failure to Follow Road/Pavement Markings",
+      "official_category_proposed": "Disregarding Traffic Signals",
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Do NOT state that an ordinance covers a marking behavior until the applicable authoritative text supports that interpretation.",
+        "Verify any necessary connection between the amending ordinance and underlying traffic-control-device provisions."
+      ],
+      "behavior_details": [
+        "Overtaking across a solid pavement marking (when marking geometry configured).",
+        "Crossing a solid pavement marking (when supported by existing detection evidence).",
+        "Restricted-lane zone dwell as a partial proxy (review outcome)."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": ["Counterflow", "Disregarding Traffic Sign"],
+      "notes": "Proposed grouping is Disregarding Traffic Signals. Retain specific observed details."
+    },
+    "Illegal Terminal": {
+      "canonical_rule": "Illegal Terminal",
+      "official_category_proposed": null,
+      "legal_status": "flag_only",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Do NOT rename every Illegal Terminal case to loading/unloading.",
+        "Do NOT infer passenger activity from stopping alone.",
+        "Do NOT add a new loading/unloading detector through this task.",
+        "Keep a terminal/queue/facility allegation unverified or flag_only until an applicable provision is verified."
+      ],
+      "behavior_details": [
+        "PUV (jeepney/tricycle/autorickshaw) or van with for-hire context, stationary in loading/unloading zone, with passenger-activity evidence.",
+        "Bus requires explicit passenger-activity evidence."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Illegal Loading or Unloading of Passengers is a POSSIBLE legal classification only when evidence and verified provision support that behavior. Initial status: flag_only."
+    },
+    "Unauthorized Passenger in Applicable Truck/Pickup Cargo Area": {
+      "canonical_rule": "Unauthorized Passenger in Applicable Truck/Pickup Cargo Area",
+      "official_category_proposed": null,
+      "legal_status": "flag_only",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Do NOT attach a CO944 penalty without a verified provision.",
+        "Research applicable national or local rule, including vehicle registration, permitted capacity, and freight-handler exceptions.",
+        "Do NOT assume an open cargo bed is legally equivalent to a vehicle's top or cover.",
+        "Do NOT broaden or rewrite the existing detector scope."
+      ],
+      "behavior_details": [
+        "Person associated with truck/pickup cargo ROI (rear 45% of vehicle bbox) via overlap + shared motion for >= persistence threshold.",
+        "Applicability: truck and pickup_truck classes only."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Initial legal status: flag_only. Preserve full canonical identifier. Evidence of a person in an open pickup cargo bed is preserved but no penalty is attached."
+    },
+    "Substandard / Nut-Shell Helmet": {
+      "canonical_rule": "Substandard / Nut-Shell Helmet",
+      "official_category_proposed": null,
+      "legal_status": "unverified",
+      "verified_elements": [],
+      "unresolved_elements": [
+        "Verify whether the proposed official helmet category legally covers the observed behavior.",
+        "Do NOT infer certification noncompliance from visual shape alone.",
+        "Retain 'suspected' or equivalent uncertainty where evidence does not establish compliance status."
+      ],
+      "behavior_details": [
+        "Helmet classified as nut_shell/substandard form factor detected on a rider associated with a motorcycle.",
+        "Requires model classes: motorcycle, person, helmet_acceptable, helmet_nut_shell."
+      ],
+      "provision_reference": null,
+      "penalty_schedule": null,
+      "source_url": null,
+      "mapping_version": "1.0.0",
+      "is_grouped_with": [],
+      "notes": "Do not infer compliance noncompliance from shape alone. Retain suspected uncertainty."
+    }
+  }
+}
