@@ -29,9 +29,9 @@ When documentation and implementation conflict, **report and reconcile** the con
 
 ## Current implementation and approved next revision
 
-- Current implemented schema **v1.2.0**: **11** vehicle detector classes (`autorickshaw`; single `van`; no canonical `uv_express_van` / `piaggio`); **16** object + **9** scene = **25** labels.
+- Current implemented schema **v1.3.0**: **10** vehicle detector classes (`autorickshaw`; single `van`; SUV/crossover consolidated into `car`; no canonical `uv_express_van` / `piaggio`); **15** object + **9** scene = **24** labels.
 - Legacy compatibility: `uv_express_van` normalizes to `van`; ambiguous `piaggio` stays UNCERTAIN until body-form review (`sidecar`→`tricycle`, `integrated`→`autorickshaw`). Migration manifest: `config/training/label_migration_1_1_to_1_2.json`.
-- Seven-class baseline **label set** (`bicycle`, `bus`, `car`, `jeepney`, `motorcycle`, `tricycle`, `truck`) is a valid subset of the 11-class roster; missing production classes `suv_crossover`, `van`, `autorickshaw`, `pickup_truck` must be reported and fail-closed where required. The trained seven-class `best.pt` remains in an **external** training output directory and is **not** integrated into `D:\tavidm\models` (do not claim `models/best.pt` exists).
+- Seven-class baseline **label set** (`bicycle`, `bus`, `car`, `jeepney`, `motorcycle`, `tricycle`, `truck`) is a valid subset of the 10-class roster; missing production classes `van`, `autorickshaw`, and `pickup_truck` must be reported and fail-closed where required. The trained seven-class `best.pt` remains in an **external** training output directory and is **not** integrated into `D:\tavidm\models` (do not claim `models/best.pt` exists).
 - Fixed-camera pavement markings still use operator-saved templates in the design direction; scene marking YOLO classes remain in the pilot schema until a separate markings migration.
 - **12** canonical traffic violations (unchanged by the vehicle-class revision)
 - Violation-engine remediation (2026-08-24): dual confidence, state expiry, footprint membership, geometry profiles, temporal evidence, capability gate — see `docs/VIOLATION_ENGINE_SPECIFICATION.md` §43.

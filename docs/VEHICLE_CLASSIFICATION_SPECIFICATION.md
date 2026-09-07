@@ -2,8 +2,8 @@
 
 **Project:** TAVIDM — Traffic Violation Detection and Monitoring System
 **Specification:** Vehicle Classification
-**Status:** ACTIVE — owner-approved 2026-08-22 revision; machine-readable/runtime contract aligned at schema_version **1.2.0**
-**Machine-readable contract:** `config/training/class_schema.json` schema_version **1.2.0** (11 vehicle detector classes; 16 object + 9 scene = 25 labels)
+**Status:** ACTIVE — owner-approved 2026-08-27 revision; machine-readable/runtime contract aligned at schema_version **1.3.0**
+**Machine-readable contract:** `config/training/class_schema.json` schema_version **1.3.0** (10 vehicle detector classes; 15 object + 9 scene = 24 labels)
 **IMPORTANT:** This specification is subject to revision based on feedback, corrections, or requirements provided by the thesis adviser/panel/professor. When such feedback is explicitly provided by the user, treat the newer approved decision as superseding the previous specification. Frozen detector-class names must not be silently renamed.
 **Purpose:** Define how TAVIDM classifies vehicles and how vehicle classification is consumed by the Violation Engine.
 
@@ -50,7 +50,7 @@ Example:
 ```text
 Vehicle
  ├── Broad Class: passenger_vehicle   (derived; not a detector label)
- │    └── Detector: car | suv_crossover | van
+ │    └── Detector: car | van
  │
  ├── Broad Class: public_utility_vehicle
  │    └── Detector: jeepney | tricycle | autorickshaw | bus
@@ -77,23 +77,22 @@ without treating broad groups themselves as YOLO detector labels.
 
 # 3. Frozen Vehicle Detector Classes
 
-TAVIDM freezes exactly **11** visual vehicle detector classes under the owner-approved 2026-08-22 revision. The machine-readable contract and runtime registry are aligned at schema_version **1.2.0**.
+TAVIDM freezes exactly **10** visual vehicle detector classes under the owner-approved 2026-08-27 revision. The machine-readable contract and runtime registry are aligned at schema_version **1.3.0**.
 
 These strings are detector labels. They must not be merged, collapsed, or replaced by broad category names.
 
-### Canonical vehicle detector roster (count = 11)
+### Canonical vehicle detector roster (count = 10)
 
 1. `car`
-2. `suv_crossover`
-3. `van`
-4. `jeepney`
-5. `tricycle`
-6. `autorickshaw`
-7. `bus`
-8. `truck`
-9. `pickup_truck`
-10. `motorcycle`
-11. `bicycle`
+2. `van`
+3. `jeepney`
+4. `tricycle`
+5. `autorickshaw`
+6. `bus`
+7. `truck`
+8. `pickup_truck`
+9. `motorcycle`
+10. `bicycle`
 
 ### Required distinctions
 
@@ -101,6 +100,7 @@ These strings are detector labels. They must not be merged, collapsed, or replac
 * `van` is the only visual van detector class. Apparent public/for-hire operation is contextual metadata, not `uv_express_van` object detection.
 * `tricycle` and `autorickshaw` are separate from each other and from `motorcycle`.
 * `bus` and `jeepney` are separate.
+* Sedans, SUVs, and crossovers use the canonical `car` label; legacy `suv` and `suv_crossover` labels normalize to `car`.
 * Broad keys such as `passenger_vehicle`, `public_utility_vehicle`, and `commercial_vehicle` are **derived hierarchy values**, not detector labels.
 * `UNKNOWN` / `UNCERTAIN` are review states, not detector classes.
 * `Private Vehicle` is a display/manuscript phrase only; it is not a detector label.
@@ -109,7 +109,7 @@ These strings are detector labels. They must not be merged, collapsed, or replac
 ### Derived hierarchy (from `class_schema.json`)
 
 ```text
-passenger_vehicle        → car, suv_crossover, van
+passenger_vehicle        → car, van
 public_utility_vehicle   → jeepney, tricycle, autorickshaw, bus; van only when contextual public/for-hire evidence supports applicability
 commercial_vehicle       → truck, pickup_truck
 two_or_three_wheeled     → motorcycle, tricycle, autorickshaw, bicycle
@@ -134,15 +134,15 @@ The exact applicable rules are defined by the Violation Engine specification.
 
 ## 3.2 Car (`car`)
 
-General passenger vehicles such as ordinary cars and sedans.
+General passenger vehicles including ordinary cars, sedans, SUVs, and crossovers.
 
 Broad class: `passenger_vehicle`.
 
 ---
 
-## 3.3 SUV / Crossover (`suv_crossover`)
+## 3.3 Legacy SUV / Crossover mapping
 
-SUVs and similar passenger vehicles are classified separately when visual evidence supports it.
+`suv` and `suv_crossover` are legacy source/model labels. Normalize both to canonical `car`; do not annotate them as separate detector classes.
 
 Broad class: `passenger_vehicle`.
 
@@ -736,7 +736,7 @@ Both specifications should be loaded before implementing or modifying the TAVIDM
 **Current status:**
 
 > Vehicle Classification Specification — ACTIVE; owner-approved 2026-08-22 roster has **11 visual vehicle detector classes** (includes separate `pickup_truck`, uses `autorickshaw`, and uses one `van` class)
-> Machine-readable/runtime alignment: `config/training/class_schema.json` schema_version **1.2.0** matches `core/detection_config.FROZEN_VEHICLE_DETECTOR_CLASSES`
+> Machine-readable/runtime alignment: `config/training/class_schema.json` schema_version **1.3.0** matches `core/detection_config.FROZEN_VEHICLE_DETECTOR_CLASSES`
 > Violation Engine Specification — ACTIVE / DESIGN IN PROGRESS
 > Design update: `docs/VIOLATION_ENGINE_DESIGN_UPDATE_2026-08-16.md`
 > Canonical violation roster: 12 types; Illegal Parking and Illegal Terminal are separate

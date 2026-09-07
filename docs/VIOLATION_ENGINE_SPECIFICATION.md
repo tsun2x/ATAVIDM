@@ -1482,12 +1482,12 @@ Statuses: **implemented** = automatic candidates with working logic under stated
 
 ## 43.9 Vehicle detector roster (aligned 2026-08-24)
 
-The violation engine consumes the **11-class** vehicle detector roster from `config/training/class_schema.json` schema_version **1.2.0**. This does **not** change the **12** canonical violation rules.
+The violation engine consumes the **10-class** vehicle detector roster from `config/training/class_schema.json` schema_version **1.3.0**. SUV and crossover labels normalize to `car`. This does **not** change the **12** canonical violation rules.
 
 * `van` is the only visual van class; UV Express / for-hire is contextual metadata (never a YOLO class).
 * `autorickshaw` is the integrated three-wheel detector class; `piaggio` is brand metadata only.
 * Legacy `uv_express_van` may normalize to `van`. Ambiguous legacy `piaggio` is UNCERTAIN until body-form review.
-* A trained seven-class baseline **label set** is a valid subset of the 11-class roster; missing `suv_crossover`, `van`, `autorickshaw`, `pickup_truck` must fail-close related automatic evaluation. The trained seven-class `best.pt` remains external (not integrated into `D:\tavidm\models`; do not claim `models/best.pt` exists).
+* A trained seven-class baseline **label set** is a valid subset of the 10-class roster; missing `van`, `autorickshaw`, and `pickup_truck` must fail-close related automatic evaluation. The trained seven-class `best.pt` remains external (not integrated into `D:\tavidm\models`; do not claim `models/best.pt` exists).
 
 1. Exact Illegal Parking / Illegal Terminal numerical dwell and parking-like / terminal-like evidence thresholds (frozen legal policy).
 2. Obstruction legitimate-exception detectors (enforcer, queue, incident) — currently not automatic.

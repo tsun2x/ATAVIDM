@@ -34,13 +34,13 @@ PRETRAINED_WEIGHTS = "yolov8m.pt"
 # Detection classes
 # ---------------------------------------------------------------------------
 # Frozen Phase 2 vehicle detector roster (owner-approved 2026-08-22 / implemented
-# 2026-08-24): exactly **11** vehicle labels. Machine-readable contract:
-# config/training/class_schema.json (schema_version 1.2.0).
+# 2026-08-27): exactly **10** vehicle labels. Machine-readable contract:
+# config/training/class_schema.json (schema_version 1.3.0).
 # Attribute / person labels remain separate from the vehicle roster.
 # Broad hierarchy keys (passenger_vehicle, etc.) are NOT detector labels.
 
 YOLO_CLASS_CAR = "car"
-YOLO_CLASS_SUV_CROSSOVER = "suv_crossover"
+YOLO_CLASS_SUV_CROSSOVER = "suv_crossover"  # legacy alias consolidated to car
 YOLO_CLASS_VAN = "van"
 YOLO_CLASS_JEEPNEY = "jeepney"
 YOLO_CLASS_TRICYCLE = "tricycle"
@@ -57,7 +57,7 @@ YOLO_CLASS_HELMET_NUT_SHELL = "helmet_nut_shell"
 YOLO_CLASS_SIDE_MIRROR = "side_mirror"
 
 # Legacy / non-canonical labels (compatibility only — not in the frozen roster).
-YOLO_CLASS_SUV = "suv"  # legacy alias for suv_crossover
+YOLO_CLASS_SUV = "suv"  # legacy alias consolidated to car
 YOLO_CLASS_HELMET = "helmet"  # legacy generic helmet class
 LEGACY_CLASS_UV_EXPRESS_VAN = "uv_express_van"  # consolidates to van
 LEGACY_CLASS_PIAGGIO = "piaggio"  # brand; requires body-form review
@@ -68,7 +68,6 @@ YOLO_CLASS_PIAGGIO = LEGACY_CLASS_PIAGGIO
 
 FROZEN_VEHICLE_DETECTOR_CLASSES = (
     YOLO_CLASS_CAR,
-    YOLO_CLASS_SUV_CROSSOVER,
     YOLO_CLASS_VAN,
     YOLO_CLASS_JEEPNEY,
     YOLO_CLASS_TRICYCLE,
@@ -83,7 +82,7 @@ FROZEN_VEHICLE_DETECTOR_CLASSES = (
 # Seven-class baseline roster (label set only). A trained seven-class ``best.pt``
 # exists in an *external* training output directory and has **not** been
 # integrated into ``D:\tavidm\models``. Do not claim ``models/best.pt`` exists.
-# When such a model is loaded elsewhere, it is a valid subset of the 11-class roster.
+# When such a model is loaded elsewhere, it is a valid subset of the 10-class roster.
 SEVEN_CLASS_BASELINE_VEHICLES = (
     YOLO_CLASS_BICYCLE,
     YOLO_CLASS_BUS,
@@ -94,7 +93,6 @@ SEVEN_CLASS_BASELINE_VEHICLES = (
     YOLO_CLASS_TRUCK,
 )
 SEVEN_CLASS_BASELINE_MISSING = (
-    YOLO_CLASS_SUV_CROSSOVER,
     YOLO_CLASS_VAN,
     YOLO_CLASS_AUTORICKSHAW,
     YOLO_CLASS_PICKUP_TRUCK,
@@ -104,7 +102,6 @@ SEVEN_CLASS_BASELINE_MISSING = (
 VEHICLE_HIERARCHY: dict[str, tuple[str, ...]] = {
     "passenger_vehicle": (
         YOLO_CLASS_CAR,
-        YOLO_CLASS_SUV_CROSSOVER,
         YOLO_CLASS_VAN,
     ),
     # van may also be treated as PUV when contextual for-hire evidence exists;
@@ -135,8 +132,11 @@ VEHICLE_CATEGORIES: dict[str, tuple[str, ...]] = {
     "Two- or Three-Wheeled Vehicle": VEHICLE_HIERARCHY["two_or_three_wheeled"],
 }
 
-# Runtime vehicle set used by the rule engine (frozen + safe legacy suv alias).
-VEHICLE_CLASSES = FROZEN_VEHICLE_DETECTOR_CLASSES + (YOLO_CLASS_SUV,)
+# Runtime vehicle set used by the rule engine (frozen + safe legacy SUV aliases).
+VEHICLE_CLASSES = FROZEN_VEHICLE_DETECTOR_CLASSES + (
+    YOLO_CLASS_SUV,
+    YOLO_CLASS_SUV_CROSSOVER,
+)
 
 # Labels a loaded model may still emit that we accept for compatibility processing.
 LEGACY_ACCEPTED_MODEL_LABELS = (
@@ -166,7 +166,8 @@ CARGO_PASSENGER_APPLICABLE_CLASSES = (
 
 # Safe legacy → canonical consolidations only (never piaggio).
 LEGACY_VEHICLE_CLASS_ALIASES = {
-    YOLO_CLASS_SUV: YOLO_CLASS_SUV_CROSSOVER,
+    YOLO_CLASS_SUV: YOLO_CLASS_CAR,
+    YOLO_CLASS_SUV_CROSSOVER: YOLO_CLASS_CAR,
     LEGACY_CLASS_UV_EXPRESS_VAN: YOLO_CLASS_VAN,
 }
 
@@ -189,7 +190,7 @@ def normalize_vehicle_class(class_label: str) -> str:
 
 @dataclass(frozen=True)
 class VehicleLabelResolution:
-    """Result of resolving a model/annotation vehicle label to the 11-class roster."""
+    """Result of resolving a model/annotation vehicle label to the 10-class roster."""
 
     raw_class: str
     canonical_class: str | None
@@ -277,7 +278,7 @@ def is_canonical_vehicle_class(class_label: str) -> bool:
 
 
 def seven_class_baseline_coverage(available_classes: set[str] | tuple[str, ...] | list[str]) -> dict:
-    """Report how a loaded model covers the 11-class roster vs the 7-class baseline."""
+    """Report how a loaded model covers the 10-class roster vs the 7-class baseline."""
     available = {str(c).lower() for c in available_classes}
     present = [c for c in FROZEN_VEHICLE_DETECTOR_CLASSES if c in available]
     missing = [c for c in FROZEN_VEHICLE_DETECTOR_CLASSES if c not in available]

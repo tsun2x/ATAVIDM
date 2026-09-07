@@ -1,0 +1,49 @@
+{
+  "manifest_version": "1.0",
+  "from_schema_version": "1.2.0",
+  "to_schema_version": "1.3.0",
+  "purpose": "Name-based migration guidance for the owner-approved merge of SUV/crossover into car. Does not rewrite datasets.",
+  "safe_consolidations": [
+    {
+      "from": "suv_crossover",
+      "to": "car",
+      "action": "safe_rename",
+      "notes": "SUVs, crossovers, and sedans share the canonical car detector label. Preserve source provenance during remapping."
+    },
+    {
+      "from": "suv",
+      "to": "car",
+      "action": "safe_rename",
+      "notes": "Legacy short SUV labels use the same owner-approved consolidation."
+    }
+  ],
+  "requires_image_review": [],
+  "added_canonical_classes": [],
+  "removed_canonical_classes": ["suv_crossover"],
+  "unchanged_canonical_classes": [
+    "car",
+    "van",
+    "jeepney",
+    "tricycle",
+    "autorickshaw",
+    "bus",
+    "truck",
+    "pickup_truck",
+    "motorcycle",
+    "bicycle"
+  ],
+  "numeric_yolo_class_id_policy": {
+    "warning": "YOLO class IDs are embedded in each weights file's names map. Never rewrite label IDs by assuming the 1.2.0 order.",
+    "safe_approach": "Validate the source names map, remap by class name, then export a new dataset version whose numeric IDs match schema 1.3.0."
+  },
+  "seven_class_baseline_weights": {
+    "status": "external_training_output_not_integrated",
+    "classes": ["bicycle", "bus", "car", "jeepney", "motorcycle", "tricycle", "truck"],
+    "missing_canonical": ["van", "autorickshaw", "pickup_truck"],
+    "notes": "The seven-class baseline already uses car as its only passenger-car body label and remains a valid subset of the 10-class roster."
+  },
+  "dry_run": {
+    "utility": "python -m core.label_migration_audit",
+    "behavior": "Reports the current contract and optional numeric label counts without rewriting files."
+  }
+}

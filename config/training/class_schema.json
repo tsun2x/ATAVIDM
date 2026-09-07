@@ -1,12 +1,11 @@
 {
-  "schema_version": "1.2.0",
+  "schema_version": "1.3.0",
   "status": "frozen_for_phase2_pilot",
   "model_family": "YOLOv8m",
   "tracker": "ByteTrack",
   "principle": "Annotations describe observable objects or attributes; violations are rule-engine outputs.",
   "object_classes": [
     "car",
-    "suv_crossover",
     "van",
     "jeepney",
     "tricycle",
@@ -41,20 +40,21 @@
     "collision_vehicle",
     "private_vehicle",
     "public_utility_vehicle",
+    "suv",
+    "suv_crossover",
     "uv_express_van",
     "piaggio",
     "unknown"
   ],
   "unknown_policy": "Do not force a class when the object or attribute is not visually observable; record the review state as unknown or uncertain. UNKNOWN and UNCERTAIN are review states, not detector labels.",
   "hierarchy": {
-    "passenger_vehicle": ["car", "suv_crossover", "van"],
+    "passenger_vehicle": ["car", "van"],
     "public_utility_vehicle": ["jeepney", "tricycle", "autorickshaw", "bus"],
     "commercial_vehicle": ["truck", "pickup_truck"],
     "two_or_three_wheeled": ["motorcycle", "tricycle", "autorickshaw", "bicycle"]
   },
   "vehicle_detector_classes": [
     "car",
-    "suv_crossover",
     "van",
     "jeepney",
     "tricycle",
@@ -66,17 +66,17 @@
     "bicycle"
   ],
   "notes": {
+    "car": "Includes sedans, SUVs, and crossovers. SUV/crossover is not a separate detector class.",
     "van": "Only visual van detector class. UV Express / public-for-hire operation is contextual metadata, not a YOLO class. Plate appearance alone is not conclusive authorization.",
     "autorickshaw": "Integrated three-wheel passenger/cargo body. Distinct from conventional motorcycle-with-sidecar tricycle and from motorcycle. Piaggio is brand metadata, not a detector class.",
     "pickup_truck": "Separate detector class from truck. Applicable to Unauthorized Passenger in Applicable Truck/Pickup Cargo Area. Not automatically included in truck-ban applicability.",
-    "suv_crossover": "SUVs and crossover passenger vehicles. Unrelated to UV Express. Derived passenger_vehicle with car and van.",
     "broad_categories": "Hierarchy keys are derived broad classes for rule applicability; they are not detector labels.",
-    "legacy_labels": "uv_express_van may normalize to van at runtime. Ambiguous legacy piaggio must not auto-map; requires body-form review (tricycle vs autorickshaw) or UNCERTAIN."
+    "legacy_labels": "suv and suv_crossover normalize to car; uv_express_van normalizes to van. Ambiguous legacy piaggio must not auto-map; requires body-form review (tricycle vs autorickshaw) or UNCERTAIN."
   },
   "counts": {
-    "vehicle_detector_classes": 11,
-    "object_classes": 16,
+    "vehicle_detector_classes": 10,
+    "object_classes": 15,
     "scene_classes": 9,
-    "total_labels": 25
+    "total_labels": 24
   }
 }

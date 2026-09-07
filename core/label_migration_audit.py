@@ -24,7 +24,7 @@ from core.detection_config import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST_PATH = ROOT / "config" / "training" / "label_migration_1_1_to_1_2.json"
+MANIFEST_PATH = ROOT / "config" / "training" / "label_migration_1_2_to_1_3.json"
 SCHEMA_PATH = ROOT / "config" / "training" / "class_schema.json"
 
 
@@ -60,8 +60,9 @@ def audit_label_directory(labels_dir: Path) -> dict:
         "class_id_counts": dict(sorted(id_counts.items())),
         "warning": (
             "Numeric class IDs are dataset-specific. Do not assume they match "
-            "the 1.1.0 or 1.2.0 name order without validating the source names map. "
-            f"Legacy name consolidations: {LEGACY_CLASS_UV_EXPRESS_VAN}→van (safe); "
+            "a prior schema's name order without validating the source names map. "
+            "Legacy SUV labels consolidate to car; "
+            f"{LEGACY_CLASS_UV_EXPRESS_VAN}→van (safe); "
             f"{LEGACY_CLASS_PIAGGIO}→tricycle|autorickshaw (manual review only)."
         ),
     }

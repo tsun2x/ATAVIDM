@@ -205,7 +205,7 @@ def baseline_capability_notes(available_classes: Iterable[str]) -> list[str]:
     if coverage["is_valid_seven_class_subset"]:
         missing = ", ".join(SEVEN_CLASS_BASELINE_MISSING)
         notes.append(
-            "Loaded model matches the seven-class baseline subset of the 11-class "
+            "Loaded model matches the seven-class baseline subset of the 10-class "
             f"roster. Unavailable canonical vehicle classes: {missing}. "
             "Rules requiring those classes must fail closed."
         )

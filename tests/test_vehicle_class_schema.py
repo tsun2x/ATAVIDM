@@ -1,4 +1,4 @@
-"""Frozen 11-class vehicle detector roster and Phase 2 class-schema contract tests."""
+"""Frozen 10-class vehicle detector roster and Phase 2 class-schema contract tests."""
 
 from __future__ import annotations
 
@@ -38,7 +38,6 @@ SCHEMA_PATH = ROOT / "config" / "training" / "class_schema.json"
 
 FROZEN_VEHICLES = (
     "car",
-    "suv_crossover",
     "van",
     "jeepney",
     "tricycle",
@@ -78,9 +77,9 @@ def _load_schema() -> dict:
 
 
 class TestFrozenVehicleRoster:
-    def test_exactly_eleven_unique_vehicle_classes(self):
-        assert len(FROZEN_VEHICLE_DETECTOR_CLASSES) == 11
-        assert len(set(FROZEN_VEHICLE_DETECTOR_CLASSES)) == 11
+    def test_exactly_ten_unique_vehicle_classes(self):
+        assert len(FROZEN_VEHICLE_DETECTOR_CLASSES) == 10
+        assert len(set(FROZEN_VEHICLE_DETECTOR_CLASSES)) == 10
 
     def test_exact_membership_and_order(self):
         assert FROZEN_VEHICLE_DETECTOR_CLASSES == FROZEN_VEHICLES
@@ -100,10 +99,14 @@ class TestFrozenVehicleRoster:
         assert YOLO_CLASS_TRUCK in FROZEN_VEHICLE_DETECTOR_CLASSES
         assert YOLO_CLASS_PICKUP_TRUCK != YOLO_CLASS_TRUCK
 
-    def test_suv_crossover_distinct_from_van(self):
-        assert YOLO_CLASS_SUV_CROSSOVER in FROZEN_VEHICLE_DETECTOR_CLASSES
+    def test_suv_and_crossover_merge_into_car(self):
+        assert YOLO_CLASS_SUV_CROSSOVER not in FROZEN_VEHICLE_DETECTOR_CLASSES
         assert YOLO_CLASS_VAN in FROZEN_VEHICLE_DETECTOR_CLASSES
-        assert YOLO_CLASS_SUV_CROSSOVER != YOLO_CLASS_VAN
+        assert normalize_vehicle_class("suv") == "car"
+        assert normalize_vehicle_class("suv_crossover") == "car"
+        assert resolve_vehicle_label("suv").canonical_class == "car"
+        assert resolve_vehicle_label("suv_crossover").canonical_class == "car"
+        assert vehicle_hierarchy_key("suv") == "passenger_vehicle"
         assert vehicle_hierarchy_key("suv_crossover") == "passenger_vehicle"
         assert vehicle_hierarchy_key("van") == "passenger_vehicle"
 
@@ -218,9 +221,8 @@ class TestSevenClassBaseline:
         assert coverage["is_valid_seven_class_subset"] is True
         assert set(coverage["missing_canonical"]) == set(SEVEN_CLASS_BASELINE_MISSING)
 
-    def test_missing_four_production_classes_reported(self):
+    def test_missing_three_production_classes_reported(self):
         assert SEVEN_CLASS_BASELINE_MISSING == (
-            "suv_crossover",
             "van",
             "autorickshaw",
             "pickup_truck",
@@ -234,20 +236,20 @@ class TestSevenClassBaseline:
 class TestClassSchemaContract:
     def test_schema_version_and_status(self):
         schema = _load_schema()
-        assert schema["schema_version"] == "1.2.0"
+        assert schema["schema_version"] == "1.3.0"
         assert schema["status"] == "frozen_for_phase2_pilot"
 
     def test_object_and_scene_counts(self):
         schema = _load_schema()
         objects = schema["object_classes"]
         scenes = schema["scene_classes"]
-        assert len(objects) == 16
+        assert len(objects) == 15
         assert len(scenes) == 9
-        assert len(objects) + len(scenes) == 25
-        assert schema["counts"]["vehicle_detector_classes"] == 11
-        assert schema["counts"]["object_classes"] == 16
+        assert len(objects) + len(scenes) == 24
+        assert schema["counts"]["vehicle_detector_classes"] == 10
+        assert schema["counts"]["object_classes"] == 15
         assert schema["counts"]["scene_classes"] == 9
-        assert schema["counts"]["total_labels"] == 25
+        assert schema["counts"]["total_labels"] == 24
 
     def test_vehicle_detector_classes_match_runtime(self):
         schema = _load_schema()
@@ -262,38 +264,40 @@ class TestClassSchemaContract:
         assert "piaggio" not in objects
         assert "uv_express_van" not in vehicles
         assert "piaggio" not in vehicles
+        assert "suv_crossover" not in objects
+        assert "suv_crossover" not in vehicles
         assert "uv_express_van" in schema["excluded_classes"]
         assert "piaggio" in schema["excluded_classes"]
+        assert "suv_crossover" in schema["excluded_classes"]
         assert "autorickshaw" in objects
         assert "autorickshaw" in vehicles
 
     def test_hierarchy_in_schema(self):
         schema = _load_schema()
         assert schema["hierarchy"]["commercial_vehicle"] == ["truck", "pickup_truck"]
-        assert schema["hierarchy"]["passenger_vehicle"] == ["car", "suv_crossover", "van"]
+        assert schema["hierarchy"]["passenger_vehicle"] == ["car", "van"]
         assert "autorickshaw" in schema["hierarchy"]["public_utility_vehicle"]
         assert "uv_express_van" not in schema["hierarchy"]["public_utility_vehicle"]
         assert "piaggio" not in schema["hierarchy"]["two_or_three_wheeled"]
 
     def test_runtime_and_schema_agree_via_audit(self):
         contract = summarize_contract()
-        assert contract["schema_version"] == "1.2.0"
+        assert contract["schema_version"] == "1.3.0"
         assert contract["runtime_matches_schema"] is True
-        assert len(contract["vehicle_detector_classes"]) == 11
+        assert len(contract["vehicle_detector_classes"]) == 10
 
 
 class TestMigrationManifest:
     def test_manifest_safe_and_review_actions(self):
         manifest = load_manifest()
-        assert manifest["from_schema_version"] == "1.1.0"
-        assert manifest["to_schema_version"] == "1.2.0"
+        assert manifest["from_schema_version"] == "1.2.0"
+        assert manifest["to_schema_version"] == "1.3.0"
         safe = {item["from"]: item["to"] for item in manifest["safe_consolidations"]}
-        assert safe["uv_express_van"] == "van"
-        review = manifest["requires_image_review"][0]
-        assert review["from"] == "piaggio"
-        assert set(review["candidates"]) == {"tricycle", "autorickshaw"}
-        assert "autorickshaw" in manifest["added_canonical_classes"]
-        assert set(manifest["removed_canonical_classes"]) == {"uv_express_van", "piaggio"}
+        assert safe["suv"] == "car"
+        assert safe["suv_crossover"] == "car"
+        assert manifest["requires_image_review"] == []
+        assert manifest["added_canonical_classes"] == []
+        assert manifest["removed_canonical_classes"] == ["suv_crossover"]
 
 
 class TestApplicabilityHelpers:
@@ -309,8 +313,9 @@ class TestApplicabilityHelpers:
         assert is_truck_ban_applicable("truck")
         assert not is_truck_ban_applicable("pickup_truck")
 
-    def test_legacy_suv_normalizes_to_suv_crossover(self):
-        assert normalize_vehicle_class("suv") == "suv_crossover"
+    def test_legacy_suv_normalizes_to_car(self):
+        assert normalize_vehicle_class("suv") == "car"
+        assert normalize_vehicle_class("suv_crossover") == "car"
         assert vehicle_hierarchy_key("suv") == "passenger_vehicle"
 
 

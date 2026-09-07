@@ -1,22 +1,21 @@
 # Phase 2 Annotation Guide
 
-Use `config/training/class_schema.json` (schema_version **1.2.0**) as the label source of truth.
+Use `config/training/class_schema.json` (schema_version **1.3.0**) as the label source of truth.
 
-The pilot contract freezes **25** labels: **16** object classes and **9** scene classes. Exactly **11** of the object classes are vehicle detector classes.
+The pilot contract freezes **24** labels: **15** object classes and **9** scene classes. Exactly **10** of the object classes are vehicle detector classes.
 
-## Canonical vehicle detector roster (11)
+## Canonical vehicle detector roster (10)
 
 1. `car`
-2. `suv_crossover`
-3. `van`
-4. `jeepney`
-5. `tricycle`
-6. `autorickshaw`
-7. `bus`
-8. `truck`
-9. `pickup_truck`
-10. `motorcycle`
-11. `bicycle`
+2. `van`
+3. `jeepney`
+4. `tricycle`
+5. `autorickshaw`
+6. `bus`
+7. `truck`
+8. `pickup_truck`
+9. `motorcycle`
+10. `bicycle`
 
 ## General rules
 
@@ -27,13 +26,13 @@ The pilot contract freezes **25** labels: **16** object classes and **9** scene 
 - Preserve `truck` and `pickup_truck` as distinct classes. Do not collapse them.
 - Preserve `tricycle` and `autorickshaw` as distinct from each other and from `motorcycle`.
 - Preserve `bus` and `jeepney` as distinct.
-- `suv_crossover` covers SUVs and crossovers; it is unrelated to UV Express.
+- Label sedans, SUVs, and crossovers as `car`; do not annotate `suv` or `suv_crossover` as detector classes.
 - Associate `rider` only with people actually on the motorcycle; adjacent pedestrians remain `person`.
 - Use `helmet_nut_shell` only for visibly supported form. Other supported helmets use `helmet_acceptable`; uncertain type goes to review.
 - A mirror that is occluded or outside useful resolution is unknown, not absent.
 - Label only supported Philippine sign and marking families. Do not map foreign-looking signs into Philippine classes.
 - Do not annotate `violation`; the rule engine derives candidates from objects, tracks, zones, time, and context.
-- Do not annotate `collision_vehicle`, `private_vehicle`, `public_utility_vehicle`, `uv_express_van`, `piaggio`, or `unknown` as detector labels. Broad hierarchy keys are derived, not drawn.
+- Do not annotate `collision_vehicle`, `private_vehicle`, `public_utility_vehicle`, `suv`, `suv_crossover`, `uv_express_van`, `piaggio`, or `unknown` as detector labels. Broad hierarchy keys are derived, not drawn.
 - When evidence is insufficient, record `UNKNOWN` / `UNCERTAIN` as a review state. Do not force a class.
 
 ## Pickup truck (`pickup_truck`)
@@ -82,10 +81,11 @@ A person whose box merely overlaps the vehicle box is **not** sufficient evidenc
 
 ## Legacy migration (do not bulk-auto-rewrite)
 
-See `config/training/label_migration_1_1_to_1_2.json`:
+See the historical `config/training/label_migration_1_1_to_1_2.json` and current `config/training/label_migration_1_2_to_1_3.json`:
 
 - `uv_express_van` → `van` (safe consolidation)
 - `piaggio` → `tricycle` **or** `autorickshaw` only after image review of body form
+- `suv` / `suv_crossover` → `car` (safe name consolidation after validating the source names map)
 
 Dry-run audit (no rewrites): `python -m core.label_migration_audit`
 
