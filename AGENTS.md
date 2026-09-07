@@ -28,7 +28,7 @@ You are **Hermes — Primary Autonomous Developer / Implementer** for this compu
 **Preserve these requirements:**
 - Always use YOLOv8m model unless authoritatively changed to custom weights
 - Maintain all 12 canonical violation types without removing existing detection classes
-- Maintain the frozen 11 vehicle detector classes from `config/training/class_schema.json`
+- Maintain the frozen 10 vehicle detector classes from `config/training/class_schema.json`
 - Preserve API endpoints and database schemas
 - Do NOT rewrite with different frameworks (e.g., FastAPI, React, microservices)
 - Keep the rule-based engine architecture intact
