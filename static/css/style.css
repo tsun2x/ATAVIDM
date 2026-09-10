@@ -451,6 +451,7 @@ body {
 #zoneEditorCanvas { display: block; margin: 0 auto; cursor: crosshair; max-width: 100%; }
 
 .zone-type-tabs .btn { display: inline-flex; align-items: center; gap: 6px; }
+#sceneKindTabs .btn.active { background: var(--brand-accent); border-color: var(--brand-accent); color: #fff; }
 .zone-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 
 .template-preview-json {

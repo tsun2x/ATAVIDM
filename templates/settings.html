@@ -99,6 +99,25 @@
                                     </span>
                                     {% endfor %}
                                 </div>
+                                {% if group.group_id == 'Obstruction of Traffic Flow' or 'Obstruction' in group.canonical_rules %}
+                                <div class="tavidm-switch-reason small mt-1" data-dwell-for="Obstruction">
+                                    Obstruction dwell:
+                                    <strong data-setting-value="obstruction_dwell_sec">{{ settings.obstruction_dwell_sec }}</strong>s
+                                    <a class="ms-1" href="#param-obstruction-dwell">Edit under Detection &amp; Rule Parameters</a>
+                                </div>
+                                <div class="tavidm-switch-reason small mt-1" data-dwell-for="crossing_block">
+                                    Pedestrian-crossing block:
+                                    <strong data-setting-value="crossing_block_sec">{{ settings.crossing_block_sec }}</strong>s
+                                    <a class="ms-1" href="#param-crossing-block">Edit under Detection &amp; Rule Parameters</a>
+                                </div>
+                                {% endif %}
+                                {% if group.group_id == 'Illegal Terminal' or 'Illegal Terminal' in group.canonical_rules %}
+                                <div class="tavidm-switch-reason small mt-1" data-dwell-for="Illegal Terminal">
+                                    Loading / terminal dwell:
+                                    <strong data-setting-value="loading_dwell_sec">{{ settings.loading_dwell_sec }}</strong>s
+                                    <a class="ms-1" href="#param-loading-dwell">Edit under Detection &amp; Rule Parameters</a>
+                                </div>
+                                {% endif %}
                                 {% if group.mixed %}
                                 <div class="tavidm-switch-reason text-warning small">
                                     Mixed legacy state — underlying rules differ. Saving without changing this
@@ -133,7 +152,7 @@
             </div>
         </div>
 
-        <div class="card card-panel mt-4">
+        <div class="card card-panel mt-4" id="detection-rule-parameters">
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection &amp; Rule Parameters</h5></div>
             <div class="card-body">
                 <div class="mb-4">
@@ -170,15 +189,15 @@
                     </div>
                 </div>
                 <div class="row g-2 mb-3">
-                    <div class="col-4">
+                    <div class="col-4" id="param-obstruction-dwell">
                         <label class="form-label" for="obstructionDwell">Obstruction (s)</label>
                         <input type="number" class="form-control" id="obstructionDwell" value="{{ settings.obstruction_dwell_sec }}" min="1" step="0.5">
                     </div>
-                    <div class="col-4">
+                    <div class="col-4" id="param-loading-dwell">
                         <label class="form-label" for="loadingDwell">Loading Zone (s)</label>
                         <input type="number" class="form-control" id="loadingDwell" value="{{ settings.loading_dwell_sec }}" min="1" step="0.5">
                     </div>
-                    <div class="col-4">
+                    <div class="col-4" id="param-crossing-block">
                         <label class="form-label" for="crossingBlock">Crossing Block (s)</label>
                         <input type="number" class="form-control" id="crossingBlock" value="{{ settings.crossing_block_sec }}" min="1" step="0.5">
                     </div>

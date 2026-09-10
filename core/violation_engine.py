@@ -346,14 +346,38 @@ def _iou(a: dict[str, Any], b: dict[str, Any]) -> float:
 
 def _associate_riders(
     motorcycle: dict[str, Any],
-    persons: list[dict[str, Any]],
+    riders: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    riders: list[dict[str, Any]] = []
-    for person in persons:
-        center = _bbox_center(person)
+    """Associate motorcycle with rider detections only (never person)."""
+    associated: list[dict[str, Any]] = []
+    for rider in riders:
+        if rider.get("class_label") != YOLO_CLASS_RIDER:
+            continue
+        center = _bbox_center(rider)
         if _point_in_padded_bbox(center, motorcycle, RIDER_ASSOCIATION_PADDING):
-            riders.append(person)
-    return riders
+            associated.append(rider)
+    return associated
+
+
+def _rider_detections(tracked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [d for d in tracked if d.get("class_label") == YOLO_CLASS_RIDER]
+
+
+def _rider_capability_ok(
+    state: RuleEngineState,
+    rule_name: str,
+    model_classes: tuple[str, ...] | None,
+) -> bool:
+    if model_classes is None:
+        return True
+    available = {str(c).lower() for c in model_classes}
+    if YOLO_CLASS_RIDER.lower() not in available:
+        state.diagnostics.append(
+            f"{rule_name}: automatic evaluation disabled — rider class unavailable; "
+            "person detections cannot substitute."
+        )
+        return False
+    return True
 
 
 def _helmet_labels(tracked: list[dict[str, Any]]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -495,22 +519,20 @@ def check_no_helmet(
         return []
     if model_classes is not None and not classes_satisfy_rule(VIOLATION_NO_HELMET, model_classes):
         state.diagnostics.append(
-            "No Helmet automatic evaluation disabled: required helmet classes missing."
+            "No Helmet automatic evaluation disabled: required helmet/rider classes missing."
         )
+        return []
+    if not _rider_capability_ok(state, VIOLATION_NO_HELMET, model_classes):
         return []
 
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
-    persons = [
-        d
-        for d in tracked
-        if d.get("class_label") in (YOLO_CLASS_PERSON, YOLO_CLASS_RIDER)
-    ]
+    riders_pool = _rider_detections(tracked)
     acceptable, nut, _ = _helmet_labels(tracked)
 
     events: list[ViolationEvent] = []
     for mc in motorcycles:
         track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, persons)
+        riders = _associate_riders(mc, riders_pool)
         ts = float(mc.get("timestamp_sec", 0))
         if not riders:
             state.persistence.pop(("no_helmet", track_id), None)
@@ -568,19 +590,21 @@ def check_substandard_helmet(
     if model_classes is not None and not classes_satisfy_rule(
         VIOLATION_SUBSTANDARD_HELMET, model_classes
     ):
+        state.diagnostics.append(
+            "Substandard / Nut-Shell Helmet: automatic evaluation disabled "
+            "(missing rider/nut-shell prerequisites)."
+        )
+        return []
+    if not _rider_capability_ok(state, VIOLATION_SUBSTANDARD_HELMET, model_classes):
         return []
 
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
-    persons = [
-        d
-        for d in tracked
-        if d.get("class_label") in (YOLO_CLASS_PERSON, YOLO_CLASS_RIDER)
-    ]
+    riders_pool = _rider_detections(tracked)
     acceptable, nut, _ = _helmet_labels(tracked)
     events: list[ViolationEvent] = []
     for mc in motorcycles:
         track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, persons)
+        riders = _associate_riders(mc, riders_pool)
         ts = float(mc.get("timestamp_sec", 0))
         if not riders:
             continue
@@ -617,12 +641,11 @@ def check_no_side_mirror(
     *,
     model_classes: tuple[str, ...] | None = None,
 ) -> list[ViolationEvent]:
-    """No Side Mirror — PRESENT / ABSENT / UNKNOWN.
+    """No Side Mirror — permanently manual-review only.
 
-    Non-detection alone is never proof of absence. Vehicle bbox size and
-    detector confidence do not establish mirror visibility, orientation,
-    cropping, or occlusion. Without approved affirmative-absence evidence the
-    observation remains UNKNOWN and no candidate is emitted (PARTIAL / NEEDS DECISION).
+    One detected mirror proves presence of at least one mirror, not two.
+    Missing detection never proves absence alone. Candidates require multi-frame
+    evidence with both mounting areas clearly observable.
     """
     if not _rule_allowed(state, VIOLATION_NO_SIDE_MIRROR):
         return []
@@ -641,56 +664,135 @@ def check_no_side_mirror(
         if d.get("class_label") in VEHICLE_CLASSES
         and d.get("class_label") != "bicycle"
     ]
-    # Record PRESENT observations only. Absence is never inferred from
-    # non-detection; no persistence timer is advanced for missing mirrors.
+    events: list[ViolationEvent] = []
+    persist = float(VIOLATION_PERSISTENCE_SEC) + 1.0
+
     for veh in vehicles:
         track_id = int(veh["track_id"])
         ts = float(veh.get("timestamp_sec", 0))
+        # Real observation producer: tri-state mounting visibility.
+        visibility = veh.get("mirror_roi_visibility")
+        if visibility is None:
+            # Absent producer → UNKNOWN (fail closed). Never hardcode True.
+            visibility = "unknown"
+        if visibility is True:
+            visibility = "both_visible"
+        if visibility is False:
+            visibility = "unsuitable"
+
+        associated = []
         vx, vy = float(veh["bbox_x"]), float(veh["bbox_y"])
         vw, vh = float(veh["bbox_w"]), float(veh["bbox_h"])
-        present = False
         for m in mirrors:
             if _iou(veh, m) > 0 or _boxes_overlap(veh, m):
                 mx = float(m["bbox_x"]) + float(m["bbox_w"]) / 2
                 my = float(m["bbox_y"]) + float(m["bbox_h"]) / 2
                 if vx <= mx <= vx + vw and vy <= my <= vy + vh * 0.6:
-                    present = True
-                    break
+                    side = "left" if mx < vx + vw / 2 else "right"
+                    associated.append(side)
+
+        unique_sides = set(associated)
         ctx = state.contextual.setdefault(
             ("side_mirror", track_id),
-            {"state": "UNKNOWN", "present_frames": 0},
+            {
+                "state": "UNKNOWN",
+                "present_frames": 0,
+                "suspect_frames": 0,
+                "mirror_count_samples": [],
+            },
         )
-        if present:
-            ctx["state"] = "PRESENT"
+
+        if len(unique_sides) >= 2:
+            ctx["state"] = "PRESENT_BOTH"
             ctx["present_frames"] = int(ctx.get("present_frames", 0)) + 1
-        else:
-            # Stay UNKNOWN — do not treat non-detection as ABSENT and do not
-            # start/advance an absence persistence tracker.
-            if ctx.get("state") != "PRESENT":
-                ctx["state"] = "UNKNOWN"
+            ctx["suspect_frames"] = 0
             state.persistence.pop(("no_side_mirror", track_id), None)
-        state.note_condition(VIOLATION_NO_SIDE_MIRROR, track_id, False, ts)
-    return []
+            state.note_condition(VIOLATION_NO_SIDE_MIRROR, track_id, False, ts)
+            continue
+
+        if len(unique_sides) == 1:
+            # One associated mirror proves at least one is present. Missing
+            # mirror_roi_visibility must not erase that evidence or claim both.
+            if ctx.get("state") != "PRESENT_BOTH":
+                ctx["state"] = "PRESENT"
+            ctx["present_frames"] = int(ctx.get("present_frames", 0)) + 1
+
+        if visibility not in ("both_visible", "clear"):
+            # Cropped/blurred/distant/occluded/unknown: no candidate.
+            # Do not prove absence, and do not overwrite PRESENT / PRESENT_BOTH.
+            if ctx.get("state") not in ("PRESENT", "PRESENT_BOTH"):
+                ctx["state"] = "UNKNOWN"
+            ctx["suspect_frames"] = 0
+            state.persistence.pop(("no_side_mirror", track_id), None)
+            state.note_condition(VIOLATION_NO_SIDE_MIRROR, track_id, False, ts)
+            continue
+
+        if len(unique_sides) == 1:
+            # Both mounting areas observable and only one mirror → review candidate.
+            # Keep PRESENT as the evidence state (never PRESENT_BOTH).
+            ctx["suspect_kind"] = "SUSPECT_ONE"
+            ctx["suspect_frames"] = int(ctx.get("suspect_frames", 0)) + 1
+        elif len(unique_sides) == 0:
+            ctx["state"] = "SUSPECT_ZERO"
+            ctx["suspect_kind"] = "SUSPECT_ZERO"
+            ctx["suspect_frames"] = int(ctx.get("suspect_frames", 0)) + 1
+        else:
+            ctx["suspect_frames"] = 0
+
+        condition = ctx["suspect_frames"] > 0 and ctx.get("suspect_kind") in (
+            "SUSPECT_ONE",
+            "SUSPECT_ZERO",
+        )
+        tracker = state.tracker_for("no_side_mirror", track_id)
+        if tracker.update(condition, ts, threshold_sec=persist) and condition:
+            score = score_from_persistence(
+                detection_confidence=float(veh.get("confidence", 0)),
+                elapsed_sec=tracker.elapsed(ts),
+                required_sec=persist,
+                contextual_availability=0.55,
+            )
+            _emit(
+                state,
+                events,
+                VIOLATION_NO_SIDE_MIRROR,
+                veh,
+                frame_number,
+                f"Vehicle track #{track_id}: mirror mounting areas observable with "
+                f"{len(unique_sides)} usable mirror observation(s) across multiple "
+                f"frames — pending manual review (never auto-confirmed).",
+                score,
+                outcome="review",
+            )
+        state.note_condition(VIOLATION_NO_SIDE_MIRROR, track_id, condition, ts)
+    return events
 
 
 def check_motorcycle_overloading(
     tracked: list[dict[str, Any]],
     state: RuleEngineState,
     frame_number: int,
+    *,
+    model_classes: tuple[str, ...] | None = None,
 ) -> list[ViolationEvent]:
-    """More than two occupants actually riding the motorcycle."""
+    """More than two riders actually associated with the motorcycle."""
     if not _rule_allowed(state, VIOLATION_MOTORCYCLE_OVERLOADING):
         return []
+    if model_classes is not None and not classes_satisfy_rule(
+        VIOLATION_MOTORCYCLE_OVERLOADING, model_classes
+    ):
+        state.diagnostics.append(
+            "Motorcycle Overloading: automatic evaluation disabled "
+            "(missing motorcycle/rider classes)."
+        )
+        return []
+    if not _rider_capability_ok(state, VIOLATION_MOTORCYCLE_OVERLOADING, model_classes):
+        return []
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
-    persons = [
-        d
-        for d in tracked
-        if d.get("class_label") in (YOLO_CLASS_PERSON, YOLO_CLASS_RIDER)
-    ]
+    riders_pool = _rider_detections(tracked)
     events: list[ViolationEvent] = []
     for mc in motorcycles:
         track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, persons)
+        riders = _associate_riders(mc, riders_pool)
         tracker = state.tracker_for("overloading", track_id)
         ts = float(mc.get("timestamp_sec", 0))
         condition = len(riders) > 2
@@ -721,67 +823,28 @@ def check_cargo_passenger(
     frame_number: int,
     *,
     model_classes: tuple[str, ...] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> list[ViolationEvent]:
-    """Person associated with truck/pickup cargo ROI via shared motion + persistence."""
+    """Person in truck/pickup cargo region via multi-frame geometric evidence."""
     if not _rule_allowed(state, VIOLATION_CARGO_PASSENGERS):
         return []
     if model_classes is not None and not classes_satisfy_rule(
         VIOLATION_CARGO_PASSENGERS, model_classes
     ):
         return []
+    from core.cargo_passenger import evaluate_cargo_passenger_candidates
 
-    vehicles = [
-        d for d in tracked if is_cargo_passenger_applicable(str(d.get("class_label", "")))
-    ]
-    persons = [d for d in tracked if d.get("class_label") == YOLO_CLASS_PERSON]
-    events: list[ViolationEvent] = []
-    for veh in vehicles:
-        track_id = int(veh["track_id"])
-        ts = float(veh.get("timestamp_sec", 0))
-        # Cargo ROI ≈ rear 45% of vehicle bbox.
-        vx, vy = float(veh["bbox_x"]), float(veh["bbox_y"])
-        vw, vh = float(veh["bbox_w"]), float(veh["bbox_h"])
-        cargo = {
-            "bbox_x": vx + vw * 0.55,
-            "bbox_y": vy + vh * 0.25,
-            "bbox_w": vw * 0.45,
-            "bbox_h": vh * 0.75,
-        }
-        v_speed = float(veh.get("speed_px_per_sec") or 0.0)
-        associated = 0
-        for person in persons:
-            if not _boxes_overlap(cargo, person):
-                continue
-            p_speed = float(person.get("speed_px_per_sec") or 0.0)
-            # Shared motion: speeds within 40% or both near-stationary.
-            shared = abs(v_speed - p_speed) <= max(8.0, 0.4 * max(v_speed, p_speed, 1.0))
-            if shared:
-                associated += 1
-        condition = associated > 0
-        tracker = state.tracker_for("cargo_passenger", track_id)
-        # One-frame overlap is insufficient — require persistence.
-        if tracker.update(condition, ts, threshold_sec=max(2.0, VIOLATION_PERSISTENCE_SEC)):
-            score = score_from_persistence(
-                detection_confidence=float(veh.get("confidence", 0)),
-                elapsed_sec=tracker.elapsed(ts),
-                required_sec=max(2.0, VIOLATION_PERSISTENCE_SEC),
-                association_quality=min(1.0, 0.5 + 0.25 * associated),
-                contextual_availability=0.6,
-            )
-            label = str(veh.get("class_label", "vehicle"))
-            _emit(
-                state,
-                events,
-                VIOLATION_CARGO_PASSENGERS,
-                veh,
-                frame_number,
-                f"{label} track #{track_id}: person associated with cargo ROI "
-                f"via overlap + shared motion for >={max(2.0, VIOLATION_PERSISTENCE_SEC)}s.",
-                score,
-                outcome="review",
-            )
-        state.note_condition(VIOLATION_CARGO_PASSENGERS, track_id, condition, ts)
-    return events
+    params = params or {}
+    live_mode = bool(params.get("_live_mode", False))
+    history = params.get("_track_history")
+    return evaluate_cargo_passenger_candidates(
+        tracked,
+        state,
+        frame_number,
+        history=history,
+        live_mode=live_mode,
+        emit_fn=_emit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -893,32 +956,80 @@ def check_illegal_terminal(
     frame_number: int,
     params: dict[str, Any],
     geometry: GeometryProfile | None = None,
+    *,
+    all_tracked: list[dict[str, Any]] | None = None,
 ) -> list[ViolationEvent]:
-    """Illegal Terminal — PUV/terminal context required; stop alone insufficient."""
+    """Illegal Terminal — PUV + activity region + multi-frame boarding/alighting."""
     if not _rule_allowed(state, VIOLATION_ILLEGAL_TERMINAL):
         return []
 
-    def _terminal_context(det: dict[str, Any]) -> TriState:
+    import math as _math
+
+    from core.scene_annotation import RuleSceneContext
+    from core.tracker import point_in_polygon
+
+    rule_scene = params.get("_rule_scene")
+    activity_regions = []
+    if isinstance(rule_scene, RuleSceneContext):
+        activity_regions = list(rule_scene.activity_regions)
+
+    frame_persons = [
+        d
+        for d in (all_tracked or [])
+        if d.get("class_label") == YOLO_CLASS_PERSON
+    ]
+
+    def _terminal_activity(det: dict[str, Any]) -> TriState:
         label = str(det.get("class_label", ""))
-        if label in TERMINAL_STRICT_CLASSES:
-            # Passenger-activity evidence is not yet available → UNKNOWN unless
-            # caller injects contextual flag on the detection.
-            if det.get("terminal_passenger_activity") is True:
-                return TriState.TRUE
-            if det.get("terminal_passenger_activity") is False:
-                return TriState.FALSE
-            return TriState.UNKNOWN
+
+        # Van remains UNKNOWN until a separately approved non-model for-hire source.
         if label == YOLO_CLASS_VAN:
-            # Van needs apparent public/for-hire context.
-            if det.get("apparent_for_hire") is True and det.get("terminal_passenger_activity") is True:
-                return TriState.TRUE
             return TriState.UNKNOWN
-        if label == YOLO_CLASS_BUS:
-            # Bus retained only with explicit passenger-activity evidence.
-            if det.get("terminal_passenger_activity") is True:
-                return TriState.TRUE
+
+        if label not in PUV_CLASSES:
+            return TriState.FALSE
+
+        # Compatibility: explicit flags still honored when set.
+        if det.get("terminal_passenger_activity") is True:
+            return TriState.TRUE
+        if det.get("terminal_passenger_activity") is False:
+            return TriState.FALSE
+
+        if not activity_regions:
             return TriState.UNKNOWN
-        return TriState.FALSE
+
+        cx = float(det.get("centroid_x", det["bbox_x"] + det["bbox_w"] / 2))
+        cy = float(det.get("centroid_y", det["bbox_y"] + det["bbox_h"] / 2))
+        in_activity = False
+        for region in activity_regions:
+            pts = region.points_list()
+            if len(pts) >= 3 and point_in_polygon(cx, cy, pts):
+                in_activity = True
+                break
+        if not in_activity:
+            return TriState.UNKNOWN
+
+        # Person/vehicle overlap alone is insufficient — need approach geometry.
+        evidence = 0
+        for person in frame_persons:
+            if not _boxes_overlap(det, person):
+                # Near-boundary approach still counts when heading toward vehicle.
+                px = float(person["bbox_x"] + person["bbox_w"] / 2)
+                py = float(person["bbox_y"] + person["bbox_h"] / 2)
+                dist = _math.hypot(cx - px, cy - py)
+                if dist > max(float(det["bbox_w"]), float(det["bbox_h"])) * 1.2:
+                    continue
+            p_heading = person.get("direction_degrees")
+            if p_heading is None:
+                continue
+            px = float(person["bbox_x"] + person["bbox_w"] / 2)
+            py = float(person["bbox_y"] + person["bbox_h"] / 2)
+            toward = _math.degrees(_math.atan2(cy - py, cx - px)) % 360.0
+            if angle_difference(float(p_heading), toward) <= 45.0:
+                evidence += 1
+        if evidence > 0:
+            return TriState.TRUE
+        return TriState.UNKNOWN
 
     return _check_zone_dwell(
         vehicles,
@@ -931,11 +1042,11 @@ def check_illegal_terminal(
         dwell_sec=float(params.get("loading_dwell_sec", 8.0)),
         reason_template=(
             "PUV track #{track_id} terminal-like dwell in No Loading zone "
-            ">={dwell}s with passenger-activity evidence."
+            ">={dwell}s with passenger-activity evidence (manual review)."
         ),
         class_filter=PUV_CLASSES,
         geometry=geometry,
-        require_extra=_terminal_context,
+        require_extra=_terminal_activity,
         outcome="review",
     )
 
@@ -1002,24 +1113,92 @@ def check_counterflow(
     params: dict[str, Any],
     geometry: GeometryProfile | None = None,
 ) -> list[ViolationEvent]:
+    """Counterflow using per-lane flow when v2 lanes exist; legacy fallback otherwise."""
     if not _rule_allowed(state, VIOLATION_COUNTERFLOW):
         return []
-    lane_flow = float(params.get("lane_flow_degrees", 90.0))
+    from core.scene_annotation import RuleSceneContext
+    from core.tracker import point_in_polygon
+    from core.trajectory import angle_difference_degrees
+
+    rule_scene = params.get("_rule_scene")
     tolerance = float(params.get("flow_tolerance_degrees", 60.0))
-    opposite = (lane_flow + 180.0) % 360.0
-    # Design direction: initial 4s persistence (not invented legal threshold —
-    # uses configurable param with documented default).
     persist = float(params.get("counterflow_persist_sec", 4.0))
+    min_dir = float(params.get("min_direction_px", 40.0))
+    if geometry is not None:
+        min_dir = geometry.min_direction_px()
+
+    use_v2_lanes = (
+        isinstance(rule_scene, RuleSceneContext) and len(rule_scene.lanes) > 0
+    )
+    legacy_flow = float(params.get("lane_flow_degrees", 90.0))
+    # Legacy lane_flow_degrees only when one legacy active_lane and no v2 flows.
+    allow_legacy_flow = (not use_v2_lanes) or (
+        len(getattr(rule_scene, "lanes", ())) == 0
+        and len(getattr(rule_scene, "lane_flows", ())) == 0
+        and bool(polygon)
+    )
 
     events: list[ViolationEvent] = []
     for det in vehicles:
         track_id = int(det["track_id"])
         ts = float(det.get("timestamp_sec", 0))
         heading = det.get("direction_degrees")
-        inside = _in_zone(det, polygon, state, "counterflow", policy=POLICY_LANE)
+        cx = float(det.get("centroid_x", det["bbox_x"] + det["bbox_w"] / 2))
+        cy = float(det.get("centroid_y", det["bbox_y"] + det["bbox_h"] / 2))
+
+        lane_flow: float | None = None
+        inside = False
+        ambiguous = False
+
+        if use_v2_lanes:
+            containing = []
+            for lane in rule_scene.lanes:
+                pts = lane.points_list()
+                if len(pts) >= 3 and point_in_polygon(cx, cy, pts):
+                    containing.append(lane)
+            if not containing:
+                inside = False
+            elif len(containing) > 1:
+                flows = []
+                flow_by_lane = {f.lane_id: f.degrees for f in rule_scene.lane_flows}
+                for lane in containing:
+                    if lane.id not in flow_by_lane:
+                        ambiguous = True
+                        break
+                    flows.append(flow_by_lane[lane.id])
+                if not ambiguous and flows:
+                    # Equivalent directions may resolve; conflicting → UNKNOWN.
+                    ref = flows[0]
+                    if any(angle_difference_degrees(ref, f) > 30.0 for f in flows[1:]):
+                        ambiguous = True
+                    else:
+                        inside = True
+                        lane_flow = ref
+                else:
+                    ambiguous = True
+            else:
+                lane = containing[0]
+                inside = True
+                flow_by_lane = {f.lane_id: f.degrees for f in rule_scene.lane_flows}
+                if lane.id not in flow_by_lane:
+                    # Missing arrow → UNKNOWN/suppress
+                    state.note_condition(VIOLATION_COUNTERFLOW, track_id, False, ts)
+                    state.persistence.pop(("counterflow", track_id), None)
+                    continue
+                lane_flow = flow_by_lane[lane.id]
+        else:
+            inside = _in_zone(det, polygon, state, "counterflow", policy=POLICY_LANE)
+            if allow_legacy_flow:
+                lane_flow = legacy_flow
+
+        if ambiguous or heading is None or lane_flow is None:
+            state.note_condition(VIOLATION_COUNTERFLOW, track_id, False, ts)
+            state.persistence.pop(("counterflow", track_id), None)
+            continue
+
+        opposite = (float(lane_flow) + 180.0) % 360.0
         condition = (
-            heading is not None
-            and inside
+            inside
             and angle_difference(float(heading), opposite) <= tolerance
         )
         tracker = state.tracker_for("counterflow", track_id)
@@ -1037,7 +1216,7 @@ def check_counterflow(
                 det,
                 frame_number,
                 f"Vehicle track #{track_id} travelling {float(heading):.0f}deg "
-                f"against lane flow ({lane_flow:.0f}deg) in Active Lane "
+                f"against lane flow ({float(lane_flow):.0f}deg) "
                 f"for >={persist}s.",
                 score,
             )
@@ -1129,42 +1308,57 @@ def check_pavement_markings(
         return []
     events: list[ViolationEvent] = []
 
-    # Preferred path: configured marking segments with permitted/prohibited side.
+    # Preferred path: configured marking segments with prohibited_from.
     markings = marking_geometry or params.get("marking_geometry") or []
+    history = params.get("_track_history")
     if markings:
+        from core.trajectory import crossed_oriented_line
+
         for det in vehicles:
             track_id = int(det["track_id"])
             ts = float(det.get("timestamp_sec", 0))
             heading = det.get("direction_degrees")
             crossed = False
             for marking in markings:
-                geom = marking.get("polygon") or marking.get("polyline") or []
+                mtype = str(marking.get("type") or "")
+                # Review-only types until separately approved.
+                if mtype in (
+                    "single_solid",
+                    "solid_broken",
+                    "generic_marking",
+                ):
+                    continue
+                geom = (
+                    marking.get("polygon")
+                    or marking.get("polyline")
+                    or marking.get("points")
+                    or []
+                )
                 if len(geom) < 2:
                     continue
-                # Trajectory segment: use last motion via centroid if present.
-                cx = float(det.get("centroid_x", det["bbox_x"] + det["bbox_w"] / 2))
-                cy = float(det.get("centroid_y", det["bbox_y"] + det["bbox_h"] / 2))
-                mem = evaluate_zone_membership(
-                    det,
-                    geom if len(geom) >= 3 else [
-                        geom[0],
-                        geom[-1],
-                        [geom[-1][0] + 1, geom[-1][1] + 1],
-                    ],
-                    policy=POLICY_LANE,
-                    hysteresis=state.membership_hysteresis,
-                    hysteresis_key=("marking", track_id),
+                prohibited = marking.get("prohibited_from") or marking.get(
+                    "prohibited_side"
                 )
-                prohibited = marking.get("prohibited_side")
-                side = marking.get("vehicle_side")
-                if mem.state is MembershipState.INSIDE or mem.overlap_ratio >= 0.2:
-                    if prohibited and side and side == prohibited:
-                        crossed = True
-                    elif marking.get("type") in ("double_solid", "marking_double_solid"):
-                        crossed = True
-                    elif prohibited is None and marking.get("type"):
-                        # Marking present but side unknown → do not invent.
-                        crossed = False
+                if mtype in ("double_solid", "marking_double_solid"):
+                    prohibited = prohibited or "both"
+                if prohibited not in ("left", "right", "both"):
+                    continue
+                prev = curr = None
+                if history is not None:
+                    snap = history.get(track_id)
+                    if snap is not None and len(snap.observations) >= 2:
+                        o0, o1 = snap.observations[-2], snap.observations[-1]
+                        prev = (o0.x, o0.y)
+                        curr = (o1.x, o1.y)
+                if prev is None or curr is None or heading is None:
+                    continue
+                a = (float(geom[0][0]), float(geom[0][1]))
+                b = (float(geom[-1][0]), float(geom[-1][1]))
+                if crossed_oriented_line(
+                    prev, curr, a, b, prohibited_from=str(prohibited)
+                ):
+                    crossed = True
+                    break
             tracker = state.tracker_for("pavement_markings", track_id)
             if tracker.update(crossed and heading is not None, ts):
                 score = score_from_persistence(
@@ -1180,16 +1374,18 @@ def check_pavement_markings(
                     VIOLATION_PAVEMENT_MARKINGS,
                     det,
                     frame_number,
-                    f"Vehicle track #{track_id} trajectory conflicts with configured "
-                    f"pavement marking geometry.",
+                    f"Vehicle track #{track_id} crossed pavement marking from a "
+                    f"prohibited side (manual review).",
                     score,
                     outcome="review",
                 )
             state.note_condition(VIOLATION_PAVEMENT_MARKINGS, track_id, crossed, ts)
         return events
 
-    # Partial proxy: restricted lane zone (legacy behavior), review outcome.
+    # Restricted-lane: outside-to-inside transition with hysteresis.
     if restricted_lane and len(restricted_lane) >= 3:
+        from core.trajectory import ZoneMembershipHysteresis, point_in_polygon as tip
+
         restricted = tuple(
             params.get("restricted_lane_classes", DEFAULT_RESTRICTED_LANE_CLASSES)
         )
@@ -1198,14 +1394,22 @@ def check_pavement_markings(
                 continue
             track_id = int(det["track_id"])
             ts = float(det.get("timestamp_sec", 0))
-            inside = _in_zone(det, restricted_lane, state, "restricted_lane", policy=POLICY_LANE)
+            cx = float(det.get("centroid_x", det["bbox_x"] + det["bbox_w"] / 2))
+            cy = float(det.get("centroid_y", det["bbox_y"] + det["bbox_h"] / 2))
+            currently = tip((cx, cy), restricted_lane)
+            hyst = state.contextual.setdefault(
+                ("restricted_hyst", track_id),
+                ZoneMembershipHysteresis(enter_frames=2, exit_frames=2),
+            )
+            transition = hyst.update(currently)
+            entered = transition == "entered"
             tracker = state.tracker_for("restricted_lane", track_id)
-            if tracker.update(inside, ts):
+            if tracker.update(entered or currently, ts) and entered:
                 score = score_from_persistence(
                     detection_confidence=float(det.get("confidence", 0)),
                     elapsed_sec=tracker.elapsed(ts),
                     required_sec=VIOLATION_PERSISTENCE_SEC,
-                    contextual_availability=0.5,
+                    contextual_availability=0.6,
                 )
                 _emit(
                     state,
@@ -1213,13 +1417,12 @@ def check_pavement_markings(
                     VIOLATION_PAVEMENT_MARKINGS,
                     det,
                     frame_number,
-                    f"{det.get('class_label', 'vehicle')} track #{track_id} inside "
-                    f"Restricted Lane (pavement-markings proxy; marking geometry "
-                    f"not configured).",
+                    f"{det.get('class_label', 'vehicle')} track #{track_id} "
+                    f"entered Restricted Lane (outside-to-inside; manual review).",
                     score,
                     outcome="review",
                 )
-            state.note_condition(VIOLATION_PAVEMENT_MARKINGS, track_id, inside, ts)
+            state.note_condition(VIOLATION_PAVEMENT_MARKINGS, track_id, entered, ts)
     else:
         state.diagnostics.append(
             "Failure to Follow Road/Pavement Markings: no marking geometry or "
@@ -1234,69 +1437,133 @@ def check_disregarding_traffic_sign(
     frame_number: int,
     params: dict[str, Any],
 ) -> list[ViolationEvent]:
-    """Disregarding Traffic Sign — supported signs only; no speed-limit.
+    """Disregarding Traffic Sign — no-entry threshold crossing only in this release.
 
-    Fail-closed unless configured supported sign annotations and conflicting
-    track behavior are available.
+    Other maneuver signs remain review-only/unsupported. Do not rely on unset
+    performed_* fields as the normal path.
     """
     if not _rule_allowed(state, VIOLATION_DISREGARDING_SIGN):
         return []
-    signs = params.get("supported_signs") or []
+
+    from core.scene_annotation import RuleSceneContext
+    from core.trajectory import (
+        crossed_oriented_line,
+        endpoint_jitter,
+        is_parallel_motion,
+        motion_projects_into_direction,
+    )
+
+    rule_scene = params.get("_rule_scene")
+    history = params.get("_track_history")
+    signs = []
+    thresholds = []
+    if isinstance(rule_scene, RuleSceneContext) and rule_scene.signs:
+        signs = list(rule_scene.signs)
+        thresholds = list(rule_scene.threshold_lines)
+    else:
+        signs = params.get("supported_signs") or []
+
     if not signs:
         state.diagnostics.append(
             "Disregarding Traffic Sign: no supported sign annotations configured; "
-            "automatic evaluation disabled. STOP and speed-limit are excluded."
+            "automatic evaluation disabled."
         )
         return []
 
     events: list[ViolationEvent] = []
     vehicles = [d for d in tracked if _is_usable_vehicle_detection(d)]
-    allowed_types = {
-        "no_entry",
-        "no_overtaking",
-        "no_left_turn",
-        "no_u_turn",
-        "no_parking",
-        "no_stopping",
-        "sign_no_entry",
-        "sign_no_overtaking",
-        "sign_no_left_turn",
-        "sign_no_u_turn",
-        "sign_no_parking",
-        "sign_no_stopping",
-    }
+    min_dir = float(params.get("min_direction_px", 40.0))
+
     for sign in signs:
-        stype = str(sign.get("type", "")).lower()
+        if hasattr(sign, "type"):
+            stype = str(sign.type).lower()
+            sign_lane_ids = list(sign.lane_ids)
+            sign_id = sign.id
+        else:
+            stype = str(sign.get("type", "")).lower()
+            sign_lane_ids = list(sign.get("lane_ids") or [])
+            sign_id = str(sign.get("id") or stype)
+
         if stype in ("stop", "speed_limit", "sign_stop", "sign_speed_limit"):
             continue
-        if stype not in allowed_types:
+        # Only no-entry is executable; others stay unsupported.
+        if stype not in ("no_entry", "sign_no_entry"):
+            state.diagnostics.append(
+                f"Disregarding Traffic Sign: '{stype}' remains review-only/unsupported "
+                "in this release (no-entry only)."
+            )
             continue
-        zone = sign.get("applicability_polygon") or sign.get("polygon") or []
-        behavior = sign.get("prohibited_behavior", "enter")
+
+        # Resolve threshold: matching threshold_line or points on the sign.
+        line_a = line_b = None
+        prohibited_vec = None
+        for th in thresholds:
+            if sign_lane_ids and th.lane_ids and not set(sign_lane_ids) & set(th.lane_ids):
+                continue
+            if len(th.points) >= 2:
+                line_a = th.points[0]
+                line_b = th.points[-1]
+                # Prohibited direction: A→B normal into the restricted side, or
+                # metadata vector when provided.
+                meta = th.metadata if hasattr(th, "metadata") else {}
+                if meta.get("prohibited_vector"):
+                    pv = meta["prohibited_vector"]
+                    prohibited_vec = (float(pv[0]), float(pv[1]))
+                else:
+                    # Default: crossing from A-left toward A-right is not assumed;
+                    # use segment direction as prohibited motion projection axis.
+                    prohibited_vec = (line_b[0] - line_a[0], line_b[1] - line_a[1])
+                    # Prefer perpendicular into "entry" if annotated.
+                    if meta.get("prohibited_from") == "left":
+                        prohibited_vec = (
+                            -(line_b[1] - line_a[1]),
+                            (line_b[0] - line_a[0]),
+                        )
+                    elif meta.get("prohibited_from") == "right":
+                        prohibited_vec = (
+                            (line_b[1] - line_a[1]),
+                            -(line_b[0] - line_a[0]),
+                        )
+                break
+        if line_a is None and hasattr(sign, "points") and len(sign.points) >= 2:
+            line_a, line_b = sign.points[0], sign.points[-1]
+            prohibited_vec = (line_b[0] - line_a[0], line_b[1] - line_a[1])
+        if line_a is None or line_b is None or prohibited_vec is None:
+            continue
+
         for det in vehicles:
             track_id = int(det["track_id"])
             ts = float(det.get("timestamp_sec", 0))
-            if len(zone) < 3:
+            prev = curr = None
+            if history is not None:
+                snap = history.get(track_id)
+                if snap is not None and len(snap.observations) >= 2:
+                    # Bottom-center approx from centroids for crossing.
+                    o0, o1 = snap.observations[-2], snap.observations[-1]
+                    prev = (o0.x, o0.y + float(det.get("bbox_h", 0)) / 2)
+                    curr = (o1.x, o1.y + float(det.get("bbox_h", 0)) / 2)
+            if prev is None or curr is None:
+                state.note_condition(VIOLATION_DISREGARDING_SIGN, track_id, False, ts)
                 continue
-            inside = _in_zone(det, zone, state, f"sign_{stype}", policy=POLICY_LANE)
-            heading = det.get("direction_degrees")
-            conflict = False
-            if behavior == "enter" and inside:
-                conflict = True
-            elif behavior == "left_turn" and inside and heading is not None:
-                # Without a frozen turn detector, require explicit flag.
-                conflict = bool(det.get("performed_left_turn"))
-            elif behavior == "u_turn" and inside:
-                conflict = bool(det.get("performed_u_turn"))
-            elif behavior == "overtake" and inside:
-                conflict = bool(det.get("performed_overtake"))
-            tracker = state.tracker_for(f"sign_{stype}", track_id)
+            motion = (curr[0] - prev[0], curr[1] - prev[1])
+            if endpoint_jitter([prev, curr], max_jitter=min_dir * 0.25):
+                continue
+            if is_parallel_motion(motion, line_a, line_b):
+                continue
+            if not motion_projects_into_direction(
+                motion, prohibited_vec, min_projection=min_dir * 0.5
+            ):
+                continue
+            conflict = crossed_oriented_line(
+                prev, curr, line_a, line_b, prohibited_from="both"
+            )
+            tracker = state.tracker_for(f"sign_no_entry_{sign_id}", track_id)
             if tracker.update(conflict, ts):
                 score = score_from_persistence(
                     detection_confidence=float(det.get("confidence", 0)),
                     elapsed_sec=tracker.elapsed(ts),
                     required_sec=VIOLATION_PERSISTENCE_SEC,
-                    contextual_availability=0.7,
+                    contextual_availability=0.75,
                 )
                 _emit(
                     state,
@@ -1304,8 +1571,8 @@ def check_disregarding_traffic_sign(
                     VIOLATION_DISREGARDING_SIGN,
                     det,
                     frame_number,
-                    f"Vehicle track #{track_id} conflicting behavior vs supported "
-                    f"sign '{stype}'.",
+                    f"Vehicle track #{track_id} crossed no-entry threshold "
+                    f"({sign_id}) in prohibited direction (manual review).",
                     score,
                     outcome="review",
                 )
@@ -1348,17 +1615,34 @@ def evaluate_detection_rules(
     recording_time_known: bool | None = None,
     frame_size: tuple[int, int] | None = None,
     now_sec: float | None = None,
+    scene: Any | None = None,
+    history: Any | None = None,
 ) -> list[ViolationEvent]:
     """Run every enabled rule on the current frame's tracked detections.
 
     ``now_time`` is the scene/recording clock when known. When recording
     datetime is unavailable, time-dependent rules receive UNKNOWN and must
     not use upload/processing wall-clock time.
+
+    ``scene`` is the preferred ``RuleSceneContext``. Raw ``zones`` remains a
+    compatibility-only input. ``history`` is an optional immutable
+    ``TrackHistoryView`` for trajectory-aware rules.
     """
+    from core.scene_annotation import SceneAnnotationError, merge_rule_scene_inputs
+
     merged = dict(DEFAULT_RULE_PARAMETERS)
     if params:
         merged.update(params)
     zones = zones or {}
+    try:
+        rule_scene = merge_rule_scene_inputs(scene=scene, zones=zones, params=merged)
+    except SceneAnnotationError as exc:
+        raise ValueError(str(exc)) from exc
+    # Compatibility zones mirror the projected legacy map for existing rules.
+    zones = dict(rule_scene.legacy_zones)
+    # Stash for rules that opt into structured scene / history (Gates 5–8).
+    merged["_rule_scene"] = rule_scene
+    merged["_track_history"] = history
 
     enabled_set = (
         set(enabled_violations)
@@ -1379,28 +1663,39 @@ def evaluate_detection_rules(
         merged = dict(merged)
         merged["stationary_px"] = geometry.stationary_px_per_sec()
         merged["min_direction_px"] = geometry.min_direction_px()
+        merged["_rule_scene"] = rule_scene
+        merged["_track_history"] = history
 
     # Capability gate snapshot (once per state unless refreshed by caller).
     if model_classes is not None and not state.capability:
         context_flags = {
             "zone:no_parking": bool(zones.get("no_parking")),
-            "zone:active_lane": bool(zones.get("active_lane")),
+            "zone:active_lane": bool(zones.get("active_lane") or rule_scene.lanes),
             "zone:active_lane_or_crossing": bool(
-                zones.get("active_lane") or zones.get("pedestrian_crossing")
+                zones.get("active_lane")
+                or rule_scene.lanes
+                or zones.get("pedestrian_crossing")
             ),
             "zone:truck_ban_zone": bool(zones.get("truck_ban_zone")),
-            "zone:loading_unloading_or_terminal": bool(zones.get("loading_unloading")),
+            "zone:loading_unloading_or_terminal": bool(
+                zones.get("loading_unloading") or rule_scene.activity_regions
+            ),
             "recording_datetime": bool(
                 recording_time_known
                 if recording_time_known is not None
                 else now_time is not None
             ),
-            "lane_flow_degrees": "lane_flow_degrees" in merged,
-            "marking_geometry": bool(merged.get("marking_geometry") or zones.get("restricted_lane")),
-            "supported_sign_annotations": bool(merged.get("supported_signs")),
+            "lane_flow_degrees": "lane_flow_degrees" in merged
+            or bool(rule_scene.lane_flows),
+            "marking_geometry": bool(
+                merged.get("marking_geometry")
+                or zones.get("restricted_lane")
+                or rule_scene.markings
+            ),
+            "supported_sign_annotations": bool(
+                merged.get("supported_signs") or rule_scene.signs
+            ),
             "puv_context": True,  # evaluated per-detection as TriState
-            "mirror_roi_visibility": True,
-            "cargo_roi_association": True,
         }
         for name in CANONICAL_VIOLATIONS:
             if name in enabled_set:
@@ -1448,11 +1743,19 @@ def evaluate_detection_rules(
             )
         )
     if VIOLATION_MOTORCYCLE_OVERLOADING in enabled_set:
-        events.extend(check_motorcycle_overloading(tracked, state, frame_number))
+        events.extend(
+            check_motorcycle_overloading(
+                tracked, state, frame_number, model_classes=model_classes
+            )
+        )
     if VIOLATION_CARGO_PASSENGERS in enabled_set:
         events.extend(
             check_cargo_passenger(
-                tracked, state, frame_number, model_classes=model_classes
+                tracked,
+                state,
+                frame_number,
+                model_classes=model_classes,
+                params=merged,
             )
         )
     if VIOLATION_DISREGARDING_SIGN in enabled_set:
@@ -1473,12 +1776,20 @@ def evaluate_detection_rules(
                     vehicles, zones["active_lane"], state, frame_number, merged, geometry
                 )
             )
-        if VIOLATION_COUNTERFLOW in enabled_set:
-            events.extend(
-                check_counterflow(
-                    vehicles, zones["active_lane"], state, frame_number, merged, geometry
-                )
+    # Counterflow: v2 lanes or legacy active_lane polygon.
+    if VIOLATION_COUNTERFLOW in enabled_set and (
+        zones.get("active_lane") or getattr(rule_scene, "lanes", ())
+    ):
+        events.extend(
+            check_counterflow(
+                vehicles,
+                zones.get("active_lane") or [],
+                state,
+                frame_number,
+                merged,
+                geometry,
             )
+        )
     if zones.get("pedestrian_crossing") and VIOLATION_OBSTRUCTION in enabled_set:
         events.extend(
             check_blocking_pedestrian(
@@ -1511,9 +1822,22 @@ def evaluate_detection_rules(
                 frame_number,
                 merged,
                 geometry,
+                all_tracked=tracked,
             )
         )
     if VIOLATION_PAVEMENT_MARKINGS in enabled_set:
+        scene_markings = None
+        if getattr(rule_scene, "markings", None):
+            scene_markings = [
+                {
+                    "id": m.id,
+                    "type": m.type,
+                    "polyline": m.points_list(),
+                    "prohibited_from": m.prohibited_from,
+                    "lane_ids": list(m.lane_ids),
+                }
+                for m in rule_scene.markings
+            ]
         events.extend(
             check_pavement_markings(
                 vehicles,
@@ -1521,6 +1845,7 @@ def evaluate_detection_rules(
                 frame_number,
                 merged,
                 restricted_lane=zones.get("restricted_lane"),
+                marking_geometry=scene_markings,
             )
         )
 

@@ -13,12 +13,55 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 # Seconds without an update before a track is discarded.
 TRACK_EXPIRY_SEC = 5.0
 # Sliding window (seconds) used for speed/direction estimation.
 MOTION_WINDOW_SEC = 2.0
+
+
+@dataclass(frozen=True)
+class CentroidObservation:
+    timestamp_sec: float
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class TrackHistorySnapshot:
+    track_id: int
+    class_label: str
+    observations: tuple[CentroidObservation, ...]
+    last_seen: float
+    stationary_since: float | None
+
+    def centroids(self) -> tuple[tuple[float, float], ...]:
+        return tuple((o.x, o.y) for o in self.observations)
+
+
+@dataclass(frozen=True)
+class TrackHistoryView:
+    """Bounded immutable projection of tracker-owned history for rules."""
+
+    tracks: Mapping[int, TrackHistorySnapshot]
+    now_sec: float
+    expiry_sec: float = TRACK_EXPIRY_SEC
+
+    def get(self, track_id: int) -> TrackHistorySnapshot | None:
+        return self.tracks.get(int(track_id))
+
+    def __contains__(self, track_id: object) -> bool:
+        try:
+            return int(track_id) in self.tracks  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+
+    def __iter__(self) -> Iterator[TrackHistorySnapshot]:
+        return iter(self.tracks.values())
+
+    def ids(self) -> tuple[int, ...]:
+        return tuple(self.tracks.keys())
 
 
 @dataclass
@@ -83,6 +126,19 @@ class TrackHistory:
         self.stationary_since = None
         return 0.0
 
+    def snapshot(self) -> TrackHistorySnapshot:
+        observations = tuple(
+            CentroidObservation(timestamp_sec=ts, x=cx, y=cy)
+            for ts, cx, cy in self.points
+        )
+        return TrackHistorySnapshot(
+            track_id=self.track_id,
+            class_label=self.class_label,
+            observations=observations,
+            last_seen=self.last_seen,
+            stationary_since=self.stationary_since,
+        )
+
 
 class TrackState:
     """Registry of TrackHistory objects keyed by ByteTrack ID."""
@@ -114,9 +170,16 @@ class TrackState:
             cy = float(det["bbox_y"]) + float(det["bbox_h"]) / 2
 
             history = self.tracks.get(tid)
+            label = str(det.get("class_label", ""))
             if history is None:
-                history = TrackHistory(track_id=tid, class_label=str(det.get("class_label", "")))
+                history = TrackHistory(track_id=tid, class_label=label)
                 self.tracks[tid] = history
+            elif label and history.class_label and label != history.class_label:
+                # Identity/class change clears prior trajectory for this ID.
+                history = TrackHistory(track_id=tid, class_label=label)
+                self.tracks[tid] = history
+            else:
+                history.class_label = label or history.class_label
             history.add(ts, cx, cy)
             dwell = history.update_stationary(ts, self.stationary_px)
 
@@ -130,6 +193,20 @@ class TrackState:
 
         self._prune(clock)
         return annotated
+
+    def history_view(self, now: float | None = None) -> TrackHistoryView:
+        """Immutable snapshot for rule evaluation (cannot mutate tracker state)."""
+        clock = float(now) if now is not None else 0.0
+        if clock <= 0 and self.tracks:
+            clock = max(h.last_seen for h in self.tracks.values())
+        snapshots = {
+            tid: history.snapshot()
+            for tid, history in self.tracks.items()
+            if clock - history.last_seen <= TRACK_EXPIRY_SEC
+        }
+        return TrackHistoryView(
+            tracks=snapshots, now_sec=clock, expiry_sec=TRACK_EXPIRY_SEC
+        )
 
     def _prune(self, now: float) -> None:
         stale = [tid for tid, h in self.tracks.items() if now - h.last_seen > TRACK_EXPIRY_SEC]

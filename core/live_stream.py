@@ -16,11 +16,12 @@ import cv2
 from core.detection_config import confidence_band
 from core.detector import Detector, DetectorError
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
+from core.model_capability import extract_model_class_names
+from core.scene_annotation import load_scene_annotation
 from core.tracker import TrackState
 from core.video_processor import load_rule_parameters
 from core.violation_config import load_enabled_violations
 from core.violation_engine import RuleEngineState, evaluate_detection_rules
-from core.zone_config import parse_zones_json
 from database import db
 
 _BOX_COLOR = (246, 130, 59)   # BGR
@@ -31,7 +32,9 @@ class LiveStreamWorker(threading.Thread):
     def __init__(self, camera: dict[str, Any]) -> None:
         super().__init__(daemon=True, name=f"camera-{camera['id']}")
         self.camera = camera
-        self.zones = parse_zones_json(camera.get("zones_json"))
+        scene = load_scene_annotation(camera.get("zones_json"))
+        self.rule_scene = scene.to_rule_context()
+        self.zones = dict(self.rule_scene.legacy_zones)
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
@@ -78,6 +81,8 @@ class LiveStreamWorker(threading.Thread):
             self.error = str(exc)
             return
 
+        model_classes = extract_model_class_names(detector)
+
         cap = cv2.VideoCapture(self.camera["rtsp_url"])
         if not cap.isOpened():
             self.status = "error"
@@ -115,9 +120,12 @@ class LiveStreamWorker(threading.Thread):
 
                 events = evaluate_detection_rules(
                     tracked, rule_state, frame_number,
-                    zones=self.zones, params=params,
+                    zones=self.zones, params={**params, "_live_mode": True},
                     enabled_violations=enabled_violations,
                     now_sec=timestamp_sec,
+                    scene=self.rule_scene,
+                    model_classes=model_classes,
+                    history=track_state.history_view(now=timestamp_sec),
                 )
                 by_track = {int(d["track_id"]): d for d in tracked}
                 for event in events:

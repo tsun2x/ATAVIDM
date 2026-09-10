@@ -180,6 +180,9 @@
             if (action === "delete_video") {
                 show = (window.TAVIDM_USER_ROLE || "") === "admin";
             }
+            if (action === "edit_annotation") {
+                show = !!video.has_annotation && !video.processing;
+            }
             item.classList.toggle("d-none", !show);
         });
         document.getElementById("btnModeLivePreview")?.classList.toggle("d-none", !video.processing);
@@ -458,6 +461,29 @@
         else if (action === "download_annotated" && activeVideo.annotated_video_url) {
             window.location.href = activeVideo.annotated_video_url + "?download=1";
         } else if (action === "history") openHistory(activeVideo.db_id);
+        else if (action === "edit_annotation") {
+            fetch("/api/videos/" + activeVideo.db_id + "/annotation")
+                .then(function (r) { return r.json(); })
+                .then(function (payload) {
+                    if (!payload.success || !payload.annotation) {
+                        showToast("Annotation", payload.error || "No saved annotation to edit.", "warning");
+                        return;
+                    }
+                    const raw = payload.annotation.zones_json;
+                    const scene = window.TAVIDMZoneEditor.parseSceneDocument(raw, window.TAVIDM_ZONE_TYPES || []);
+                    window.TAVIDM_upload.openAnnotationWizard({
+                        video: activeVideo,
+                        frame_url: activeVideo.frame_url,
+                        templates: window.TAVIDM_ZONE_TEMPLATES || [],
+                        frame_ready: true,
+                        existing_scene: scene,
+                        start_at_editor: true,
+                    });
+                })
+                .catch(function () {
+                    showToast("Annotation", "Could not load saved annotation.", "danger");
+                });
+        }
         else if (action === "reprocess") openProcessConfirm(activeVideo);
         else if (action === "remove_results") {
             if (!confirm("Remove processing results for " + activeVideo.filename + "? Source and annotation are kept.")) return;

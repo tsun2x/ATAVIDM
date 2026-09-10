@@ -1,9 +1,23 @@
-"""Zone type registry and JSON validation for traffic annotations."""
+"""Zone type registry and JSON validation for traffic annotations.
+
+Legacy polygon helpers remain for compatibility. Structured v2 documents
+must go through ``core.scene_annotation`` so unknown/v2 fields are not
+silently destroyed on write.
+"""
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+from core.scene_annotation import (
+    LEGACY_ZONE_KEYS,
+    SceneAnnotationError,
+    dumps_scene_annotation,
+    empty_legacy_zones,
+    load_scene_annotation,
+    serialize_scene_raw,
+)
 
 # Manuscript ROI examples (Ch3): No Parking Zones, Loading and Unloading Areas,
 # Truck Ban Areas, Pedestrian Crossings, Restricted Road Segments / Lanes.
@@ -22,7 +36,7 @@ VIDEO_STATUSES = ("uploaded", "annotating", "ready", "processing", "processed")
 
 
 def empty_zones() -> dict[str, list[list[float]]]:
-    return {key: [] for key in REQUIRED_ZONE_KEYS}
+    return empty_legacy_zones()
 
 
 def zones_for_api() -> list[dict[str, str]]:
@@ -39,28 +53,24 @@ def _normalize_point(point: Any) -> list[float]:
 
 
 def parse_zones_json(raw: str | dict[str, Any] | None) -> dict[str, list[list[float]]]:
-    if raw is None or raw == "":
-        return empty_zones()
-    if isinstance(raw, dict):
-        data = raw
-    else:
-        data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError("zones_json must be a JSON object.")
+    """Return the explicit legacy six-key polygon projection.
 
-    normalized = empty_zones()
-    for key, points in data.items():
-        if key not in ZONE_TYPES:
-            continue
-        if not isinstance(points, list):
-            raise ValueError(f"Zone '{key}' must be a list of points.")
-        normalized[key] = [_normalize_point(pt) for pt in points]
-    return normalized
+    This does not rewrite storage. For round-trip-safe serialization of v2
+    documents use ``dumps_zones`` / ``serialize_scene_raw``.
+    """
+    try:
+        scene = load_scene_annotation(raw)
+    except SceneAnnotationError as exc:
+        raise ValueError(str(exc)) from exc
+    return scene.legacy_zones()
 
 
-def dumps_zones(zones: dict[str, Any]) -> str:
-    parsed = parse_zones_json(zones)
-    return json.dumps(parsed)
+def dumps_zones(zones: dict[str, Any] | str | None) -> str:
+    """Serialize annotations without converting legacy↔v2 or dropping v2 fields."""
+    try:
+        return serialize_scene_raw(zones)
+    except SceneAnnotationError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def zones_complete(zones: dict[str, Any], min_points: int = 3) -> bool:
@@ -70,3 +80,12 @@ def zones_complete(zones: dict[str, Any], min_points: int = 3) -> bool:
     if not drawn:
         return False
     return all(len(pts) >= min_points for pts in drawn)
+
+
+def loads_scene(raw: str | dict[str, Any] | None):
+    """Load a SceneAnnotation (legacy or v2)."""
+    return load_scene_annotation(raw)
+
+
+def dumps_scene(scene) -> str:
+    return dumps_scene_annotation(scene)

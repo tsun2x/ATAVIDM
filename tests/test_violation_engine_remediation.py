@@ -260,7 +260,7 @@ class TestModelCapabilityGate:
                 timestamp_sec=0.0,
             ),
             _vehicle(
-                class_label="person",
+                class_label="rider",
                 track_id=2,
                 bbox_x=110,
                 bbox_y=90,
@@ -281,7 +281,7 @@ class TestModelCapabilityGate:
         ]
         classes = (
             "motorcycle",
-            "person",
+            "rider",
             "helmet_acceptable",
             "helmet_nut_shell",
         )

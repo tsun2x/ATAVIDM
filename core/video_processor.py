@@ -131,12 +131,16 @@ def get_processing_context(video_id: int) -> dict[str, Any]:
     Load everything the detection pipeline needs for a video.
     Zones always come from the video annotation — never hardcoded.
     """
+    from core.scene_annotation import load_scene_annotation
+
     video = db.get_video(video_id)
     if video is None:
         raise ValueError(f"Video {video_id} not found.")
 
     annotation = db.get_annotation_by_video(video_id)
-    zones = parse_zones_json(annotation["zones_json"]) if annotation else {}
+    scene = load_scene_annotation(annotation["zones_json"] if annotation else None)
+    rule_scene = scene.to_rule_context()
+    zones = dict(rule_scene.legacy_zones)
 
     template = None
     if video.get("template_id"):
@@ -149,6 +153,7 @@ def get_processing_context(video_id: int) -> dict[str, Any]:
         "recorded_at": video.get("recorded_at"),
         "duration_sec": video.get("duration_sec"),
         "zones": zones,
+        "scene": rule_scene,
         "annotation_id": annotation["id"] if annotation else None,
         "template_id": video.get("template_id"),
         "template_name": template["template_name"] if template else None,
@@ -496,6 +501,8 @@ def process_video(
                 recording_time_known=recording_time_known,
                 frame_size=(frame_w, frame_h),
                 now_sec=timestamp_sec,
+                scene=ctx.get("scene"),
+                history=track_state.history_view(now=timestamp_sec),
             )
             by_track = {int(d["track_id"]): d for d in tracked}
             viol_ids = {int(e.track_id) for e in frame_events if e.track_id is not None}

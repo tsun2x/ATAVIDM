@@ -66,6 +66,7 @@ from core.zone_config import (
     zones_complete,
     zones_for_api,
 )
+from core.scene_annotation import serialize_scene_raw
 from database import db
 
 app = Flask(__name__)
@@ -717,8 +718,9 @@ def api_save_annotation(video_id: int):
     source_template_id = payload.get("source_template_id")
 
     try:
-        zones = parse_zones_json(payload.get("zones_json") or payload.get("zones") or {})
-        zones_json = dumps_zones(zones)
+        raw_zones = payload.get("zones_json") or payload.get("zones") or {}
+        zones_json = serialize_scene_raw(raw_zones)
+        zones = parse_zones_json(zones_json)
     except (ValueError, json.JSONDecodeError) as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
 
@@ -2062,9 +2064,19 @@ def api_get_settings():
 @auth.role_required("admin")
 def api_save_settings():
     from core.detection_config import DEFAULT_RULE_PARAMETERS
+    from core.rule_parameter_validation import (
+        RuleParameterValidationError,
+        validate_rule_parameters,
+    )
 
     payload = request.get_json(silent=True) or {}
-    values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
+    raw_values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
+    try:
+        values = validate_rule_parameters(raw_values) if raw_values else {}
+    except RuleParameterValidationError as exc:
+        # Atomic rejection: do not write partial parameter updates.
+        return jsonify({"success": False, "error": str(exc)}), 400
+
     if "enabled_violations" in payload:
         raw = payload.get("enabled_violations")
         if not isinstance(raw, list):
@@ -2085,6 +2097,7 @@ def api_save_settings():
             "success": True,
             "message": "Settings saved.",
             "enabled_violations": list(enabled),
+            "settings": values,
         }
     )
 

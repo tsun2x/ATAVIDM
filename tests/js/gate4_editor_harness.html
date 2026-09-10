@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>TAVIDM Gate 4 editor harness</title>
+    <style>
+        body { font-family: sans-serif; background: #0f172a; color: #e2e8f0; margin: 16px; }
+        canvas { background: #1e293b; border: 1px solid #334155; }
+        button, select { margin: 4px; }
+        pre { background: #111827; padding: 8px; overflow: auto; max-height: 240px; }
+    </style>
+</head>
+<body>
+    <h1>Gate 4 annotation editor harness</h1>
+    <p id="status">loading</p>
+    <div id="sceneKindTabs"></div>
+    <div id="zoneTypeTabs"></div>
+    <button type="button" id="btnNew">New object</button>
+    <button type="button" id="btnDelete">Delete selected</button>
+    <button type="button" id="btnSave">Save</button>
+    <button type="button" id="btnReload">Reload saved</button>
+    <canvas id="zoneEditorCanvas" width="640" height="360"></canvas>
+    <pre id="docOut"></pre>
+    <script src="../../static/js/zone_editor.js"></script>
+    <script>
+        (function () {
+            const zoneTypes = [
+                { key: "no_parking", label: "No Parking", color: "#e63946" },
+                { key: "active_lane", label: "Active Lane", color: "#3b82f6" },
+                { key: "loading_unloading", label: "Loading/Unloading", color: "#8b5cf6" },
+                { key: "restricted_lane", label: "Restricted Lane", color: "#ec4899" },
+                { key: "pedestrian_crossing", label: "Crossing", color: "#22c55e" },
+                { key: "truck_ban_zone", label: "Truck Ban", color: "#f59e0b" },
+            ];
+            const canvas = document.getElementById("zoneEditorCanvas");
+            const img = document.createElement("canvas");
+            img.width = 640;
+            img.height = 360;
+            const g = img.getContext("2d");
+            g.fillStyle = "#334155";
+            g.fillRect(0, 0, 640, 360);
+            g.fillStyle = "#64748b";
+            g.fillRect(40, 80, 560, 160);
+            const image = new Image();
+            image.onload = function () {
+                const saved = localStorage.getItem("gate4_scene");
+                window.__gate4 = TAVIDMZoneEditor.create(canvas, {
+                    zoneTypes: zoneTypes,
+                    sceneDocument: saved
+                        ? TAVIDMZoneEditor.parseSceneDocument(saved, zoneTypes)
+                        : TAVIDMZoneEditor.emptySceneV2(),
+                    image: image,
+                });
+                if (!saved) seedDemo();
+                document.getElementById("status").textContent = saved ? "reloaded" : "ready";
+                renderDoc();
+            };
+            image.src = img.toDataURL("image/png");
+
+            function seedDemo() {
+                const ed = window.__gate4;
+                ed.scene.create("zones", "loading_unloading", [[40, 40], [160, 40], [160, 120], [40, 120]], { id: "zone-load" });
+                ed.scene.create("lanes", "active_lane", [[200, 60], [520, 60], [520, 140], [200, 140]], { id: "lane-keep" });
+                ed.scene.create("lanes", "active_lane", [[200, 170], [520, 170], [520, 250], [200, 250]], { id: "lane-b" });
+                ed.scene.create("flow_arrows", "lane_flow", [[220, 100], [480, 100]], { id: "arrow-a", lane_ids: ["lane-keep"] });
+                ed.scene.create("threshold_lines", "no_entry_threshold", [[180, 40], [180, 280]], { id: "th-1" });
+                ed.scene.create("markings", "double_solid", [[40, 200], [180, 200]], { id: "mk-1", prohibited_from: "both" });
+                ed.scene.create("signs", "no_entry", [[40, 240], [90, 240], [90, 290], [40, 290]], { id: "sg-1" });
+                ed.scene.create("activity_regions", "passenger_activity", [[540, 60], [620, 60], [620, 140], [540, 140]], { id: "act-1" });
+                ed.scene.select("lane-keep");
+                ed.draw();
+            }
+
+            window.__gate4Verify = function () {
+                const doc = window.__gate4.getSceneDocument();
+                return {
+                    status: document.getElementById("status").textContent,
+                    schema_version: doc.schema_version,
+                    ids: {
+                        zones: doc.zones.map(function (o) { return o.id; }),
+                        lanes: doc.lanes.map(function (o) { return o.id; }),
+                        flow_arrows: doc.flow_arrows.map(function (o) { return o.id; }),
+                        threshold_lines: doc.threshold_lines.map(function (o) { return o.id; }),
+                        markings: doc.markings.map(function (o) { return o.id; }),
+                        signs: doc.signs.map(function (o) { return o.id; }),
+                        activity_regions: doc.activity_regions.map(function (o) { return o.id; }),
+                    },
+                    selected: window.__gate4.scene.selectedId,
+                    loading_unloading: doc.zones.filter(function (z) { return z.type === "loading_unloading"; }).length,
+                    lane_count: doc.lanes.length,
+                    moved_point: doc.lanes[0] && doc.lanes[0].points[0],
+                };
+            };
+            window.__gate4Move = function () {
+                window.__gate4.scene.movePoint("lane-keep", 0, [210, 70]);
+                window.__gate4.draw();
+                renderDoc();
+                return window.__gate4Verify();
+            };
+            window.__gate4DeleteSign = function () {
+                window.__gate4.scene.delete("sg-1");
+                window.__gate4.draw();
+                renderDoc();
+                return window.__gate4Verify();
+            };
+
+            function renderDoc() {
+                if (!window.__gate4) return;
+                document.getElementById("docOut").textContent = JSON.stringify(
+                    window.__gate4.getSceneDocument(),
+                    null,
+                    2
+                );
+            }
+            document.getElementById("btnNew").onclick = function () {
+                window.__gate4.newObject();
+                renderDoc();
+            };
+            document.getElementById("btnDelete").onclick = function () {
+                window.__gate4.deleteSelected();
+                renderDoc();
+            };
+            document.getElementById("btnSave").onclick = function () {
+                window.__gate4Saved = window.__gate4.getSceneDocument({ completeOnly: true });
+                localStorage.setItem("gate4_scene", JSON.stringify(window.__gate4Saved));
+                document.getElementById("status").textContent = "saved";
+                renderDoc();
+            };
+            document.getElementById("btnReload").onclick = function () {
+                const raw = localStorage.getItem("gate4_scene");
+                window.__gate4.loadSceneDocument(raw ? JSON.parse(raw) : (window.__gate4Saved || TAVIDMZoneEditor.emptySceneV2()));
+                document.getElementById("status").textContent = "reloaded";
+                renderDoc();
+            };
+            canvas.addEventListener("mouseup", renderDoc);
+        })();
+    </script>
+</body>
+</html>

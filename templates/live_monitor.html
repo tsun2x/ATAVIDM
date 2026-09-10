@@ -71,6 +71,7 @@
                                 <li><button class="dropdown-item d-none" type="button" data-action="watch_live">Watch Live Processing</button></li>
                                 <li><button class="dropdown-item d-none" type="button" data-action="preview_annotated">Preview Annotated Result</button></li>
                                 <li><button class="dropdown-item d-none" type="button" data-action="download_annotated">Download Annotated Result</button></li>
+                                <li><button class="dropdown-item" type="button" data-action="edit_annotation">Edit Annotation</button></li>
                                 <li><button class="dropdown-item" type="button" data-action="history">View History</button></li>
                                 <li><hr class="dropdown-divider"></li>
                                 <li><button class="dropdown-item" type="button" data-action="reprocess">Reprocess</button></li>
@@ -268,12 +269,24 @@
 
                 <div id="wizardStepEditor" class="d-none">
                     <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
-                        <div class="btn-group btn-group-sm zone-type-tabs" id="zoneTypeTabs" role="group"></div>
+                        <div class="btn-group btn-group-sm" id="sceneKindTabs" role="group" aria-label="Scene object kinds"></div>
                         <div class="d-flex gap-2">
-                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnResetZone"><i class="bi bi-arrow-counterclockwise"></i> Reset Zone</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnNewSceneObject"><i class="bi bi-plus"></i> New object</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnDeleteSceneObject"><i class="bi bi-trash"></i> Delete selected</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="btnResetZone"><i class="bi bi-arrow-counterclockwise"></i> Reset</button>
                         </div>
                     </div>
-                    <p class="small text-muted mb-2">Click to add points · Drag to move · Double-click point to delete · Shift+drag to pan · Scroll to zoom</p>
+                    <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                        <div class="btn-group btn-group-sm zone-type-tabs" id="zoneTypeTabs" role="group"></div>
+                        <select id="sceneLaneSelect" class="form-select form-select-sm d-none" style="width:auto" aria-label="Apply to lane"></select>
+                        <select id="sceneProhibitedFrom" class="form-select form-select-sm d-none" style="width:auto" aria-label="Prohibited from">
+                            <option value="both">prohibited from both</option>
+                            <option value="left">prohibited from left</option>
+                            <option value="right">prohibited from right</option>
+                        </select>
+                        <span class="small text-muted" id="sceneSelectedLabel"></span>
+                    </div>
+                    <p class="small text-muted mb-2">Click to add points · Drag to move · Double-click point to delete · New object starts another shape · Shift+drag to pan · Scroll to zoom</p>
                     <div class="zone-editor-wrap" id="zoneEditorWrap">
                         <canvas id="zoneEditorCanvas"></canvas>
                     </div>

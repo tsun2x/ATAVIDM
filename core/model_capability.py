@@ -43,12 +43,12 @@ RULE_REQUIRED_CLASSES: dict[str, tuple[str, ...]] = {
     VIOLATION_TRUCK_BAN: (YOLO_CLASS_TRUCK,),
     VIOLATION_NO_HELMET: (
         YOLO_CLASS_MOTORCYCLE,
-        YOLO_CLASS_PERSON,
+        YOLO_CLASS_RIDER,
         YOLO_CLASS_HELMET_ACCEPTABLE,
         YOLO_CLASS_HELMET_NUT_SHELL,
     ),
     VIOLATION_NO_SIDE_MIRROR: (YOLO_CLASS_SIDE_MIRROR,),
-    VIOLATION_MOTORCYCLE_OVERLOADING: (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_PERSON),
+    VIOLATION_MOTORCYCLE_OVERLOADING: (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_RIDER),
     VIOLATION_DISREGARDING_SIGN: (),  # needs configured sign annotations, not YOLO alone
     VIOLATION_PAVEMENT_MARKINGS: (),  # needs operator-saved marking geometry
     VIOLATION_ILLEGAL_TERMINAL: (),
@@ -58,8 +58,7 @@ RULE_REQUIRED_CLASSES: dict[str, tuple[str, ...]] = {
     ),
     VIOLATION_SUBSTANDARD_HELMET: (
         YOLO_CLASS_MOTORCYCLE,
-        YOLO_CLASS_PERSON,
-        YOLO_CLASS_HELMET_ACCEPTABLE,
+        YOLO_CLASS_RIDER,
         YOLO_CLASS_HELMET_NUT_SHELL,
     ),
 }
@@ -67,11 +66,11 @@ RULE_REQUIRED_CLASSES: dict[str, tuple[str, ...]] = {
 # Alternate acceptable class sets (any one complete set satisfies the gate).
 RULE_ALTERNATE_CLASS_SETS: dict[str, tuple[tuple[str, ...], ...]] = {
     VIOLATION_NO_HELMET: (
-        (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_PERSON, YOLO_CLASS_HELMET),
+        (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_RIDER, YOLO_CLASS_HELMET),
         (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_RIDER, YOLO_CLASS_HELMET_ACCEPTABLE),
     ),
     VIOLATION_SUBSTANDARD_HELMET: (
-        (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_PERSON, YOLO_CLASS_HELMET_NUT_SHELL),
+        (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_RIDER, YOLO_CLASS_HELMET_ACCEPTABLE, YOLO_CLASS_HELMET_NUT_SHELL),
     ),
     VIOLATION_CARGO_PASSENGERS: (
         (YOLO_CLASS_PERSON, YOLO_CLASS_PICKUP_TRUCK),
@@ -87,8 +86,8 @@ RULE_REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
     VIOLATION_ILLEGAL_TERMINAL: ("zone:loading_unloading_or_terminal", "puv_context"),
     VIOLATION_PAVEMENT_MARKINGS: ("marking_geometry",),
     VIOLATION_DISREGARDING_SIGN: ("supported_sign_annotations",),
-    VIOLATION_NO_SIDE_MIRROR: ("mirror_roi_visibility",),
-    VIOLATION_CARGO_PASSENGERS: ("cargo_roi_association",),
+    # Mirror/cargo visibility is produced per-episode by observation helpers —
+    # not unconditional context flags.
 }
 
 

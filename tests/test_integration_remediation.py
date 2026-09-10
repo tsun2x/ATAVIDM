@@ -116,7 +116,7 @@ class TestModelCapabilityDetectorClassNames:
 
     def test_rules_enabled_when_required_classes_present(self):
         det = _fake_detector_with_names(
-            {0: "car", 1: "truck", 2: "side_mirror", 3: "motorcycle", 4: "person", 5: "helmet"}
+            {0: "car", 1: "truck", 2: "side_mirror", 3: "motorcycle", 4: "rider", 5: "helmet"}
         )
         names = extract_model_class_names(det)
         assert classes_satisfy_rule(VIOLATION_NO_SIDE_MIRROR, names)
@@ -127,6 +127,18 @@ class TestModelCapabilityDetectorClassNames:
             names,
         )
         assert all(c.automatic_evaluation for c in caps)
+
+    def test_no_helmet_not_enabled_when_person_substitutes_for_rider(self):
+        det = _fake_detector_with_names(
+            {0: "motorcycle", 1: "person", 2: "helmet", 3: "car"}
+        )
+        names = extract_model_class_names(det)
+        assert "person" in names
+        assert "rider" not in names
+        assert not classes_satisfy_rule("No Helmet", names)
+        cap = assess_rule_capability("No Helmet", names)
+        assert cap.automatic_evaluation is False
+        assert any("rider" in item for item in cap.missing_prerequisites)
 
     def test_malformed_and_unknown_rosters_fail_closed(self):
         empty = _fake_detector_with_names({})
@@ -258,6 +270,124 @@ class TestSideMirrorFailClosed:
             )
             assert ev == []
         assert state.contextual[("side_mirror", 1)]["state"] == "PRESENT"
+
+    def test_two_associated_sides_record_both_and_emit_nothing(self):
+        state = RuleEngineState()
+        classes = ("car", "side_mirror")
+        state.capability[VIOLATION_NO_SIDE_MIRROR] = assess_rule_capability(
+            VIOLATION_NO_SIDE_MIRROR, classes
+        )
+        veh = _vehicle(bbox_x=100, bbox_y=80, bbox_w=120, bbox_h=80, confidence=0.9)
+        left = {
+            "track_id": 98,
+            "class_label": "side_mirror",
+            "confidence": 0.8,
+            "bbox_x": 105.0,
+            "bbox_y": 85.0,
+            "bbox_w": 16.0,
+            "bbox_h": 12.0,
+            "timestamp_sec": 0.0,
+        }
+        right = {
+            "track_id": 99,
+            "class_label": "side_mirror",
+            "confidence": 0.8,
+            "bbox_x": 190.0,
+            "bbox_y": 85.0,
+            "bbox_w": 16.0,
+            "bbox_h": 12.0,
+            "timestamp_sec": 0.0,
+        }
+        for t in range(3):
+            veh["timestamp_sec"] = float(t)
+            left["timestamp_sec"] = float(t)
+            right["timestamp_sec"] = float(t)
+            ev = evaluate_detection_rules(
+                [veh, left, right],
+                state,
+                frame_number=t,
+                enabled_violations=(VIOLATION_NO_SIDE_MIRROR,),
+                model_classes=classes,
+            )
+            assert ev == []
+        assert state.contextual[("side_mirror", 1)]["state"] == "PRESENT_BOTH"
+
+    def test_one_mirror_never_proves_both_present(self):
+        state = RuleEngineState()
+        classes = ("car", "side_mirror")
+        state.capability[VIOLATION_NO_SIDE_MIRROR] = assess_rule_capability(
+            VIOLATION_NO_SIDE_MIRROR, classes
+        )
+        veh = _vehicle(
+            bbox_x=100,
+            bbox_y=80,
+            bbox_w=120,
+            bbox_h=80,
+            confidence=0.9,
+            mirror_roi_visibility="both_visible",
+        )
+        mirror = {
+            "track_id": 99,
+            "class_label": "side_mirror",
+            "confidence": 0.8,
+            "bbox_x": 110.0,
+            "bbox_y": 85.0,
+            "bbox_w": 20.0,
+            "bbox_h": 15.0,
+            "timestamp_sec": 0.0,
+        }
+        evaluate_detection_rules(
+            [veh, mirror],
+            state,
+            frame_number=0,
+            enabled_violations=(VIOLATION_NO_SIDE_MIRROR,),
+            model_classes=classes,
+        )
+        assert state.contextual[("side_mirror", 1)]["state"] == "PRESENT"
+        assert state.contextual[("side_mirror", 1)]["state"] != "PRESENT_BOTH"
+
+    def test_one_mirror_with_visibility_can_emit_review(self):
+        state = RuleEngineState()
+        classes = ("car", "side_mirror")
+        state.capability[VIOLATION_NO_SIDE_MIRROR] = assess_rule_capability(
+            VIOLATION_NO_SIDE_MIRROR, classes
+        )
+        veh = _vehicle(
+            bbox_x=100,
+            bbox_y=80,
+            bbox_w=120,
+            bbox_h=80,
+            confidence=0.9,
+            mirror_roi_visibility="both_visible",
+        )
+        mirror = {
+            "track_id": 99,
+            "class_label": "side_mirror",
+            "confidence": 0.8,
+            "bbox_x": 110.0,
+            "bbox_y": 85.0,
+            "bbox_w": 20.0,
+            "bbox_h": 15.0,
+            "timestamp_sec": 0.0,
+        }
+        events = []
+        for t in range(5):
+            veh["timestamp_sec"] = float(t)
+            mirror["timestamp_sec"] = float(t)
+            events.extend(
+                evaluate_detection_rules(
+                    [veh, mirror],
+                    state,
+                    frame_number=t,
+                    enabled_violations=(VIOLATION_NO_SIDE_MIRROR,),
+                    model_classes=classes,
+                )
+            )
+        assert state.contextual[("side_mirror", 1)]["state"] == "PRESENT"
+        assert any(
+            e.violation_type == VIOLATION_NO_SIDE_MIRROR and e.outcome == "review"
+            for e in events
+        )
 
     def test_rule_status_partial_and_needs_decision(self, test_db):
         assert VIOLATION_NO_SIDE_MIRROR in PARTIAL_VIOLATIONS

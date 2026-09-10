@@ -360,7 +360,7 @@ class TestNoHelmet:
         
         # Rider positioned to be associated with motorcycle
         person = {
-            "class_label": "person",
+            "class_label": "rider",
             "track_id": 2,
             "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40,
             "confidence": 0.9, "speed_px_per_sec": 0.0,
@@ -372,7 +372,13 @@ class TestNoHelmet:
             ts = frame * 0.3
             mc["timestamp_sec"] = ts
             person["timestamp_sec"] = ts
-            evt = check_no_helmet([mc, person], state, frame, rule_params)
+            evt = check_no_helmet(
+                [mc, person],
+                state,
+                frame,
+                rule_params,
+                model_classes=("motorcycle", "rider", "helmet_acceptable", "helmet_nut_shell"),
+            )
             events.extend(evt)
         
         assert any(e.violation_type == VIOLATION_NO_HELMET for e in events), \
@@ -397,9 +403,9 @@ class TestMotorcycleOverloading:
         }
         
         persons = [
-            {"class_label": "person", "track_id": 2, "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
-            {"class_label": "person", "track_id": 3, "bbox_x": 130, "bbox_y": 95, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
-            {"class_label": "person", "track_id": 4, "bbox_x": 118, "bbox_y": 102, "bbox_w": 18, "bbox_h": 22, "confidence": 0.9, "speed_px_per_sec": 0.0},
+            {"class_label": "rider", "track_id": 2, "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
+            {"class_label": "rider", "track_id": 3, "bbox_x": 130, "bbox_y": 95, "bbox_w": 20, "bbox_h": 40, "confidence": 0.9, "speed_px_per_sec": 0.0},
+            {"class_label": "rider", "track_id": 4, "bbox_x": 118, "bbox_y": 102, "bbox_w": 18, "bbox_h": 22, "confidence": 0.9, "speed_px_per_sec": 0.0},
         ]
         
         events = []
@@ -408,7 +414,12 @@ class TestMotorcycleOverloading:
             mc["timestamp_sec"] = ts
             for p in persons:
                 p["timestamp_sec"] = ts
-            evt = check_motorcycle_overloading([mc] + persons, state, frame)
+            evt = check_motorcycle_overloading(
+                [mc] + persons,
+                state,
+                frame,
+                model_classes=("motorcycle", "rider"),
+            )
             events.extend(evt)
         
         # Should NOT produce Cargo Passengers

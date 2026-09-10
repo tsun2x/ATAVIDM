@@ -24,7 +24,11 @@
     const wizardStepTemplatePrompt = document.getElementById("wizardStepTemplatePrompt");
     const wizardTemplateSelect = document.getElementById("wizardTemplateSelect");
     const zoneTypeTabs = document.getElementById("zoneTypeTabs");
+    const sceneKindTabs = document.getElementById("sceneKindTabs");
     const zoneEditorCanvas = document.getElementById("zoneEditorCanvas");
+    const sceneLaneSelect = document.getElementById("sceneLaneSelect");
+    const sceneProhibitedFrom = document.getElementById("sceneProhibitedFrom");
+    const sceneSelectedLabel = document.getElementById("sceneSelectedLabel");
 
     if (!dropzone || !fileInput) return;
 
@@ -43,6 +47,9 @@
         mode: "new",
         sourceTemplateId: null,
         pendingZones: null,
+        pendingScene: null,
+        existingScene: null,
+        startAtEditor: false,
     };
 
     if (wizardModalEl && window.bootstrap) {
@@ -103,22 +110,96 @@
         });
     }
 
-    function buildZoneTabs() {
-        if (!zoneTypeTabs) return;
-        zoneTypeTabs.innerHTML = "";
-        zoneTypes.forEach(function (zt, idx) {
+    function currentTypeOptions(kind) {
+        if (kind === "zones") {
+            return (zoneTypes || []).filter(function (zt) { return zt.key !== "active_lane"; });
+        }
+        const kinds = (window.TAVIDMZoneEditor && window.TAVIDMZoneEditor.SCENE_KINDS) || [];
+        const def = kinds.find(function (k) { return k.key === kind; });
+        return (def && def.types) || [];
+    }
+
+    function refreshSceneFields() {
+        if (!zoneEditor) return;
+        const kind = zoneEditor.objectKind;
+        const selected = zoneEditor.selectedObject && zoneEditor.selectedObject();
+        if (sceneSelectedLabel) {
+            sceneSelectedLabel.textContent = selected
+                ? ("Selected: " + selected.id + " (" + selected.type + ")")
+                : "No object selected";
+        }
+        if (sceneLaneSelect) {
+            const needsLane = kind === "flow_arrows" || kind === "threshold_lines" || kind === "signs" || kind === "markings";
+            sceneLaneSelect.classList.toggle("d-none", !needsLane);
+            sceneLaneSelect.innerHTML = '<option value="">— Apply to lane —</option>';
+            (zoneEditor.scene.objects.lanes || []).forEach(function (lane) {
+                const opt = document.createElement("option");
+                opt.value = lane.id;
+                opt.textContent = lane.id;
+                sceneLaneSelect.appendChild(opt);
+            });
+            if (selected && selected.lane_ids && selected.lane_ids[0]) {
+                sceneLaneSelect.value = selected.lane_ids[0];
+            }
+        }
+        if (sceneProhibitedFrom) {
+            const showPf = kind === "markings";
+            sceneProhibitedFrom.classList.toggle("d-none", !showPf);
+            if (selected && selected.prohibited_from) sceneProhibitedFrom.value = selected.prohibited_from;
+        }
+    }
+
+    function buildKindTabs() {
+        if (!sceneKindTabs || !window.TAVIDMZoneEditor) return;
+        sceneKindTabs.innerHTML = "";
+        const kinds = window.TAVIDMZoneEditor.SCENE_KINDS || [];
+        const activeKind = zoneEditor ? zoneEditor.objectKind : "zones";
+        kinds.forEach(function (kind) {
             const btn = document.createElement("button");
             btn.type = "button";
-            btn.className = "btn btn-outline-secondary" + (idx === 0 ? " active" : "");
+            btn.className = "btn btn-outline-secondary" + (kind.key === activeKind ? " active" : "");
+            btn.dataset.kind = kind.key;
+            btn.textContent = kind.label;
+            btn.addEventListener("click", function () {
+                sceneKindTabs.querySelectorAll(".btn").forEach(function (b) { b.classList.remove("active"); });
+                btn.classList.add("active");
+                if (zoneEditor) zoneEditor.setObjectKind(kind.key);
+                buildTypeTabs();
+                refreshSceneFields();
+            });
+            sceneKindTabs.appendChild(btn);
+        });
+    }
+
+    function buildTypeTabs() {
+        if (!zoneTypeTabs) return;
+        zoneTypeTabs.innerHTML = "";
+        const kind = zoneEditor ? zoneEditor.objectKind : "zones";
+        const types = currentTypeOptions(kind);
+        const activeType = zoneEditor ? zoneEditor.objectType : (types[0] && types[0].key);
+        types.forEach(function (zt, idx) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn btn-outline-secondary" + (zt.key === activeType || (!activeType && idx === 0) ? " active" : "");
             btn.dataset.zoneKey = zt.key;
             btn.innerHTML = '<span class="zone-dot" style="background:' + zt.color + '"></span> ' + zt.label;
             btn.addEventListener("click", function () {
                 zoneTypeTabs.querySelectorAll(".btn").forEach(function (b) { b.classList.remove("active"); });
                 btn.classList.add("active");
-                if (zoneEditor) zoneEditor.setActiveZone(zt.key);
+                if (zoneEditor) {
+                    if (kind === "zones") zoneEditor.setActiveZone(zt.key);
+                    else zoneEditor.setObjectKind(kind, zt.key);
+                }
+                refreshSceneFields();
             });
             zoneTypeTabs.appendChild(btn);
         });
+    }
+
+    function buildZoneTabs() {
+        buildKindTabs();
+        buildTypeTabs();
+        refreshSceneFields();
     }
 
     function destroyEditor() {
@@ -128,26 +209,30 @@
         }
     }
 
-    function initEditor(zones) {
+    function initEditor(sceneDoc) {
         destroyEditor();
         if (!zoneEditorCanvas || !wizardState.frameUrl) return;
         zoneEditor = window.TAVIDMZoneEditor.create(zoneEditorCanvas, {
             imageUrl: wizardState.frameUrl + "?t=" + Date.now(),
             zoneTypes: zoneTypes,
-            zones: zones,
+            sceneDocument: sceneDoc || window.TAVIDMZoneEditor.emptySceneV2(),
             activeZone: zoneTypes[0] && zoneTypes[0].key,
+            onChange: refreshSceneFields,
         });
         buildZoneTabs();
     }
 
-    function getInitialZones() {
+    function getInitialScene() {
+        if (wizardState.existingScene) {
+            return window.TAVIDMZoneEditor.parseSceneDocument(wizardState.existingScene, zoneTypes);
+        }
         if (wizardState.mode === "template" && wizardState.sourceTemplateId) {
             const tpl = wizardState.templates.find(function (t) {
                 return String(t.id) === String(wizardState.sourceTemplateId);
             });
-            if (tpl) return window.TAVIDMZoneEditor.parseZones(tpl.zones_json, zoneTypes);
+            if (tpl) return window.TAVIDMZoneEditor.parseSceneDocument(tpl.zones_json, zoneTypes);
         }
-        return window.TAVIDMZoneEditor.emptyZones(zoneTypes);
+        return window.TAVIDMZoneEditor.emptySceneV2();
     }
 
     function openAnnotationWizard(payload) {
@@ -156,6 +241,8 @@
         wizardState.templates = payload.templates || [];
         wizardState.mode = wizardState.templates.length ? "choose" : "new";
         wizardState.sourceTemplateId = null;
+        wizardState.existingScene = payload.existing_scene || null;
+        wizardState.startAtEditor = !!payload.start_at_editor;
 
         populateTemplateSelect(wizardState.templates);
         document.getElementById("optionUseTemplate")?.classList.toggle("d-none", !wizardState.templates.length);
@@ -172,6 +259,10 @@
 
         showWizardStep("choose");
         wizardModal?.show();
+        if (wizardState.startAtEditor) {
+            initEditor(getInitialScene());
+            showWizardStep("editor");
+        }
     }
 
     function appendVideoToList(video) {
@@ -227,14 +318,20 @@
     }
 
     function saveAnnotation(saveMode, extra) {
-        const zones = wizardState.pendingZones || (zoneEditor ? zoneEditor.getZones() : {});
-        if (!window.TAVIDMZoneEditor.zonesComplete(zones, zoneTypes)) {
-            showToast("Incomplete Zones", "Draw at least one zone; each drawn zone needs at least 3 points.", "warning");
+        const scene = wizardState.pendingScene
+            || (zoneEditor ? zoneEditor.getSceneDocument({ completeOnly: true }) : window.TAVIDMZoneEditor.emptySceneV2());
+        if (!window.TAVIDMZoneEditor.sceneSaveReady(scene, zoneTypes)) {
+            showToast("Incomplete Zones", "Draw at least one zone or lane; each drawn polygon needs at least 3 points.", "warning");
+            return;
+        }
+        const check = window.TAVIDMZoneEditor.validateSceneDocument(scene);
+        if (!check.ok) {
+            showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
             return;
         }
 
         const body = Object.assign({
-            zones: zones,
+            zones: scene,
             save_mode: saveMode,
             source_template_id: wizardState.sourceTemplateId,
         }, extra || {});
@@ -285,7 +382,7 @@
         } else {
             wizardState.sourceTemplateId = null;
         }
-        initEditor(getInitialZones());
+        initEditor(getInitialScene());
         showWizardStep("editor");
     });
 
@@ -295,13 +392,39 @@
 
     document.getElementById("btnResetZone")?.addEventListener("click", function () {
         if (zoneEditor) zoneEditor.resetActiveZone();
+        refreshSceneFields();
+    });
+
+    document.getElementById("btnNewSceneObject")?.addEventListener("click", function () {
+        if (zoneEditor) zoneEditor.newObject();
+        refreshSceneFields();
+    });
+
+    document.getElementById("btnDeleteSceneObject")?.addEventListener("click", function () {
+        if (zoneEditor) zoneEditor.deleteSelected();
+        refreshSceneFields();
+    });
+
+    sceneLaneSelect?.addEventListener("change", function () {
+        const selected = zoneEditor && zoneEditor.selectedObject && zoneEditor.selectedObject();
+        if (!selected || !sceneLaneSelect.value) return;
+        selected.lane_ids = [sceneLaneSelect.value];
+        if (zoneEditor) zoneEditor.draw();
+    });
+
+    sceneProhibitedFrom?.addEventListener("change", function () {
+        if (!zoneEditor) return;
+        zoneEditor.prohibitedFrom = sceneProhibitedFrom.value;
+        const selected = zoneEditor.selectedObject && zoneEditor.selectedObject();
+        if (selected) selected.prohibited_from = sceneProhibitedFrom.value;
+        zoneEditor.draw();
     });
 
     document.getElementById("btnWizardSaveAnnotation")?.addEventListener("click", function () {
         if (!zoneEditor) return;
-        wizardState.pendingZones = zoneEditor.getZones();
-        if (!window.TAVIDMZoneEditor.zonesComplete(wizardState.pendingZones, zoneTypes)) {
-            showToast("Incomplete Zones", "Draw at least one zone; each drawn zone needs at least 3 points.", "warning");
+        wizardState.pendingScene = zoneEditor.getSceneDocument({ completeOnly: true });
+        if (!window.TAVIDMZoneEditor.sceneSaveReady(wizardState.pendingScene, zoneTypes)) {
+            showToast("Incomplete Zones", "Draw at least one zone or lane; each drawn polygon needs at least 3 points.", "warning");
             return;
         }
         const updateBtn = document.getElementById("btnUpdateTemplate");
