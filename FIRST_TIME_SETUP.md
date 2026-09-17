@@ -131,7 +131,7 @@ Edit `.env` if needed:
 | `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
 | `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
 | `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
-| `MAX_UPLOAD_MB` | `500` | Max upload size in MB |
+| `MAX_UPLOAD_MB` | `3072` | Max upload size in MB (3 GiB; env-driven) |
 
 The app runs without a `.env` file — defaults are used. `.env` is gitignored.
 
@@ -274,7 +274,7 @@ Or stop the other process using port 5000.
 ### Upload fails or frame extraction error
 
 - Use **MP4** only.
-- Check file size (default max 500 MB).
+- Check file size (default max 3072 MB / 3 GiB).
 - Ensure `dataset/raw/` and `dataset/frames/` are writable.
 - Confirm OpenCV imports: `python -c "import cv2"`.
 

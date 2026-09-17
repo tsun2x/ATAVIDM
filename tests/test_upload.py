@@ -46,6 +46,11 @@ class TestDiskSpaceGuard:
 
 
 class TestSizeLimit:
+    def test_default_limit_allows_three_gibibyte_uploads(self):
+        # Regression: leaving the old 500 MiB default rejects approved 3 GiB videos.
+        assert upload_mod.config.MAX_UPLOAD_MB == 3072
+        assert upload_mod.config.MAX_CONTENT_LENGTH == 3072 * 1024 * 1024
+
     def test_rejects_over_max(self, monkeypatch):
         monkeypatch.setattr(upload_mod.config, "MAX_UPLOAD_MB", 1)
         monkeypatch.setattr(upload_mod.config, "MAX_CONTENT_LENGTH", 1 * 1024 * 1024)

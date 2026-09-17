@@ -133,7 +133,7 @@ Edit `.env` if needed:
 | `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
 | `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
 | `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
-| `MAX_UPLOAD_MB` | `500` | Max single upload size in MB (env-driven; UI shows it on the upload panel) |
+| `MAX_UPLOAD_MB` | `3072` | Max single upload size in MB (3 GiB; env-driven; UI shows it on the upload panel) |
 | `UPLOAD_DISK_HEADROOM_MB` | `500` | Free-disk headroom (MB) required *in addition to* the file size before an upload is accepted |
 
 The app runs without a `.env` file — defaults are used. `.env` is gitignored.
@@ -143,7 +143,7 @@ The app runs without a `.env` file — defaults are used. `.env` is gitignored.
 Uploaded MP4s are saved **in full** to `dataset/raw`, so multi-GB footage is
 not "free". Two guards protect the host:
 
-- **Size limit** — `MAX_UPLOAD_MB` (default `500`) enforces the hard cap and
+- **Size limit** — `MAX_UPLOAD_MB` (default `3072`, or 3 GiB) enforces the hard cap and
   returns a clear `413`/`400` when exceeded. Raise it only after confirming
   there is enough free disk for the file plus headroom.
 - **Disk-space pre-check** — before saving, the upload path is checked with
@@ -308,7 +308,7 @@ Or stop the other process using port 5000.
 ### Upload fails or frame extraction error
 
 - Use **MP4** only.
-- Check file size (default max 500 MB).
+- Check file size (default max 3072 MB / 3 GiB).
 - Ensure `dataset/raw/` and `dataset/frames/` are writable.
 - Confirm OpenCV imports: `python -c "import cv2"`.
 

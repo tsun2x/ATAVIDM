@@ -15,7 +15,7 @@ ANNOTATED_FOLDER = os.environ.get(
 EVIDENCE_FOLDER = os.environ.get("EVIDENCE_FOLDER", str(BASE_DIR / "static" / "evidence"))
 # Generated PDF/Excel reports.
 REPORTS_FOLDER = os.environ.get("REPORTS_FOLDER", str(BASE_DIR / "static" / "reports"))
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "3072"))
 MAX_CONTENT_LENGTH = MAX_UPLOAD_MB * 1024 * 1024
 ALLOWED_VIDEO_EXTENSIONS = {"mp4"}
 # Period boundaries for upload/processing analytics (never use recording time).
