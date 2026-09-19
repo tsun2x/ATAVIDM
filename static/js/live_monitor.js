@@ -23,6 +23,7 @@
     const processProgressPanel = document.getElementById("processProgressPanel");
     const videoActionsDropdown = document.getElementById("videoActionsDropdown");
     const btnProcessSelected = document.getElementById("btnProcessSelected");
+    const btnCancelProcessing = document.getElementById("btnCancelProcessing");
 
     let activeCamera = null;
     let activeVideo = null;
@@ -49,6 +50,7 @@
         activeVideo = null;
         watchingLive = false;
         btnProcess?.classList.add("d-none");
+        btnCancelProcessing?.classList.add("d-none");
         btnStopStream?.classList.add("d-none");
         liveIndicator?.classList.add("d-none");
         mediaModeBar?.classList.add("d-none");
@@ -189,6 +191,40 @@
         document.getElementById("btnModeAnnotated")?.classList.toggle("d-none", !video.annotated_video_ready);
     }
 
+    function syncVideoRow(videoId, changes) {
+        const checkbox = videoList?.querySelector('.bulk-video-check[value="' + videoId + '"]');
+        const row = checkbox?.closest(".camera-item-row");
+        const button = row?.querySelector(".camera-item");
+        if (!button) return;
+        let video;
+        try { video = JSON.parse(button.dataset.video || "{}"); } catch (err) { video = {}; }
+        Object.assign(video, changes || {});
+        button.dataset.video = JSON.stringify(video);
+
+        const status = video.processing ? "processing" : (video.status || "uploaded");
+        const label = row.querySelector(".video-status-label");
+        if (label) {
+            const condition = video.condition || "peak";
+            label.textContent = condition.charAt(0).toUpperCase() + condition.slice(1) +
+                " · " + status.charAt(0).toUpperCase() + status.slice(1);
+        }
+        row.querySelector(".cam-status-dot")?.classList.toggle("online", !!video.processed);
+        row.querySelector(".cam-status-dot")?.classList.toggle("offline", !video.processed);
+
+        if (checkbox) {
+            const ready = !!(video.has_annotation && !video.processing &&
+                (video.status === "ready" || video.status === "processed"));
+            checkbox.disabled = !ready;
+            checkbox.setAttribute("data-ready", ready ? "1" : "0");
+            if (!ready) checkbox.checked = false;
+        }
+        if (activeVideo && activeVideo.db_id === Number(videoId)) {
+            Object.assign(activeVideo, video);
+            sourceMeta.textContent = (video.condition || "peak") + " · " + status;
+        }
+        refreshBulkButton();
+    }
+
     function selectVideo(video, btn) {
         clearActive();
         activeVideo = video;
@@ -204,6 +240,7 @@
         const canProcess = video.has_annotation && (video.status === "ready" || video.status === "processed") && !video.processing;
         if (canProcess) btnProcess?.classList.remove("d-none");
         if (video.processing) {
+            btnCancelProcessing?.classList.remove("d-none");
             processProgressPanel?.classList.remove("d-none");
             pollProcessing(video.db_id);
         }
@@ -253,6 +290,12 @@
             ? Object.keys(classes).map(function (k) { return k + ": " + classes[k]; }).join(", ")
             : "—";
         document.getElementById("ppClasses").textContent = classText;
+        const crossings = payload.crossing_counts || {};
+        document.getElementById("ppCrossings").textContent = payload.vehicles_crossed == null
+            ? "Requires a configured counting line"
+            : payload.vehicles_crossed + (Object.keys(crossings).length
+                ? " (" + Object.keys(crossings).map(function (k) { return k + ": " + crossings[k]; }).join(", ") + ")"
+                : "");
         if (payload.queue_position != null && payload.queue_position > 0) {
             document.getElementById("ppStage").textContent = "queued (position " + payload.queue_position + ")";
         }
@@ -271,8 +314,9 @@
             "<div><strong>Model:</strong> " + (payload.model_identifier || "YOLOv8m") + "</div>" +
             "<div><strong>Duration:</strong> " + formatSec(payload.elapsed_sec) +
             " · Source: " + formatSec(payload.source_duration_sec) + "</div>" +
-            "<div><strong>Detection records:</strong> " + (payload.detection_records || 0) +
-            (payload.unique_tracks != null ? " · Unique tracks: " + payload.unique_tracks : "") + "</div>" +
+            "<div><strong>Detection observations:</strong> " + (payload.detection_records || 0) +
+            (payload.unique_tracks != null ? " · ByteTrack IDs observed (diagnostic): " + payload.unique_tracks : "") + "</div>" +
+            "<div><strong>Vehicles crossed:</strong> " + (payload.vehicles_crossed == null ? "Requires a counting line" : payload.vehicles_crossed) + "</div>" +
             "<div><strong>Violation candidates:</strong> " + (payload.violation_candidates || 0) +
             ' · <a href="/review-queue">Open Review Queue</a></div>' +
             (classLines ? "<ul class='mb-1'>" + classLines + "</ul>" : "") +
@@ -302,7 +346,8 @@
                     if (watchingLive && mediaMode === "live_preview" && feedImage && !feedImage.src.includes("process-preview")) {
                         showImage("/api/videos/" + videoId + "/process-preview?t=" + Date.now());
                     }
-                    if (payload.job_state === "done" || payload.stage === "completed" || payload.video_status === "processed") {
+                    if (payload.stage !== "cancelled" && payload.job_state !== "cancelled" &&
+                        (payload.job_state === "done" || payload.stage === "completed" || payload.video_status === "processed")) {
                         clearInterval(statusPoll);
                         statusPoll = null;
                         feedStatus.textContent = "Processing complete.";
@@ -314,7 +359,15 @@
                             activeVideo.annotated_video_url = payload.annotated_video_url;
                             updateActionMenu(activeVideo);
                             btnProcess?.classList.remove("d-none");
+                            btnCancelProcessing?.classList.add("d-none");
                         }
+                        syncVideoRow(videoId, {
+                            processing: false,
+                            processed: true,
+                            status: "processed",
+                            annotated_video_ready: !!payload.annotated_video_ready,
+                            annotated_video_url: payload.annotated_video_url,
+                        });
                         showCompletionSummary(payload);
                         showToast("Processing Complete", "Detection records persisted; candidates sent to review when rules fired.", "success");
                         refreshAlerts();
@@ -326,7 +379,25 @@
                         if (activeVideo && activeVideo.db_id === videoId) {
                             activeVideo.processing = false;
                             btnProcess?.classList.remove("d-none");
+                            btnCancelProcessing?.classList.add("d-none");
                         }
+                        syncVideoRow(videoId, {
+                            processing: false,
+                            status: payload.video_status || (activeVideo?.processed ? "processed" : "ready"),
+                        });
+                    } else if (payload.job_state === "cancelled" || payload.stage === "cancelled") {
+                        clearInterval(statusPoll); statusPoll = null;
+                        feedStatus.textContent = "Processing cancelled.";
+                        btnCancelProcessing?.classList.add("d-none");
+                        btnCancelProcessing.disabled = false;
+                        btnCancelProcessing.innerHTML = '<i class="bi bi-stop-circle me-1"></i> Stop Processing';
+                        btnProcess?.classList.remove("d-none");
+                        if (activeVideo) activeVideo.processing = false;
+                        syncVideoRow(videoId, {
+                            processing: false,
+                            status: payload.video_status || (activeVideo?.processed ? "processed" : "ready"),
+                        });
+                        showToast("Processing Cancelled", "Partial results from this attempt are not current.", "info");
                     }
                 });
         };
@@ -428,8 +499,11 @@
                 if (payload.success) {
                     if (activeVideo) {
                         activeVideo.processing = true;
+                        activeVideo.status = "processing";
                         updateActionMenu(activeVideo);
                     }
+                    syncVideoRow(videoId, { processing: true, status: "processing" });
+                    btnCancelProcessing?.classList.remove("d-none");
                     watchingLive = viewerMode === "watch_live";
                     if (watchingLive) setMediaMode("live_preview");
                     processProgressPanel?.classList.remove("d-none");
@@ -448,6 +522,25 @@
     btnProcess?.addEventListener("click", function () {
         if (!activeVideo) return;
         openProcessConfirm(activeVideo);
+    });
+
+    btnCancelProcessing?.addEventListener("click", function () {
+        if (!activeVideo || !confirm("Stop processing this video? Partial results from this attempt will not be used.")) return;
+        btnCancelProcessing.disabled = true;
+        btnCancelProcessing.textContent = "Stopping…";
+        fetch("/api/videos/" + activeVideo.db_id + "/process-status").then(function (r) { return r.json(); })
+            .then(function (status) {
+                return fetch("/api/videos/" + activeVideo.db_id + "/process-cancel", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ run_id: status.run_id })
+                });
+            }).then(function (r) { return r.json(); }).then(function (payload) {
+                if (!payload.success) throw new Error(payload.error || "Could not stop processing.");
+                feedStatus.textContent = payload.state === "cancelled" ? "Processing cancelled." : "Stopping…";
+            }).catch(function (err) {
+                showToast("Stop Failed", err.message, "danger");
+                btnCancelProcessing.disabled = false;
+            });
     });
 
     // Actions menu
@@ -507,6 +600,7 @@
             pendingDeleteVideo = activeVideo;
             document.getElementById("deleteVideoFilename").textContent = activeVideo.filename;
             document.getElementById("deleteVideoConfirmInput").value = "";
+            document.getElementById("deleteConfirmedDependents").checked = false;
             bootstrap.Modal.getOrCreateInstance(document.getElementById("deleteVideoModal")).show();
         }
     });
@@ -514,10 +608,14 @@
     document.getElementById("btnConfirmDeleteVideo")?.addEventListener("click", function () {
         if (!pendingDeleteVideo) return;
         const typed = document.getElementById("deleteVideoConfirmInput").value;
+        const deleteConfirmed = document.getElementById("deleteConfirmedDependents").checked;
         fetch("/api/videos/" + pendingDeleteVideo.db_id, {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ confirm_filename: typed }),
+            body: JSON.stringify({
+                confirm_filename: typed,
+                delete_confirmed_dependents: deleteConfirmed,
+            }),
         })
             .then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); })
             .then(function (res) {
@@ -526,11 +624,15 @@
                     return;
                 }
                 bootstrap.Modal.getOrCreateInstance(document.getElementById("deleteVideoModal")).hide();
-                showToast("Deleted", pendingDeleteVideo.filename + " removed.", "success");
+                const deletedName = pendingDeleteVideo.filename;
+                showToast("Deleted", deletedName + " removed.", "success");
                 const row = videoList?.querySelector('[data-video*="\\"db_id\\": ' + pendingDeleteVideo.db_id + '"]')
                     || videoList?.querySelector('input.bulk-video-check[value="' + pendingDeleteVideo.db_id + '"]')?.closest(".camera-item-row");
                 row?.remove();
                 clearActive();
+                document.getElementById("deleteConfirmedDependents").checked = false;
+                pendingDeleteVideo = null;
+                refreshBulkButton();
             });
     });
 
@@ -575,6 +677,18 @@
                         const rules = Array.isArray(r.enabled_violations)
                             ? r.enabled_violations.join(", ")
                             : "—";
+                        let annotationSummary = "annotation snapshot unavailable";
+                        try {
+                            const geometry = typeof r.geometry_snapshot_json === "string"
+                                ? JSON.parse(r.geometry_snapshot_json) : (r.geometry_snapshot_json || {});
+                            const scene = geometry.scene_annotation || {};
+                            const objectCount = ["zones", "lanes", "flow_arrows", "threshold_lines", "markings", "signs", "activity_regions"]
+                                .reduce(function (sum, key) {
+                                    return sum + (Array.isArray(scene[key]) ? scene[key].length : 0);
+                                }, 0);
+                            annotationSummary = "annotation #" + (geometry.annotation_id || "—") +
+                                " · scene objects=" + objectCount;
+                        } catch (err) { /* retain unavailable summary */ }
                         return "<li>Run #" + esc(r.id) +
                             (r.is_current_result ? " <strong>(current result)</strong>" : "") +
                             (r.is_latest_attempt && !r.is_current_result
@@ -587,8 +701,8 @@
                             " · queued=" + esc(r.queued_at || "—") +
                             " · start=" + esc(r.started_at || "—") +
                             " · finish=" + esc(r.finished_at || "—") +
-                            " · detections=" + esc(r.detection_records || 0) +
                             " · candidates=" + esc(r.violation_candidates || 0) +
+                            " · " + esc(annotationSummary) +
                             " · rules=[" + esc(rules) + "]" +
                             (r.error_message ? " · error=" + esc(r.error_message) : "") +
                             "</li>";
@@ -679,6 +793,164 @@
                 showToast("Bulk Failed", "Network error.", "danger");
             });
     });
+
+    // --- Cross-video processing jobs ------------------------------------------
+
+    const liveActiveJobs = document.getElementById("liveActiveJobs");
+    const liveCompletedJobs = document.getElementById("liveCompletedJobs");
+    const jobsTarget = window.TAVIDMProcessingJobs?.parseLiveMonitorTarget(window.location.search) || {
+        videoId: null, runId: null, tab: "active",
+    };
+    let jobsTargetApplied = false;
+
+    function setJobsTab(tab) {
+        const completed = tab === "completed";
+        liveActiveJobs?.classList.toggle("d-none", completed);
+        liveCompletedJobs?.classList.toggle("d-none", !completed);
+        document.querySelectorAll("[data-jobs-tab]").forEach(function (button) {
+            const selected = button.dataset.jobsTab === (completed ? "completed" : "active");
+            button.classList.toggle("active", selected);
+            button.setAttribute("aria-selected", selected ? "true" : "false");
+        });
+    }
+
+    document.getElementById("processingJobsWorkspace")?.addEventListener("click", function (event) {
+        const tab = event.target.closest("[data-jobs-tab]");
+        if (tab) setJobsTab(tab.dataset.jobsTab);
+    });
+
+    function findVideoButton(videoId) {
+        return Array.from(videoList?.querySelectorAll(".camera-item[data-video]") || []).find(function (button) {
+            try { return Number(JSON.parse(button.dataset.video).db_id) === Number(videoId); }
+            catch (error) { return false; }
+        }) || null;
+    }
+
+    function openJob(job) {
+        const button = findVideoButton(job.video_id);
+        if (!button) {
+            showToast("Video unavailable", "This processing history entry no longer has a video.", "warning");
+            return;
+        }
+        let video;
+        try { video = JSON.parse(button.dataset.video); } catch (error) { return; }
+        const isActive = job.status === "queued" || job.status === "running";
+        Object.assign(video, {
+            processing: isActive,
+            status: isActive ? "processing" : (job.video_status || video.status),
+            processed: job.status === "completed" && job.is_current_result ? true : video.processed,
+            latest_run_id: job.id,
+            annotated_video_ready: !!job.annotated_video_url,
+            annotated_video_url: job.annotated_video_url || null,
+        });
+        button.dataset.video = JSON.stringify(video);
+        selectVideo(video, button);
+        if (!isActive && job.annotated_video_url) setMediaMode("annotated");
+        window.history.replaceState({}, "", job.live_monitor_url);
+    }
+
+    function jobCard(job, active) {
+        const card = document.createElement("article");
+        card.className = "live-job-card";
+        card.dataset.runId = String(job.id);
+        const title = document.createElement("div");
+        title.className = "d-flex justify-content-between gap-2";
+        const name = document.createElement("span");
+        name.className = "live-job-card-title";
+        name.textContent = job.filename;
+        const state = document.createElement("span");
+        state.className = "badge text-bg-" + (job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "cancelled" ? "secondary" : "warning");
+        state.textContent = window.TAVIDMProcessingJobs.describeJobState(job);
+        title.append(name, state);
+        const meta = document.createElement("div");
+        meta.className = "live-job-card-meta";
+        meta.textContent = active
+            ? "Run #" + job.id + " · " + (job.stage || job.status) + " · " + Math.round(Number(job.progress_percent) || 0) + "%" +
+              (job.queue_position ? " · queue " + job.queue_position : "") +
+              (job.processing_fps != null ? " · " + Number(job.processing_fps).toFixed(1) + " FPS" : "")
+            : "Run #" + job.id + " · finished " + (job.finished_at || "—") + " · observations " +
+              (job.detection_records || 0) + " · candidates " + (job.violation_candidates || 0) +
+              (job.vehicles_crossed == null ? "" : " · crossed " + job.vehicles_crossed);
+        const actions = document.createElement("div");
+        actions.className = "live-job-card-actions";
+        const open = document.createElement("button");
+        open.type = "button";
+        open.className = "btn btn-sm btn-outline-secondary";
+        open.textContent = active ? "Watch" : (job.annotated_video_url ? "Preview result" : "Open video");
+        open.addEventListener("click", function () { openJob(job); });
+        actions.appendChild(open);
+        if (job.download_url) {
+            const download = document.createElement("a");
+            download.className = "btn btn-sm btn-outline-danger";
+            download.href = job.download_url;
+            download.textContent = "Download";
+            actions.appendChild(download);
+        }
+        if (active && job.can_stop) {
+            const stop = document.createElement("button");
+            stop.type = "button";
+            stop.className = "btn btn-sm btn-outline-danger";
+            stop.textContent = "Stop";
+            stop.addEventListener("click", function () {
+                if (!confirm("Stop processing " + job.filename + "? Partial results will not be used.")) return;
+                stop.disabled = true;
+                fetch("/api/videos/" + job.video_id + "/process-cancel", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ run_id: job.id }),
+                }).then(function (response) { return response.json(); }).then(function (payload) {
+                    if (!payload.success) throw new Error(payload.error || "Could not stop processing.");
+                    window.TAVIDMProcessingJobs.controller?.refresh();
+                }).catch(function (error) {
+                    stop.disabled = false;
+                    showToast("Stop failed", error.message, "danger");
+                });
+            });
+            actions.appendChild(stop);
+        }
+        card.append(title, meta, actions);
+        return card;
+    }
+
+    function renderLiveJobs(snapshot) {
+        const active = Array.isArray(snapshot.active) ? snapshot.active : [];
+        const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
+        document.getElementById("liveActiveJobsCount").textContent = String(active.length);
+        [
+            [liveActiveJobs, active, true, "No videos are queued or processing."],
+            [liveCompletedJobs, recent, false, "No completed, failed, or cancelled jobs yet."],
+        ].forEach(function (entry) {
+            const container = entry[0];
+            if (!container) return;
+            container.replaceChildren();
+            if (!entry[1].length) {
+                const empty = document.createElement("p");
+                empty.className = "text-muted small p-3 mb-0";
+                empty.textContent = entry[3];
+                container.appendChild(empty);
+            } else {
+                entry[1].forEach(function (job) { container.appendChild(jobCard(job, entry[2])); });
+            }
+        });
+        active.forEach(function (job) { syncVideoRow(job.video_id, { processing: true, status: "processing" }); });
+        if (!jobsTargetApplied && (jobsTarget.videoId || jobsTarget.runId)) {
+            const all = active.concat(recent);
+            const requested = all.find(function (job) {
+                return jobsTarget.runId ? job.id === jobsTarget.runId : job.video_id === jobsTarget.videoId;
+            });
+            jobsTargetApplied = true;
+            setJobsTab(jobsTarget.tab);
+            if (requested) openJob(requested);
+            else showToast("Processing job unavailable", "The requested job is no longer available in recent history.", "warning");
+        }
+    }
+
+    document.addEventListener("tavidm:processing-jobs-updated", function (event) {
+        renderLiveJobs(event.detail.snapshot);
+    });
+    const initialJobsSnapshot = window.TAVIDMProcessingJobs?.controller?.getSnapshot();
+    if (initialJobsSnapshot) renderLiveJobs(initialJobsSnapshot);
+    setJobsTab(jobsTarget.tab);
 
     // --- Violation alerts -------------------------------------------------------
 

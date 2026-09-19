@@ -28,7 +28,7 @@ LEGACY_ZONE_KEYS: tuple[str, ...] = (
 ZONE_OBJECT_TYPES = frozenset(LEGACY_ZONE_KEYS)
 LANE_OBJECT_TYPE = "active_lane"
 FLOW_ARROW_TYPE = "lane_flow"
-THRESHOLD_LINE_TYPES = frozenset({"threshold", "no_entry_threshold"})
+THRESHOLD_LINE_TYPES = frozenset({"threshold", "counting_line", "no_entry_threshold"})
 MARKING_TYPES = frozenset(
     {
         "double_solid",

@@ -35,6 +35,7 @@
             color: "#f97316",
             types: [
                 { key: "threshold", label: "Threshold", color: "#f97316" },
+                { key: "counting_line", label: "Vehicle counting line", color: "#16a34a" },
                 { key: "no_entry_threshold", label: "No-entry threshold", color: "#ef4444" },
             ],
         },

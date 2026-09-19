@@ -1,0 +1,3 @@
+-- Applied idempotently by sqlite_adapter._apply_migration_010.
+-- SQLite requires a guarded table rebuild to extend processing_runs.status.
+-- The canonical fresh-schema definition lives in database/schema.sql.

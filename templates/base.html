@@ -77,6 +77,13 @@
                                id="globalSearch" name="q" aria-label="Search violation records">
                         <button class="btn btn-sm btn-outline-secondary" type="submit" id="globalSearchSubmit">Search</button>
                     </form>
+                    <button class="btn btn-icon position-relative" type="button"
+                            id="processingJobsToggle" data-bs-toggle="offcanvas"
+                            data-bs-target="#processingJobsDrawer" aria-controls="processingJobsDrawer"
+                            aria-label="0 active processing jobs" title="Processing jobs">
+                        <i class="bi bi-cpu"></i>
+                        <span class="notification-badge d-none" id="processingJobsCount">0</span>
+                    </button>
                     {% if current_user.role in ('admin', 'enforcer') %}
                     <a href="{{ url_for('review_queue') }}" class="btn btn-icon position-relative" aria-label="Review Queue" title="Review Queue">
                         <i class="bi bi-inbox"></i>
@@ -126,9 +133,26 @@
 
     <div class="sidebar-overlay" id="sidebarOverlay"></div>
     <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
+    <aside class="offcanvas offcanvas-end processing-jobs-drawer" tabindex="-1"
+           id="processingJobsDrawer" aria-labelledby="processingJobsDrawerLabel">
+        <div class="offcanvas-header">
+            <div>
+                <h5 class="offcanvas-title" id="processingJobsDrawerLabel">Processing jobs</h5>
+                <p class="small text-muted mb-0" id="processingJobsConnection">Loading processing history…</p>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body p-0">
+            <h6 class="processing-jobs-heading">Active</h6>
+            <div id="globalActiveJobs" aria-live="polite"></div>
+            <h6 class="processing-jobs-heading border-top">Recent</h6>
+            <div id="globalRecentJobs"></div>
+        </div>
+    </aside>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/processing_jobs.js') }}"></script>
     {% block extra_js %}{% endblock %}
 </body>
 </html>

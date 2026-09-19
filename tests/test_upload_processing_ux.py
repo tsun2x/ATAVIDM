@@ -104,6 +104,66 @@ class TestProgressMonotonic:
         assert snap2["eta_sec"] is None or snap2["eta_sec"] >= 0
 
 
+class TestProcessingCancellation:
+    def test_queued_run_is_cancelled_without_stopping_other_jobs(self, enforcer_client, test_db):
+        vid = test_db.insert_video(filename="queued.mp4", filepath="/tmp/queued.mp4", status="ready")
+        run_id = test_db.create_processing_run(vid, "[]")
+        tracker = ProgressTracker(run_id=run_id, video_id=vid)
+        tracker.set_queued(True, position=1)
+        app_module._process_queue.append((vid, tuple(), run_id))
+        app_module._processing_jobs[vid] = {"state": "processing", "run_id": run_id, "tracker": tracker}
+        response = enforcer_client.post(f"/api/videos/{vid}/process-cancel", json={"run_id": run_id})
+        assert response.status_code == 200
+        assert response.get_json()["state"] == "cancelled"
+        assert not any(entry[2] == run_id for entry in app_module._process_queue)
+        assert test_db.get_processing_run(run_id)["status"] == "cancelled"
+
+    def test_live_monitor_distinguishes_observations_tracks_crossings_and_stop(self):
+        js = Path("static/js/live_monitor.js").read_text(encoding="utf-8")
+        html = Path("templates/live_monitor.html").read_text(encoding="utf-8")
+        assert "Detection observations by class" in html
+        assert "ByteTrack IDs observed (diagnostic)" in js
+        assert "Vehicles crossed" in html
+        assert "btnCancelProcessing" in html and "/process-cancel" in js
+
+    def test_stale_run_id_is_rejected(self, enforcer_client, test_db):
+        vid = test_db.insert_video(filename="stale.mp4", filepath="/tmp/stale.mp4", status="ready")
+        current = test_db.create_processing_run(vid, "[]")
+        tracker = ProgressTracker(run_id=current, video_id=vid)
+        app_module._processing_jobs[vid] = {"state": "processing", "run_id": current, "tracker": tracker}
+        response = enforcer_client.post(f"/api/videos/{vid}/process-cancel", json={"run_id": current + 99})
+        assert response.status_code == 409
+
+    def test_running_job_receives_run_scoped_cooperative_signal(self, enforcer_client, test_db, monkeypatch):
+        started = threading.Event()
+        observed = threading.Event()
+
+        def fake_process(video_id, cancel_requested=None, **kwargs):
+            started.set()
+            for _ in range(100):
+                if cancel_requested and cancel_requested():
+                    observed.set()
+                    from core.video_processor import ProcessVideoCancelled
+                    raise ProcessVideoCancelled("cancelled")
+                time.sleep(0.01)
+            return ProcessVideoResult(events=[])
+
+        monkeypatch.setattr(app_module, "process_video", fake_process)
+        vid = test_db.insert_video(filename="running.mp4", filepath="/tmp/running.mp4", status="ready")
+        test_db.upsert_annotation(vid, ZONES)
+        started_resp = enforcer_client.post(f"/api/videos/{vid}/process", json={"enabled_violations": []})
+        run_id = started_resp.get_json()["run_id"]
+        assert started.wait(2)
+        response = enforcer_client.post(f"/api/videos/{vid}/process-cancel", json={"run_id": run_id})
+        assert response.status_code == 200
+        assert observed.wait(2)
+        for _ in range(100):
+            if test_db.get_processing_run(run_id)["status"] == "cancelled":
+                break
+            time.sleep(0.01)
+        assert test_db.get_processing_run(run_id)["status"] == "cancelled"
+
+
 class TestSameRunLivePreview:
     def test_watch_live_does_not_duplicate_inference(self, enforcer_client, test_db, monkeypatch):
         calls = {"n": 0}
@@ -175,6 +235,34 @@ class TestSameRunLivePreview:
 
 
 class TestAnnotatedWriter:
+    def test_structured_scene_objects_are_visible_in_processing_overlay(self):
+        from core.scene_annotation import load_scene_annotation
+
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        scene = load_scene_annotation({
+            "schema_version": 2,
+            "zones": [],
+            "lanes": [{
+                "id": "lane-1", "type": "active_lane",
+                "points": [[10, 10], [70, 10], [70, 90], [10, 90]],
+            }],
+            "flow_arrows": [{
+                "id": "flow-1", "type": "lane_flow", "lane_ids": ["lane-1"],
+                "points": [[25, 75], [55, 25]],
+            }],
+            "threshold_lines": [{
+                "id": "count-1", "type": "counting_line",
+                "points": [[80, 20], [140, 100]],
+            }],
+            "markings": [], "signs": [], "activity_regions": [],
+        })
+
+        annotated = annotate_frame(frame, [], zones={}, scene=scene)
+
+        assert annotated.sum() > 0
+        assert np.count_nonzero(annotated[10, 10:71]) > 0
+        assert np.count_nonzero(annotated[20:101, 80:141]) > 0
+
     def test_annotated_frames_and_reopen(self, tmp_path, monkeypatch):
         import config
 
@@ -525,6 +613,13 @@ class TestStatusContract:
         ):
             assert key in body
 
+    def test_live_monitor_resynchronizes_row_and_bulk_selection_after_state_changes(self):
+        js = Path("static/js/live_monitor.js").read_text(encoding="utf-8")
+        assert "function syncVideoRow" in js
+        assert "refreshBulkButton();" in js
+        assert 'status: "processing"' in js
+        assert 'status: "processed"' in js
+
 class TestPermanentDeleteConfirmation:
     def test_missing_blank_wrong_confirmation_no_delete(self, client, test_db, tmp_path, monkeypatch):
         import bcrypt
@@ -579,6 +674,130 @@ class TestPermanentDeleteConfirmation:
         assert result['success'] is True
         assert test_db.get_video(vid) is None
         assert not path.exists()
+
+    def test_confirmed_dependency_requires_explicit_override_then_cascades(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        import config
+        from core.video_lifecycle import VideoLifecycleError, delete_video_permanently
+
+        monkeypatch.setattr(config, 'UPLOAD_FOLDER', str(tmp_path))
+        monkeypatch.setattr(config, 'FRAMES_FOLDER', str(tmp_path / 'frames'))
+        monkeypatch.setattr(config, 'EVIDENCE_FOLDER', str(tmp_path / 'ev'))
+        monkeypatch.setattr(config, 'ANNOTATED_FOLDER', str(tmp_path / 'ann'))
+        (tmp_path / 'frames').mkdir()
+        (tmp_path / 'ann').mkdir()
+        vid, path = _ready_video(test_db, tmp_path, 'with_case.mp4')
+        violation_id = test_db.insert_violation(
+            video_id=vid,
+            track_id=7,
+            violation_type=VIOLATION_ILLEGAL_PARKING,
+            confidence=0.91,
+            frame_number=3,
+            timestamp_sec=0.1,
+            status='confirmed',
+        )
+
+        with pytest.raises(VideoLifecycleError) as excinfo:
+            delete_video_permanently(
+                vid,
+                is_busy=lambda _v: False,
+                expected_filename='with_case.mp4',
+            )
+        assert excinfo.value.status_code == 409
+        assert test_db.get_video(vid) is not None
+
+        result = delete_video_permanently(
+            vid,
+            is_busy=lambda _v: False,
+            expected_filename='with_case.mp4',
+            allow_confirmed_dependents=True,
+        )
+        assert result['success'] is True
+        assert result['deleted_confirmed_violations'] == 1
+        assert test_db.get_video(vid) is None
+        assert test_db.get_violation(violation_id) is None
+        assert not path.exists()
+        audit = test_db.list_system_audit_events(event_type='video_deleted')[-1]
+        detail = json.loads(audit['detail_json'])
+        assert detail['confirmed_violations_deleted'] == 1
+        assert detail['confirmed_dependents_override'] is True
+
+
+class TestAnnotationResultInvalidation:
+    def test_removed_completed_run_is_not_current(self, test_db):
+        vid = test_db.insert_video(filename='stale.mp4', filepath='/tmp/stale.mp4', status='processed')
+        run_id = test_db.create_processing_run(vid, '[]')
+        test_db.finish_processing_run(
+            run_id,
+            status='completed',
+            progress={
+                'results_run_scoped': True,
+                'results_scope_explicit': True,
+                'annotated_video_ready': True,
+                'annotated_video_path': '/tmp/stale-result.webm',
+            },
+        )
+        assert test_db.get_current_completed_result_run(vid)['id'] == run_id
+
+        test_db.clear_processing_run_artifact(run_id)
+
+        assert test_db.get_current_completed_result_run(vid) is None
+        assert test_db.resolve_current_detection_scope(vid) == ('legacy', None)
+
+    def test_annotation_change_retires_machine_results_but_preserves_confirmed_case(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        import config
+        from core.video_lifecycle import invalidate_processing_results_for_annotation_change
+
+        monkeypatch.setattr(config, 'UPLOAD_FOLDER', str(tmp_path))
+        monkeypatch.setattr(config, 'FRAMES_FOLDER', str(tmp_path / 'frames'))
+        monkeypatch.setattr(config, 'EVIDENCE_FOLDER', str(tmp_path / 'ev'))
+        monkeypatch.setattr(config, 'ANNOTATED_FOLDER', str(tmp_path / 'ann'))
+        (tmp_path / 'frames').mkdir()
+        (tmp_path / 'ev').mkdir()
+        (tmp_path / 'ann').mkdir()
+        vid, _path = _ready_video(test_db, tmp_path, 'annotation-change.mp4')
+        run_id = test_db.create_processing_run(vid, '[]')
+        test_db.finish_processing_run(
+            run_id,
+            status='completed',
+            progress={'results_run_scoped': True, 'results_scope_explicit': True},
+        )
+        test_db.insert_detection(
+            vid, 1, 0.0, 4, 'car', 0.9, 1, 2, 30, 20,
+            processing_run_id=run_id,
+        )
+        review_id = test_db.insert_review_queue(
+            video_id=vid,
+            track_id=4,
+            violation_type=VIOLATION_ILLEGAL_PARKING,
+            confidence=0.8,
+            frame_number=1,
+            status='pending',
+            processing_run_id=run_id,
+        )
+        violation_id = test_db.insert_violation(
+            video_id=vid,
+            track_id=4,
+            violation_type=VIOLATION_ILLEGAL_PARKING,
+            confidence=0.9,
+            frame_number=1,
+            timestamp_sec=0.0,
+            status='confirmed',
+        )
+
+        result = invalidate_processing_results_for_annotation_change(
+            vid, is_busy=lambda _v: False
+        )
+
+        assert result['status'] == 'ready'
+        assert test_db.get_video(vid)['processed'] in (0, False)
+        assert test_db.get_current_completed_result_run(vid) is None
+        assert test_db.get_review_item(review_id) is None
+        assert test_db.get_violation(violation_id)['status'] == 'confirmed'
+        assert test_db.detection_summary_for_video(vid)['detection_records'] == 0
 
     def test_db_failure_restores_files(self, test_db, tmp_path, monkeypatch):
         import config

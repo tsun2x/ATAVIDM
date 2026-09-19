@@ -5,6 +5,24 @@
 {% block page_subtitle %}RTSP live streams and recorded video processing{% endblock %}
 
 {% block content %}
+<section class="card card-panel mb-4" id="processingJobsWorkspace">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <div>
+            <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Processing Jobs</h5>
+            <p class="small text-muted mb-0">Jobs remain available while you switch videos or pages.</p>
+        </div>
+        <div class="btn-group btn-group-sm" role="tablist" aria-label="Processing job history">
+            <button class="btn btn-outline-secondary active" type="button" data-jobs-tab="active"
+                    aria-selected="true">Active <span class="badge text-bg-danger ms-1" id="liveActiveJobsCount">0</span></button>
+            <button class="btn btn-outline-secondary" type="button" data-jobs-tab="completed"
+                    aria-selected="false">Completed</button>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div id="liveActiveJobs" class="live-jobs-list" aria-live="polite"></div>
+        <div id="liveCompletedJobs" class="live-jobs-list d-none"></div>
+    </div>
+</section>
 <div class="row g-4">
     <div class="col-lg-8">
         <div class="card card-panel">
@@ -51,9 +69,10 @@
                         <div class="col-6 col-md-3">Elapsed: <span id="ppElapsed">—</span></div>
                         <div class="col-6 col-md-3">FPS: <span id="ppFps">—</span></div>
                         <div class="col-6 col-md-3">ETA: <span id="ppEta">—</span></div>
-                        <div class="col-6 col-md-3">Detections: <span id="ppDetections">—</span></div>
+                        <div class="col-6 col-md-3">Detection observations: <span id="ppDetections">—</span></div>
                         <div class="col-6 col-md-3">Candidates: <span id="ppCandidates">—</span></div>
-                        <div class="col-12">Classes: <span id="ppClasses">—</span></div>
+                        <div class="col-12">Detection observations by class: <span id="ppClasses">—</span></div>
+                        <div class="col-12">Vehicles crossed: <span id="ppCrossings">Requires a counting line</span></div>
                     </div>
                     <div class="mt-2 d-none" id="ppCompletionSummary"></div>
                 </div>
@@ -81,6 +100,9 @@
                         </div>
                         <button class="btn btn-sm btn-danger d-none" id="btnProcessVideo">
                             <i class="bi bi-cpu me-1"></i> Process Video
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger d-none" id="btnCancelProcessing">
+                            <i class="bi bi-stop-circle me-1"></i> Stop Processing
                         </button>
                         <button class="btn btn-sm btn-outline-secondary d-none" id="btnStopStream">
                             <i class="bi bi-stop-circle me-1"></i> Stop Stream
@@ -393,7 +415,14 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <p>This permanently deletes the source video, reference frame, annotated outputs, and eligible unconfirmed results.</p>
+                <p>This permanently deletes the source video, reference frame, annotated outputs, and dependent results.</p>
+                <div class="form-check border border-danger-subtle rounded p-3 ps-5 mb-3">
+                    <input class="form-check-input" type="checkbox" id="deleteConfirmedDependents">
+                    <label class="form-check-label" for="deleteConfirmedDependents">
+                        Also permanently delete any confirmed violations that depend on this video.
+                    </label>
+                    <div class="form-text text-danger">Required only when confirmed violations exist. Report references still block deletion.</div>
+                </div>
                 <p class="mb-2">Type the filename to confirm:</p>
                 <p class="fw-semibold" id="deleteVideoFilename">—</p>
                 <input type="text" class="form-control" id="deleteVideoConfirmInput" autocomplete="off" aria-label="Confirm filename">

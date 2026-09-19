@@ -599,12 +599,47 @@ body {
 .bulk-check-wrap { border-right: 1px solid var(--border-color); }
 .camera-item-row .camera-item { border-left: 0; }
 
+#processingJobsToggle.has-active-jobs { color: var(--brand-accent); }
+.processing-jobs-drawer { width: min(430px, 100vw); }
+.processing-jobs-heading {
+    padding: 0.8rem 1rem;
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
 .search-box .btn { min-height: 38px; }
 
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
     outline: 3px solid #2563eb;
     outline-offset: 2px;
 }
+.processing-job-item {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.2rem 0.75rem;
+    padding: 0.8rem 1rem;
+    border-top: 1px solid var(--border-color);
+    color: inherit;
+    text-decoration: none;
+}
+.processing-job-item:hover, .processing-job-item:focus-visible { background: #f8fafc; }
+.processing-job-name { font-weight: 600; overflow-wrap: anywhere; }
+.processing-job-status { font-size: 0.75rem; text-transform: capitalize; color: var(--brand-accent); }
+.processing-job-detail { grid-column: 1 / -1; color: var(--text-muted); font-size: 0.8rem; }
+.live-jobs-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.live-job-card {
+    display: grid;
+    gap: 0.35rem;
+    padding: 0.9rem 1rem;
+    border-right: 1px solid var(--border-color);
+    border-top: 1px solid var(--border-color);
+}
+.live-job-card-title { font-weight: 600; overflow-wrap: anywhere; }
+.live-job-card-meta { color: var(--text-muted); font-size: 0.8rem; }
+.live-job-card-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.25rem; }
 
 @media (max-width: 991.98px) {
     .sidebar { transform: translateX(-100%); }

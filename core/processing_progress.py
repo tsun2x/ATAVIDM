@@ -14,6 +14,7 @@ STAGES = (
     "processing",
     "finalizing",
     "completed",
+    "cancelled",
     "failed",
 )
 
@@ -35,6 +36,8 @@ class ProcessingStatus:
     detection_records: int = 0
     unique_tracks: int | None = None
     class_counts: dict[str, int] = field(default_factory=dict)
+    vehicles_crossed: int | None = None
+    crossing_counts: dict[str, int] = field(default_factory=dict)
     violation_candidates: int = 0
     annotated_video_ready: bool = False
     annotated_video_url: str | None = None
@@ -116,6 +119,14 @@ class ProgressTracker:
             self._status.state = "error"
             self._refresh_timing_locked()
 
+    def mark_cancelled(self) -> None:
+        with self._lock:
+            self._status.stage = "cancelled"
+            self._status.state = "cancelled"
+            self._status.queued = False
+            self._status.error = None
+            self._refresh_timing_locked()
+
     def mark_completed(self, *, annotated_ready: bool, annotated_url: str | None) -> None:
         with self._lock:
             self._status.stage = "completed"
@@ -138,6 +149,8 @@ class ProgressTracker:
         class_counts_delta: dict[str, int] | None = None,
         track_ids: set[int] | None = None,
         violation_delta: int = 0,
+        vehicles_crossed: int | None = None,
+        crossing_counts: dict[str, int] | None = None,
     ) -> None:
         with self._lock:
             # Monotonic: never decrease frames or percent for a run.
@@ -151,6 +164,9 @@ class ProgressTracker:
             if track_ids:
                 self._track_ids.update(int(t) for t in track_ids)
                 self._status.unique_tracks = len(self._track_ids)
+            if vehicles_crossed is not None:
+                self._status.vehicles_crossed = int(vehicles_crossed)
+                self._status.crossing_counts = dict(crossing_counts or {})
             total = self._status.total_frames
             if total and total > 0:
                 pct = min(100.0, (frames_processed / total) * 100.0)

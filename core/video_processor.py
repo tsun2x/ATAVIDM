@@ -37,6 +37,7 @@ from core.temporal_evidence import (
     evidence_timing_dict,
 )
 from core.tracker import TrackState
+from core.vehicle_crossing_counter import VehicleCrossingCounter
 from core.violation_config import load_enabled_violations
 from core.violation_engine import (
     RuleEngineState,
@@ -67,6 +68,8 @@ class ProcessVideoResult:
     detection_records: int = 0
     unique_tracks: int | None = None
     class_counts: dict[str, int] = field(default_factory=dict)
+    vehicles_crossed: int | None = None
+    crossing_counts: dict[str, int] = field(default_factory=dict)
     violation_candidates: int = 0
     annotated_video_path: str | None = None
     annotated_video_ready: bool = False
@@ -102,6 +105,10 @@ class ProcessVideoError(RuntimeError):
         self.diagnostics_json = diagnostics_json
         self.geometry_snapshot_json = geometry_snapshot_json
         self.progress_snapshot = progress_snapshot
+
+
+class ProcessVideoCancelled(ProcessVideoError):
+    """Cooperative, run-scoped cancellation requested by an authorized user."""
 
 
 def load_rule_parameters() -> dict[str, Any]:
@@ -154,6 +161,7 @@ def get_processing_context(video_id: int) -> dict[str, Any]:
         "duration_sec": video.get("duration_sec"),
         "zones": zones,
         "scene": rule_scene,
+        "scene_document": scene,
         "annotation_id": annotation["id"] if annotation else None,
         "template_id": video.get("template_id"),
         "template_name": template["template_name"] if template else None,
@@ -280,6 +288,7 @@ def process_video(
     enabled_violations: tuple[str, ...] | None = None,
     processing_run_id: int | str | None = None,
     progress_tracker: ProgressTracker | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> ProcessVideoResult:
     """
     Run the full YOLOv8m -> ByteTrack -> rule engine pipeline on one video.
@@ -356,7 +365,10 @@ def process_video(
             rule_params=params,
             zone_polygons={k: v for k, v in ctx["zones"].items() if v},
         )
-        geometry_snapshot_json = json.dumps(geometry.snapshot())
+        geometry_snapshot = geometry.snapshot()
+        geometry_snapshot["annotation_id"] = ctx.get("annotation_id")
+        geometry_snapshot["scene_annotation"] = ctx["scene_document"].to_storage_dict()
+        geometry_snapshot_json = json.dumps(geometry_snapshot)
 
         if progress_tracker:
             progress_tracker.set_stage("loading_model")
@@ -384,6 +396,8 @@ def process_video(
             ) from exc
 
         track_state = TrackState(stationary_px=geometry.stationary_px_per_sec())
+        counting_lines = [line for line in ctx["scene"].threshold_lines if line.type == "counting_line"]
+        crossing_counter = VehicleCrossingCounter(counting_lines)
         rule_state = RuleEngineState()
 
         model_classes = extract_model_class_names(detector)
@@ -438,6 +452,8 @@ def process_video(
         run_id_int = int(processing_run_id) if processing_run_id is not None else None
 
         while True:
+            if cancel_requested is not None and cancel_requested():
+                raise ProcessVideoCancelled("Processing cancelled by user.", progress_snapshot=_snap())
             ok, frame = cap.read()
             if not ok:
                 break
@@ -456,6 +472,7 @@ def process_video(
 
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
+            crossing_counter.update(tracked)
 
             frame_class_delta: dict[str, int] = {}
             frame_track_ids: set[int] = set()
@@ -522,6 +539,7 @@ def process_video(
                 tracked,
                 zones=ctx["zones"],
                 violation_track_ids=viol_ids,
+                scene=ctx.get("scene_document"),
             )
             if writer is not None:
                 writer.write(annotated)
@@ -546,6 +564,8 @@ def process_video(
                     class_counts_delta=frame_class_delta,
                     track_ids=frame_track_ids,
                     violation_delta=len(frame_events),
+                    vehicles_crossed=crossing_counter.total,
+                    crossing_counts=crossing_counter.by_class,
                 )
             _legacy_progress(frames_done, total_frames or frames_done)
 
@@ -590,6 +610,8 @@ def process_video(
             detection_records=detection_total,
             unique_tracks=len(track_ids) if track_ids else 0,
             class_counts=dict(class_counts),
+            vehicles_crossed=crossing_counter.total,
+            crossing_counts=dict(crossing_counter.by_class),
             violation_candidates=len(events),
             annotated_video_path=annotated_path,
             annotated_video_ready=annotated_ready,
@@ -609,6 +631,11 @@ def process_video(
             result.progress_snapshot = progress_tracker.snapshot()
         return result
     except ProcessVideoError:
+        try:
+            if "evidence_buf" in locals():
+                evidence_buf.abort()
+        except Exception:
+            pass
         if writer is not None:
             writer.abort()
         raise

@@ -40,6 +40,16 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row)
 
 
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def get_connection() -> sqlite3.Connection:
     db_path = get_db_path()
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +141,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_007(conn)
     _apply_migration_008(conn)
     _apply_migration_009(conn)
+    _apply_migration_010(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -218,31 +229,57 @@ def _apply_migration_002(conn: sqlite3.Connection) -> None:
             """
         )
 
-
     if _table_exists(conn, "videos"):
         if not _column_exists(conn, "videos", "status"):
-            conn.execute(
-                "ALTER TABLE videos ADD COLUMN status TEXT DEFAULT 'uploaded'"
-            )
+            conn.execute("ALTER TABLE videos ADD COLUMN status TEXT DEFAULT 'uploaded'")
         if not _column_exists(conn, "videos", "annotation_id"):
             conn.execute("ALTER TABLE videos ADD COLUMN annotation_id INTEGER")
         if not _column_exists(conn, "videos", "template_id"):
             conn.execute("ALTER TABLE videos ADD COLUMN template_id INTEGER")
+        conn.execute("UPDATE videos SET status = 'processed' WHERE processed = 1 AND (status IS NULL OR status = 'uploaded')")
+        conn.execute("UPDATE videos SET status = 'uploaded' WHERE status IS NULL")
 
-        conn.execute(
+
+def _apply_migration_010(conn: sqlite3.Connection) -> None:
+    """Allow durable cancellation and persist conservative crossing totals."""
+    if not _table_exists(conn, "processing_runs"):
+        return
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='processing_runs'").fetchone()
+    ddl = (row[0] or "") if row else ""
+    if "'cancelled'" not in ddl:
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(processing_runs)").fetchall()]
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
             """
-            UPDATE videos
-            SET status = 'processed'
-            WHERE processed = 1 AND (status IS NULL OR status = 'uploaded')
+            CREATE TABLE processing_runs_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, video_id INTEGER REFERENCES videos(id) ON DELETE CASCADE,
+              started_at DATETIME DEFAULT CURRENT_TIMESTAMP, finished_at DATETIME,
+              status TEXT CHECK(status IN ('queued','running','completed','failed','cancelled')) DEFAULT 'queued',
+              enabled_violations_json TEXT NOT NULL DEFAULT '[]', error_message TEXT,
+              diagnostics_json TEXT, geometry_snapshot_json TEXT, stage TEXT, viewer_mode TEXT DEFAULT 'background',
+              queued_at DATETIME, frames_processed INTEGER DEFAULT 0, total_frames INTEGER, progress_percent REAL DEFAULT 0,
+              elapsed_sec REAL, processing_fps REAL, detection_records INTEGER DEFAULT 0, unique_tracks INTEGER,
+              class_counts_json TEXT DEFAULT '{}', violation_candidates INTEGER DEFAULT 0,
+              annotated_video_path TEXT, annotated_video_ready INTEGER DEFAULT 0, model_identifier TEXT,
+              source_duration_sec REAL, results_removed_at DATETIME, effective_output_fps REAL,
+              results_run_scoped INTEGER NOT NULL DEFAULT 0, results_scope_explicit INTEGER NOT NULL DEFAULT 0,
+              results_scope_origin TEXT, crossing_counts_json TEXT DEFAULT '{}', vehicles_crossed INTEGER
+            );
             """
         )
-        conn.execute(
-            """
-            UPDATE videos
-            SET status = 'uploaded'
-            WHERE status IS NULL
-            """
-        )
+        target = [r[1] for r in conn.execute("PRAGMA table_info(processing_runs_new)").fetchall()]
+        shared = [c for c in columns if c in target]
+        quoted = ", ".join(f'"{c}"' for c in shared)
+        conn.execute(f"INSERT INTO processing_runs_new ({quoted}) SELECT {quoted} FROM processing_runs")
+        conn.execute("DROP TABLE processing_runs")
+        conn.execute("ALTER TABLE processing_runs_new RENAME TO processing_runs")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processing_runs_video_id ON processing_runs(video_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_processing_runs_status ON processing_runs(status)")
+        conn.execute("PRAGMA foreign_keys = ON")
+    for col, kind in (("crossing_counts_json", "TEXT DEFAULT '{}'"), ("vehicles_crossed", "INTEGER")):
+        if not _column_exists(conn, "processing_runs", col):
+            conn.execute(f"ALTER TABLE processing_runs ADD COLUMN {col} {kind}")
 
 
 def _apply_migration_003(conn: sqlite3.Connection) -> None:
@@ -1095,6 +1132,12 @@ def update_processing_run_progress(run_id: int, progress: dict[str, Any]) -> Non
     if "class_counts" in progress and progress["class_counts"] is not None:
         fields.append("class_counts_json = ?")
         params.append(json.dumps(progress["class_counts"]))
+    if "crossing_counts" in progress and progress["crossing_counts"] is not None:
+        fields.append("crossing_counts_json = ?")
+        params.append(json.dumps(progress["crossing_counts"]))
+    if progress.get("vehicles_crossed") is not None:
+        fields.append("vehicles_crossed = ?")
+        params.append(int(progress["vehicles_crossed"]))
     if not fields:
         return
     params.append(run_id)
@@ -1148,6 +1191,12 @@ def finish_processing_run(
             if class_counts_json is not None:
                 extra_sets += ", class_counts_json = ?"
                 extra_params.append(class_counts_json)
+            if progress.get("crossing_counts") is not None:
+                extra_sets += ", crossing_counts_json = ?"
+                extra_params.append(json.dumps(progress["crossing_counts"]))
+            if progress.get("vehicles_crossed") is not None:
+                extra_sets += ", vehicles_crossed = ?"
+                extra_params.append(int(progress["vehicles_crossed"]))
             if ann_path is not None:
                 extra_sets += ", annotated_video_path = ?"
                 extra_params.append(ann_path)
@@ -1205,12 +1254,18 @@ def get_authoritative_completed_run(video_id: int) -> dict[str, Any] | None:
     with db_session() as conn:
         if not _column_exists(conn, "processing_runs", "results_run_scoped"):
             return None
+        removed_clause = (
+            "AND results_removed_at IS NULL"
+            if _column_exists(conn, "processing_runs", "results_removed_at")
+            else ""
+        )
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM processing_runs
             WHERE video_id = ?
               AND status = 'completed'
               AND COALESCE(results_run_scoped, 0) = 1
+              {removed_clause}
             ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
             LIMIT 1
             """,
@@ -1222,10 +1277,16 @@ def get_authoritative_completed_run(video_id: int) -> dict[str, Any] | None:
 def get_latest_completed_processing_run(video_id: int) -> dict[str, Any] | None:
     """Latest successfully completed run (any scoping) — artifact fallback."""
     with db_session() as conn:
+        removed_clause = (
+            "AND results_removed_at IS NULL"
+            if _column_exists(conn, "processing_runs", "results_removed_at")
+            else ""
+        )
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM processing_runs
             WHERE video_id = ? AND status = 'completed'
+              {removed_clause}
             ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
             LIMIT 1
             """,
@@ -1268,6 +1329,141 @@ def list_processing_runs(video_id: int) -> list[dict[str, Any]]:
             (video_id,),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+
+def list_processing_jobs(
+    *, recent_limit: int = 20, video_id: int | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Return active and bounded terminal processing runs across videos.
+
+    This is the durable source for global processing UX. Result authority is
+    derived from run ownership flags, never from detection row counts.
+    """
+    limit = max(1, min(int(recent_limit), 100))
+    filter_sql = "AND pr.video_id = ?" if video_id is not None else ""
+    filter_params: tuple[Any, ...] = (int(video_id),) if video_id is not None else ()
+    with db_session() as conn:
+        rows = conn.execute(
+            f"""
+            WITH recent_ids AS (
+                SELECT pr.id
+                FROM processing_runs pr
+                WHERE pr.status IN ('completed', 'failed', 'cancelled')
+                  {filter_sql}
+                ORDER BY COALESCE(pr.finished_at, pr.started_at, pr.queued_at) DESC,
+                         pr.id DESC
+                LIMIT ?
+            )
+            SELECT
+                pr.*,
+                v.filename,
+                v.condition,
+                v.status AS video_status,
+                CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM processing_runs newer
+                    WHERE newer.video_id = pr.video_id AND newer.id > pr.id
+                ) THEN 1 ELSE 0 END AS is_latest_attempt,
+                CASE WHEN pr.status = 'completed'
+                          AND pr.results_removed_at IS NULL
+                          AND (
+                              (COALESCE(pr.results_run_scoped, 0) = 1 AND NOT EXISTS (
+                                  SELECT 1 FROM processing_runs newer
+                                  WHERE newer.video_id = pr.video_id
+                                    AND newer.status = 'completed'
+                                    AND COALESCE(newer.results_run_scoped, 0) = 1
+                                    AND newer.results_removed_at IS NULL
+                                    AND (COALESCE(newer.finished_at, newer.started_at) >
+                                         COALESCE(pr.finished_at, pr.started_at)
+                                         OR (COALESCE(newer.finished_at, newer.started_at) =
+                                             COALESCE(pr.finished_at, pr.started_at)
+                                             AND newer.id > pr.id))
+                              ))
+                              OR
+                              (NOT EXISTS (
+                                  SELECT 1 FROM processing_runs owned
+                                  WHERE owned.video_id = pr.video_id
+                                    AND owned.status = 'completed'
+                                    AND COALESCE(owned.results_run_scoped, 0) = 1
+                                    AND owned.results_removed_at IS NULL
+                              ) AND NOT EXISTS (
+                                  SELECT 1 FROM processing_runs newer
+                                  WHERE newer.video_id = pr.video_id
+                                    AND newer.status = 'completed'
+                                    AND newer.results_removed_at IS NULL
+                                    AND (COALESCE(newer.finished_at, newer.started_at) >
+                                         COALESCE(pr.finished_at, pr.started_at)
+                                         OR (COALESCE(newer.finished_at, newer.started_at) =
+                                             COALESCE(pr.finished_at, pr.started_at)
+                                             AND newer.id > pr.id))
+                              ))
+                          )
+                     THEN 1 ELSE 0 END AS is_current_result
+            FROM processing_runs pr
+            JOIN videos v ON v.id = pr.video_id
+            WHERE ((pr.status IN ('queued', 'running') {filter_sql})
+                   OR pr.id IN (SELECT id FROM recent_ids))
+            ORDER BY COALESCE(pr.finished_at, pr.started_at, pr.queued_at) DESC,
+                     pr.id DESC
+            """,
+            (*filter_params, limit, *filter_params),
+        ).fetchall()
+
+    active: list[dict[str, Any]] = []
+    recent: list[dict[str, Any]] = []
+    for row in rows:
+        raw = _row_to_dict(row) or {}
+        class_counts = _safe_json_object(raw.get("class_counts_json"))
+        crossing_counts = _safe_json_object(raw.get("crossing_counts_json"))
+        total_frames = raw.get("total_frames")
+        frames_processed = int(raw.get("frames_processed") or 0)
+        fps = raw.get("processing_fps")
+        eta_sec = None
+        if fps and float(fps) > 0 and total_frames is not None:
+            eta_sec = max(0.0, (int(total_frames) - frames_processed) / float(fps))
+        current = bool(raw.get("is_current_result"))
+        item = {
+            "id": int(raw["id"]),
+            "video_id": int(raw["video_id"]),
+            "filename": raw.get("filename") or f"Video #{raw['video_id']}",
+            "condition": raw.get("condition"),
+            "video_status": raw.get("video_status"),
+            "status": raw.get("status"),
+            "stage": raw.get("stage"),
+            "viewer_mode": raw.get("viewer_mode"),
+            "queued_at": raw.get("queued_at"),
+            "started_at": raw.get("started_at"),
+            "finished_at": raw.get("finished_at"),
+            "frames_processed": frames_processed,
+            "total_frames": total_frames,
+            "progress_percent": float(raw.get("progress_percent") or 0),
+            "elapsed_sec": raw.get("elapsed_sec"),
+            "processing_fps": fps,
+            "eta_sec": eta_sec,
+            "detection_records": int(raw.get("detection_records") or 0),
+            "unique_tracks": raw.get("unique_tracks"),
+            "class_counts": class_counts,
+            "vehicles_crossed": raw.get("vehicles_crossed"),
+            "crossing_counts": crossing_counts,
+            "violation_candidates": int(raw.get("violation_candidates") or 0),
+            "model_identifier": raw.get("model_identifier"),
+            "error_message": raw.get("error_message"),
+            "is_current_result": current,
+            "is_latest_attempt": bool(raw.get("is_latest_attempt")),
+            "is_superseded": raw.get("status") == "completed" and not current,
+            "results_removed": raw.get("results_removed_at") is not None,
+            "annotated_video_ready": bool(raw.get("annotated_video_ready")),
+            "geometry_snapshot_available": bool(raw.get("geometry_snapshot_json")),
+            "_artifact_path": raw.get("annotated_video_path"),
+        }
+        (active if item["status"] in ("queued", "running") else recent).append(item)
+    active.sort(key=lambda item: (
+        0 if item["status"] == "running" else 1,
+        item.get("queued_at") or "",
+        item["id"],
+    ))
+    for position, item in enumerate(active):
+        item["queue_position"] = 0 if item["status"] == "running" else position
+    return {"active": active, "recent": recent}
 
 
 def clear_processing_run_artifact(run_id: int) -> None:

@@ -44,6 +44,7 @@ start_processing_run = _adapter.start_processing_run
 finish_processing_run = _adapter.finish_processing_run
 get_processing_run = _adapter.get_processing_run
 list_processing_runs = _adapter.list_processing_runs
+list_processing_jobs = _adapter.list_processing_jobs
 recover_orphaned_processing = _adapter.recover_orphaned_processing
 list_zone_templates = _adapter.list_zone_templates
 get_zone_template = _adapter.get_zone_template

@@ -11,6 +11,15 @@ _BOX_COLOR = (246, 130, 59)  # BGR — detections
 _VIOLATION_COLOR = (40, 40, 220)  # BGR — rule-fired tracks
 _ZONE_COLOR = (57, 57, 230)
 _LABEL_BG = (20, 20, 20)
+_SCENE_COLORS = {
+    "zones": (57, 57, 230),
+    "lanes": (230, 150, 35),
+    "flow_arrows": (45, 200, 255),
+    "threshold_lines": (180, 70, 220),
+    "markings": (220, 220, 60),
+    "signs": (70, 200, 70),
+    "activity_regions": (200, 100, 200),
+}
 
 
 def annotate_frame(
@@ -18,6 +27,7 @@ def annotate_frame(
     detections: Sequence[Mapping[str, Any]],
     zones: Mapping[str, Sequence[Sequence[float]]] | None = None,
     violation_track_ids: Iterable[int] | None = None,
+    scene: Any | None = None,
 ) -> Any:
     """Draw zones, detection boxes/labels, and highlight violation candidates.
 
@@ -34,6 +44,8 @@ def annotate_frame(
             pts = [(int(p[0]), int(p[1])) for p in polygon]
             for i in range(len(pts)):
                 cv2.line(annotated, pts[i], pts[(i + 1) % len(pts)], _ZONE_COLOR, 2)
+    if scene is not None:
+        _draw_scene_document(annotated, scene)
 
     for det in detections:
         try:
@@ -67,6 +79,29 @@ def annotate_frame(
         _draw_label(annotated, label, x, max(y - 6, 12), color)
 
     return annotated
+
+
+def _draw_scene_document(frame: Any, scene: Any) -> None:
+    """Render the complete saved v2 scene, not only its legacy projection."""
+    for collection_name, color in _SCENE_COLORS.items():
+        objects = getattr(scene, collection_name, ()) or ()
+        for obj in objects:
+            points = getattr(obj, "points", ()) or ()
+            if len(points) < 2:
+                continue
+            pts = [(int(p[0]), int(p[1])) for p in points]
+            is_polygon = collection_name in {
+                "zones", "lanes", "signs", "activity_regions"
+            } and len(pts) >= 3
+            if collection_name == "flow_arrows":
+                cv2.arrowedLine(frame, pts[0], pts[-1], color, 2, tipLength=0.12)
+                for start, end in zip(pts, pts[1:]):
+                    cv2.line(frame, start, end, color, 2)
+            else:
+                for start, end in zip(pts, pts[1:]):
+                    cv2.line(frame, start, end, color, 2)
+                if is_polygon:
+                    cv2.line(frame, pts[-1], pts[0], color, 2)
 
 
 def _draw_label(frame: Any, text: str, x: int, y: int, color: tuple[int, int, int]) -> None:
