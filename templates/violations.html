@@ -47,7 +47,7 @@
                 <input type="date" class="form-control" id="filterDate">
             </div>
             <div class="col-md-1">
-                <button class="btn btn-outline-secondary w-100" id="resetFilters">
+                <button class="btn btn-outline-secondary w-100" id="resetFilters" aria-label="Reset violation filters">
                     <i class="bi bi-arrow-counterclockwise"></i>
                 </button>
             </div>
@@ -119,8 +119,8 @@
                         </td>
                         <td>
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-outline-danger btn-view-detail" title="View Details"><i class="bi bi-eye"></i></button>
-                                <button class="btn btn-outline-secondary btn-view-evidence" title="View Evidence"><i class="bi bi-image"></i></button>
+                                <button class="btn btn-outline-danger btn-view-detail" title="View Details" aria-label="View details for {{ v.id }}"><i class="bi bi-eye"></i></button>
+                                <button class="btn btn-outline-secondary btn-view-evidence" title="View Evidence" aria-label="View evidence for {{ v.id }}"><i class="bi bi-image"></i></button>
                             </div>
                         </td>
                     </tr>
@@ -140,7 +140,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-info-circle me-2"></i>Violation Details</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body" id="detailModalBody"></div>
             <div class="modal-footer">
@@ -156,7 +156,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-image me-2"></i>Evidence Snapshot</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body text-center" id="evidenceModalBody"></div>
             <div class="modal-footer">

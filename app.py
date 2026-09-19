@@ -371,7 +371,7 @@ def _system_status() -> dict:
     videos = db.list_videos()
     last_processed = next((v["filename"] for v in videos if v.get("processed")), "—")
     return {
-        "pipeline": "Ready",
+        "pipeline": "Configured",
         "model": f"{MODEL_FAMILY} ({'custom' if is_custom else 'COCO pretrained'})",
         "tracker": "ByteTrack",
         "db": db.active_backend().upper(),

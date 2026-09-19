@@ -3,6 +3,31 @@
  * Shared utilities and sidebar navigation
  */
 
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function toastToneClass(type) {
+    return {
+        success: "text-bg-success",
+        danger: "text-bg-danger",
+        warning: "text-bg-warning",
+        info: "text-bg-info",
+    }[type] || "text-bg-info";
+}
+
+if (typeof window !== "undefined") {
+    window.TAVIDMMainUI = { escapeHtml: escapeHtml, toastToneClass: toastToneClass };
+}
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { escapeHtml: escapeHtml, toastToneClass: toastToneClass };
+}
+
 (function () {
     "use strict";
 
@@ -12,13 +37,16 @@
     const sidebarOverlay = document.getElementById("sidebarOverlay");
 
     function toggleSidebar() {
-        sidebar.classList.toggle("show");
-        sidebarOverlay.classList.toggle("show");
+        const expanded = !sidebar.classList.contains("show");
+        sidebar.classList.toggle("show", expanded);
+        sidebarOverlay.classList.toggle("show", expanded);
+        sidebarToggle?.setAttribute("aria-expanded", String(expanded));
     }
 
     function closeSidebar() {
         sidebar.classList.remove("show");
         sidebarOverlay.classList.remove("show");
+        sidebarToggle?.setAttribute("aria-expanded", "false");
     }
 
     if (sidebarToggle) {
@@ -28,6 +56,13 @@
     if (sidebarOverlay) {
         sidebarOverlay.addEventListener("click", closeSidebar);
     }
+
+    document.addEventListener?.("keydown", function (e) {
+        if (e.key === "Escape" && sidebar?.classList.contains("show")) {
+            closeSidebar();
+            sidebarToggle?.focus();
+        }
+    });
 
     // Close sidebar on resize to desktop
     window.addEventListener("resize", function () {
@@ -58,20 +93,17 @@
         if (!container) return;
 
         const toastId = "toast-" + Date.now();
-        const bgClass = {
-            success: "text-bg-success",
-            danger: "text-bg-danger",
-            warning: "text-bg-warning",
-            info: "text-bg-danger",
-        }[type] || "text-bg-danger";
+        const bgClass = toastToneClass(type);
+        const safeTitle = escapeHtml(title);
+        const safeMessage = escapeHtml(message);
 
         const html =
             '<div id="' + toastId + '" class="toast ' + bgClass + '" role="alert" aria-live="assertive" aria-atomic="true">' +
             '<div class="toast-header">' +
-            "<strong class=\"me-auto\">" + title + "</strong>" +
+            "<strong class=\"me-auto\">" + safeTitle + "</strong>" +
             '<button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>' +
             "</div>" +
-            '<div class="toast-body">' + message + "</div>" +
+            '<div class="toast-body">' + safeMessage + "</div>" +
             "</div>";
 
         container.insertAdjacentHTML("beforeend", html);

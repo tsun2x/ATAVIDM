@@ -11,11 +11,14 @@
             <span class="badge bg-warning-subtle text-warning me-2" id="pendingCount">{{ review_items|length }} Pending</span>
             <span class="text-muted small">≥95% auto-queued · 80–94% careful review · &lt;80% logged for monitoring</span>
         </div>
-        <div class="btn-group btn-group-sm">
-            <button class="btn btn-outline-secondary" id="filterAll">All</button>
-            <button class="btn btn-outline-secondary" id="filterLowConf">Low Confidence</button>
-            <button class="btn btn-outline-secondary" id="filterCareful">Careful Review</button>
+        <div class="btn-group btn-group-sm" role="group" aria-label="Filter review queue">
+            <button class="btn btn-outline-secondary active" id="filterAll" data-review-filter="all" aria-pressed="true">All</button>
+            <button class="btn btn-outline-secondary" id="filterLowConf" data-review-filter="low" aria-pressed="false">Low Confidence</button>
+            <button class="btn btn-outline-secondary" id="filterCareful" data-review-filter="careful" aria-pressed="false">Careful Review</button>
         </div>
+    </div>
+    <div class="card-footer py-2">
+        <span class="small text-muted" id="reviewFilterStatus" aria-live="polite">Showing {{ review_items|length }} of {{ review_items|length }} pending detections.</span>
     </div>
 </div>
 
@@ -62,15 +65,21 @@
                             </span>
                         </td>
                         <td>
-                            <button class="btn btn-sm btn-outline-secondary btn-view-evidence" title="View Evidence">
+                            <button class="btn btn-sm btn-outline-secondary btn-view-evidence" title="View Evidence"
+                                    aria-label="View evidence for {{ item.display_id }}">
                                 <i class="bi bi-image"></i>
                             </button>
                         </td>
                         <td class="small">{{ item.queued_at }}</td>
                         <td>
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-success btn-approve" title="Confirm Violation"><i class="bi bi-check-lg"></i></button>
-                                <button class="btn btn-outline-secondary btn-dismiss" title="Dismiss"><i class="bi bi-x-lg"></i></button>
+                                <button class="btn btn-success btn-approve" title="Confirm Violation"
+                                        aria-label="Confirm violation {{ item.display_id }}"
+                                        data-confirm-message="Confirm {{ item.display_id }} as a violation?"
+                                        data-loading-label="Confirming…"><i class="bi bi-check-lg"></i></button>
+                                <button class="btn btn-outline-secondary btn-dismiss" title="Dismiss"
+                                        aria-label="Dismiss detection {{ item.display_id }}"
+                                        data-loading-label="Dismissing…"><i class="bi bi-x-lg"></i></button>
                             </div>
                         </td>
                     </tr>
@@ -90,7 +99,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-image me-2"></i>Evidence Snapshot</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body text-center" id="evidenceModalBody"></div>
         </div>

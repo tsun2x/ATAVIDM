@@ -2,21 +2,35 @@
  * TAVIDM - Review Queue (manual violation validation)
  */
 
+function matchesReviewFilter(item, filterName) {
+    const confidence = Number(item && item.confidence);
+    if (filterName === "low") return confidence < 0.80;
+    if (filterName === "careful") return confidence >= 0.80 && confidence < 0.95;
+    return true;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { matchesReviewFilter: matchesReviewFilter };
+}
+
 (function () {
     "use strict";
 
     const tbody = document.getElementById("reviewBody");
     const evidenceModal = new bootstrap.Modal(document.getElementById("evidenceModal"));
     const pendingCount = document.getElementById("pendingCount");
+    const filterStatus = document.getElementById("reviewFilterStatus");
+    const filterButtons = Array.from(document.querySelectorAll?.("[data-review-filter]") || []);
+    const escapeHtml = window.TAVIDMMainUI?.escapeHtml || function (value) { return String(value ?? ""); };
 
     function showEvidence(item) {
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
         const sceneImg = item.evidence_url
-            ? '<img src="' + item.evidence_url + '" alt="Evidence" class="evidence-preview img-fluid rounded">'
+            ? '<img src="' + escapeHtml(item.evidence_url) + '" alt="Evidence" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
         const vehicleImg = item.vehicle_evidence_url
-            ? '<img src="' + item.vehicle_evidence_url + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
+            ? '<img src="' + escapeHtml(item.vehicle_evidence_url) + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4"><i class="bi bi-car-front fs-1 d-block mb-2"></i>No vehicle crop captured.</div>';
         const plateStatus = item.plate_status || "not_attempted";
         const plateLine = plateStatus === "recognized" && item.plate_text
@@ -31,13 +45,13 @@
             '<div class="tab-pane fade show active" id="rqScene" role="tabpanel">' + sceneImg + "</div>" +
             '<div class="tab-pane fade" id="rqVehicle" role="tabpanel">' + vehicleImg + "</div>" +
             "</div>" +
-            "<p class=\"mt-3 text-muted\">" + item.display_id + " · " + item.violation_type + " · Track #" + item.track_id + "</p>" +
-            "<p class=\"small text-muted\">" + item.reason_log + "</p>" +
-            "<p class=\"small text-muted\">" + plateLine + "</p>" +
-            "<p class=\"small\">Legal status: <strong>" + (item.legal_status || "—") + "</strong>" +
+            "<p class=\"mt-3 text-muted\">" + escapeHtml(item.display_id) + " · " + escapeHtml(item.violation_type) + " · Track #" + escapeHtml(item.track_id) + "</p>" +
+            "<p class=\"small text-muted\">" + escapeHtml(item.reason_log) + "</p>" +
+            "<p class=\"small text-muted\">" + escapeHtml(plateLine) + "</p>" +
+            "<p class=\"small\">Legal status: <strong>" + escapeHtml(item.legal_status || "—") + "</strong>" +
             (item.flag_only ? " · <span class=\"badge bg-warning text-dark\">flag_only review material</span>" : "") + "</p>" +
-            "<p class=\"small text-muted\">Proposed official: " + (item.proposed_official_category || "—") +
-            (item.verified_official_category ? " · Verified: " + item.verified_official_category : " · Verified: none") + "</p>" +
+            "<p class=\"small text-muted\">Proposed official: " + escapeHtml(item.proposed_official_category || "—") +
+            (item.verified_official_category ? " · Verified: " + escapeHtml(item.verified_official_category) : " · Verified: none") + "</p>" +
             "<p class=\"small text-muted\">Timestamp OCR: unavailable — confirm event time after case materialization.</p>";
         evidenceModal.show();
     }
@@ -46,9 +60,26 @@
         if (!pendingCount || !tbody) return;
         const remaining = tbody.querySelectorAll("tr[data-item]").length;
         pendingCount.textContent = remaining + " Pending";
+        updateVisibleCount();
     }
 
-    function postAction(item, action, row) {
+    function setRowBusy(row, busy, loadingLabel) {
+        row.setAttribute("aria-busy", String(busy));
+        row.querySelectorAll("button").forEach(function (button) {
+            button.disabled = busy;
+            if (busy && button.dataset.loadingLabel) {
+                button.dataset.previousAriaLabel = button.getAttribute("aria-label") || "";
+                button.setAttribute("aria-label", button.dataset.loadingLabel);
+            } else if (!busy && button.dataset.previousAriaLabel) {
+                button.setAttribute("aria-label", button.dataset.previousAriaLabel);
+                delete button.dataset.previousAriaLabel;
+            }
+        });
+        if (busy && loadingLabel && filterStatus) filterStatus.textContent = loadingLabel;
+    }
+
+    function postAction(item, action, row, trigger) {
+        setRowBusy(row, true, trigger?.dataset.loadingLabel);
         fetch("/api/review-queue/" + item.id + "/" + action, { method: "POST" })
             .then(function (r) { return r.json(); })
             .then(function (payload) {
@@ -61,10 +92,12 @@
                         showToast("Dismissed", item.violation_type + " detection dismissed.", "info");
                     }
                 } else {
+                    setRowBusy(row, false);
                     showToast("Error", payload.error || "Action failed.", "danger");
                 }
             })
             .catch(function () {
+                setRowBusy(row, false);
                 showToast("Error", "Request failed. Please try again.", "danger");
             });
     }
@@ -75,30 +108,42 @@
         let item;
         try { item = JSON.parse(row.dataset.item); } catch (err) { return; }
 
-        if (e.target.closest(".btn-view-evidence")) showEvidence(item);
-        if (e.target.closest(".btn-approve")) postAction(item, "confirm", row);
-        if (e.target.closest(".btn-dismiss")) postAction(item, "dismiss", row);
+        const evidenceButton = e.target.closest(".btn-view-evidence");
+        const approveButton = e.target.closest(".btn-approve");
+        const dismissButton = e.target.closest(".btn-dismiss");
+        if (evidenceButton) showEvidence(item);
+        if (approveButton) {
+            if (!window.confirm(approveButton.dataset.confirmMessage)) return;
+            postAction(item, "confirm", row, approveButton);
+        }
+        if (dismissButton) postAction(item, "dismiss", row, dismissButton);
     });
 
-    // Confidence-band filters (manuscript manual-review policy).
-    document.getElementById("filterCareful")?.addEventListener("click", function () {
-        filterRows(function (item) { return item.confidence >= 0.80 && item.confidence < 0.95; });
-    });
+    function updateVisibleCount() {
+        if (!tbody || !filterStatus) return;
+        const rows = Array.from(tbody.querySelectorAll("tr[data-item]"));
+        const visible = rows.filter(function (row) { return row.style.display !== "none"; }).length;
+        filterStatus.textContent = "Showing " + visible + " of " + rows.length + " pending detections.";
+    }
 
-    document.getElementById("filterLowConf")?.addEventListener("click", function () {
-        filterRows(function (item) { return item.confidence < 0.80; });
-    });
-
-    document.getElementById("filterAll")?.addEventListener("click", function () {
-        tbody.querySelectorAll("tr").forEach(function (row) { row.style.display = ""; });
-    });
-
-    function filterRows(fn) {
+    function filterRows(filterName) {
         tbody.querySelectorAll("tr[data-item]").forEach(function (row) {
             try {
                 const item = JSON.parse(row.dataset.item);
-                row.style.display = fn(item) ? "" : "none";
+                row.style.display = matchesReviewFilter(item, filterName) ? "" : "none";
             } catch (err) { row.style.display = "none"; }
         });
+        filterButtons.forEach(function (button) {
+            const active = button.dataset.reviewFilter === filterName;
+            button.setAttribute("aria-pressed", String(active));
+            button.classList.toggle("active", active);
+        });
+        updateVisibleCount();
     }
+
+    filterButtons.forEach(function (button) {
+        button.addEventListener("click", function () { filterRows(button.dataset.reviewFilter); });
+    });
+
+    updateVisibleCount();
 })();

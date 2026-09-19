@@ -49,8 +49,8 @@
 
             <div class="sidebar-footer">
                 <div class="system-status">
-                    <span class="status-dot online"></span>
-                    <span>Pipeline Ready</span>
+                    <span class="status-dot neutral" aria-hidden="true"></span>
+                    <span>Decision-support mode</span>
                 </div>
                 <small class="text-muted d-block mt-1">Decision-Support v1.0</small>
             </div>
@@ -59,7 +59,8 @@
         <div class="main-content">
             <header class="top-navbar">
                 <div class="d-flex align-items-center gap-3">
-                    <button class="btn btn-icon sidebar-toggle d-lg-none" id="sidebarToggle" aria-label="Toggle sidebar">
+                    <button class="btn btn-icon sidebar-toggle d-lg-none" id="sidebarToggle"
+                            aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="false">
                         <i class="bi bi-list"></i>
                     </button>
                     <div>
@@ -69,10 +70,13 @@
                 </div>
 
                 <div class="top-navbar-actions">
-                    <div class="search-box d-none d-md-flex">
+                    <form class="search-box d-none d-md-flex" action="{{ url_for('violations') }}" method="get" role="search">
+                        <label class="visually-hidden" for="globalSearch">Search violation records</label>
                         <i class="bi bi-search"></i>
-                        <input type="text" class="form-control" placeholder="Search violations..." id="globalSearch">
-                    </div>
+                        <input type="search" class="form-control" placeholder="Search violations..."
+                               id="globalSearch" name="q" aria-label="Search violation records">
+                        <button class="btn btn-sm btn-outline-secondary" type="submit" id="globalSearchSubmit">Search</button>
+                    </form>
                     {% if current_user.role in ('admin', 'enforcer') %}
                     <a href="{{ url_for('review_queue') }}" class="btn btn-icon position-relative" aria-label="Review Queue" title="Review Queue">
                         <i class="bi bi-inbox"></i>

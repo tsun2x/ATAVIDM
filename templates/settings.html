@@ -36,10 +36,10 @@
                                 <td class="small text-muted">{{ tpl.last_used_at or '—' }}</td>
                                 <td>
                                     <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-outline-secondary btn-preview-template" title="Preview"><i class="bi bi-eye"></i></button>
-                                        <button class="btn btn-outline-secondary btn-edit-template" title="Edit"><i class="bi bi-pencil"></i></button>
-                                        <button class="btn btn-outline-secondary btn-duplicate-template" title="Duplicate"><i class="bi bi-copy"></i></button>
-                                        <button class="btn btn-outline-danger btn-delete-template" title="Delete"><i class="bi bi-trash"></i></button>
+                                        <button class="btn btn-outline-secondary btn-preview-template" title="Preview" aria-label="Preview zone template {{ tpl.template_name }}"><i class="bi bi-eye"></i></button>
+                                        <button class="btn btn-outline-secondary btn-edit-template" title="Edit" aria-label="Edit zone template {{ tpl.template_name }}"><i class="bi bi-pencil"></i></button>
+                                        <button class="btn btn-outline-secondary btn-duplicate-template" title="Duplicate" aria-label="Duplicate zone template {{ tpl.template_name }}"><i class="bi bi-copy"></i></button>
+                                        <button class="btn btn-outline-danger btn-delete-template" title="Delete" aria-label="Delete zone template {{ tpl.template_name }}"><i class="bi bi-trash"></i></button>
                                     </div>
                                 </td>
                             </tr>
@@ -251,7 +251,7 @@
                                     {% endif %}
                                 </td>
                                 <td class="small">{{ user.created_at }}</td>
-                                <td><button class="btn btn-sm btn-outline-secondary btn-edit-user"><i class="bi bi-pencil"></i></button></td>
+                                <td><button class="btn btn-sm btn-outline-secondary btn-edit-user" aria-label="Edit user {{ user.username }}"><i class="bi bi-pencil"></i></button></td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -288,8 +288,8 @@
                                 </td>
                                 <td>
                                     <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-outline-secondary btn-edit-camera" title="Edit"><i class="bi bi-pencil"></i></button>
-                                        <button class="btn btn-outline-danger btn-delete-camera" title="Delete"><i class="bi bi-trash"></i></button>
+                                        <button class="btn btn-outline-secondary btn-edit-camera" title="Edit" aria-label="Edit camera {{ cam.name }}"><i class="bi bi-pencil"></i></button>
+                                        <button class="btn btn-outline-danger btn-delete-camera" title="Delete" aria-label="Delete camera {{ cam.name }}"><i class="bi bi-trash"></i></button>
                                     </div>
                                 </td>
                             </tr>
@@ -318,7 +318,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="templateEditorTitle">Edit Zone Template</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <input type="hidden" id="editTemplateId">
@@ -348,7 +348,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="templatePreviewTitle">Template Preview</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <pre class="template-preview-json mb-0" id="templatePreviewJson"></pre>
@@ -363,7 +363,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="userEditorTitle">Add User</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <input type="hidden" id="editUserId">
@@ -406,7 +406,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="cameraEditorTitle">Add Camera</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <input type="hidden" id="editCameraId">
