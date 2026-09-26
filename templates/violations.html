@@ -29,7 +29,7 @@
                 <select class="form-select" id="filterVideo">
                     <option value="">All Videos</option>
                     {% for vid in videos %}
-                    <option value="{{ vid.name }}">{{ vid.filename }}</option>
+                    <option value="{{ vid.filename }}">{{ vid.filename }}</option>
                     {% endfor %}
                 </select>
             </div>
@@ -130,7 +130,7 @@
         </div>
     </div>
     <div class="card-footer d-flex flex-wrap justify-content-between align-items-center gap-2">
-        <span class="text-muted small" id="paginationInfo">Showing 1–8 of {{ violations|length }}</span>
+        <span class="text-muted small" id="paginationInfo">Showing {{ 1 if violation_total else 0 }}–{{ violations|length }} of {{ violation_total }}</span>
         <nav><ul class="pagination pagination-sm mb-0" id="pagination"></ul></nav>
     </div>
 </div>
@@ -168,6 +168,6 @@
 {% endblock %}
 
 {% block extra_js %}
-<script>window.TAVIDM_VIOLATIONS = {{ violations | tojson }};</script>
+<script>window.TAVIDM_VIOLATION_TOTAL = {{ violation_total|int }};</script>
 <script src="{{ url_for('static', filename='js/violations.js') }}"></script>
 {% endblock %}

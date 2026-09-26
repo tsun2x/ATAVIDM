@@ -24,6 +24,12 @@
             : '<span class="badge bg-success-subtle text-success">Excel</span>';
     }
 
+    function escapeHtml(value) {
+        return String(value == null ? "" : value)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
     function renderHistory(reports) {
         if (!historyBody) return;
         if (!reports.length) {
@@ -33,12 +39,12 @@
         historyBody.innerHTML = reports.map(function (r) {
             return (
                 "<tr>" +
-                "<td>" + r.name + "</td>" +
-                '<td class="small">' + r.date + "</td>" +
-                '<td class="small text-muted">' + r.filters + "</td>" +
+                "<td>" + escapeHtml(r.name) + "</td>" +
+                '<td class="small">' + escapeHtml(r.date) + "</td>" +
+                '<td class="small text-muted">' + escapeHtml(r.filters) + "</td>" +
                 "<td>" + formatBadge(r.type) + "</td>" +
-                '<td class="small">' + r.generated_by + "</td>" +
-                '<td><a class="btn btn-sm btn-outline-danger" href="' + r.download_url + '" title="Download"><i class="bi bi-download"></i></a></td>' +
+                '<td class="small">' + escapeHtml(r.generated_by) + "</td>" +
+                '<td><a class="btn btn-sm btn-outline-danger" href="' + escapeHtml(r.download_url) + '" title="Download"><i class="bi bi-download"></i></a></td>' +
                 "</tr>"
             );
         }).join("");

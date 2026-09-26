@@ -489,7 +489,7 @@ class TemporalEvidenceBuffer:
 
 
 def _project_relative(path: Path) -> str:
-    base = Path(EVIDENCE_FOLDER).resolve().parent.parent
+    base = Path(__file__).resolve().parents[1]
     try:
         return str(path.resolve().relative_to(base)).replace("\\", "/")
     except ValueError:

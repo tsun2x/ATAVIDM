@@ -128,7 +128,8 @@ Edit `.env` if needed:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `FLASK_SECRET_KEY` | (change in production) | Flask session signing |
+| `FLASK_SECRET_KEY` | Random per-process in development; required in production | Flask session signing |
+| `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` | Required for first admin setup or replacement of legacy `admin123` | Initial admin password (12+ characters) |
 | `DB_BACKEND` | `sqlite` | Active database backend |
 | `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
 | `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
@@ -180,6 +181,8 @@ tavidm/
 ├── database/tavidm.db      ← SQLite (created on first run)
 ├── dataset/raw/            ← Uploaded MP4 files
 ├── dataset/frames/         ← Extracted first frames for zone editor
+├── dataset/evidence/       ← Private evidence (served after sign-in)
+├── dataset/reports/        ← Private generated reports (served after sign-in)
 └── venv/                   ← Your virtual environment (not in git)
 ```
 
@@ -191,6 +194,9 @@ You do **not** need to run a separate database script. Starting the app calls `d
 
 From the project root (where `app.py` is located), with the virtual environment active:
 
+For the first launch, set the bootstrap admin password before starting the app;
+the required setup and PowerShell example are in **7.A Configure first-run credentials**.
+
 ```bash
 python app.py
 ```
@@ -199,7 +205,7 @@ Expected output:
 
 ```
  * Serving Flask app 'app'
- * Debug mode: on
+ * Debug mode: off
  * Running on http://127.0.0.1:5000
 ```
 
@@ -211,17 +217,36 @@ Open a browser:
 
 ## 7. First-time walkthrough
 
-### A. Sign in
+### A. Configure first-run credentials
+
+Before the first run, set `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` in `.env` to a
+unique password of at least 12 characters. The app uses it to create the admin
+account and will also replace the old `admin123` bootstrap password if that
+legacy account exists. Set `FLASK_SECRET_KEY` in `.env` to a stable random
+secret for deployments; development creates a temporary random key when it is
+omitted. Production mode refuses to start without an explicit key.
+
+PowerShell example for one terminal session (keep the values private; a stable
+key must be reused after restarts):
+
+```powershell
+$env:TAVIDM_BOOTSTRAP_ADMIN_PASSWORD = 'replace-this-with-your-own-unique-password'
+$env:FLASK_SECRET_KEY = (& python -c "import secrets; print(secrets.token_hex(32))").Trim()
+```
+
+### B. Sign in
 
 Open **http://localhost:5000** — you are redirected to the login page.
 
-Default bootstrap account (created on first run — change the password afterwards in Settings):
-
 | Username | Password | Role |
 |----------|----------|------|
-| `admin` | `admin123` | System Administrator |
+| `admin` | The value of `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` | System Administrator |
 
-### B. Explore the UI
+The in-memory video processing queue is shared by threads in one app process.
+Run one worker process; multiple WSGI worker processes would each have a separate
+queue and could process videos concurrently.
+
+### C. Explore the UI
 
 | URL | Page |
 |-----|------|

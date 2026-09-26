@@ -7,6 +7,7 @@ date range, violation type, and location/source, exportable as PDF or Excel.
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -266,14 +267,14 @@ def generate_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ext = "pdf" if report_format == "pdf" else "xlsx"
-    out_path = out_dir / f"violation_report_{stamp}.{ext}"
+    out_path = out_dir / f"violation_report_{stamp}_{uuid.uuid4().hex[:8]}.{ext}"
 
     if report_format == "pdf":
         _generate_pdf(rows, title, filters, out_path)
     else:
         _generate_excel(rows, title, filters, out_path)
 
-    base = Path(REPORTS_FOLDER).resolve().parent.parent  # project root
+    base = Path(__file__).resolve().parents[1]
     try:
         rel_path = str(out_path.resolve().relative_to(base)).replace("\\", "/")
     except ValueError:

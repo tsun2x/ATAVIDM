@@ -276,17 +276,33 @@
                 payload.templates.forEach(function (tpl) {
                     const tr = document.createElement("tr");
                     tr.dataset.templateId = tpl.id;
-                    tr.innerHTML =
-                        '<td><div class="fw-semibold">' + tpl.template_name + '</div>' +
-                        (tpl.description ? '<small class="text-muted">' + tpl.description + '</small>' : '') + '</td>' +
-                        '<td><span class="badge bg-secondary-subtle text-secondary">' + (tpl.usage_count || 0) + '</span></td>' +
-                        '<td class="small text-muted">' + (tpl.last_used_at || "—") + '</td>' +
-                        '<td><div class="btn-group btn-group-sm">' +
+                    const nameCell = document.createElement("td");
+                    const name = document.createElement("div");
+                    name.className = "fw-semibold";
+                    name.textContent = tpl.template_name || "";
+                    nameCell.appendChild(name);
+                    if (tpl.description) {
+                        const description = document.createElement("small");
+                        description.className = "text-muted";
+                        description.textContent = tpl.description;
+                        nameCell.appendChild(description);
+                    }
+                    const usageCell = document.createElement("td");
+                    const usage = document.createElement("span");
+                    usage.className = "badge bg-secondary-subtle text-secondary";
+                    usage.textContent = String(Number(tpl.usage_count) || 0);
+                    usageCell.appendChild(usage);
+                    const lastUsedCell = document.createElement("td");
+                    lastUsedCell.className = "small text-muted";
+                    lastUsedCell.textContent = tpl.last_used_at || "—";
+                    const actionsCell = document.createElement("td");
+                    actionsCell.innerHTML = '<div class="btn-group btn-group-sm">' +
                         '<button class="btn btn-outline-secondary btn-preview-template" title="Preview"><i class="bi bi-eye"></i></button>' +
                         '<button class="btn btn-outline-secondary btn-edit-template" title="Edit"><i class="bi bi-pencil"></i></button>' +
                         '<button class="btn btn-outline-secondary btn-duplicate-template" title="Duplicate"><i class="bi bi-copy"></i></button>' +
                         '<button class="btn btn-outline-danger btn-delete-template" title="Delete"><i class="bi bi-trash"></i></button>' +
-                        '</div></td>';
+                        '</div>';
+                    tr.append(nameCell, usageCell, lastUsedCell, actionsCell);
                     tableBody.appendChild(tr);
                 });
                 bindTemplateRowActions();

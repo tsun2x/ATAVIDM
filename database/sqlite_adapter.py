@@ -2363,10 +2363,18 @@ def _build_violation_filters(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     search = filters.get("search")
     if search:
         clauses.append(
-            "(violation_type LIKE ? OR CAST(id AS TEXT) LIKE ? OR reason_log LIKE ?)"
+            "(violation_type LIKE ? OR CAST(id AS TEXT) LIKE ? OR CAST(track_id AS TEXT) LIKE ? OR reason_log LIKE ? "
+            "OR EXISTS (SELECT 1 FROM videos WHERE videos.id = violations.video_id AND videos.filename LIKE ?))"
         )
         pattern = f"%{search}%"
-        params.extend([pattern, pattern, pattern])
+        params.extend([pattern, pattern, pattern, pattern, pattern])
+
+    video_name = filters.get("video_name")
+    if video_name:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM videos WHERE videos.id = violations.video_id AND videos.filename = ?)"
+        )
+        params.append(video_name)
 
     violation_type = filters.get("violation_type")
     if violation_type:

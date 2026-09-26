@@ -5,13 +5,13 @@
 (function () {
     "use strict";
 
-    const allViolations = window.TAVIDM_VIOLATIONS || [];
-    let filtered = [...allViolations];
+    let allViolations = [];
+    let totalRecords = Number(window.TAVIDM_VIOLATION_TOTAL || 0);
     let currentPage = 1;
     let pageSize = 8;
-    let sortField = "timestamp";
-    let sortDir = "desc";
     let selectedViolation = null;
+    let requestSequence = 0;
+    let filterTimer = null;
 
     const searchInput = document.getElementById("searchInput");
     const filterType = document.getElementById("filterType");
@@ -36,7 +36,8 @@
 
     function escapeHtml(s) {
         return String(s == null ? "" : s)
-            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
 
     function plateBadge(v) {
@@ -60,9 +61,9 @@
     function evidenceImage(url, caption) {
         if (!url) {
             return '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>' +
-                (caption || "No evidence snapshot available.") + "</div>";
+                escapeHtml(caption || "No evidence snapshot available.") + "</div>";
         }
-        return '<img src="' + url + '" alt="' + (caption || "Evidence") +
+        return '<img src="' + escapeHtml(url) + '" alt="' + escapeHtml(caption || "Evidence") +
             '" class="evidence-preview img-fluid rounded">';
     }
 
@@ -73,60 +74,64 @@
         const status = filterStatus?.value || "";
         const date = filterDate?.value || "";
 
-        filtered = allViolations.filter(function (v) {
-            const matchQuery = !query || [v.id, v.type, v.video_name, v.status, v.track_id]
-                .some(function (f) { return String(f).toLowerCase().includes(query); });
-            const matchDate = !date || v.timestamp.startsWith(date);
-            return matchQuery && matchDate &&
-                (!type || v.type === type) &&
-                (!video || v.video_name === video) &&
-                (!status || v.status === status);
-        });
-
-        applySort();
         currentPage = 1;
-        render();
+        loadPage({ search: query, violation_type: type, video_name: video, status: status,
+            date_from: date || "", date_to: date || "" });
     }
 
-    function applySort() {
-        const sortVal = sortSelect?.value || "newest";
-        if (sortVal === "newest") { sortField = "timestamp"; sortDir = "desc"; }
-        else if (sortVal === "oldest") { sortField = "timestamp"; sortDir = "asc"; }
-        else if (sortVal === "confidence_desc") { sortField = "confidence"; sortDir = "desc"; }
-        else if (sortVal === "confidence_asc") { sortField = "confidence"; sortDir = "asc"; }
-        else if (sortVal === "type") { sortField = "type"; sortDir = "asc"; }
-
-        filtered.sort(function (a, b) {
-            let valA, valB;
-            switch (sortField) {
-                case "confidence": valA = a.confidence; valB = b.confidence; break;
-                case "timestamp": valA = a.timestamp_iso; valB = b.timestamp_iso; break;
-                case "video": valA = a.video_name; valB = b.video_name; break;
-                default: valA = a[sortField] || ""; valB = b[sortField] || "";
-            }
-            if (valA < valB) return sortDir === "asc" ? -1 : 1;
-            if (valA > valB) return sortDir === "asc" ? 1 : -1;
-            return 0;
+    function loadPage(filters) {
+        const sequence = ++requestSequence;
+        const params = new URLSearchParams({
+            page: String(currentPage),
+            per_page: String(pageSize),
+            sort: sortSelect?.value || "newest",
         });
+        const active = filters || {
+            search: (searchInput?.value || "").trim(),
+            violation_type: filterType?.value || "",
+            video_name: filterVideo?.value || "",
+            status: filterStatus?.value || "",
+            date_from: filterDate?.value || "",
+            date_to: filterDate?.value || "",
+        };
+        Object.keys(active).forEach(function (key) { if (active[key]) params.set(key, active[key]); });
+        fetch("/api/violations?" + params.toString())
+            .then(function (response) {
+                if (!response.ok) throw new Error(response.status === 401 ? "Session expired. Sign in again." : "Could not load violations.");
+                return response.json();
+            })
+            .then(function (payload) {
+                if (sequence !== requestSequence) return;
+                if (!payload.success) throw new Error(payload.error || "Could not load violations.");
+                allViolations = payload.items || [];
+                totalRecords = Number(payload.total) || 0;
+                currentPage = payload.page || currentPage;
+                render();
+            })
+            .catch(function (error) {
+                if (sequence !== requestSequence) return;
+                if (tbody) tbody.innerHTML = '<tr><td colspan="9" class="text-center text-danger py-4">' + escapeHtml(error.message) + '</td></tr>';
+                totalRecords = 0;
+                renderPagination();
+                updatePaginationInfo();
+            });
     }
 
     function render() {
-        const start = (currentPage - 1) * pageSize;
-        const page = filtered.slice(start, start + pageSize);
-        if (resultCount) resultCount.textContent = filtered.length;
+        if (resultCount) resultCount.textContent = totalRecords;
 
         if (tbody) {
-            tbody.innerHTML = page.map(function (v) {
+            tbody.innerHTML = allViolations.map(function (v) {
                 const plate = plateBadge(v);
                 return (
-                    "<tr data-violation='" + JSON.stringify(v).replace(/'/g, "&#39;") + "'>" +
-                    "<td><code>" + v.id + "</code></td>" +
-                    '<td><span class="vtype-badge vtype-' + v.type_slug + '">' + v.type + "</span></td>" +
-                    '<td class="small">' + v.video_name + "</td>" +
-                    "<td>" + v.timestamp + "</td>" +
+                    "<tr data-violation='" + escapeHtml(JSON.stringify(v)) + "'>" +
+                    "<td><code>" + escapeHtml(v.id) + "</code></td>" +
+                    '<td><span class="vtype-badge vtype-' + escapeHtml(v.type_slug) + '">' + escapeHtml(v.type) + "</span></td>" +
+                    '<td class="small">' + escapeHtml(v.video_name) + "</td>" +
+                    "<td>" + escapeHtml(v.timestamp) + "</td>" +
                     '<td><span class="confidence-badge confidence-' + getConfidenceClass(v.confidence) + '">' +
                     Math.round(v.confidence * 100) + "%</span></td>" +
-                    '<td><span class="badge status-badge status-' + v.status + '">' + v.status + "</span></td>" +
+                    '<td><span class="badge status-badge status-' + escapeHtml(v.status) + '">' + escapeHtml(v.status) + "</span></td>" +
                     '<td class="small">' + (v.vehicle_class && v.vehicle_class !== "—" ? escapeHtml(v.vehicle_class) : "—") + "</td>" +
                     "<td>" + plate + "</td>" +
                     '<td><div class="btn-group btn-group-sm">' +
@@ -142,24 +147,25 @@
 
     function renderPagination() {
         if (!pagination) return;
-        const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+        const totalPages = Math.max(1, Math.ceil(totalRecords / pageSize));
         let html = '<li class="page-item ' + (currentPage === 1 ? "disabled" : "") + '"><a class="page-link" href="#" data-page="' + (currentPage - 1) + '">&laquo;</a></li>';
-        for (let i = 1; i <= totalPages; i++) {
-            if (totalPages > 7 && Math.abs(i - currentPage) > 2 && i !== 1 && i !== totalPages) {
-                if (i === 2 || i === totalPages - 1) html += '<li class="page-item disabled"><span class="page-link">...</span></li>';
-                continue;
-            }
+        const visiblePages = new Set([1, totalPages]);
+        for (let i = Math.max(2, currentPage - 2); i <= Math.min(totalPages - 1, currentPage + 2); i++) visiblePages.add(i);
+        let previous = 0;
+        Array.from(visiblePages).sort(function (a, b) { return a - b; }).forEach(function (i) {
+            if (previous && i - previous > 1) html += '<li class="page-item disabled"><span class="page-link">...</span></li>';
             html += '<li class="page-item ' + (i === currentPage ? "active" : "") + '"><a class="page-link" href="#" data-page="' + i + '">' + i + "</a></li>";
-        }
+            previous = i;
+        });
         html += '<li class="page-item ' + (currentPage === totalPages ? "disabled" : "") + '"><a class="page-link" href="#" data-page="' + (currentPage + 1) + '">&raquo;</a></li>';
         pagination.innerHTML = html;
     }
 
     function updatePaginationInfo() {
         if (!paginationInfo) return;
-        const start = filtered.length ? (currentPage - 1) * pageSize + 1 : 0;
-        const end = Math.min(currentPage * pageSize, filtered.length);
-        paginationInfo.textContent = "Showing " + start + "\u2013" + end + " of " + filtered.length;
+        const start = totalRecords ? (currentPage - 1) * pageSize + 1 : 0;
+        const end = Math.min((currentPage - 1) * pageSize + allViolations.length, totalRecords);
+        paginationInfo.textContent = "Showing " + start + "\u2013" + end + " of " + totalRecords;
     }
 
     function showDetail(v) {
@@ -176,8 +182,8 @@
                 : "—");
         body.innerHTML =
             '<div class="detail-grid">' +
-            detailField("Violation ID", v.id) +
-            detailField("Canonical Type", '<span class="vtype-badge vtype-' + v.type_slug + '">' + escapeHtml(v.type) + "</span>") +
+            detailField("Violation ID", escapeHtml(v.id)) +
+            detailField("Canonical Type", '<span class="vtype-badge vtype-' + escapeHtml(v.type_slug) + '">' + escapeHtml(v.type) + "</span>") +
             detailField("Official Category", official) +
             detailField("Legal Status", legalBadge) +
             detailField("Contributing Behaviors", escapeHtml((v.contributing_behaviors || []).join("; ") || v.type)) +
@@ -192,7 +198,7 @@
             detailField("Frame", v.frame_number) +
             detailField("Detected At", escapeHtml(v.timestamp)) +
             detailField("Confidence", Math.round(v.confidence * 100) + "%") +
-            detailField("Status", '<span class="badge status-badge status-' + v.status + '">' + v.status + "</span>") +
+            detailField("Status", '<span class="badge status-badge status-' + escapeHtml(v.status) + '">' + escapeHtml(v.status) + "</span>") +
             detailField("Reason Log", escapeHtml(v.reason_log || ""), true) +
             "</div>" +
             '<hr><div class="d-flex flex-wrap gap-2" id="caseActionBar">' +
@@ -282,7 +288,7 @@
             "</ul>" +
             '<div class="tab-content">' +
             '<div class="tab-pane fade show active" id="paneScene" role="tabpanel">' + sceneImg +
-            "<p class=\"mt-2 text-muted small\">" + v.id + " · " + v.type + " · Track #" + v.track_id + " · " + v.timestamp + "</p></div>" +
+            "<p class=\"mt-2 text-muted small\">" + escapeHtml(v.id) + " · " + escapeHtml(v.type) + " · Track #" + escapeHtml(v.track_id) + " · " + escapeHtml(v.timestamp) + "</p></div>" +
             '<div class="tab-pane fade" id="paneVehicle" role="tabpanel">' + vehicleImg +
             "<p class=\"mt-2 text-muted small\">Vehicle/object crop. Plate recognition is not performed in this build.</p></div>" +
             "</div>";
@@ -291,21 +297,25 @@
 
     [searchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) {
         if (!el) return;
-        el.addEventListener("input", applyFilters);
+        el.addEventListener("input", function () {
+            window.clearTimeout(filterTimer);
+            filterTimer = window.setTimeout(applyFilters, 250);
+        });
         if (el.tagName === "SELECT") el.addEventListener("change", applyFilters);
     });
 
-    sortSelect?.addEventListener("change", function () { applySort(); render(); });
+    sortSelect?.addEventListener("change", function () { currentPage = 1; loadPage(); });
 
     document.getElementById("resetFilters")?.addEventListener("click", function () {
         [searchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) { if (el) el.value = ""; });
+        window.clearTimeout(filterTimer);
         applyFilters();
     });
 
     pageSizeSelect?.addEventListener("change", function () {
         pageSize = parseInt(this.value, 10);
         currentPage = 1;
-        render();
+        loadPage();
     });
 
     pagination?.addEventListener("click", function (e) {
@@ -313,8 +323,8 @@
         const link = e.target.closest("[data-page]");
         if (!link) return;
         const page = parseInt(link.dataset.page, 10);
-        const totalPages = Math.ceil(filtered.length / pageSize);
-        if (page >= 1 && page <= totalPages) { currentPage = page; render(); }
+        const totalPages = Math.ceil(totalRecords / pageSize);
+        if (page >= 1 && page <= totalPages) { currentPage = page; loadPage(); }
     });
 
     tbody?.addEventListener("click", function (e) {

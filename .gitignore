@@ -21,9 +21,11 @@ build/
 
 # Generated evidence snapshots
 static/evidence/
+dataset/evidence/
 
 # Generated reports
 static/reports/
+dataset/reports/
 exports/*
 !exports/.gitkeep
 

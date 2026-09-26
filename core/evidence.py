@@ -36,9 +36,9 @@ def save_evidence_snapshot(
     """
     Draw the offending detection on a copy of the frame and save it.
 
-    Returns the saved path relative to the project root (e.g.
-    ``static/evidence/video_3/illegal_parking_f001234_t007.jpg``) so it can be
-    stored in the database and served by Flask.
+    Returns a project-relative path when possible, or an absolute path for a
+    separately configured evidence directory. Files are served through an
+    authenticated endpoint rather than Flask's public static route.
 
     Label shows violation_confidence when provided (not raw detector score).
     """
@@ -71,13 +71,14 @@ def save_evidence_snapshot(
         raise ValueError("Unsafe evidence filename rejected.")
     out_path = out_dir / filename
     # Ensure resolved path stays under evidence root.
-    if not str(out_path.resolve()).startswith(str(Path(EVIDENCE_FOLDER).resolve())):
-        raise ValueError("Unsafe evidence path rejected (directory traversal).")
+    try:
+        out_path.resolve().relative_to(Path(EVIDENCE_FOLDER).resolve())
+    except ValueError as exc:
+        raise ValueError("Unsafe evidence path rejected (directory traversal).") from exc
     cv2.imwrite(str(out_path), annotated)
 
-    base = Path(EVIDENCE_FOLDER).resolve().parent.parent  # project root
     try:
-        return str(out_path.resolve().relative_to(base)).replace("\\", "/")
+        return str(out_path.resolve().relative_to(Path(__file__).resolve().parents[1])).replace("\\", "/")
     except ValueError:
         return str(out_path)
 
@@ -110,9 +111,9 @@ def save_vehicle_crop(
     """
     Save a tight crop of the detected vehicle/object (no annotation overlay).
 
-    Returns the project-relative path (``static/evidence/<source>/vehicle_*.jpg``)
-    or ``None`` if the bbox is missing or empty. This is the vehicle evidence
-    image surfaced in the violations/review detail + evidence modals.
+    Returns the project-relative path when possible, or an absolute path for
+    an external configured evidence directory. Returns ``None`` if the bbox
+    is missing or empty. Evidence is served through authenticated routes.
 
     NOTE: This is NOT license-plate recognition. No OCR or plate text is
     generated here; plate fields are managed separately and intentionally left
@@ -128,12 +129,15 @@ def save_vehicle_crop(
     track_id = int(detection.get("track_id", -1))
     filename = f"vehicle_f{frame_number:06d}_t{track_id:03d}.jpg"
     out_path = out_dir / filename
+    try:
+        out_path.resolve().relative_to(Path(EVIDENCE_FOLDER).resolve())
+    except ValueError as exc:
+        raise ValueError("Unsafe evidence path rejected (directory traversal).") from exc
     ok = cv2.imwrite(str(out_path), crop)
     if not ok:
         return None
 
-    base = Path(EVIDENCE_FOLDER).resolve().parent.parent  # project root
     try:
-        return str(out_path.resolve().relative_to(base)).replace("\\", "/")
+        return str(out_path.resolve().relative_to(Path(__file__).resolve().parents[1])).replace("\\", "/")
     except ValueError:
         return str(out_path)

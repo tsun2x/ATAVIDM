@@ -21,7 +21,10 @@ if (typeof module !== "undefined" && module.exports) {
     const pendingCount = document.getElementById("pendingCount");
     const filterStatus = document.getElementById("reviewFilterStatus");
     const filterButtons = Array.from(document.querySelectorAll?.("[data-review-filter]") || []);
-    const escapeHtml = window.TAVIDMMainUI?.escapeHtml || function (value) { return String(value ?? ""); };
+    const escapeHtml = window.TAVIDMMainUI?.escapeHtml || function (value) {
+        return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    };
 
     function showEvidence(item) {
         const body = document.getElementById("evidenceModalBody");
@@ -58,8 +61,9 @@ if (typeof module !== "undefined" && module.exports) {
 
     function updateCount() {
         if (!pendingCount || !tbody) return;
-        const remaining = tbody.querySelectorAll("tr[data-item]").length;
-        pendingCount.textContent = remaining + " Pending";
+        const total = Math.max(0, Number(pendingCount.dataset.total || 0) - 1);
+        pendingCount.dataset.total = String(total);
+        pendingCount.textContent = total + " Pending";
         updateVisibleCount();
     }
 
@@ -123,7 +127,8 @@ if (typeof module !== "undefined" && module.exports) {
         if (!tbody || !filterStatus) return;
         const rows = Array.from(tbody.querySelectorAll("tr[data-item]"));
         const visible = rows.filter(function (row) { return row.style.display !== "none"; }).length;
-        filterStatus.textContent = "Showing " + visible + " of " + rows.length + " pending detections.";
+        const total = Number(pendingCount?.dataset.total || 0);
+        filterStatus.textContent = "Showing " + visible + " of " + rows.length + " on this page · " + total + " pending total.";
     }
 
     function filterRows(filterName) {

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,6 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_file,
     send_from_directory,
     url_for,
 )
@@ -78,6 +78,9 @@ from database import db
 app = Flask(__name__)
 app.config["SECRET_KEY"] = config.FLASK_SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = config.SESSION_COOKIE_SECURE
 
 ensure_upload_dir()
 db.init_db()
@@ -129,6 +132,13 @@ def _format_duration(duration_sec: float | None) -> str:
     total = int(duration_sec)
     minutes, seconds = divmod(total, 60)
     return f"{minutes}:{seconds:02d}"
+
+
+def _int_query_arg(name: str, default: int) -> int:
+    try:
+        return int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _db_video_to_ui(row: dict) -> dict:
@@ -207,10 +217,50 @@ def _source_label(video_id: int | None, videos: dict[int, dict]) -> str:
     return video["filename"] if video else f"Video #{video_id}"
 
 
-def _evidence_url(evidence_path: str | None) -> str | None:
-    if not evidence_path:
+def _record_evidence_url(record_id: int, kind: str, *, review: bool = False) -> str | None:
+    endpoint = "api_review_evidence" if review else "api_violation_evidence"
+    return url_for(endpoint, record_id=record_id, kind=kind)
+
+
+def _private_file_path(stored_path: str | None, roots: list[str | Path]) -> Path | None:
+    if not stored_path:
         return None
-    return "/" + evidence_path.lstrip("/")
+    raw_path = Path(str(stored_path))
+    candidate = raw_path if raw_path.is_absolute() else Path(config.BASE_DIR) / raw_path
+    allowed_roots = [
+        Path(root).resolve() if Path(root).is_absolute() else (Path(config.BASE_DIR) / root).resolve()
+        for root in roots
+    ]
+    try:
+        return resolve_under_roots(candidate, allowed_roots)
+    except MediaPathError:
+        return None
+
+
+def _evidence_media_response(stored_path: str | None):
+    roots = [config.EVIDENCE_FOLDER, Path(config.BASE_DIR) / "static" / "evidence"]
+    file_path = _private_file_path(stored_path, roots)
+    if file_path is None:
+        return jsonify({"success": False, "error": "Evidence file not found."}), 404
+    allowed_roots = [
+        Path(root).resolve() if Path(root).is_absolute() else (Path(config.BASE_DIR) / root).resolve()
+        for root in roots
+    ]
+    return safe_media_response(
+        file_path,
+        roots=allowed_roots,
+        request=request,
+        download_name=file_path.name,
+        as_attachment=False,
+    )
+
+
+@app.before_request
+def _block_public_private_static_files():
+    path = request.path.lower()
+    if path.startswith(("/static/evidence/", "/static/reports/")):
+        return jsonify({"success": False, "error": "File not found."}), 404
+    return None
 
 
 def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
@@ -269,8 +319,9 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "status": row.get("status"),
         "condition": (video or {}).get("condition") or "—",
         "vehicle_class": row.get("vehicle_class") or "—",
-        "evidence_url": _evidence_url(row.get("evidence_path")),
-        "vehicle_evidence_url": _evidence_url(row.get("vehicle_evidence_path")),
+        "evidence_url": _record_evidence_url(vid, "scene") if row.get("evidence_path") else None,
+        "vehicle_evidence_url": _record_evidence_url(vid, "vehicle") if row.get("vehicle_evidence_path") else None,
+        "evidence_clip_url": _record_evidence_url(vid, "clip") if row.get("evidence_clip_path") else None,
         "plate_text": (plate_row or {}).get("accepted_plate_text") or row.get("plate_text") or None,
         "plate_status": (plate_row or {}).get("plate_status") or row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
@@ -311,8 +362,9 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "confidence": row.get("confidence") or 0,
         "frame_number": row.get("frame_number"),
         "vehicle_class": row.get("vehicle_class") or "—",
-        "evidence_url": _evidence_url(row.get("evidence_path")),
-        "vehicle_evidence_url": _evidence_url(row.get("vehicle_evidence_path")),
+        "evidence_url": _record_evidence_url(row["id"], "scene", review=True) if row.get("evidence_path") else None,
+        "vehicle_evidence_url": _record_evidence_url(row["id"], "vehicle", review=True) if row.get("vehicle_evidence_path") else None,
+        "evidence_clip_url": _record_evidence_url(row["id"], "clip", review=True) if row.get("evidence_clip_path") else None,
         "plate_text": row.get("plate_text") or None,
         "plate_status": row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
@@ -438,6 +490,15 @@ def login():
             return render_template("login.html"), 401
         auth.login_user(user)
         next_url = request.args.get("next") or url_for("dashboard")
+        target = urlparse(urljoin(request.host_url, next_url))
+        if (
+            not next_url.startswith("/")
+            or next_url.startswith("//")
+            or "\\" in next_url
+            or target.scheme not in {"http", "https"}
+            or target.netloc != request.host
+        ):
+            next_url = url_for("dashboard")
         return redirect(next_url)
     if auth.current_user():
         return redirect(url_for("dashboard"))
@@ -500,15 +561,66 @@ def live_monitor():
 @app.route("/violations")
 @auth.login_required
 def violations():
-    videos = _video_name_map()
-    rows, _total = db.list_violations(page=1, per_page=1000, sort="newest")
+    _rows, total = db.list_violations(page=1, per_page=1, sort="newest")
     return render_template(
         "violations.html",
-        violations=[_violation_to_ui(r, videos) for r in rows],
+        violations=[],
+        violation_total=total,
         violation_types=list(CANONICAL_VIOLATIONS),
         videos=[_db_video_to_ui(row) for row in db.list_videos()],
         statuses=STATUSES,
     )
+
+
+@app.route("/api/violations", methods=["GET"])
+@auth.login_required
+def api_list_violations():
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 8)))
+    sort = request.args.get("sort", "newest")
+    if sort not in {"newest", "oldest", "confidence_desc", "confidence_asc", "type"}:
+        sort = "newest"
+    filters = {
+        key: request.args.get(key)
+        for key in ("search", "violation_type", "video_name", "date_from", "date_to", "status")
+        if request.args.get(key)
+    }
+    video_id = request.args.get("video_id", "")
+    if video_id.isdigit():
+        filters["video_id"] = int(video_id)
+    rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort)
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+        rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort)
+    videos = _video_name_map()
+    return jsonify({
+        "success": True,
+        "items": [_violation_to_ui(row, videos) for row in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    })
+
+
+@app.route("/api/violations/<int:record_id>/evidence/<kind>")
+@auth.login_required
+def api_violation_evidence(record_id: int, kind: str):
+    path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
+    row = db.get_violation(record_id)
+    if path_key is None or row is None:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    return _evidence_media_response(row.get(path_key))
+
+
+@app.route("/api/review-queue/<int:record_id>/evidence/<kind>")
+@auth.role_required("enforcer")
+def api_review_evidence(record_id: int, kind: str):
+    path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
+    row = db.get_review_item(record_id)
+    if path_key is None or row is None:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    return _evidence_media_response(row.get(path_key))
 
 
 @app.route("/analytics")
@@ -556,10 +668,19 @@ def settings():
 @auth.role_required("enforcer")
 def review_queue():
     videos = _video_name_map()
-    rows, _total = db.list_review_queue(status="pending", page=1, per_page=200)
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
+    rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page)
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+        rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page)
     return render_template(
         "review_queue.html",
         review_items=[_review_to_ui(r, videos) for r in rows],
+        review_total=total,
+        review_page=page,
+        review_per_page=per_page,
     )
 
 
@@ -1878,12 +1999,20 @@ def api_upload_processing_analytics():
 @auth.login_required
 def api_review_queue():
     status = request.args.get("status", "pending")
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
     videos = _video_name_map()
-    rows, total = db.list_review_queue(status=status, page=1, per_page=200)
+    rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
     return jsonify({
         "success": True,
         "items": [_review_to_ui(r, videos) for r in rows],
         "total": total,
+        "page": page,
+        "per_page": per_page,
     })
 
 
@@ -2174,10 +2303,21 @@ def api_download_report(report_id: int):
     row = db.get_report(report_id)
     if row is None:
         return jsonify({"success": False, "error": "Report not found."}), 404
-    file_path = Path(config.BASE_DIR) / row["file_path"]
-    if not file_path.is_file():
+    roots = [config.REPORTS_FOLDER, Path(config.BASE_DIR) / "static" / "reports"]
+    file_path = _private_file_path(row.get("file_path"), roots)
+    if file_path is None:
         return jsonify({"success": False, "error": "Report file is missing."}), 404
-    return send_file(file_path, as_attachment=True)
+    allowed_roots = [
+        Path(root).resolve() if Path(root).is_absolute() else (Path(config.BASE_DIR) / root).resolve()
+        for root in roots
+    ]
+    return safe_media_response(
+        file_path,
+        roots=allowed_roots,
+        request=request,
+        download_name=file_path.name,
+        as_attachment=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2382,4 +2522,6 @@ def api_camera_stop(camera_id: int):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    is_development = os.environ.get("TAVIDM_ENV", "development").strip().lower() == "development"
+    debug_enabled = is_development and os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug_enabled, port=5000)
