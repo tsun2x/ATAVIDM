@@ -33,12 +33,9 @@ def test_db(test_db_path: str) -> Any:
 
 
 @pytest.fixture
-def client(test_db_path: str):
-    """Flask test client with a fresh DB and the default admin seeded."""
+def client(test_db: Any):
+    """Flask test client using the test's single initialized DB."""
     from core import auth
-    from database import sqlite_adapter
-
-    sqlite_adapter.init_db(force=True)
     auth.ensure_default_admin()
     import app as flask_app
 
