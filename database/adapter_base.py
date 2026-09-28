@@ -189,6 +189,71 @@ class DatabaseAdapter(Protocol):
     def confirm_review_item(self, review_id: int, reviewed_by: int) -> int: ...
     def dismiss_review_item(self, review_id: int, reviewed_by: int) -> None: ...
 
+    # Motorcycle detail review (separate queue; never a violation case)
+    def upsert_motorcycle_detail_candidate(
+        self,
+        *,
+        video_id: int,
+        run_key: str,
+        track_id: int,
+        occurrence_index: int,
+        occurrence_key: str,
+        selector_version: str,
+        processing_run_id: int | None = None,
+        frame_number: int | None = None,
+        timestamp_sec: float | None = None,
+        frame_score: float | None = None,
+        score_breakdown_json: str = "{}",
+        frame_count: int = 0,
+        size_bytes: int = 0,
+        frames_json: str = "[]",
+        detection_bbox_json: str = "{}",
+        source_width: int | None = None,
+        source_height: int | None = None,
+    ) -> int: ...
+    def get_motorcycle_detail_candidate(self, candidate_id: int) -> dict[str, Any] | None: ...
+    def list_motorcycle_detail_candidates(
+        self,
+        *,
+        scan_state: str | None = None,
+        human_outcome: str | None = None,
+        video_id: int | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]: ...
+    def count_motorcycle_detail_pending(self) -> int: ...
+    def count_motorcycle_detail_by_state(self) -> dict[str, dict[str, int]]: ...
+    def claim_motorcycle_detail_scans(self, limit: int) -> list[dict[str, Any]]: ...
+    def finish_motorcycle_detail_scan(
+        self,
+        *,
+        candidate_id: int,
+        observations_json: str,
+        association_json: str,
+        uncertainty_json: str,
+        scan_model: str | None,
+        scan_class_map_json: str,
+        scan_seconds: float | None = None,
+    ) -> None: ...
+    def record_motorcycle_detail_scan_failure(
+        self, *, candidate_id: int, error: str, max_attempts: int
+    ) -> str: ...
+    def recover_stale_motorcycle_detail_scans(
+        self, *, stale_sec: float, max_attempts: int, include_recent: bool = False
+    ) -> int: ...
+    def count_queued_motorcycle_detail_scans(self) -> int: ...
+    def note_motorcycle_detail_scan_gate(self, *, reason: str, limit: int = 500) -> int: ...
+    def record_motorcycle_detail_review(
+        self,
+        *,
+        candidate_id: int,
+        outcome: str,
+        reviewed_by: int | None,
+        notes: str | None = None,
+    ) -> None: ...
+    def list_motorcycle_detail_run_keys_for_video(self, video_id: int) -> list[str]: ...
+    def purge_motorcycle_detail_candidates_for_video(self, video_id: int) -> int: ...
+
     # System settings
     def get_all_settings(self) -> dict[str, str]: ...
     def get_setting(self, key: str, default: str | None = None) -> str | None: ...

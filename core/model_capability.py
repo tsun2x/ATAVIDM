@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from core.detection_config import (
     CANONICAL_VIOLATIONS,
+    ObjectClassMapReport,
     SEVEN_CLASS_BASELINE_MISSING,
     VIOLATION_CARGO_PASSENGERS,
     VIOLATION_COUNTERFLOW,
@@ -213,4 +214,29 @@ def baseline_capability_notes(available_classes: Iterable[str]) -> list[str]:
         notes.append(
             f"Loaded model is missing canonical vehicle classes: {missing}."
         )
+    return notes
+
+
+def object_roster_capability_notes(
+    report: ObjectClassMapReport | None,
+) -> list[str]:
+    """Notes for a checkpoint verified against the 15-class object roster.
+
+    Additive only: a legacy roster contributes no note, so existing diagnostics
+    and the stored ``diagnostics_json`` shape are unchanged for the currently
+    selected checkpoint. The ten vehicle classes remain the vehicle subset; the
+    five non-vehicle object classes (person, rider, helmets, side_mirror) are
+    observable object/attribute labels and are never counted as vehicles.
+    """
+    if report is None:
+        return []
+    if getattr(report, "is_legacy_roster", True):
+        return []
+    notes = [f"Class roster: {report.summary}"]
+    notes.append(
+        "Object roster carries 10 vehicle classes and 5 non-vehicle object "
+        "classes (person, rider, helmet_acceptable, helmet_nut_shell, "
+        "side_mirror). Line-crossing vehicle counts use the vehicle subset only; "
+        "detection records cover all object classes."
+    )
     return notes

@@ -89,6 +89,25 @@ violations_by_vehicle_class = _adapter.violations_by_vehicle_class
 violations_by_video = _adapter.violations_by_video
 count_all_violations = _adapter.count_all_violations
 
+# Motorcycle detail review (separate queue; never a violation case)
+upsert_motorcycle_detail_candidate = _adapter.upsert_motorcycle_detail_candidate
+get_motorcycle_detail_candidate = _adapter.get_motorcycle_detail_candidate
+list_motorcycle_detail_candidates = _adapter.list_motorcycle_detail_candidates
+count_motorcycle_detail_pending = _adapter.count_motorcycle_detail_pending
+count_motorcycle_detail_by_state = _adapter.count_motorcycle_detail_by_state
+claim_motorcycle_detail_scans = _adapter.claim_motorcycle_detail_scans
+finish_motorcycle_detail_scan = _adapter.finish_motorcycle_detail_scan
+record_motorcycle_detail_scan_failure = _adapter.record_motorcycle_detail_scan_failure
+recover_stale_motorcycle_detail_scans = _adapter.recover_stale_motorcycle_detail_scans
+count_queued_motorcycle_detail_scans = _adapter.count_queued_motorcycle_detail_scans
+note_motorcycle_detail_scan_gate = _adapter.note_motorcycle_detail_scan_gate
+record_motorcycle_detail_review = _adapter.record_motorcycle_detail_review
+list_motorcycle_detail_run_keys_for_video = _adapter.list_motorcycle_detail_run_keys_for_video
+purge_motorcycle_detail_candidates_for_video = (
+    _adapter.purge_motorcycle_detail_candidates_for_video
+)
+detail_dedup_key = _adapter.detail_dedup_key
+
 # Stage B: Legal-policy persistence, case linkage, audit, permissions
 get_active_legal_policy_version = _adapter.get_active_legal_policy_version
 get_legal_policy_version = _adapter.get_legal_policy_version

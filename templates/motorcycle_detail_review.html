@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+
+{% block title %}Motorcycle Detail Review{% endblock %}
+{% block page_title %}Motorcycle Detail Review{% endblock %}
+{% block page_subtitle %}Helmet and side-mirror observations for motorcycle tracks — review aid only, never a violation case{% endblock %}
+
+{% block content %}
+<div class="card card-panel mb-4">
+    <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <div>
+            <span class="badge bg-warning-subtle text-warning me-2" id="detailPendingCount" data-total="{{ detail_total }}">{{ detail_total }} Pending</span>
+            <span class="text-muted small">
+                Scan: {{ detail_counts.scan_states.queued }} queued · {{ detail_counts.scan_states.scanning }} scanning ·
+                {{ detail_counts.scan_states.ready }} ready · {{ detail_counts.scan_states.failed }} failed
+            </span>
+        </div>
+        <div class="btn-group btn-group-sm" role="group" aria-label="Filter detail queue">
+            <a class="btn btn-outline-secondary {% if detail_outcome == 'pending' %}active{% endif %}"
+               href="{{ url_for('motorcycle_detail_review', outcome='pending') }}"
+               aria-pressed="{{ 'true' if detail_outcome == 'pending' else 'false' }}">Pending</a>
+            <a class="btn btn-outline-secondary {% if detail_outcome == 'reviewed' %}active{% endif %}"
+               href="{{ url_for('motorcycle_detail_review', outcome='reviewed') }}"
+               aria-pressed="{{ 'true' if detail_outcome == 'reviewed' else 'false' }}">Reviewed</a>
+            <a class="btn btn-outline-secondary {% if detail_outcome == 'dismissed' %}active{% endif %}"
+               href="{{ url_for('motorcycle_detail_review', outcome='dismissed') }}"
+               aria-pressed="{{ 'true' if detail_outcome == 'dismissed' else 'false' }}">Dismissed</a>
+            <a class="btn btn-outline-secondary {% if detail_outcome == 'uncertain' %}active{% endif %}"
+               href="{{ url_for('motorcycle_detail_review', outcome='uncertain') }}"
+               aria-pressed="{{ 'true' if detail_outcome == 'uncertain' else 'false' }}">Uncertain</a>
+            <a class="btn btn-outline-secondary {% if detail_outcome == 'all' %}active{% endif %}"
+               href="{{ url_for('motorcycle_detail_review', outcome='all') }}"
+               aria-pressed="{{ 'true' if detail_outcome == 'all' else 'false' }}">All</a>
+        </div>
+    </div>
+    <div class="card-footer py-2">
+        <p class="small text-muted mb-1" id="detailQueueStatus" aria-live="polite">
+            Showing {{ detail_items|length }} on this page of {{ detail_total }} {{ detail_outcome }} candidates.
+        </p>
+        <p class="small text-warning mb-0">
+            <i class="bi bi-info-circle me-1"></i>
+            This queue records observations only. It has <strong>no confirm action</strong> and can never create a violation case.
+        </p>
+    </div>
+</div>
+
+{% if not detail_gate.configured %}
+<div class="alert alert-secondary py-2 small" role="status">
+    Detail checkpoint: not designated. Crop scans stay queued and fail closed until
+    <code>TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS</code> (or the
+    <code>motorcycle_detail_weights</code> system setting) points to a checkpoint whose class
+    map matches the 15-class object roster in exact ID order.
+</div>
+{% elif not detail_gate.exists %}
+<div class="alert alert-danger py-2 small" role="status">
+    Detail checkpoint configured but missing on disk: <code>{{ detail_gate.path }}</code>.
+    Crop scans stay queued and fail closed.
+</div>
+{% endif %}
+
+{% set detail_pages = ((detail_total + detail_per_page - 1) // detail_per_page) %}
+{% if detail_pages > 1 %}
+<nav class="mb-3" aria-label="Motorcycle detail review pages">
+    <ul class="pagination pagination-sm justify-content-end">
+        <li class="page-item {% if detail_page <= 1 %}disabled{% endif %}">
+            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page-1, per_page=detail_per_page) }}" aria-label="Previous">Previous</a>
+        </li>
+        <li class="page-item disabled"><span class="page-link">Page {{ detail_page }} of {{ detail_pages }}</span></li>
+        <li class="page-item {% if detail_page >= detail_pages %}disabled{% endif %}">
+            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page+1, per_page=detail_per_page) }}" aria-label="Next">Next</a>
+        </li>
+    </ul>
+</nav>
+{% endif %}
+
+<div class="card card-panel">
+    <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-bicycle me-2"></i>Motorcycle Detail Candidates</h5></div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 align-middle" id="detailTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Source</th>
+                        <th>Track / Occurrence</th>
+                        <th>Scan</th>
+                        <th>Score</th>
+                        <th>Evidence</th>
+                        <th>Outcome</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="detailBody">
+                    {% for item in detail_items %}
+                    <tr data-item='{{ item | tojson }}'>
+                        <td><code>{{ item.display_id }}</code></td>
+                        <td class="small">{{ item.video_name }}</td>
+                        <td class="small">#{{ item.track_id }} · occ {{ item.occurrence_index }}<br>
+                            <span class="text-muted">{{ item.occurrence_key }}</span></td>
+                        <td>
+                            <span class="badge bg-{{ 'success' if item.scan_state == 'ready' else ('danger' if item.scan_state == 'failed' else ('info' if item.scan_state == 'scanning' else 'secondary')) }}">
+                                {{ item.scan_state }}
+                            </span>
+                            {% if item.scan_error %}<div class="small text-muted">{{ item.scan_error }}</div>{% endif %}
+                        </td>
+                        <td class="small">{{ '%.2f'|format(item.frame_score or 0) }}</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-secondary btn-detail-evidence" title="View Evidence"
+                                    aria-label="View evidence for {{ item.display_id }}">
+                                <i class="bi bi-image"></i>
+                            </button>
+                        </td>
+                        <td><span class="badge bg-secondary" data-outcome-badge>{{ item.human_outcome }}</span></td>
+                        <td>
+                            <div class="btn-group btn-group-sm">
+                                <button class="btn btn-outline-primary btn-detail-outcome" data-outcome="reviewed"
+                                        title="Record reviewed observation"
+                                        aria-label="Record reviewed observation for {{ item.display_id }}"
+                                        data-loading-label="Saving…"><i class="bi bi-clipboard-check"></i></button>
+                                <button class="btn btn-outline-warning btn-detail-outcome" data-outcome="uncertain"
+                                        title="Mark uncertain" aria-label="Mark {{ item.display_id }} uncertain"
+                                        data-loading-label="Saving…"><i class="bi bi-question-circle"></i></button>
+                                <button class="btn btn-outline-secondary btn-detail-outcome" data-outcome="dismissed"
+                                        title="Dismiss flag" aria-label="Dismiss {{ item.display_id }}"
+                                        data-loading-label="Dismissing…"><i class="bi bi-x-lg"></i></button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr id="detailEmptyRow">
+                        <td colspan="8" class="text-center text-muted py-4">No motorcycle detail candidates yet. Process an uploaded video to populate this queue.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="detailEvidenceModal" tabindex="-1">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-bicycle me-2"></i><span id="detailModalTitle">Detail Evidence</span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="detailModalBody"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/motorcycle_detail_review.js') }}"></script>
+{% endblock %}

@@ -133,6 +133,25 @@ def _normalize_confirmation(value: str | None) -> str:
     return str(value).strip()
 
 
+def _detail_evidence_dirs(video_id: int) -> list[Path]:
+    """Run-scoped motorcycle detail-evidence directories for a video.
+
+    Includes directories derived from stored candidate rows and from this
+    video's processing runs, so a partially written run is covered too.
+    """
+    import config as _cfg
+
+    root = Path(_cfg.EVIDENCE_FOLDER) / "detail"
+    keys: set[str] = set()
+    try:
+        keys.update(db.list_motorcycle_detail_run_keys_for_video(video_id))
+    except Exception:
+        logger.exception("Failed to list detail run keys for video %s", video_id)
+    for run in db.list_processing_runs(video_id):
+        keys.add(f"run_{run['id']}")
+    return [root / key for key in sorted(keys)]
+
+
 def require_filename_confirmation(video: dict[str, Any], expected_filename: str | None) -> None:
     """Validate nonempty exact filename confirmation. Raises VideoLifecycleError."""
     confirm = _normalize_confirmation(expected_filename)
@@ -199,7 +218,10 @@ def remove_processing_results(
             if val:
                 _safe_unlink(Path(val), evidence_roots)
 
+    detail_dirs = _detail_evidence_dirs(video_id)
     db.delete_unconfirmed_results_for_video(video_id)
+    for detail_dir in detail_dirs:
+        _safe_unlink(detail_dir, evidence_roots)
 
     for run in db.list_processing_runs(video_id):
         _safe_unlink(run_artifact_dir(run["id"]), annotated_roots)
@@ -255,10 +277,13 @@ def invalidate_processing_results_for_annotation_change(
             if value:
                 _safe_unlink(Path(value), evidence_roots)
 
+    detail_dirs = _detail_evidence_dirs(video_id)
     db.delete_unconfirmed_results_for_video(video_id)
     for run in db.list_processing_runs(video_id):
         _safe_unlink(run_artifact_dir(run["id"]), annotated_roots)
         db.clear_processing_run_artifact(run["id"])
+    for detail_dir in detail_dirs:
+        _safe_unlink(detail_dir, evidence_roots)
 
     db.update_video(video_id, processed=0, status="ready")
     db.insert_video_history_event(
@@ -331,6 +356,8 @@ def delete_video_permanently(
         candidates.append((run_artifact_dir(run["id"]), annotated_roots))
     for p in _collect_evidence_paths(video_id):
         candidates.append((p, evidence_roots))
+    for detail_dir in _detail_evidence_dirs(video_id):
+        candidates.append((detail_dir, evidence_roots))
     import config as _cfg
     candidates.append((Path(_cfg.EVIDENCE_FOLDER) / f"video_{video_id}", evidence_roots))
     if filepath:

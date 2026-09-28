@@ -7,15 +7,19 @@ annotated frame available as JPEG for the Live Monitor MJPEG feed.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any
 
 import cv2
 
+logger = logging.getLogger(__name__)
+
 from core.detection_config import confidence_band
-from core.detector import Detector, DetectorError
+from core.detector import Detector, DetectorError, enforce_object_class_contract
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
+from core.gpu_inference_slot import PRIORITY_LIVE_FRAME, gpu_inference_slot
 from core.model_capability import extract_model_class_names
 from core.scene_annotation import load_scene_annotation
 from core.tracker import TrackState
@@ -81,7 +85,17 @@ class LiveStreamWorker(threading.Thread):
             self.error = str(exc)
             return
 
+        # Class-roster contract before the capture loop: a 15-class
+        # object-roster checkpoint must expose the exact declared ID->name order.
+        try:
+            enforce_object_class_contract(detector)
+        except DetectorError as exc:
+            self.status = "error"
+            self.error = str(exc)
+            return
+
         model_classes = extract_model_class_names(detector)
+        gpu_slot = gpu_inference_slot()
 
         cap = cv2.VideoCapture(self.camera["rtsp_url"])
         if not cap.isOpened():
@@ -95,6 +109,7 @@ class LiveStreamWorker(threading.Thread):
         frame_skip = max(int(params["frame_skip"]), 1)
         conf_threshold = float(params["confidence_threshold"])
         frame_number = -1
+        skipped_frames = 0
         started = time.monotonic()
 
         try:
@@ -114,7 +129,19 @@ class LiveStreamWorker(threading.Thread):
                     continue
 
                 timestamp_sec = time.monotonic() - started
-                raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
+                # Lowest-priority user of the single GPU: never wait and never
+                # queue. If an uploaded-video job, a detail crop batch, or a
+                # manual scan holds the device, this frame is skipped instead of
+                # starting a second YOLOv8 pass.
+                with gpu_slot.reservation(
+                    f"live-frame:camera-{self.camera['id']}",
+                    timeout=0.0,
+                    priority=PRIORITY_LIVE_FRAME,
+                ) as acquired:
+                    if not acquired:
+                        skipped_frames += 1
+                        continue
+                    raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
                 tracked = track_state.update(raw, now=timestamp_sec)
                 self._publish(self._annotate(frame, tracked))
 
@@ -161,6 +188,12 @@ class LiveStreamWorker(threading.Thread):
                     )
         finally:
             cap.release()
+            if skipped_frames:
+                logger.info(
+                    "camera %s skipped %d frame(s) while the GPU was reserved",
+                    self.camera["id"],
+                    skipped_frames,
+                )
             self.status = "stopped"
 
 

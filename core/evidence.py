@@ -141,3 +141,145 @@ def save_vehicle_crop(
         return str(out_path.resolve().relative_to(Path(__file__).resolve().parents[1])).replace("\\", "/")
     except ValueError:
         return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Motorcycle detail-review evidence (separate from violation evidence)
+# ---------------------------------------------------------------------------
+
+
+def detail_root() -> Path:
+    """Root of the private motorcycle detail-evidence tree."""
+    return Path(EVIDENCE_FOLDER) / "detail"
+
+
+def _safe_detail_key(value: str, *, label: str) -> str:
+    text = str(value or "").strip()
+    if not text or ".." in text or "/" in text or "\\" in text:
+        raise ValueError(f"Unsafe detail evidence {label} rejected.")
+    slug = _slug(text)
+    if not slug:
+        raise ValueError(f"Unsafe detail evidence {label} rejected.")
+    return slug
+
+
+def detail_run_dir(run_key: str) -> Path:
+    """Run-scoped private directory: ``<evidence>/detail/<run_key>``.
+
+    Run-specific paths cannot collide across reprocessing of the same video.
+    """
+    root = detail_root()
+    out_dir = root / _safe_detail_key(run_key, label="run key")
+    resolved_root = root.resolve()
+    try:
+        out_dir.resolve().relative_to(resolved_root)
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise ValueError("Unsafe evidence path rejected (directory traversal).") from exc
+    return out_dir
+
+
+def detail_occurrence_dir(run_key: str, occurrence_key: str) -> Path:
+    return detail_run_dir(run_key) / _safe_detail_key(occurrence_key, label="occurrence key")
+
+
+def _stored_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path(__file__).resolve().parents[1])).replace("\\", "/")
+    except ValueError:
+        return str(path.resolve()).replace("\\", "/")
+
+
+def _write_detail_image(path: Path, image: Any, *, quality: int) -> int | None:
+    ok = cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok or not path.is_file():
+        return None
+    return int(path.stat().st_size)
+
+
+def save_detail_evidence(
+    frame: Any,
+    crop_rect: Any,
+    *,
+    run_key: str,
+    occurrence_key: str,
+    frame_index: int,
+    scene_quality: int = 85,
+    crop_quality: int = 92,
+) -> dict[str, Any] | None:
+    """Save a source-resolution scene and a padded crop for one selected frame.
+
+    Returns ``{"scene_path", "crop_path", "size_bytes"}`` or ``None`` when the
+    crop is unusable or either image write fails. A failed write is never
+    reported as stored evidence.
+    """
+    out_dir = detail_occurrence_dir(run_key, occurrence_key)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    h_img, w_img = frame.shape[:2]
+    x1 = max(0, int(crop_rect.x))
+    y1 = max(0, int(crop_rect.y))
+    x2 = min(w_img, int(crop_rect.x + crop_rect.w))
+    y2 = min(h_img, int(crop_rect.y + crop_rect.h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    index = max(1, int(frame_index))
+    scene_path = out_dir / f"scene_f{index}.jpg"
+    crop_path = out_dir / f"crop_f{index}.jpg"
+    scene_bytes = _write_detail_image(scene_path, frame, quality=scene_quality)
+    if scene_bytes is None:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    crop_bytes = _write_detail_image(crop_path, crop, quality=crop_quality)
+    if crop_bytes is None:
+        try:
+            scene_path.unlink()
+        except OSError:  # pragma: no cover - best effort
+            pass
+        return None
+    return {
+        "scene_path": _stored_path(scene_path),
+        "crop_path": _stored_path(crop_path),
+        "size_bytes": int(scene_bytes) + int(crop_bytes),
+    }
+
+
+def save_detail_overlay(
+    image: Any,
+    *,
+    run_key: str,
+    occurrence_key: str,
+    frame_index: int,
+    quality: int = 85,
+) -> str | None:
+    """Save the mapped-box overlay for one selected frame (scan-time artifact)."""
+    out_dir = detail_occurrence_dir(run_key, occurrence_key)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    out_path = out_dir / f"overlay_f{max(1, int(frame_index))}.jpg"
+    if _write_detail_image(out_path, image, quality=quality) is None:
+        return None
+    return _stored_path(out_path)
+
+
+def remove_detail_run(run_key: str) -> bool:
+    """Delete one run's detail evidence tree (never touches other runs)."""
+    import shutil
+
+    try:
+        out_dir = detail_run_dir(run_key)
+    except ValueError:
+        return False
+    if not out_dir.is_dir():
+        return False
+    res = out_dir.resolve()
+    root = detail_root().resolve()
+    if res == root or root not in res.parents:
+        return False
+    shutil.rmtree(res, ignore_errors=True)
+    return True

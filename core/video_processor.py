@@ -22,11 +22,21 @@ import cv2
 
 from core.annotated_writer import AnnotatedVideoWriter, AnnotatedWriterError
 from core.detection_config import DEFAULT_RULE_PARAMETERS, confidence_band
-from core.detector import Detector, DetectorError, resolve_weights_path
+from core.detector import (
+    Detector,
+    DetectorError,
+    enforce_object_class_contract,
+    resolve_weights_path,
+)
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
 from core.frame_annotate import annotate_frame
 from core.geometry_profile import build_geometry_profile
-from core.model_capability import extract_model_class_names, baseline_capability_notes
+from core.motorcycle_detail import MotorcycleDetailCollector
+from core.model_capability import (
+    extract_model_class_names,
+    baseline_capability_notes,
+    object_roster_capability_notes,
+)
 from core.processing_preview import preview_hub
 from core.processing_progress import ProgressTracker
 from core.temporal_evidence import (
@@ -79,6 +89,9 @@ class ProcessVideoResult:
     source_duration_sec: float | None = None
     effective_output_fps: float | None = None
     progress_snapshot: dict[str, Any] | None = None
+    # Additive motorcycle detail-review fields (no effect on violation results).
+    motorcycle_detail_candidates: int = 0
+    motorcycle_detail_summary: dict[str, Any] = field(default_factory=dict)
 
     def __iter__(self):
         return iter(self.events)
@@ -131,6 +144,34 @@ def load_rule_parameters() -> dict[str, Any]:
         except (TypeError, ValueError):
             pass  # keep the default when a stored value is malformed
     return params
+
+
+def _detail_collection_enabled() -> bool:
+    """Whether motorcycle detail candidates are collected during processing.
+
+    Controlled by ``TAVIDM_MOTORCYCLE_DETAIL_ENABLED`` (default on). Disabled
+    mode leaves the pipeline behaviour exactly as before this feature.
+    """
+    try:
+        import config
+
+        return bool(getattr(config, "MOTORCYCLE_DETAIL_ENABLED", True))
+    except Exception:  # pragma: no cover - config import failure is not expected
+        return True
+
+
+def _discard_run_detail_evidence(collector: Any) -> None:
+    """Drop partial detail evidence after a failed *run-scoped* attempt.
+
+    Direct (run-less) processing shares a stable key with the previous
+    successful attempt, so its files are intentionally left alone.
+    """
+    if collector is None or not str(getattr(collector, "run_key", "")).startswith("run_"):
+        return
+    try:
+        collector.discard()
+    except Exception:
+        logger.exception("failed to discard motorcycle detail evidence")
 
 
 def get_processing_context(video_id: int) -> dict[str, Any]:
@@ -395,6 +436,19 @@ def process_video(
                 progress_snapshot=_snap(),
             ) from exc
 
+        # Class-roster contract: a 15-class object-roster checkpoint must expose
+        # the exact declared ID->name order. Enforced before any frame is read so
+        # a mis-mapped checkpoint can never produce detections or evidence.
+        object_roster_report = None
+        try:
+            object_roster_report = enforce_object_class_contract(detector)
+        except DetectorError as exc:
+            raise ProcessVideoError(
+                str(exc),
+                geometry_snapshot_json=geometry_snapshot_json,
+                progress_snapshot=_snap(),
+            ) from exc
+
         track_state = TrackState(stationary_px=geometry.stationary_px_per_sec())
         counting_lines = [line for line in ctx["scene"].threshold_lines if line.type == "counting_line"]
         crossing_counter = VehicleCrossingCounter(counting_lines)
@@ -411,6 +465,11 @@ def process_video(
             diagnostics.notes.append(note)
             rule_state.diagnostics.append(note)
             logger.warning("%s", note)
+        for note in object_roster_capability_notes(object_roster_report):
+            diagnostics.notes.append(note)
+            rule_state.diagnostics.append(note)
+            logger.info("class roster: %s", note)
+
         for note in diagnostics.notes:
             logger.info("processing diagnostic: %s", note)
         for rule_cap in diagnostics.rule_capabilities:
@@ -451,6 +510,18 @@ def process_video(
         last_ts = 0.0
         run_id_int = int(processing_run_id) if processing_run_id is not None else None
 
+        # Motorcycle detail candidates (uploaded-video processing only). The
+        # collector only scores frames this pipeline already processed and writes
+        # bounded, run-scoped evidence; it never feeds the violation engine.
+        detail_collector = MotorcycleDetailCollector(
+            video_id=video_id,
+            run_key=f"run_{run_id_int}" if run_id_int is not None else f"video_{video_id}",
+            frame_w=frame_w or 0,
+            frame_h=frame_h or 0,
+            processing_run_id=run_id_int,
+            enabled=_detail_collection_enabled() and (frame_w or 0) > 0 and (frame_h or 0) > 0,
+        )
+
         while True:
             if cancel_requested is not None and cancel_requested():
                 raise ProcessVideoCancelled("Processing cancelled by user.", progress_snapshot=_snap())
@@ -473,6 +544,13 @@ def process_video(
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
             crossing_counter.update(tracked)
+            if detail_collector.enabled:
+                detail_collector.observe(
+                    frame,
+                    tracked,
+                    frame_number=frame_number,
+                    timestamp_sec=timestamp_sec,
+                )
 
             frame_class_delta: dict[str, int] = {}
             frame_track_ids: set[int] = set()
@@ -602,6 +680,21 @@ def process_video(
                     progress_snapshot=_snap(),
                 ) from exc
 
+        # Finalize motorcycle detail candidates (bounded, run-scoped evidence).
+        # Observations are produced later by a separate queued scan; nothing here
+        # touches the violation engine or the existing review queue.
+        detail_summary: dict[str, Any] = {}
+        if detail_collector.enabled:
+            detail_collector.wrap_up()
+            persisted = detail_collector.persist()
+            detail_summary = detail_collector.summary()
+            detail_summary["persisted"] = persisted
+            logger.info(
+                "motorcycle detail candidates persisted for run %s: %s",
+                run_id_int,
+                detail_summary,
+            )
+
         db.mark_video_processed(video_id)
         result = ProcessVideoResult(
             events=events,
@@ -620,6 +713,8 @@ def process_video(
             total_frames=total_frames or None,
             source_duration_sec=source_duration,
             effective_output_fps=effective_fps,
+            motorcycle_detail_candidates=int(detail_summary.get("persisted") or 0),
+            motorcycle_detail_summary=detail_summary,
         )
         if progress_tracker:
             url = (
@@ -658,3 +753,8 @@ def process_video(
             cap.release()
         if writer is not None:
             writer.close()
+        # A run that failed before candidates were committed must not leave
+        # partial detail evidence behind for its own run-scoped directory.
+        _discard_run_detail_evidence(
+            None if "detail_summary" in locals() else locals().get("detail_collector")
+        )

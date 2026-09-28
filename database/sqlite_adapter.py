@@ -142,6 +142,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_008(conn)
     _apply_migration_009(conn)
     _apply_migration_010(conn)
+    _apply_migration_011(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -190,6 +191,17 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);
         """
     )
+
+
+def _apply_migration_011(conn: sqlite3.Connection) -> None:
+    """Additive motorcycle detail-review table (separate queue).
+
+    Idempotent DDL only: creates one new table and its indexes. No existing
+    table, column, or constraint is touched.
+    """
+    migration = Path(__file__).parent / "migrations" / "011_motorcycle_detail_review.sql"
+    if migration.is_file():
+        conn.executescript(migration.read_text(encoding="utf-8"))
 
 
 def _apply_migration_002(conn: sqlite3.Connection) -> None:
@@ -810,6 +822,7 @@ def init_db(force: bool = False) -> None:
         if force:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS motorcycle_detail_candidates;
                 DROP TABLE IF EXISTS case_action_events;
                 DROP TABLE IF EXISTS recurrence_reviews;
                 DROP TABLE IF EXISTS plate_verifications;
@@ -1617,7 +1630,11 @@ def list_violation_rows_for_video(video_id: int) -> list[dict[str, Any]]:
 
 
 def delete_unconfirmed_results_for_video(video_id: int) -> None:
-    """Remove detections and pending/dismissed review rows; keep confirmed violations."""
+    """Remove detections and pending/dismissed review rows; keep confirmed violations.
+
+    Motorcycle detail-review candidates are machine review aids and are removed
+    with the rest of the unconfirmed results for the video.
+    """
     with db_session() as conn:
         conn.execute("DELETE FROM detections WHERE video_id = ?", (video_id,))
         conn.execute(
@@ -1627,6 +1644,10 @@ def delete_unconfirmed_results_for_video(video_id: int) -> None:
             """,
             (video_id,),
         )
+        if _table_exists(conn, "motorcycle_detail_candidates"):
+            conn.execute(
+                "DELETE FROM motorcycle_detail_candidates WHERE video_id = ?", (video_id,)
+            )
 
 
 def delete_video_cascade_unprotected(video_id: int) -> None:
@@ -1638,6 +1659,8 @@ def delete_video_cascade_unprotected(video_id: int) -> None:
 def _cascade_delete_video_rows(conn: sqlite3.Connection, video_id: int) -> None:
     conn.execute("DELETE FROM detections WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM review_queue WHERE video_id = ?", (video_id,))
+    if _table_exists(conn, "motorcycle_detail_candidates"):
+        conn.execute("DELETE FROM motorcycle_detail_candidates WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM violations WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM annotations WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM processing_runs WHERE video_id = ?", (video_id,))
@@ -5009,3 +5032,499 @@ def offense_suggestions_enabled_for_active_policy() -> bool:
     except json.JSONDecodeError:
         return False
     return bool(detail.get("offense_suggestions_enabled"))
+
+
+# ---------------------------------------------------------------------------
+# Motorcycle detail review (SEPARATE queue — never a violation case)
+# ---------------------------------------------------------------------------
+#
+# The crop-pass observations stored here are review aids. No function in this
+# section writes to ``violations`` or ``review_queue``; nothing here can create
+# or confirm a violation case.
+
+DETAIL_SCAN_STATES = ("queued", "scanning", "ready", "failed")
+DETAIL_HUMAN_OUTCOMES = ("pending", "reviewed", "dismissed", "uncertain")
+DETAIL_REVIEW_OUTCOMES = ("reviewed", "dismissed", "uncertain")
+
+
+def detail_dedup_key(run_scope: str, occurrence_key: str, selector_version: str) -> str:
+    """Encoded (processing run, track occurrence, selector version) identity."""
+    return f"{run_scope}|{occurrence_key}|{selector_version}"
+
+
+def _detail_run_scope(processing_run_id: int | None, video_id: int) -> str:
+    """Run identity for dedup.
+
+    Real processing runs dedup on the run row. Direct (run-less) calls dedup on
+    the video identity instead, so two videos sharing a ByteTrack ID in separate
+    direct calls can never collapse into one candidate row.
+    """
+    return f"run:{int(processing_run_id)}" if processing_run_id is not None else f"video:{int(video_id)}"
+
+
+def _detail_primary_bbox(frames_json: str, frame_number: int | None) -> str:
+    """Derive the stored source-space detection box from the selected frames."""
+    try:
+        frames = json.loads(frames_json or "[]")
+    except json.JSONDecodeError:
+        return "{}"
+    if not isinstance(frames, list) or not frames:
+        return "{}"
+    chosen = None
+    for frame in frames:
+        if isinstance(frame, dict) and frame.get("frame_number") == frame_number:
+            chosen = frame
+            break
+    if chosen is None:
+        chosen = next((f for f in frames if isinstance(f, dict)), None)
+    if chosen is None:
+        return "{}"
+    box = chosen.get("detection_bbox")
+    return json.dumps(box) if isinstance(box, dict) else "{}"
+
+
+def upsert_motorcycle_detail_candidate(
+    *,
+    video_id: int,
+    run_key: str,
+    track_id: int,
+    occurrence_index: int,
+    occurrence_key: str,
+    selector_version: str,
+    processing_run_id: int | None = None,
+    frame_number: int | None = None,
+    timestamp_sec: float | None = None,
+    frame_score: float | None = None,
+    score_breakdown_json: str = "{}",
+    frame_count: int = 0,
+    size_bytes: int = 0,
+    frames_json: str = "[]",
+    detection_bbox_json: str = "{}",
+    source_width: int | None = None,
+    source_height: int | None = None,
+) -> int:
+    """Insert or update one candidate, keyed by (run, occurrence, selector).
+
+    Re-running the same processing run updates the existing candidate (fresh
+    evidence, scan reset to ``queued``) instead of creating a duplicate row. A
+    reviewer's recorded outcome is preserved.
+    """
+    dedup = detail_dedup_key(
+        _detail_run_scope(processing_run_id, video_id), occurrence_key, selector_version
+    )
+    bbox_json = detection_bbox_json if detection_bbox_json and detection_bbox_json != "{}" else ""
+    if not bbox_json:
+        bbox_json = _detail_primary_bbox(frames_json, frame_number)
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        conn.execute(
+            """
+            INSERT INTO motorcycle_detail_candidates (
+                video_id, processing_run_id, run_key, track_id, occurrence_index,
+                occurrence_key, selector_version, dedup_key, scan_state, human_outcome,
+                frame_number, timestamp_sec, source_width, source_height, frame_count,
+                frames_json, detection_bbox_json, frame_score, score_breakdown_json,
+                size_bytes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dedup_key) DO UPDATE SET
+                video_id = excluded.video_id,
+                processing_run_id = excluded.processing_run_id,
+                run_key = excluded.run_key,
+                track_id = excluded.track_id,
+                occurrence_index = excluded.occurrence_index,
+                frame_number = excluded.frame_number,
+                timestamp_sec = excluded.timestamp_sec,
+                source_width = excluded.source_width,
+                source_height = excluded.source_height,
+                frame_count = excluded.frame_count,
+                frames_json = excluded.frames_json,
+                detection_bbox_json = excluded.detection_bbox_json,
+                frame_score = excluded.frame_score,
+                score_breakdown_json = excluded.score_breakdown_json,
+                size_bytes = excluded.size_bytes,
+                scan_state = 'queued',
+                scan_model = NULL,
+                scan_class_map_json = '[]',
+                observations_json = '{}',
+                association_json = '{}',
+                uncertainty_json = '[]',
+                scan_attempts = 0,
+                scan_error = NULL,
+                scan_seconds = NULL,
+                claimed_at = NULL,
+                scanned_at = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(video_id),
+                int(processing_run_id) if processing_run_id is not None else None,
+                str(run_key),
+                int(track_id),
+                int(occurrence_index),
+                str(occurrence_key),
+                str(selector_version),
+                dedup,
+                int(frame_number) if frame_number is not None else None,
+                float(timestamp_sec) if timestamp_sec is not None else None,
+                int(source_width) if source_width is not None else None,
+                int(source_height) if source_height is not None else None,
+                int(frame_count),
+                frames_json,
+                bbox_json,
+                float(frame_score) if frame_score is not None else None,
+                score_breakdown_json,
+                int(size_bytes),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM motorcycle_detail_candidates WHERE dedup_key = ?", (dedup,)
+        ).fetchone()
+        return int(row["id"])
+
+    return json.dumps(box) if isinstance(box, dict) else "{}"
+
+
+
+def get_motorcycle_detail_candidate(candidate_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM motorcycle_detail_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_motorcycle_detail_candidates(
+    *,
+    scan_state: str | None = None,
+    human_outcome: str | None = None,
+    video_id: int | None = None,
+    page: int = 1,
+    per_page: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    """Paged detail-review candidates (newest first) with a total count."""
+    if scan_state is not None and scan_state not in DETAIL_SCAN_STATES:
+        raise ValueError(f"Unknown scan state '{scan_state}'.")
+    if human_outcome is not None and human_outcome not in DETAIL_HUMAN_OUTCOMES:
+        raise ValueError(f"Unknown human outcome '{human_outcome}'.")
+    clauses: list[str] = []
+    params: list[Any] = []
+    if scan_state is not None:
+        clauses.append("scan_state = ?")
+        params.append(scan_state)
+    if human_outcome is not None:
+        clauses.append("human_outcome = ?")
+        params.append(human_outcome)
+    if video_id is not None:
+        clauses.append("video_id = ?")
+        params.append(int(video_id))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    offset = max(page - 1, 0) * max(per_page, 1)
+    with db_session() as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total FROM motorcycle_detail_candidates {where}", tuple(params)
+        ).fetchone()
+        total = int(total_row["total"]) if total_row else 0
+        rows = conn.execute(
+            f"""
+            SELECT * FROM motorcycle_detail_candidates {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, max(per_page, 1), offset),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows], total
+
+
+def count_motorcycle_detail_pending() -> int:
+    """Candidates still awaiting a human outcome (review-aid backlog)."""
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM motorcycle_detail_candidates
+            WHERE human_outcome = 'pending'
+            """
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+
+
+
+def claim_motorcycle_detail_scans(limit: int) -> list[dict[str, Any]]:
+    """Atomically move up to ``limit`` queued candidates into ``scanning``.
+
+    Each claim consumes one attempt, so a candidate that keeps failing cannot be
+    retried without bound.
+    """
+    if limit <= 0:
+        return []
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        candidates = conn.execute(
+            """
+            SELECT id FROM motorcycle_detail_candidates
+            WHERE scan_state = 'queued'
+            ORDER BY (frame_score IS NULL), frame_score DESC, id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        claimed: list[int] = []
+        for row in candidates:
+            cursor = conn.execute(
+                """
+                UPDATE motorcycle_detail_candidates
+                SET scan_state = 'scanning',
+                    scan_attempts = scan_attempts + 1,
+                    claimed_at = ?,
+                    scan_error = NULL,
+                    updated_at = ?
+                WHERE id = ? AND scan_state = 'queued'
+                """,
+                (now, now, int(row["id"])),
+            )
+            if cursor.rowcount == 1:
+                claimed.append(int(row["id"]))
+        if not claimed:
+            return []
+        placeholders = ",".join("?" for _ in claimed)
+        rows = conn.execute(
+            f"SELECT * FROM motorcycle_detail_candidates WHERE id IN ({placeholders})",
+            tuple(claimed),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def finish_motorcycle_detail_scan(
+    *,
+    candidate_id: int,
+    observations_json: str,
+    association_json: str,
+    uncertainty_json: str,
+    scan_model: str | None,
+    scan_class_map_json: str,
+    scan_seconds: float | None = None,
+) -> None:
+    """Mark one candidate ``ready`` with its stored observations."""
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE motorcycle_detail_candidates
+            SET scan_state = 'ready',
+                observations_json = ?,
+                association_json = ?,
+                uncertainty_json = ?,
+                scan_model = ?,
+                scan_class_map_json = ?,
+                scan_seconds = ?,
+                scan_error = NULL,
+                scanned_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                observations_json,
+                association_json,
+                uncertainty_json,
+                scan_model,
+                scan_class_map_json,
+                float(scan_seconds) if scan_seconds is not None else None,
+                now,
+                now,
+                int(candidate_id),
+            ),
+        )
+
+
+def record_motorcycle_detail_scan_failure(
+    *, candidate_id: int, error: str, max_attempts: int
+) -> str:
+    """Record a scan failure; return the resulting state (``queued``/``failed``).
+
+    Bounded retry: a candidate stays ``queued`` until ``max_attempts`` is spent,
+    then it becomes ``failed`` and stops consuming work.
+    """
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE motorcycle_detail_candidates
+            SET scan_state = CASE WHEN scan_attempts >= ? THEN 'failed' ELSE 'queued' END,
+                scan_error = ?,
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND scan_state = 'scanning'
+            """,
+            (int(max_attempts), str(error)[:500], now, int(candidate_id)),
+        )
+        row = conn.execute(
+            "SELECT scan_state FROM motorcycle_detail_candidates WHERE id = ?",
+            (int(candidate_id),),
+        ).fetchone()
+    return str(row["scan_state"]) if row else "failed"
+
+
+def recover_stale_motorcycle_detail_scans(
+    *, stale_sec: float, max_attempts: int, include_recent: bool = False
+) -> int:
+    """Re-queue (or fail) scans abandoned by a crash/restart.
+
+    A row left in ``scanning`` past ``stale_sec`` is resumed when it still has
+    attempts left, otherwise it is marked ``failed`` so queue work stays bounded.
+    ``include_recent=True`` is for process start-up, where *every* ``scanning``
+    row was claimed by a previous process and can be resumed immediately. No
+    attempt is consumed by a recovery, and no gate is evaluated.
+    """
+    import datetime as _dt
+
+    now = _dt.datetime.now().isoformat(sep=" ", timespec="seconds")
+    stale_clause = ""
+    params: list[Any] = [int(max_attempts), int(max_attempts), now]
+    if not include_recent:
+        cutoff = (
+            _dt.datetime.now() - _dt.timedelta(seconds=max(0.0, float(stale_sec)))
+        ).isoformat(sep=" ", timespec="seconds")
+        stale_clause = "  AND (claimed_at IS NULL OR claimed_at < ?)"
+        params.append(cutoff)
+    with db_session() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE motorcycle_detail_candidates
+            SET scan_state = CASE WHEN scan_attempts >= ? THEN 'failed' ELSE 'queued' END,
+                scan_error = CASE WHEN scan_attempts >= ?
+                                  THEN COALESCE(scan_error, 'scan_interrupted')
+                                  ELSE scan_error END,
+                claimed_at = NULL,
+                updated_at = ?
+            WHERE scan_state = 'scanning'{stale_clause}
+            """,
+            tuple(params),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def count_queued_motorcycle_detail_scans() -> int:
+    """Candidates waiting for a scan attempt (read-only; spends no attempt)."""
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM motorcycle_detail_candidates
+            WHERE scan_state = 'queued'
+            """
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+
+def note_motorcycle_detail_scan_gate(*, reason: str, limit: int = 500) -> int:
+    """Record why queued candidates cannot be scanned yet (no attempt consumed).
+
+    Used when the designated checkpoint is missing or its class map fails
+    validation: the gate is visible in the UI, but no inference was attempted, so
+    candidates stay ``queued`` and no retry budget is spent.
+    """
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE motorcycle_detail_candidates
+            SET scan_error = ?, updated_at = ?
+            WHERE id IN (
+                SELECT id FROM motorcycle_detail_candidates
+                WHERE scan_state = 'queued' AND scan_attempts = 0
+                LIMIT ?
+            )
+            """,
+            (str(reason)[:500], now, int(limit)),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def record_motorcycle_detail_review(
+    *,
+    candidate_id: int,
+    outcome: str,
+    reviewed_by: int | None,
+    notes: str | None = None,
+) -> None:
+    """Record a human outcome for a detail candidate.
+
+    Only review/dismiss/uncertain are accepted: this queue deliberately has no
+    case-confirm transition and never writes to ``violations``.
+    """
+    if outcome not in DETAIL_REVIEW_OUTCOMES:
+        raise ValueError(
+            f"Unsupported detail-review outcome '{outcome}'. "
+            f"Expected one of: {', '.join(DETAIL_REVIEW_OUTCOMES)}."
+        )
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT id FROM motorcycle_detail_candidates WHERE id = ?", (int(candidate_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Motorcycle detail candidate {candidate_id} not found")
+        conn.execute(
+            """
+            UPDATE motorcycle_detail_candidates
+            SET human_outcome = ?,
+                reviewed_by = ?,
+                reviewed_at = ?,
+                reviewer_notes = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                outcome,
+                int(reviewed_by) if reviewed_by is not None else None,
+                now,
+                (str(notes)[:2000] if notes else None),
+                now,
+                int(candidate_id),
+            ),
+        )
+
+
+def list_motorcycle_detail_run_keys_for_video(video_id: int) -> list[str]:
+    """Distinct run keys with stored detail evidence for a video."""
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT run_key FROM motorcycle_detail_candidates
+            WHERE video_id = ? AND run_key IS NOT NULL AND run_key != ''
+            """,
+            (int(video_id),),
+        ).fetchall()
+    return [str(r["run_key"]) for r in rows]
+
+
+def purge_motorcycle_detail_candidates_for_video(video_id: int) -> int:
+    """Delete every detail candidate for a video; returns rows removed."""
+    with db_session() as conn:
+        cursor = conn.execute(
+            "DELETE FROM motorcycle_detail_candidates WHERE video_id = ?", (int(video_id),)
+        )
+        return int(cursor.rowcount or 0)
+
+
+def count_motorcycle_detail_by_state() -> dict[str, int]:
+    """Scan-state and human-outcome counts for the detail-review workspace."""
+    with db_session() as conn:
+        scan_rows = conn.execute(
+            """
+            SELECT scan_state AS k, COUNT(*) AS n FROM motorcycle_detail_candidates
+            GROUP BY scan_state
+            """
+        ).fetchall()
+        outcome_rows = conn.execute(
+            """
+            SELECT human_outcome AS k, COUNT(*) AS n FROM motorcycle_detail_candidates
+            GROUP BY human_outcome
+            """
+        ).fetchall()
+    counts = {state: 0 for state in DETAIL_SCAN_STATES}
+    counts.update({str(r["k"]): int(r["n"]) for r in scan_rows})
+    outcomes = {state: 0 for state in DETAIL_HUMAN_OUTCOMES}
+    outcomes.update({str(r["k"]): int(r["n"]) for r in outcome_rows})
+    return {"scan_states": counts, "human_outcomes": outcomes}

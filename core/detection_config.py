@@ -14,8 +14,10 @@ implementation follows the team's chosen variant.)
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # Model
@@ -79,6 +81,51 @@ FROZEN_VEHICLE_DETECTOR_CLASSES = (
     YOLO_CLASS_BICYCLE,
 )
 
+# ---------------------------------------------------------------------------
+# Object detector roster (ordered) — future 15-class checkpoints
+# ---------------------------------------------------------------------------
+# ``config/training/class_schema.json`` (schema_version 1.3.0) declares 15
+# ``object_classes`` **in detector-ID order**. A future 15-class checkpoint
+# (V9.1 family) must reproduce this exact ID->name order or the application
+# refuses to process video with it. See ``validate_object_class_map`` and
+# ``core.detector.enforce_object_class_contract``.
+#
+# The first ten entries are the *vehicle* subset (``FROZEN_VEHICLE_DETECTOR_CLASSES``).
+# This is NOT a 15-class vehicle roster: people, riders, helmets, and mirrors are
+# observable object/attribute labels, never vehicles.
+OBJECT_DETECTOR_CLASSES = (
+    YOLO_CLASS_CAR,
+    YOLO_CLASS_VAN,
+    YOLO_CLASS_JEEPNEY,
+    YOLO_CLASS_TRICYCLE,
+    YOLO_CLASS_AUTORICKSHAW,
+    YOLO_CLASS_BUS,
+    YOLO_CLASS_TRUCK,
+    YOLO_CLASS_PICKUP_TRUCK,
+    YOLO_CLASS_MOTORCYCLE,
+    YOLO_CLASS_BICYCLE,
+    YOLO_CLASS_PERSON,
+    YOLO_CLASS_RIDER,
+    YOLO_CLASS_HELMET_ACCEPTABLE,
+    YOLO_CLASS_HELMET_NUT_SHELL,
+    YOLO_CLASS_SIDE_MIRROR,
+)
+OBJECT_DETECTOR_CLASS_COUNT = len(OBJECT_DETECTOR_CLASSES)
+
+# The non-vehicle tail of the object roster. Attribute / person labels.
+NON_VEHICLE_OBJECT_CLASSES = OBJECT_DETECTOR_CLASSES[
+    len(FROZEN_VEHICLE_DETECTOR_CLASSES):
+]
+NON_VEHICLE_OBJECT_CLASS_SET = frozenset(NON_VEHICLE_OBJECT_CLASSES)
+
+# The object roster is the vehicle subset in schema ID order plus the non-vehicle
+# tail. Keep this assertion close to the definition so a future roster edit that
+# breaks the prefix relationship fails loudly at import time.
+assert OBJECT_DETECTOR_CLASSES[: len(FROZEN_VEHICLE_DETECTOR_CLASSES)] == (
+    FROZEN_VEHICLE_DETECTOR_CLASSES
+)
+_OBJECT_CLASS_NAME_SET = frozenset(OBJECT_DETECTOR_CLASSES)
+
 # Seven-class baseline roster (label set only). A trained seven-class ``best.pt``
 # exists in an *external* training output directory and has **not** been
 # integrated into ``D:\tavidm\models``. Do not claim ``models/best.pt`` exists.
@@ -97,6 +144,49 @@ SEVEN_CLASS_BASELINE_MISSING = (
     YOLO_CLASS_AUTORICKSHAW,
     YOLO_CLASS_PICKUP_TRUCK,
 )
+
+# Legacy rosters that are *intentionally* smaller than the 15-class object roster
+# and must keep working without the caller declaring anything. Compared as a set
+# of names; ID order is not part of the legacy contract.
+LEGACY_13_CLASS_ATTRIBUTES = (
+    YOLO_CLASS_PERSON,
+    YOLO_CLASS_RIDER,
+    YOLO_CLASS_HELMET,
+)
+
+KNOWN_LEGACY_DETECTOR_ROSTERS: tuple[frozenset[str], ...] = tuple(
+    frozenset(_names)
+    for _names in (
+        SEVEN_CLASS_BASELINE_VEHICLES,
+        FROZEN_VEHICLE_DETECTOR_CLASSES,
+        FROZEN_VEHICLE_DETECTOR_CLASSES + LEGACY_13_CLASS_ATTRIBUTES,
+    )
+)
+
+# Names that mark a checkpoint as belonging to the object-roster family.
+#
+# Stock COCO overlaps the object roster on exactly the six generic classes below
+# and declares none of the rest, so a COCO checkpoint declares no marker and stays
+# legacy. Any mis-sized map that does declare a marker is a broken object-roster
+# export (truncated or renamed) and is rejected rather than silently demoted.
+COCO_OVERLAP_WITH_OBJECT_ROSTER = frozenset(
+    {
+        YOLO_CLASS_CAR,
+        YOLO_CLASS_BUS,
+        YOLO_CLASS_TRUCK,
+        YOLO_CLASS_MOTORCYCLE,
+        YOLO_CLASS_BICYCLE,
+        YOLO_CLASS_PERSON,
+    }
+)
+OBJECT_ROSTER_MARKER_CLASSES = frozenset(OBJECT_DETECTOR_CLASSES) - (
+    COCO_OVERLAP_WITH_OBJECT_ROSTER
+)
+assert OBJECT_ROSTER_MARKER_CLASSES.isdisjoint(COCO_OVERLAP_WITH_OBJECT_ROSTER)
+assert "jeepney" in OBJECT_ROSTER_MARKER_CLASSES
+assert "side_mirror" in OBJECT_ROSTER_MARKER_CLASSES
+assert "car" not in OBJECT_ROSTER_MARKER_CLASSES
+assert "person" not in OBJECT_ROSTER_MARKER_CLASSES
 
 # Derived hierarchy (not detector labels). Keys match class_schema.json.
 VEHICLE_HIERARCHY: dict[str, tuple[str, ...]] = {
@@ -339,14 +429,352 @@ def is_truck_ban_applicable(
     return resolved.canonical_class in allowed_canon
 
 
-# Classes required before helmet-based rules may run (custom weights only).
-# Prefer frozen helmet taxonomy; legacy generic ``helmet`` remains an alternate.
+# Classes required before helmet/overloading rules may run (custom weights only).
+# Prefer the frozen helmet taxonomy; legacy generic ``helmet`` remains an
+# alternate accepted by ``core.model_capability.RULE_ALTERNATE_CLASS_SETS``.
+#
+# These mirror ``RULE_REQUIRED_CLASSES[No Helmet]`` in core/model_capability.py.
+# The rider association logic in core/violation_engine.py only ever consumes
+# ``rider`` detections, so this helper must name ``rider`` too. ``person`` is a
+# distinct object class and is never a substitute for ``rider``.
 REQUIRED_MODEL_CLASSES = (
     YOLO_CLASS_MOTORCYCLE,
-    YOLO_CLASS_PERSON,
+    YOLO_CLASS_RIDER,
     YOLO_CLASS_HELMET_ACCEPTABLE,
     YOLO_CLASS_HELMET_NUT_SHELL,
 )
+
+# Cargo-passenger evidence is a ``person`` box in a truck/pickup cargo region
+# (core/cargo_passenger.py). This set is intentionally separate from
+# ``REQUIRED_MODEL_CLASSES``: a rider is not cargo-passenger evidence.
+REQUIRED_MODEL_CLASSES_CARGO_PASSENGER = (
+    YOLO_CLASS_PERSON,
+    YOLO_CLASS_TRUCK,
+    YOLO_CLASS_PICKUP_TRUCK,
+)
+
+# Classes whose absence must disable side-mirror automatic evaluation.
+REQUIRED_MODEL_CLASSES_SIDE_MIRROR = (YOLO_CLASS_SIDE_MIRROR,)
+
+
+# ---------------------------------------------------------------------------
+# 15-class object roster contract (strict, reusable, never raises)
+# ---------------------------------------------------------------------------
+
+# Ordered-roster violation codes. Reused by callers, logs, and tests so a
+# rejection reason is machine-readable without re-deriving it.
+CLASS_MAP_MALFORMED = "malformed"
+CLASS_MAP_WRONG_COUNT = "wrong_class_count"
+CLASS_MAP_NON_CONTIGUOUS_IDS = "non_contiguous_class_ids"
+CLASS_MAP_DUPLICATE = "duplicate_names"
+CLASS_MAP_MISSING = "missing_names"
+CLASS_MAP_UNKNOWN = "unknown_names"
+CLASS_MAP_REORDERED = "reordered_names"
+
+
+@dataclass(frozen=True)
+class ObjectClassMapReport:
+    """Outcome of checking a checkpoint's ID->name map against the object roster.
+
+    ``is_object_roster`` is True when the checkpoint declares exactly
+    ``len(expected)`` classes, or when a smaller map is a broken attempt at the
+    object roster. Only then is the mapping checked for exact order. A genuine
+    legacy roster (the frozen 10-class vehicle roster, the seven-class baseline,
+    the 13-class attribute checkpoint, COCO) is reported as legacy with no errors
+    so the currently selected checkpoint keeps working.
+
+    ``malformed`` records why a map could not be read at all. An unreadable map
+    is rejected in both modes: it cannot be proven legacy, so it is not trusted.
+    """
+
+    class_count: int
+    is_object_roster: bool
+    expected: tuple[str, ...]
+    actual: tuple[str, ...]
+    errors: tuple[str, ...] = ()
+    codes: tuple[str, ...] = ()
+    malformed: str | None = None
+    order_known: bool = True
+
+    @property
+    def ok(self) -> bool:
+        """True when the checkpoint may be used (roster matches, or is legacy)."""
+        return not self.errors
+
+    @property
+    def is_legacy_roster(self) -> bool:
+        """True when the checkpoint is not an object-roster checkpoint."""
+        return not self.is_object_roster
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(n for n in self.expected if n not in self.actual)
+
+    @property
+    def unknown(self) -> tuple[str, ...]:
+        known = set(self.expected)
+        return tuple(n for n in self.actual if n not in known)
+
+    @property
+    def duplicate(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(n for n, count in Counter(self.actual).items() if count > 1)
+        )
+
+    @property
+    def summary(self) -> str:
+        if self.ok:
+            if self.is_object_roster:
+                if self.order_known:
+                    return (
+                        f"{len(self.expected)}-class object roster verified in exact "
+                        f"ID order ({self.class_count} classes)."
+                    )
+                return (
+                    f"{len(self.expected)}-class object roster membership verified "
+                    f"({self.class_count} classes); ID order not observable from this "
+                    "checkpoint's roster."
+                )
+            return (
+                f"Legacy {self.class_count}-class checkpoint accepted "
+                f"(not a {len(self.expected)}-class object-roster checkpoint)."
+            )
+        return "Class map rejected: " + ", ".join(self.errors)
+
+
+def _ordered_names_from_map(names: Any) -> tuple[tuple[str, ...] | None, str | None]:
+    """Normalize an ID->name mapping or ordered name sequence to a name tuple.
+
+    Returns ``(names, malformed_reason)``. ``names`` is None when the input is
+    malformed. Accepts ``{id: name}`` (numeric or numeric-string keys) and
+    ordered ``list``/``tuple`` name sequences.
+    """
+    if isinstance(names, Mapping):
+        if not names:
+            return None, "empty_class_map"
+        pairs: list[tuple[int, Any]] = []
+        for key, value in names.items():
+            if isinstance(key, bool):
+                return None, f"non_numeric_class_id:{key!r}"
+            if isinstance(key, int):
+                class_id = key
+            elif isinstance(key, str):
+                text = key.strip()
+                negative = text.startswith("-")
+                if negative:
+                    text = text[1:]
+                if not text.isdigit():
+                    return None, f"non_numeric_class_id:{key!r}"
+                class_id = -int(text) if negative else int(text)
+            else:
+                return None, f"non_numeric_class_id:{key!r}"
+            pairs.append((class_id, value))
+        if any(class_id < 0 for class_id, _ in pairs):
+            return None, "negative_class_id"
+        if sorted(class_id for class_id, _ in pairs) != list(range(len(pairs))):
+            return None, "non_contiguous_class_ids"
+        pairs.sort(key=lambda item: item[0])
+        values: list[Any] = [value for _class_id, value in pairs]
+    elif isinstance(names, (list, tuple)):
+        values = list(names)
+    else:
+        return None, f"unsupported_class_map_type:{type(names).__name__}"
+
+    out: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            return None, f"non_string_class_name:{value!r}"
+        text = value.strip()
+        if not text:
+            return None, "empty_class_name"
+        out.append(text.lower())
+    if not out:
+        return None, "empty_class_map"
+    return tuple(out), None
+
+
+def ordered_class_names(names: Any) -> tuple[str, ...]:
+    """ID-ordered, lowercased class names from a checkpoint ``names`` value.
+
+    Reusable normalizer shared by ``Detector`` and the strict contract validator
+    so both see the same ordering and the same malformed-input policy. Returns
+    ``()`` for an unreadable map.
+    """
+    ordered, _reason = _ordered_names_from_map(names)
+    return ordered or ()
+
+
+def validate_object_class_map(
+    names: Any,
+    *,
+    expected: Sequence[str] | None = None,
+    require_roster: bool = False,
+    order_known: bool = True,
+) -> ObjectClassMapReport:
+    """Strictly validate a checkpoint's ID->name map against the object roster.
+
+    ``names`` is a model ``names`` mapping (``{class_id: class_name}``) or an
+    ordered name sequence. The check is pure, never raises, and fails closed.
+
+    ``require_roster=False`` (default) auto-detects: a checkpoint exposing exactly
+    ``len(expected)`` classes is treated as an object-roster checkpoint and must
+    match the declared order exactly. A mis-sized map is only demoted to "legacy"
+    when it declares none of ``OBJECT_ROSTER_MARKER_CLASSES`` (stock COCO) or is one
+    of the frozen rosters in ``KNOWN_LEGACY_DETECTOR_ROSTERS``; a truncated or
+    renamed object-roster export is rejected, so the currently selected checkpoint
+    keeps working while a broken 15-class checkpoint cannot slip through.
+
+    ``require_roster=True`` is for a checkpoint the caller has already declared to
+    be an object-roster checkpoint. Then a mis-sized, incomplete, duplicated,
+    unknown, or reordered map is a hard rejection.
+
+    ``order_known=False`` marks a roster the caller could only observe as an
+    unordered collection. Membership is still enforced exactly; the reordering
+    check is skipped because ID order is genuinely not observable.
+    """
+    roster = tuple(expected) if expected is not None else OBJECT_DETECTOR_CLASSES
+    ordered, malformed_reason = _ordered_names_from_map(names)
+    if ordered is None:
+        # Non-contiguous IDs are a distinct, common export defect, so they get
+        # their own machine-readable code instead of the generic one.
+        codes = (
+            (CLASS_MAP_NON_CONTIGUOUS_IDS,)
+            if malformed_reason == "non_contiguous_class_ids"
+            else (CLASS_MAP_MALFORMED,)
+        )
+        if require_roster:
+            errors = (
+                f"class map is malformed ({malformed_reason}); a {len(roster)}-class "
+                "object-roster checkpoint must expose a readable {id: name} map",
+            )
+        else:
+            # An unreadable map cannot be proven legacy, so it cannot be trusted:
+            # fail closed rather than let a broken 15-class checkpoint through.
+            errors = (
+                f"class map is unreadable ({malformed_reason}); refusing to assume it "
+                "is a legacy checkpoint",
+            )
+        return ObjectClassMapReport(
+            class_count=0,
+            is_object_roster=require_roster,
+            expected=roster,
+            actual=(),
+            errors=errors,
+            codes=codes,
+            malformed=malformed_reason,
+            order_known=order_known,
+        )
+
+    class_count = len(ordered)
+    if class_count != len(roster):
+        roster_markers = OBJECT_ROSTER_MARKER_CLASSES.intersection(ordered)
+        known_legacy = frozenset(ordered) in KNOWN_LEGACY_DETECTOR_ROSTERS
+        if not require_roster and (not roster_markers or known_legacy):
+            # Unrelated to the object roster (COCO) or an intentionally frozen
+            # legacy roster: keep the currently selected checkpoint working.
+            return ObjectClassMapReport(
+                class_count=class_count,
+                is_object_roster=False,
+                expected=roster,
+                actual=ordered,
+                order_known=order_known,
+            )
+        absent = tuple(n for n in roster if n not in set(ordered))
+        if roster_markers and not known_legacy:
+            errors = (
+                f"class map reports {class_count} classes using object-roster names "
+                f"{sorted(roster_markers)} but is not a known legacy roster; missing "
+                f"{list(absent)}",
+            )
+        else:
+            errors = (
+                f"class map reports {class_count} classes but the declared object "
+                f"roster has {len(roster)}",
+            )
+        return ObjectClassMapReport(
+            class_count=class_count,
+            is_object_roster=True,
+            expected=roster,
+            actual=ordered,
+            errors=errors,
+            codes=(CLASS_MAP_WRONG_COUNT,),
+            order_known=order_known,
+        )
+
+    report = ObjectClassMapReport(
+        class_count=class_count,
+        is_object_roster=True,
+        expected=roster,
+        actual=ordered,
+        order_known=order_known,
+    )
+    errors_list: list[str] = []
+    codes_list: list[str] = []
+
+    missing = report.missing
+    if missing:
+        codes_list.append(CLASS_MAP_MISSING)
+        errors_list.append("missing class name(s): " + ", ".join(missing))
+    unknown = report.unknown
+    if unknown:
+        codes_list.append(CLASS_MAP_UNKNOWN)
+        errors_list.append("unknown class name(s): " + ", ".join(unknown))
+    duplicate = report.duplicate
+    if duplicate:
+        codes_list.append(CLASS_MAP_DUPLICATE)
+        errors_list.append("duplicate class name(s): " + ", ".join(duplicate))
+    if (
+        order_known
+        and not (missing or unknown or duplicate)
+        and ordered != roster
+    ):
+        codes_list.append(CLASS_MAP_REORDERED)
+        errors_list.append(
+            "class IDs are reordered; expected "
+            f"{list(roster)} but the checkpoint reports {list(ordered)}"
+        )
+
+    if not errors_list:
+        return report
+    return ObjectClassMapReport(
+        class_count=class_count,
+        is_object_roster=True,
+        expected=roster,
+        actual=ordered,
+        errors=tuple(errors_list),
+        codes=tuple(codes_list),
+        order_known=order_known,
+    )
+
+
+def object_class_map_report_text(
+    names: Any,
+    *,
+    expected: Sequence[str] | None = None,
+    require_roster: bool = False,
+) -> str:
+    """Reusable single-line description of a checkpoint class-map verdict."""
+    ordered, malformed_reason = _ordered_names_from_map(names)
+    if ordered is None:
+        return (
+            f"Class map unreadable ({malformed_reason}); the "
+            f"{len(expected) if expected is not None else len(OBJECT_DETECTOR_CLASSES)}"
+            "-class object roster contract could not be verified."
+        )
+    return validate_object_class_map(
+        names, expected=expected, require_roster=require_roster
+    ).summary
+
+
+def is_object_class_name(class_label: str) -> bool:
+    """True for any declared object-class name (vehicle or non-vehicle)."""
+    return str(class_label or "").strip().lower() in _OBJECT_CLASS_NAME_SET
+
+
+def is_vehicle_object_class(class_label: str) -> bool:
+    """True only for the ten-class vehicle subset of the object roster."""
+    return is_canonical_vehicle_class(class_label)
+
 
 # ---------------------------------------------------------------------------
 # Confidence policy (manuscript flowchart Step 7)

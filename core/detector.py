@@ -4,11 +4,21 @@ Project decision: TAVIDM uses YOLOv8m as the primary object detector and
 ByteTrack for multi-object tracking (Ch3 System Architecture, Layers 3-4).
 
 Weights resolution:
-1. Custom fine-tuned YOLOv8m weights in ``models/`` (13-class traffic dataset,
-   including helmet/rider classes) are loaded when present.
+1. Custom fine-tuned YOLOv8m weights in ``models/`` (the seven-class traffic
+   dataset baseline that is currently selected, or a future 15-class object-roster
+   checkpoint) are loaded when present.
 2. Otherwise the pretrained COCO YOLOv8m checkpoint is used as the development
    fallback (covers car, motorcycle, bus, truck, bicycle, person). Rules that
    require the helmet class remain inactive until custom weights are provided.
+
+Class-roster contract:
+A future 15-class checkpoint must expose the ordered 15-class object roster
+declared in ``config/training/class_schema.json`` (``OBJECT_DETECTOR_CLASSES``).
+``enforce_object_class_contract`` runs before that checkpoint processes any
+video and rejects missing, duplicate, unknown, reordered, or malformed names.
+Genuine legacy rosters (the frozen 10-class vehicle roster, the seven-class
+baseline, the 13-class attribute checkpoint, COCO) keep working unchanged, but a
+truncated or renamed object-roster export is rejected rather than demoted.
 """
 
 from __future__ import annotations
@@ -22,9 +32,13 @@ from core.detection_config import (
     LEGACY_ACCEPTED_MODEL_LABELS,
     MODELS_DIR,
     MODEL_FAMILY,
+    OBJECT_DETECTOR_CLASSES,
     PRETRAINED_WEIGHTS,
     REQUIRED_MODEL_CLASSES,
+    ObjectClassMapReport,
+    ordered_class_names,
     resolve_vehicle_label,
+    validate_object_class_map,
 )
 
 _ALLOWED = set(DETECTION_CLASSES) | set(LEGACY_ACCEPTED_MODEL_LABELS)
@@ -49,6 +63,18 @@ class DetectorError(RuntimeError):
     """Raised when the YOLOv8m model cannot be loaded or run."""
 
 
+class DetectorClassContractError(DetectorError):
+    """Raised when a checkpoint's ID->name map violates the class contract.
+
+    Carries the structured ``report`` so callers can log the exact rejection
+    reason (missing / duplicate / unknown / reordered / malformed / wrong count).
+    """
+
+    def __init__(self, message: str, report: ObjectClassMapReport) -> None:
+        super().__init__(message)
+        self.report = report
+
+
 def resolve_weights_path() -> tuple[str, bool]:
     """Return (weights_path, is_custom)."""
     for candidate in CUSTOM_WEIGHTS_CANDIDATES:
@@ -59,8 +85,102 @@ def resolve_weights_path() -> tuple[str, bool]:
 
 
 def model_classes_available(detected_labels: set[str]) -> bool:
-    """True when all classes needed for helmet/overloading rules are present."""
+    """True when all classes needed for helmet/overloading rules are present.
+
+    Requires ``rider`` (never ``person``): rider association and the helmet
+    taxonomy rules in ``core.violation_engine`` only consume ``rider`` boxes.
+    """
     return all(cls in detected_labels for cls in REQUIRED_MODEL_CLASSES)
+
+
+def object_class_contract_for(
+    detector: Any,
+    *,
+    require_roster: bool = False,
+) -> ObjectClassMapReport:
+    """Resolve and validate ``detector``'s class map without assuming its type.
+
+    A real ``Detector`` exposes ``raw_class_map`` (the checkpoint's own
+    ``model.names``), so ID order is verified. Legacy duck-typed detectors that
+    only expose the unordered ``class_names`` collection are still checked for
+    exact membership, with the reordering check skipped because ID order is not
+    observable from a set.
+    """
+    raw = getattr(detector, "raw_class_map", None)
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception:
+            raw = None
+    if isinstance(raw, (dict, list, tuple)):
+        return validate_object_class_map(
+            raw,
+            expected=OBJECT_DETECTOR_CLASSES,
+            require_roster=require_roster,
+        )
+
+    names = getattr(detector, "class_names", None)
+    if names is None:
+        return ObjectClassMapReport(
+            class_count=0,
+            is_object_roster=False,
+            expected=OBJECT_DETECTOR_CLASSES,
+            actual=(),
+        )
+    if isinstance(names, str):
+        return validate_object_class_map(
+            None,
+            expected=OBJECT_DETECTOR_CLASSES,
+            require_roster=require_roster,
+            order_known=False,
+        )
+    try:
+        members = sorted(
+            {str(name).strip().lower() for name in names if str(name).strip()}
+        )
+    except TypeError:
+        return ObjectClassMapReport(
+            class_count=0,
+            is_object_roster=False,
+            expected=OBJECT_DETECTOR_CLASSES,
+            actual=(),
+        )
+    return validate_object_class_map(
+        members,
+        expected=OBJECT_DETECTOR_CLASSES,
+        require_roster=require_roster,
+        order_known=False,
+    )
+
+
+def enforce_object_class_contract(
+    detector: Any,
+    *,
+    require_roster: bool = False,
+) -> ObjectClassMapReport:
+    """Fail closed before a checkpoint processes video.
+
+    A checkpoint that exposes the 15-class object roster must reproduce the exact
+    ID order declared in ``config/training/class_schema.json``. Missing,
+    duplicate, unknown, reordered, malformed, or mis-sized names raise
+    ``DetectorClassContractError`` carrying the structured report.
+
+    Genuine legacy rosters (the frozen 10-class vehicle roster, the seven-class
+    baseline, the 13-class attribute checkpoint, COCO) return an accepted report
+    and are unaffected. A mis-sized map that is built from object-roster names but
+    is not a known legacy roster is a broken export, not a legacy model, and is
+    rejected in the default auto mode as well.
+
+    Set ``require_roster=True`` when the caller already knows the checkpoint is an
+    object-roster checkpoint, to assert the roster up front regardless of size.
+    """
+    report = object_class_contract_for(detector, require_roster=require_roster)
+    if not report.ok:
+        raise DetectorClassContractError(
+            f"{MODEL_FAMILY} checkpoint rejected before processing: {report.summary}",
+            report,
+        )
+    return report
 
 
 class Detector:
@@ -114,9 +234,51 @@ class Detector:
         except Exception:
             return set()
 
+    def raw_class_map(self) -> Any:
+        """The checkpoint's own ID->name map (``model.names``) or None.
+
+        Returns the mapping unfiltered so the strict class-roster contract can
+        see non-numeric keys, gaps, duplicates, and order. Never raises.
+        """
+        try:
+            self.load()
+            return getattr(self._model, "names", None)
+        except Exception:
+            return None
+
+    def ordered_class_names(self) -> tuple[str, ...]:
+        """Class names ordered by detector ID. Malformed maps yield ``()``."""
+        return ordered_class_names(self.raw_class_map())
+
+    def object_class_contract(
+        self,
+        *,
+        require_roster: bool = False,
+    ) -> ObjectClassMapReport:
+        """Validate this checkpoint's ID->name map against the 15-class roster.
+
+        ``require_roster=True`` asserts up front that the checkpoint *is* an
+        object-roster checkpoint, so a truncated or unreadable map is rejected
+        instead of being mistaken for a legacy vehicle-only checkpoint.
+        """
+        return object_class_contract_for(
+            self, require_roster=require_roster
+        )
+
     def description(self) -> str:
         self.load()
         return f"{MODEL_FAMILY} ({'custom-trained' if self.is_custom else 'COCO pretrained'})"
+
+    def enforce_object_class_contract(
+        self,
+        *,
+        require_roster: bool = False,
+    ) -> ObjectClassMapReport:
+        """Raise before any frame is processed if the class map is invalid."""
+        report = enforce_object_class_contract(
+            self, require_roster=require_roster
+        )
+        return report
 
     def track_frame(
         self,

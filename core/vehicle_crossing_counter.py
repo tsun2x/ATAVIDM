@@ -1,9 +1,22 @@
-"""Conservative, run-local line-crossing vehicle passage counter."""
+"""Conservative, run-local line-crossing vehicle passage counter.
+
+Only the frozen 10-class **vehicle** subset of the object roster may increase
+``total`` (``vehicles_crossed``) or the per-class ``by_class`` counts. People,
+riders, helmets, and side mirrors are object/attribute detections: they are still
+recorded as detection records and shown in ``class_counts``, but they are never
+vehicle passages. Ambiguous legacy brands (e.g. unresolved ``piaggio``) fail
+closed and are not counted as a vehicle passage.
+"""
 
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any, Iterable
+
+from core.detection_config import (
+    FROZEN_VEHICLE_DETECTOR_CLASSES,
+    resolve_vehicle_label,
+)
 
 
 class VehicleCrossingCounter:
@@ -16,6 +29,21 @@ class VehicleCrossingCounter:
         self.total = 0 if self.available else None
         self.by_class: dict[str, int] = {}
         self.by_line: dict[str, int] = defaultdict(int)
+        # Non-vehicle object detections observed this run (diagnostic only).
+        self.non_vehicle_observations: dict[str, int] = {}
+
+    @staticmethod
+    def countable_vehicle_class(class_label: str) -> str | None:
+        """Canonical vehicle class for counting, or None when not a vehicle.
+
+        Safe legacy aliases consolidate to their canonical class; unresolved
+        ambiguous brands return None (fail closed, never counted).
+        """
+        resolved = resolve_vehicle_label(class_label)
+        canonical = resolved.canonical_class
+        if canonical in FROZEN_VEHICLE_DETECTOR_CLASSES:
+            return canonical
+        return None
 
     @staticmethod
     def _signed_distance(line: Any, point: tuple[float, float]) -> float:
@@ -40,6 +68,15 @@ class VehicleCrossingCounter:
         if not self.available:
             return
         for det in detections:
+            label = str(det.get("class_label") or "unknown")
+            vehicle_class = self.countable_vehicle_class(label)
+            if vehicle_class is None:
+                # Non-vehicle object class: observed, but never a vehicle passage
+                # and never allowed to claim a track's crossing state.
+                self.non_vehicle_observations[label] = (
+                    self.non_vehicle_observations.get(label, 0) + 1
+                )
+                continue
             if det.get("track_id") is None:
                 continue
             tid = int(det["track_id"])
@@ -65,6 +102,5 @@ class VehicleCrossingCounter:
                     continue
                 self._counted.add(key)
                 self.total = int(self.total or 0) + 1
-                label = str(det.get("class_label") or "unknown")
-                self.by_class[label] = self.by_class.get(label, 0) + 1
+                self.by_class[vehicle_class] = self.by_class.get(vehicle_class, 0) + 1
                 self.by_line[str(line.id)] += 1

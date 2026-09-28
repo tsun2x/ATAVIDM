@@ -29,6 +29,15 @@ ALLOWED_VIDEO_EXTENSIONS = {"mp4"}
 # Period boundaries for upload/processing analytics (never use recording time).
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Manila")
 
+# Motorcycle detail-review crop pass (uploaded-video processing only).
+# The detail checkpoint is designated explicitly; nothing defaults to a training
+# candidate, and a missing/unreadable class map fails the scan closed.
+MOTORCYCLE_DETAIL_WEIGHTS = os.environ.get("TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS", "").strip()
+# Set to 0 to disable detail-candidate collection during video processing.
+MOTORCYCLE_DETAIL_ENABLED = os.environ.get(
+    "TAVIDM_MOTORCYCLE_DETAIL_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
 DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower() or "sqlite"
 # DATABASE_URL is backend-agnostic. For sqlite, a local file path is also accepted.
 DATABASE_URL = os.environ.get("DATABASE_URL", os.environ.get("SQLITE_PATH", "database/tavidm.db"))

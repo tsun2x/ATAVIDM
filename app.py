@@ -50,8 +50,16 @@ from core.violation_config import (
 )
 from core.detector import resolve_weights_path
 from core.frame_extract import FrameExtractError, extract_first_frame, frame_path_for_video
+from core.gpu_inference_slot import (
+    PRIORITY_VIDEO_JOB,
+    gpu_inference_slot,
+)
 from core.live_stream import mjpeg_generator, stream_manager
 from core.media_serve import MediaPathError, resolve_under_roots, safe_media_response
+from core.motorcycle_detail_scan import (
+    DETAIL_SCAN_MANUAL_GPU_WAIT_SEC,
+    MotorcycleDetailScanner,
+)
 from core.processing_preview import preview_hub
 from core.processing_progress import ProgressTracker
 from core.processing_jobs import build_processing_jobs_snapshot
@@ -98,6 +106,15 @@ STATUSES = ["confirmed", "dismissed", "pending"]
 # video_id -> {"state": "processing"|"done"|"error", "error": str|None}
 _processing_jobs: dict[int, dict] = {}
 _processing_cancel_events: dict[int, threading.Event] = {}
+
+# One shared reservation for the single GPU inference device. The uploaded-video
+# worker, background motorcycle crop batches, the manual detail scan, and every
+# live camera frame take it in turn (see core/gpu_inference_slot.py), so two
+# YOLOv8 passes can never run at the same time.
+_gpu_slot = gpu_inference_slot()
+# Bounded wait for the device before a queued video job is put back at the head
+# of the queue and retried. Never blocks a thread forever.
+_VIDEO_JOB_GPU_WAIT_SEC = 600.0
 
 # Sequential processing queue: at most ONE process_video thread at a time
 # (RTX 3050 6GB — a single YOLOv8m + ByteTrack inference job). Each queue
@@ -442,6 +459,15 @@ def _system_status() -> dict:
 # Context + error handlers
 # ---------------------------------------------------------------------------
 
+def _detail_badge_count() -> int:
+    """Pending detail-review backlog for the nav badge (never breaks the shell)."""
+    try:
+        return int(db.count_motorcycle_detail_pending())
+    except Exception:
+        logger.exception("Failed to count pending motorcycle detail candidates")
+        return 0
+
+
 @app.context_processor
 def inject_globals():
     user = auth.current_user()
@@ -454,6 +480,12 @@ def inject_globals():
     ]
     if role in ("admin", "enforcer"):
         nav_items.append({"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"})
+        nav_items.append({
+            "endpoint": "motorcycle_detail_review",
+            "label": "Motorcycle Detail",
+            "icon": "bi-bicycle",
+            "badge_count": _detail_badge_count(),
+        })
     if role == "admin":
         nav_items.append({"endpoint": "settings", "label": "Settings", "icon": "bi-gear"})
     return {
@@ -1125,8 +1157,10 @@ def _processing_worker() -> None:
     """Single worker: drain the queue one job at a time.
 
     Exactly one inference job (YOLOv8m + ByteTrack) runs at any moment
-    because this is the only thread that ever calls ``process_video``. The
-    worker stays alive across jobs; tests may stop it via
+    because this is the only thread that ever calls ``process_video``, and it
+    holds the shared GPU reservation (``core.gpu_inference_slot``) for the whole
+    job so a motorcycle crop batch or a live camera frame cannot start a second
+    pass. The worker stays alive across jobs; tests may stop it via
     ``stop_processing_worker()`` so SQLite file locks are released.
     """
     global _running_video_id
@@ -1162,6 +1196,30 @@ def _processing_worker() -> None:
             "tracker": tracker,
             "viewer_mode": job.get("viewer_mode") or "background",
         }
+        # Reserved immediately before the first GPU inference call and released
+        # in the finally below, so cancellation, failure, and shutdown all free
+        # the device. No queue mutex is held while waiting or while inferring.
+        gpu_token = _gpu_slot.acquire(
+            f"video-job:{video_id}:{run_id}",
+            timeout=_VIDEO_JOB_GPU_WAIT_SEC,
+            priority=PRIORITY_VIDEO_JOB,
+        )
+        if gpu_token is None:
+            # Bounded wait elapsed: put the job back at the head of the queue
+            # and retry shortly rather than inferring without the reservation.
+            logger.warning(
+                "GPU reservation unavailable after %.0fs; re-queuing video %d (run %d)",
+                _VIDEO_JOB_GPU_WAIT_SEC,
+                video_id,
+                run_id,
+            )
+            with _queue_cv:
+                _process_queue.insert(0, (video_id, enabled_violations, run_id))
+                if _running_video_id == video_id:
+                    _running_video_id = None
+                _queue_cv.notify_all()
+            _worker_shutdown.wait(0.5)
+            continue
         pipeline_ok = False
         result = None
         try:
@@ -1289,9 +1347,146 @@ def _processing_worker() -> None:
         finally:
             _processing_cancel_events.pop(run_id, None)
             preview_hub.clear(video_id)
+            # Always release the device, including on cancellation/failure.
+            _gpu_slot.release(gpu_token)
             with _queue_cv:
                 if _running_video_id == video_id:
                     _running_video_id = None
+
+
+# ---------------------------------------------------------------------------
+# Motorcycle detail crop-scan worker (bounded, shared-GPU-reservation aware)
+# ---------------------------------------------------------------------------
+_detail_scanner: MotorcycleDetailScanner | None = None
+_detail_scanner_lock = threading.Lock()
+_detail_bootstrap_lock = threading.Lock()
+_detail_bootstrap_done = False
+# Set at import time when this process can never serve a request (the Flask
+# development reloader parent, or an explicit operator opt-out), so no
+# background thread is ever started twice for the same deployment.
+
+
+def _background_workers_allowed() -> bool:
+    """True when this process may own background workers.
+
+    Flask's development reloader imports the app twice: the parent re-executes
+    the module but never answers a request, so it must not start a worker
+    thread. ``TAVIDM_DISABLE_BACKGROUND_WORKERS=1`` is the operator opt-out.
+    """
+    if os.environ.get("TAVIDM_DISABLE_BACKGROUND_WORKERS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    debug = os.environ.get("WERKZEUG_DEBUG") or os.environ.get("FLASK_DEBUG") or ""
+    reloading = str(debug).strip().lower() in ("1", "true", "yes", "on")
+    serving_child = os.environ.get("WERKZEUG_RUN_MAIN", "").strip().lower() == "true"
+    return not (reloading and not serving_child)
+
+
+_detail_workers_allowed = _background_workers_allowed()
+
+
+def _detail_gpu_idle() -> bool:
+    """Cheap hint: is the single GPU video-processing slot free right now?
+
+    This is only a pre-filter. Mutual exclusion is enforced by the shared GPU
+    reservation (``_gpu_slot``), which the crop scanner, the manual scan, the
+    video worker, and every live camera frame all take.
+    """
+    with _queue_cv:
+        return _running_video_id is None and not _process_queue
+
+
+def _ensure_detail_scanner() -> MotorcycleDetailScanner:
+    """Return the single background detail scanner, starting it once.
+
+    Idempotent under repeated startup calls, tests, and the development
+    reloader: the instance is created once and ``start()`` is a no-op while the
+    thread is already alive. ``start()`` runs under the same lock as the
+    creation so two concurrent callers cannot both spawn a thread.
+    """
+    global _detail_scanner
+    with _detail_scanner_lock:
+        if _detail_scanner is None:
+            _detail_scanner = MotorcycleDetailScanner(
+                idle_check=_detail_gpu_idle, gpu_slot=_gpu_slot
+            )
+        scanner = _detail_scanner
+        if not scanner.is_alive():
+            scanner.start()
+    return scanner
+
+
+def _detail_scanner_without_starting() -> MotorcycleDetailScanner:
+    """Create the single scanner instance but do not start its thread yet.
+
+    ``bootstrap_detail_queue`` uses this so the start-up recovery completes
+    *before* the loop's first pass, which would otherwise perform the
+    stale-only recovery and consume the one-shot recovery.
+    """
+    global _detail_scanner
+    with _detail_scanner_lock:
+        if _detail_scanner is None:
+            _detail_scanner = MotorcycleDetailScanner(
+                idle_check=_detail_gpu_idle, gpu_slot=_gpu_slot
+            )
+        return _detail_scanner
+
+
+def bootstrap_detail_queue() -> MotorcycleDetailScanner | None:
+    """Resume queued/abandoned motorcycle detail work after start-up.
+
+    Performs the one-time recovery of ``scanning`` rows abandoned by a previous
+    process (they were claimed by a process that no longer exists, so they are
+    resumable immediately, not only after the stale window) and then starts the
+    background scanner. Recovery strictly precedes ``start()`` so the loop's
+    first ``run_once`` cannot perform the stale-only recovery first and consume
+    the one-shot start-up pass. This makes queued work resume **without a newly
+    enqueued video**. Runs at most once per process, in the process that
+    actually serves requests, and never duplicates a worker thread.
+    """
+    global _detail_bootstrap_done
+    with _detail_bootstrap_lock:
+        if _detail_bootstrap_done or not _detail_workers_allowed:
+            return _detail_scanner
+        try:
+            scanner = _detail_scanner_without_starting()
+            recovered = scanner.recover_abandoned(include_recent=True)
+            if recovered is None:
+                # Retry on the next request; a stale-only fallback or DB error
+                # cannot establish that recent abandoned rows were recovered.
+                return None
+            scanner = _ensure_detail_scanner()
+        except Exception:  # pragma: no cover - defensive; never block startup
+            logger.exception("failed to bootstrap the motorcycle detail scanner")
+            return None
+        _detail_bootstrap_done = True
+        return scanner
+
+
+@app.before_request
+def _start_detail_scanner_on_first_request():
+    """Start the detail scanner in the serving process only.
+
+    The reloader parent imports this module but never answers a request, so
+    hooking the first request keeps exactly one scanner thread alive per
+    deployment (and none in a bare test process that never serves traffic).
+    """
+    if _detail_workers_allowed:
+        bootstrap_detail_queue()
+
+
+def stop_detail_scanner(timeout: float = 3.0) -> None:
+    """Stop the detail scanner (tests and graceful shutdown)."""
+    global _detail_scanner
+    with _detail_scanner_lock:
+        scanner = _detail_scanner
+        _detail_scanner = None
+    if scanner is not None:
+        scanner.stop(timeout=timeout)
 
 
 def _ensure_worker() -> None:
@@ -1327,6 +1522,7 @@ def stop_processing_worker(timeout: float = 3.0) -> None:
         _worker_started = False
         _worker_thread = None
     _running_video_id = None
+    stop_detail_scanner(timeout=timeout)
 
 
 def _enqueue_processing(video_id: int, enabled_violations: tuple[str, ...], run_id: int) -> bool:
@@ -1344,6 +1540,7 @@ def _enqueue_processing(video_id: int, enabled_violations: tuple[str, ...], run_
         queued = slot_busy or position > 1 or _running_video_id is not None
         _queue_cv.notify_all()
     _ensure_worker()
+    bootstrap_detail_queue()
     return queued
 
 
@@ -1396,6 +1593,7 @@ def _try_claim_enqueue(
         _queue_cv.notify_all()
 
     _ensure_worker()
+    bootstrap_detail_queue()
     db.insert_video_history_event(
         video_id,
         "processing_queued",
@@ -2043,6 +2241,297 @@ def api_dismiss_review(review_id: int):
     db.dismiss_review_item(review_id, reviewed_by=user["id"])
     return jsonify({"success": True})
 
+
+
+# ---------------------------------------------------------------------------
+# Motorcycle detail review (SEPARATE queue — no case-confirm action)
+# ---------------------------------------------------------------------------
+# This workspace records observations or dismisses a flag. It intentionally
+# exposes no confirm / case-creation endpoint: the crop scan may supply evidence
+# or a review flag, but it can never declare, confirm, or create a violation.
+
+
+def _detail_scan_gate() -> dict[str, Any]:
+    """Non-loading view of the designated detail checkpoint (validated at scan time)."""
+    from core.motorcycle_detail_scan import designated_weights_path
+
+    path = designated_weights_path()
+    exists = bool(path and Path(path).is_file())
+    return {"configured": bool(path), "path": path or None, "exists": exists}
+
+
+def _detail_json(raw: Any, default: Any) -> Any:
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def _detail_stored_path(row: dict[str, Any], kind: str, index: int) -> str | None:
+    """Resolve an evidence kind+index against the stored row (never the client)."""
+    frames = _detail_json(row.get("frames_json"), [])
+    frame = None
+    if isinstance(frames, list):
+        for entry in frames:
+            if isinstance(entry, dict) and int(entry.get("index") or 0) == index:
+                frame = entry
+                break
+    if kind in ("scene", "crop"):
+        return (frame or {}).get(f"{kind}_path") or None
+    if kind == "overlay":
+        observations = _detail_json(row.get("observations_json"), {})
+        entries = observations.get("frames") or [] if isinstance(observations, dict) else []
+        for entry in entries:
+            if isinstance(entry, dict) and int(entry.get("index") or 0) == index:
+                return entry.get("overlay_path") or None
+    return None
+
+
+def _detail_frames_to_ui(row: dict[str, Any]) -> list[dict[str, Any]]:
+    frames = _detail_json(row.get("frames_json"), [])
+    observations = _detail_json(row.get("observations_json"), {})
+    overlays: dict[int, Any] = {}
+    if isinstance(observations, dict):
+        for entry in observations.get("frames") or []:
+            if isinstance(entry, dict):
+                overlays[int(entry.get("index") or 0)] = entry.get("overlay_path")
+    out: list[dict[str, Any]] = []
+    for frame in list(frames)[:2]:
+        if not isinstance(frame, dict):
+            continue
+        index = int(frame.get("index") or 1)
+        out.append(
+            {
+                "index": index,
+                "frame_number": frame.get("frame_number"),
+                "timestamp_sec": frame.get("timestamp_sec"),
+                "crop": frame.get("crop"),
+                "score": frame.get("score"),
+                "detection_bbox": frame.get("detection_bbox"),
+                "rider_bbox": frame.get("rider_bbox"),
+                "scan_scale_x": frame.get("scan_scale_x"),
+                "scan_scale_y": frame.get("scan_scale_y"),
+                "scene_url": (
+                    url_for(
+                        "api_motorcycle_detail_evidence",
+                        candidate_id=row["id"],
+                        kind="scene",
+                        index=index,
+                    )
+                    if frame.get("scene_path")
+                    else None
+                ),
+                "crop_url": (
+                    url_for(
+                        "api_motorcycle_detail_evidence",
+                        candidate_id=row["id"],
+                        kind="crop",
+                        index=index,
+                    )
+                    if frame.get("crop_path")
+                    else None
+                ),
+                "overlay_url": (
+                    url_for(
+                        "api_motorcycle_detail_evidence",
+                        candidate_id=row["id"],
+                        kind="overlay",
+                        index=index,
+                    )
+                    if overlays.get(index)
+                    else None
+                ),
+            }
+        )
+    return out
+
+def _motorcycle_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> dict[str, Any]:
+    observations = _detail_json(row.get("observations_json"), {})
+    association = _detail_json(row.get("association_json"), {})
+    uncertainty = _detail_json(row.get("uncertainty_json"), [])
+    return {
+        "id": row["id"],
+        "display_id": f"MD-{row['id']:05d}",
+        "video_id": row.get("video_id"),
+        "video_name": _source_label(row.get("video_id"), videos),
+        "track_id": row.get("track_id"),
+        "occurrence_index": row.get("occurrence_index"),
+        "occurrence_key": row.get("occurrence_key"),
+        "selector_version": row.get("selector_version"),
+        "processing_run_id": row.get("processing_run_id"),
+        "scan_state": row.get("scan_state"),
+        "human_outcome": row.get("human_outcome"),
+        "frame_number": row.get("frame_number"),
+        "timestamp_sec": row.get("timestamp_sec"),
+        "frame_score": row.get("frame_score"),
+        "score_breakdown": _detail_json(row.get("score_breakdown_json"), {}),
+        "detection_bbox": _detail_json(row.get("detection_bbox_json"), {}),
+        "frames": _detail_frames_to_ui(row),
+        "observations": observations if isinstance(observations, dict) else {},
+        "association": association if isinstance(association, dict) else {},
+        "uncertainty": uncertainty if isinstance(uncertainty, list) else [],
+        "scan_model": row.get("scan_model"),
+        "scan_class_map": _detail_json(row.get("scan_class_map_json"), []),
+        "scan_attempts": row.get("scan_attempts"),
+        "scan_error": row.get("scan_error"),
+        "reviewer_notes": row.get("reviewer_notes"),
+        "reviewed_at": row.get("reviewed_at"),
+        "queued_at": row.get("created_at"),
+        # Explicit contract: this queue has no case-confirm action.
+        "can_confirm": False,
+        "case_action": None,
+    }
+
+
+@app.route("/motorcycle-detail-review")
+@auth.role_required("enforcer")
+def motorcycle_detail_review():
+    videos = _video_name_map()
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
+    outcome = request.args.get("outcome", "pending")
+    if outcome not in ("pending", "reviewed", "dismissed", "uncertain", "all"):
+        outcome = "pending"
+    rows, total = db.list_motorcycle_detail_candidates(
+        human_outcome=None if outcome == "all" else outcome,
+        page=page,
+        per_page=per_page,
+    )
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+        rows, total = db.list_motorcycle_detail_candidates(
+            human_outcome=None if outcome == "all" else outcome,
+            page=page,
+            per_page=per_page,
+        )
+    return render_template(
+        "motorcycle_detail_review.html",
+        detail_items=[_motorcycle_detail_to_ui(r, videos) for r in rows],
+        detail_total=total,
+        detail_page=page,
+        detail_per_page=per_page,
+        detail_outcome=outcome,
+        detail_counts=db.count_motorcycle_detail_by_state(),
+        detail_gate=_detail_scan_gate(),
+        review_queue_count=db.count_review_pending(),
+    )
+
+
+@app.route("/api/motorcycle-detail-review", methods=["GET"])
+@auth.login_required
+def api_motorcycle_detail_list():
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
+    scan_state = request.args.get("scan_state") or None
+    outcome = request.args.get("outcome") or None
+    if outcome == "all":
+        outcome = None
+    if scan_state is not None and scan_state not in ("queued", "scanning", "ready", "failed"):
+        return jsonify({"success": False, "error": "Unknown scan state."}), 400
+    if outcome is not None and outcome not in ("pending", "reviewed", "dismissed", "uncertain"):
+        return jsonify({"success": False, "error": "Unknown outcome."}), 400
+    videos = _video_name_map()
+    rows, total = db.list_motorcycle_detail_candidates(
+        scan_state=scan_state, human_outcome=outcome, page=page, per_page=per_page
+    )
+    return jsonify(
+        {
+            "success": True,
+            "items": [_motorcycle_detail_to_ui(r, videos) for r in rows],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "counts": db.count_motorcycle_detail_by_state(),
+            "gate": _detail_scan_gate(),
+        }
+    )
+
+@app.route("/api/motorcycle-detail-review/<int:candidate_id>/evidence/<kind>")
+@auth.role_required("enforcer")
+def api_motorcycle_detail_evidence(candidate_id: int, kind: str):
+    if kind not in ("scene", "crop", "overlay"):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    row = db.get_motorcycle_detail_candidate(candidate_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    try:
+        index = int(request.args.get("index", "1"))
+    except ValueError:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    stored = _detail_stored_path(row, kind, index)
+    if not stored:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    return _evidence_media_response(stored)
+
+
+@app.route("/api/motorcycle-detail-review/<int:candidate_id>/outcome", methods=["POST"])
+@auth.role_required("enforcer")
+def api_motorcycle_detail_outcome(candidate_id: int):
+    """Record a human outcome. There is intentionally no confirm transition."""
+    payload = request.get_json(silent=True) or {}
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    notes = payload.get("notes")
+    if outcome not in ("reviewed", "dismissed", "uncertain"):
+        return jsonify(
+            {
+                "success": False,
+                "error": "Outcome must be reviewed, dismissed, or uncertain.",
+            }
+        ), 400
+    if db.get_motorcycle_detail_candidate(candidate_id) is None:
+        return jsonify({"success": False, "error": "Detail candidate not found."}), 404
+    try:
+        db.record_motorcycle_detail_review(
+            candidate_id=candidate_id,
+            outcome=outcome,
+            reviewed_by=auth.current_user()["id"],
+            notes=notes if isinstance(notes, str) else None,
+        )
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "id": candidate_id, "outcome": outcome})
+
+
+@app.route("/api/motorcycle-detail-review/scan-now", methods=["POST"])
+@auth.role_required("enforcer")
+def api_motorcycle_detail_scan_now():
+    """Run exactly one bounded scan batch while the GPU reservation is free.
+
+    ``_detail_gpu_idle()`` is a cheap pre-filter for the common case; the
+    shared reservation inside ``run_once`` is authoritative, so a live camera
+    frame or a queued video job that starts in between produces 409 (the
+    waiting time is bounded, so the request cannot block a worker thread).
+    """
+    if not _detail_gpu_idle():
+        return jsonify(
+            {"success": False, "error": "Video processing is using the GPU slot."}
+        ), 409
+    # One-shot batch on a throwaway scanner: no extra thread competes with the
+    # background worker (claims are atomic, but one inference slot is enough).
+    scanner = MotorcycleDetailScanner(
+        idle_check=_detail_gpu_idle,
+        gpu_slot=_gpu_slot,
+        slot_owner=f"detail-scan-manual:{id(request)}",
+        gpu_wait_sec=DETAIL_SCAN_MANUAL_GPU_WAIT_SEC,
+    )
+    try:
+        report = scanner.run_once()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("manual detail scan batch failed")
+        return jsonify({"success": False, "error": str(exc)}), 500
+    if report.get("skipped") == "gpu_slot_busy":
+        return jsonify(
+            {
+                "success": False,
+                "error": "GPU is busy with another inference pass; try again shortly.",
+                "report": report,
+                "gate": _detail_scan_gate(),
+            }
+        ), 409
+    return jsonify({"success": True, "report": report, "gate": _detail_scan_gate()})
 
 @app.route("/api/cases/<int:violation_id>", methods=["GET"])
 @auth.login_required
