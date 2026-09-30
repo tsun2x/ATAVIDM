@@ -19,8 +19,52 @@ function describeHelmet(association) {
         case "acceptable": return "helmet detected (acceptable shape)";
         case "nut_shell": return "nut-shell / substandard helmet shape";
         case "unknown": return "helmet unknown — absence is not proven";
+        case "ambiguous": return "ambiguous: helmet may belong to another rider";
         default: return String(association.state);
     }
+}
+
+function formatClassMap(classes) {
+    if (Array.isArray(classes)) {
+        return classes.map(function (name, id) { return id + "=" + name; }).join(", ");
+    }
+    if (classes && typeof classes === "object") {
+        return Object.keys(classes)
+            .sort(function (a, b) { return Number(a) - Number(b); })
+            .map(function (id) { return id + "=" + classes[id]; })
+            .join(", ");
+    }
+    return "";
+}
+
+function describeModel(scan, item) {
+    const identity = (scan && scan.model) || (item && item.scan_model) || "";
+    if (!identity) return "—";
+    if (!scan || !scan.model_kind) {
+        return identity + " (older scan recorded before the three-class detail contract)";
+    }
+    const parts = [scan.model_kind];
+    if (scan.architecture) parts.push("architecture " + scan.architecture);
+    if (scan.contract) parts.push("contract " + scan.contract);
+    return identity + " (" + parts.join(", ") + ")";
+}
+
+function describeAttribution(association) {
+    const context = association && association.context;
+    if (!context) return "not recorded for this scan";
+    if (!context.recorded) {
+        return "main detector rider box only; nearby motorcycles and riders were not recorded for this older row";
+    }
+    const bikes = Array.isArray(context.nearby_motorcycles) ? context.nearby_motorcycles.length : 0;
+    const riders = Array.isArray(context.nearby_riders) ? context.nearby_riders.length : 0;
+    const lists = context.truncated_lists;
+    const knownLists = lists && typeof lists === "object";
+    const bikesCut = knownLists ? lists.motorcycles === true : Boolean(context.truncated);
+    const ridersCut = knownLists ? lists.riders === true : Boolean(context.truncated);
+    return "main detector: rider " + (context.rider_state || "unknown") +
+        (context.rider_track_id != null ? " (track #" + context.rider_track_id + ")" : "") +
+        "; nearby motorcycles " + bikes + (bikesCut ? " (list truncated)" : "") +
+        "; other riders " + riders + (ridersCut ? " (list truncated)" : "");
 }
 
 function describeMirror(association) {
@@ -30,18 +74,26 @@ function describeMirror(association) {
         case "one_left": return "one mirror observed (left)";
         case "one_right": return "one mirror observed (right)";
         case "none_visible": return "no mirror observed — unknown, not proof of absence";
-        case "ambiguous": return "ambiguous: overlapping motorcycles unresolved";
+        case "ambiguous": return "ambiguous: mirror may belong to another motorcycle";
         default: return String(association.state);
     }
 }
 
 function describeRider(association) {
     if (!association) return "not scanned yet";
+    const fromMain = association.source === "main_detector" || association.source === "legacy_row";
     switch (association.state) {
-        case "associated": return "rider associated";
+        case "associated": return "rider associated" + (fromMain ? " (main detector)" : "");
         case "ambiguous": return "ambiguous: multiple riders overlap";
         default: return "no rider associated";
     }
+}
+
+function frameDetections(item, index) {
+    const frames = ((item && item.observations) || {}).frames;
+    if (!Array.isArray(frames)) return [];
+    const match = frames.filter(function (entry) { return entry && Number(entry.index) === Number(index); })[0];
+    return match && Array.isArray(match.detections) ? match.detections : [];
 }
 
 function uncertaintyList(item) {
@@ -78,6 +130,16 @@ function buildEvidenceMarkup(item) {
         const overlay = frame.overlay_url
             ? '<img src="' + escapeHtml(frame.overlay_url) + '" alt="Mapped boxes ' + i + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4">Not scanned yet — mapped boxes appear after the crop pass.</div>';
+        const detections = frameDetections(item, frame.index);
+        const detectionList = detections.length
+            ? '<ul class="small mb-0 mt-2">' + detections.map(function (d) {
+                const conf = d.confidence != null ? " " + Math.round(Number(d.confidence) * 100) + "%" : "";
+                const bbox = Array.isArray(d.source_bbox)
+                    ? " at [" + d.source_bbox.map(function (v) { return Math.round(Number(v)); }).join(", ") + "]"
+                    : "";
+                return "<li>" + escapeHtml(String(d.class_label) + conf + bbox) + "</li>";
+            }).join("") + "</ul>"
+            : (frame.overlay_url ? '<p class="small text-muted mb-0 mt-2">No detail detections in this crop (not proof of absence).</p>' : "");
         panes.push(
             '<div class="tab-pane fade' + (i === 0 ? " show active" : "") + '" id="detailFrame' + i + '" role="tabpanel">' +
             '<ul class="nav nav-pills mb-3" role="tablist">' +
@@ -85,7 +147,7 @@ function buildEvidenceMarkup(item) {
             "</ul>" + scene +
             '<div class="row g-3 mt-1"><div class="col-md-6"><p class="small text-muted mb-1">Padded motorcycle/rider crop</p>' + crop +
             "</div>" +
-            '<div class="col-md-6"><p class="small text-muted mb-1">Mapped detections (source space)</p>' + overlay + "</div></div>" +
+            '<div class="col-md-6"><p class="small text-muted mb-1">Mapped detections (source space)</p>' + overlay + detectionList + "</div></div>" +
             "</div>"
         );
     });
@@ -98,15 +160,15 @@ function buildEvidenceMarkup(item) {
     const scan = observations.scan || {};
     const reasons = uncertaintyList(item);
 
+    const classMap = formatClassMap(scan.class_map || item.scan_class_map || scan.class_names || []);
     const facts = [
         ["Rider", describeRider(rider)],
         ["Helmet", describeHelmet(helmet)],
         ["Side mirror", describeMirror(mirror)],
-        ["Model", scan.model || item.scan_model || "—"],
+        ["Attribution", describeAttribution(association)],
+        ["Model", describeModel(scan, item)],
         ["Scan confidence", scan.conf != null ? Math.round(scan.conf * 100) + "%" : "—"],
-        ["Class map", (item.scan_class_map || scan.class_names || []).length
-            ? (item.scan_class_map || scan.class_names || []).join(", ")
-            : "—"]
+        ["Class map", classMap || "—"]
     ].map(function (pair) {
         return "<dt>" + escapeHtml(pair[0]) + "</dt><dd>" + escapeHtml(pair[1]) + "</dd>";
     }).join("");
@@ -127,6 +189,10 @@ if (typeof module !== "undefined" && module.exports) {
         describeHelmet: describeHelmet,
         describeMirror: describeMirror,
         describeRider: describeRider,
+        describeModel: describeModel,
+        describeAttribution: describeAttribution,
+        formatClassMap: formatClassMap,
+        frameDetections: frameDetections,
         uncertaintyList: uncertaintyList
     };
 }

@@ -306,13 +306,6 @@ class TestDetailScannerLifecycle:
         assert scanner.start_calls == 1
 
 
-EXPECTED_15 = (
-    "car", "van", "jeepney", "tricycle", "autorickshaw", "bus", "truck",
-    "pickup_truck", "motorcycle", "bicycle", "person", "rider",
-    "helmet_acceptable", "helmet_nut_shell", "side_mirror",
-)
-
-
 def _designated_checkpoint(monkeypatch):
     """Force the one-shot manual scan past the checkpoint gate.
 
@@ -323,7 +316,10 @@ def _designated_checkpoint(monkeypatch):
     from core.motorcycle_detail_scan import DetailCheckpoint, MotorcycleDetailScanner as _Real
 
     checkpoint = DetailCheckpoint(
-        path="mock", class_names=EXPECTED_15, ok=True, identity="YOLOv8m:mock"
+        path="mock",
+        class_names=("helmet_nut_shell", "helmet_acceptable", "side_mirror"),
+        ok=True,
+        identity="md3c:mock",
     )
 
     def factory(**kwargs):

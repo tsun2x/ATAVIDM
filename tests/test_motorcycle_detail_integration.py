@@ -169,6 +169,13 @@ class TestPipelineIntegration:
         for frame in frames:
             assert Path(frame["scene_path"]).is_file()
             assert Path(frame["crop_path"]).is_file()
+            # The main detector's rider association is saved for the detail pass.
+            context = frame["main_context"]
+            assert context["source"] == "main_detector"
+            assert context["target_track_id"] == 4
+            assert context["rider"]["state"] == "associated"
+            assert context["rider"]["track_id"] == 5
+            assert frame["rider_bbox"] is not None
 
     def test_candidates_do_not_enter_the_violation_path(
         self, test_db, tmp_path, monkeypatch, pipeline

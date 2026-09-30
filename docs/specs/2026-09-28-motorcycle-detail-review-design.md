@@ -30,13 +30,16 @@ process_video (uploaded video, run-scoped)
        ├─ TrackOccurrenceRegistry  (expiry / class change / ID reuse → t<id>g<gen>)
        ├─ score_frame  (visibility, sharpness, size, clipping, occlusion, viewpoint)
        ├─ ≤2 temporally separated slots per occurrence
+       ├─ build_main_context → frames_json[].main_context (target track, main rider
+       │    state/box, other main-detector motorcycles/riders inside the crop)
        └─ save_detail_evidence → <EVIDENCE>/detail/<run_key>/<occurrence>/{scene,crop}_fN.jpg
   └─ collector.persist() → motorcycle_detail_candidates (one row per occurrence)
 
 MotorcycleDetailScanner (background thread, GPU-idle gated)
-  └─ claim queued candidate → read crop → optional upscale → YOLOv8 predict
+  └─ claim queued candidate → read crop → optional upscale → 3-class YOLOv8 predict
        ├─ map boxes back to source space (crop rect ÷ scan scale, clamped)
-       ├─ associate rider (never person) / helmet / side_mirror
+       ├─ associate helmet / side_mirror against the saved main-detector context
+       │    (rider and motorcycles come from the main detector, never person)
        └─ write observations + overlay → scan_state = ready
 
 Reviewer (enforcer) at /motorcycle-detail-review
@@ -50,17 +53,42 @@ The detail checkpoint is **designated explicitly**:
 - `TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS` (env or `.env`), or
 - the `motorcycle_detail_weights` system setting.
 
-Nothing defaults to a training candidate. Before the first crop is scanned,
-`load_detail_checkpoint` validates the checkpoint's ID→name map with
-`validate_object_class_map(..., require_roster=True)`:
+Nothing defaults to a training candidate. The detail model is a **separate
+three-class crop detector**, not the main 15-class object checkpoint. Its
+contract lives in `core/motorcycle_detail_contract.py`
+(`DETAIL_CONTRACT_VERSION = "md-detail-3c-v1"`):
+
+| ID | Class |
+|---|---|
+| 0 | `helmet_nut_shell` |
+| 1 | `helmet_acceptable` |
+| 2 | `side_mirror` |
+
+This is the order declared by the Sept 30 draft dataset's `data.yaml`. The
+exploratory YOLOv8n pilots were trained with `0=side_mirror,
+1=helmet_nut_shell, 2=helmet_acceptable`; that order is rejected, and IDs are
+never relabeled to make a checkpoint fit.
+
+Before the first crop is scanned, `load_detail_checkpoint` validates the
+checkpoint with `check_detail_class_map` (contiguous IDs from 0, exact count,
+exact names, exact order):
 
 | Condition | Result |
 |---|---|
 | No designation | `queued` + `scan_error=no_designated_detail_checkpoint` (no attempt consumed) |
 | File missing | `queued` + `detail_checkpoint_missing` |
 | Unreadable/corrupt | `queued` + `detail_checkpoint_unreadable:<err>` |
-| Reordered / renamed / truncated / legacy roster | `queued` + `detail_class_map_rejected:<summary>` |
-| Exact 15-class ID order | scan proceeds; identity = `YOLOv8m:<file>:<sha256[:12]>` |
+| Task metadata missing or blank | `queued` + `detail_checkpoint_task_missing` |
+| Task metadata not a string | `queued` + `detail_checkpoint_task_malformed:<type>` |
+| Any task other than exactly `detect` (e.g. `classify`, `segment`) | `queued` + `detail_checkpoint_wrong_task:<task>` |
+| Missing / malformed / non-contiguous / duplicate / wrong count / renamed / reordered map (includes the main 15-class roster and the pilot order) | `queued` + `detail_class_map_rejected:<code>: <reason>` |
+| Exact three-class ID order | scan proceeds; identity = `md3c:<file>:<sha256[:12]>` |
+
+At inference, `UltralyticsCropPredictor` re-checks `result.names` against the
+validated map and rejects out-of-range class IDs, so a mismatched result fails
+the attempt instead of being relabeled. Each ready row stores the model
+identity, architecture hint (e.g. `yolov8n`, or `unverified`), contract
+version, and ID→name map under `observations.scan`.
 
 Gate failures do **not** consume the retry budget because no inference was
 attempted. Inference failures do: `scan_attempts` increments per claim, and a
@@ -91,12 +119,41 @@ vehicle box), bottom 12 %, unioned with the associated rider box, grown to a
 
 ## 5. Association rules
 
-- `rider` only — generic `person` never substitutes.
+- Attribution comes from the **main detector**, not the detail model. During
+  collection each retained frame stores an additive `main_context` object in
+  `frames_json` (no schema migration): the target motorcycle track, the main
+  detector's rider association (state, box, track), and up to 8 other
+  main-detector `motorcycle`/`rider` boxes per list that intersect the crop.
+  `truncated_lists: {"motorcycles": bool, "riders": bool}` records which list
+  was cut (context version 2); the generic `truncated` flag is kept as "either
+  list". `person` detections are never stored and never count toward riders.
+- **Incomplete context fails closed.** A list is complete only when it was
+  recorded and not truncated. With the rider list incomplete, a helmet in the
+  target rider's head region is left `ambiguous`
+  (`nearby_rider_context_incomplete_helmet_unattributed`); with the motorcycle
+  list incomplete, a mirror in the target's mounting area is left `ambiguous`
+  (`nearby_motorcycle_context_incomplete_mirror_unattributed`). The other
+  attribute keeps a definite state when its own list is complete. Nothing seen
+  still means `unknown` / `none_visible`, never ambiguity or absence. Version 1
+  rows with only `truncated: true` are read as both lists truncated; a context
+  with no readable truncation flag is also treated as truncated.
+- `rider` only — generic `person` never substitutes. An ambiguous or missing
+  main-detector rider leaves the helmet `unknown`.
 - Helmet labels attach to the rider's head region (top 45 % band, widened 8 %).
+  A helmet whose centre also lies in another main-detector rider's head region
+  is left unattributed (`helmet_in_other_rider_head_region_unattributed`).
   Legacy generic `helmet` never becomes "acceptable".
 - `side_mirror` attaches to the upper mounting band of the motorcycle box,
-  split left/right; implausibly wide boxes are flagged, and overlapping
-  motorcycles produce `ambiguous` with no side assignment.
+  split left/right; implausibly wide boxes are flagged. A heavily overlapping
+  main-detector motorcycle (IoU ≥ 0.20) makes the mirror state `ambiguous`; a
+  mirror inside another motorcycle's mounting area is left unattributed
+  (`mirror_in_shared_mounting_area_unattributed`).
+- Rows written before `main_context` existed stay readable: the stored
+  `rider_bbox` is used when present, otherwise the rider is `unrecorded`, and
+  `context:nearby_motorcycles_not_recorded_for_this_row` /
+  `context:nearby_riders_not_recorded_for_this_row` are added to the
+  uncertainty list. Their neighbour lists are unrecorded (incomplete), so a
+  helmet or mirror found there is `ambiguous`, not attributed.
 - No mirror observation → `none_visible` **plus** an explicit
   `mirror:absence_not_proven_unknown` uncertainty reason. Absence is never
   proven.

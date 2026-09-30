@@ -9,6 +9,10 @@ Scope (uploaded-video processing only; live stream integration is deferred):
   motorcycle/rider crop) through :mod:`core.evidence`
 - associate ``rider`` (never generic ``person``), helmet labels, and
   ``side_mirror`` observations for a *separate human-review queue*
+- store the main detector's rider-association state and nearby *other*
+  motorcycles/riders with each selected frame (``main_context`` inside
+  ``frames_json``), because the three-class detail model cannot output
+  ``rider`` or ``motorcycle`` itself
 
 Hard boundaries:
 
@@ -460,6 +464,7 @@ class RiderAssociation:
     head_region: Box | None = None
     confidence: float = 0.0
     reasons: tuple[str, ...] = ()
+    source: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -469,6 +474,7 @@ class RiderAssociation:
             "head_region": list(self.head_region) if self.head_region else None,
             "confidence": round(float(self.confidence), 4),
             "reasons": list(self.reasons),
+            "source": self.source,
         }
 
 
@@ -576,16 +582,31 @@ def associate_helmet(
     motorcycle: Mapping[str, Any],
     rider: RiderAssociation,
     helmets: Sequence[Mapping[str, Any]],
+    *,
+    other_riders: Sequence[Box] = (),
+    other_riders_complete: bool = True,
 ) -> AttributeAssociation:
     """Associate helmet labels with the associated rider's head region.
 
     Without an associated rider the helmet state is ``unknown``: an unassociated
     helmet must not be attributed to a motorcycle. Legacy generic ``helmet`` is
     never upgraded to acceptable shape — only ``helmet_acceptable`` sets that.
+
+    ``other_riders`` are *different* riders the main detector saw near the
+    target. A helmet that also sits in one of their head regions is not
+    attributed; when nothing else remains the state is ``ambiguous``.
+
+    ``other_riders_complete=False`` means the neighbour list was truncated or
+    never recorded, so an omitted rider could own any helmet in the head region:
+    such helmets are left unattributed (``ambiguous``). With no helmet in the
+    head region the state stays ``unknown``.
     """
     if rider.state != STATE_ASSOCIATED or rider.head_region is None:
-        return AttributeAssociation(state=HELMET_UNKNOWN, reasons=("rider_not_associated",))
+        reason = "rider_ambiguous" if rider.state == STATE_AMBIGUOUS else "rider_not_associated"
+        return AttributeAssociation(state=HELMET_UNKNOWN, reasons=(reason,))
     head = rider.head_region
+    other_heads = [rider_head_region(box) for box in other_riders]
+    shared = 0
     head_height = max(1.0, head[3] - head[1])
     observations: list[AttributeObservation] = []
     for det in helmets:
@@ -607,6 +628,9 @@ def associate_helmet(
             and hbox[3] <= head[1] + head_height * 0.35
         )
         if _point_in_box(centre, head) or area_overlap >= 0.25 or sits_on_head:
+            if any(_point_in_box(centre, other) for other in other_heads):
+                shared += 1
+                continue
             observations.append(
                 AttributeObservation(
                     label=label,
@@ -614,18 +638,32 @@ def associate_helmet(
                     box=hbox,
                 )
             )
+    shared_reasons: tuple[str, ...] = (
+        ("helmet_in_other_rider_head_region_unattributed",) if shared else ()
+    )
+    if not other_riders_complete and (observations or shared):
+        return AttributeAssociation(
+            state=STATE_AMBIGUOUS,
+            reasons=("nearby_rider_context_incomplete_helmet_unattributed",) + shared_reasons,
+        )
     if not observations:
+        if shared:
+            return AttributeAssociation(state=STATE_AMBIGUOUS, reasons=shared_reasons)
         # No helmet label in the head region: UNKNOWN, never "no helmet".
         return AttributeAssociation(state=HELMET_UNKNOWN, reasons=("no_helmet_observation",))
     labels = {o.label for o in observations}
     if YOLO_CLASS_HELMET_NUT_SHELL in labels:
-        return AttributeAssociation(state=HELMET_NUT_SHELL, observations=tuple(observations))
+        return AttributeAssociation(
+            state=HELMET_NUT_SHELL, observations=tuple(observations), reasons=shared_reasons
+        )
     if YOLO_CLASS_HELMET_ACCEPTABLE in labels:
-        return AttributeAssociation(state=HELMET_ACCEPTABLE, observations=tuple(observations))
+        return AttributeAssociation(
+            state=HELMET_ACCEPTABLE, observations=tuple(observations), reasons=shared_reasons
+        )
     return AttributeAssociation(
         state=HELMET_UNKNOWN,
         observations=tuple(observations),
-        reasons=("legacy_generic_helmet_label",),
+        reasons=("legacy_generic_helmet_label",) + shared_reasons,
     )
 
 
@@ -687,6 +725,8 @@ def associate_mirrors(
     mirrors: Sequence[Mapping[str, Any]],
     *,
     motorcycles_in_frame: Sequence[Mapping[str, Any]] = (),
+    known_other_motorcycles: Sequence[Box] = (),
+    other_motorcycles_complete: bool = True,
     mount_band_frac: float = MIRROR_MOUNT_BAND_FRAC,
     max_width_ratio: float = MIRROR_MAX_WIDTH_RATIO,
     ambiguous_iou: float = MOTORCYCLE_AMBIGUOUS_IOU,
@@ -700,16 +740,20 @@ def associate_mirrors(
     spatially (see :func:`match_target_motorcycle`) and never creates that
     ambiguity. ``none_visible`` never means absence: a missed mirror detection
     is reported as ``unknown`` (see ``no_mirror_observation``).
+
+    ``known_other_motorcycles`` are boxes the main detector tracked as
+    *different* motorcycles. They skip spatial target matching (identity is
+    already known), so even a heavily overlapping neighbour keeps attribution
+    ambiguous, and a mirror inside a neighbour's mounting area is not attributed.
+
+    ``other_motorcycles_complete=False`` means that list was truncated or never
+    recorded: an omitted motorcycle could overlap the target or share its
+    mounting area, so any mirror found there is left unattributed
+    (``ambiguous``). With no mirror found the state stays ``none_visible``.
     """
     bike = box_of(motorcycle)
     bike_w = max(1.0, bike[2] - bike[0])
-    bike_h = max(1.0, bike[3] - bike[1])
-    mount_box = (
-        bike[0] - bike_w * 0.10,
-        bike[1] - bike_h * 0.10,
-        bike[2] + bike_w * 0.10,
-        bike[1] + bike_h * mount_band_frac,
-    )
+    mount_box = mirror_mount_box(bike, mount_band_frac=mount_band_frac)
 
     overlapping = other_motorcycles(
         motorcycle,
@@ -717,11 +761,14 @@ def associate_mirrors(
         target_match_iou=target_match_iou,
         ambiguous_iou=ambiguous_iou,
     )
-    if overlapping:
+    known_others = [tuple(float(v) for v in box) for box in known_other_motorcycles]
+    if overlapping or any(box_iou(bike, other) >= float(ambiguous_iou) for other in known_others):
         return AttributeAssociation(
             state=STATE_AMBIGUOUS,
             reasons=("overlapping_motorcycles_mounting_area_unresolved",),
         )
+    other_mounts = [mirror_mount_box(other, mount_band_frac=mount_band_frac) for other in known_others]
+    shared = 0
 
     observations: list[AttributeObservation] = []
     reasons: list[str] = []
@@ -737,6 +784,9 @@ def associate_mirrors(
         centre = ((mbox[0] + mbox[2]) / 2.0, (mbox[1] + mbox[3]) / 2.0)
         if not _point_in_box(centre, mount_box):
             continue
+        if any(_point_in_box(centre, other) for other in other_mounts):
+            shared += 1
+            continue
         side = "left" if centre[0] < (bike[0] + bike[2]) / 2.0 else "right"
         observations.append(
             AttributeObservation(
@@ -747,6 +797,13 @@ def associate_mirrors(
             )
         )
 
+    if shared:
+        reasons.append("mirror_in_shared_mounting_area_unattributed")
+    if not other_motorcycles_complete and (observations or shared):
+        reasons.insert(0, "nearby_motorcycle_context_incomplete_mirror_unattributed")
+        return AttributeAssociation(state=STATE_AMBIGUOUS, reasons=tuple(reasons))
+    if shared and not observations:
+        return AttributeAssociation(state=STATE_AMBIGUOUS, reasons=tuple(reasons))
     sides = {o.side for o in observations}
     if len(sides) >= 2:
         state = MIRROR_BOTH
@@ -778,14 +835,315 @@ def _boxes_overlap(a: Box, b: Box) -> bool:
 def _point_in_box(point: tuple[float, float], box: Box) -> bool:
     return box[0] <= point[0] <= box[2] and box[1] <= point[1] <= box[3]
 
-    head = rider_head_region(best_box)
-    return RiderAssociation(
-        state=STATE_ASSOCIATED,
-        rider_track_id=_track_id_of(best_det),
-        rider_box=best_box,
-        head_region=head,
-        confidence=round(float(best_overlap), 4),
-        reasons=(),
+
+def _box_centre(box: Box) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def mirror_mount_box(bike: Box, *, mount_band_frac: float = MIRROR_MOUNT_BAND_FRAC) -> Box:
+    """Upper mounting band of a motorcycle box, where side mirrors sit."""
+    bike_w = max(1.0, bike[2] - bike[0])
+    bike_h = max(1.0, bike[3] - bike[1])
+    return (
+        bike[0] - bike_w * 0.10,
+        bike[1] - bike_h * 0.10,
+        bike[2] + bike_w * 0.10,
+        bike[1] + bike_h * mount_band_frac,
+    )
+
+
+def bbox_dict(box: Box) -> dict[str, float]:
+    """Stored ``{"x","y","w","h"}`` form of an ``(x1, y1, x2, y2)`` box."""
+    return {
+        "x": round(float(box[0]), 2),
+        "y": round(float(box[1]), 2),
+        "w": round(float(box[2] - box[0]), 2),
+        "h": round(float(box[3] - box[1]), 2),
+    }
+
+
+def box_from_dict(raw: Any) -> Box | None:
+    """Parse a stored ``{"x","y","w","h"}`` box; None when missing or unusable."""
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        x, y, w, h = (float(raw[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+        return None
+    return (x, y, x + w, y + h)
+
+
+# ---------------------------------------------------------------------------
+# Main-detector context stored with each selected frame
+# ---------------------------------------------------------------------------
+
+# v2 records which list was truncated (``truncated_lists``); v1 rows carry only
+# the generic ``truncated`` flag, which is read as "both lists truncated".
+MAIN_CONTEXT_VERSION = 2
+MAX_CONTEXT_OBJECTS = 8
+CONTEXT_SOURCE_MAIN = "main_detector"
+CONTEXT_SOURCE_LEGACY = "legacy_row"
+RIDER_STATE_UNRECORDED = "unrecorded"
+_RIDER_STATES = (STATE_ASSOCIATED, STATE_AMBIGUOUS, STATE_UNASSOCIATED)
+
+
+@dataclass(frozen=True)
+class ContextObject:
+    """A nearby main-detector object recorded next to the target motorcycle."""
+
+    box: Box
+    track_id: int | None = None
+    confidence: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "track_id": self.track_id,
+            "confidence": round(float(self.confidence), 4),
+            "bbox": bbox_dict(self.box),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "ContextObject | None":
+        if not isinstance(raw, Mapping):
+            return None
+        box = box_from_dict(raw.get("bbox"))
+        if box is None:
+            return None
+        try:
+            confidence = float(raw.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return cls(box=box, track_id=_track_id_of(raw), confidence=confidence)
+
+
+@dataclass(frozen=True)
+class MainDetectorContext:
+    """Main YOLOv8m/ByteTrack context for one selected frame.
+
+    The three-class detail model cannot output ``rider`` or ``motorcycle``, so
+    rider and motorcycle attribution uses what the main detector saw in the same
+    frame: the associated ``rider`` (never ``person``), the rider-association
+    state (so an ambiguous rider stays ambiguous), and nearby *other*
+    motorcycles/riders intersecting the padded crop. Those are different tracks
+    by construction, so a heavily overlapping neighbour is never mistaken for the
+    target's own re-detection.
+
+    ``recorded`` is False for rows written before this context existed; the scan
+    then flags that nearby motorcycles were not checked instead of assuming none.
+
+    A list is *complete* only when it was recorded and not truncated. An
+    incomplete list may omit a neighbour that owns a helmet or mirror, so the
+    scan never makes a definite attribution that depends on it.
+    """
+
+    source: str
+    rider_state: str
+    rider_box: Box | None = None
+    rider_track_id: int | None = None
+    rider_reasons: tuple[str, ...] = ()
+    target_track_id: int | None = None
+    motorcycles: tuple[ContextObject, ...] = ()
+    riders: tuple[ContextObject, ...] = ()
+    motorcycles_truncated: bool = False
+    riders_truncated: bool = False
+    recorded: bool = True
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self.motorcycles_truncated or self.riders_truncated)
+
+    @property
+    def motorcycles_complete(self) -> bool:
+        return bool(self.recorded and not self.motorcycles_truncated)
+
+    @property
+    def riders_complete(self) -> bool:
+        return bool(self.recorded and not self.riders_truncated)
+
+    def truncated_lists(self) -> dict[str, bool]:
+        return {
+            "motorcycles": bool(self.motorcycles_truncated),
+            "riders": bool(self.riders_truncated),
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        """Stored form inside ``frames_json`` (``rider_bbox`` stays top-level)."""
+        return {
+            "version": MAIN_CONTEXT_VERSION,
+            "source": self.source,
+            "target_track_id": self.target_track_id,
+            "rider": {
+                "state": self.rider_state,
+                "track_id": self.rider_track_id,
+                "reasons": list(self.rider_reasons),
+            },
+            "motorcycles": [o.as_dict() for o in self.motorcycles],
+            "riders": [o.as_dict() for o in self.riders],
+            "truncated": self.truncated,
+            "truncated_lists": self.truncated_lists(),
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """Reviewer-facing summary stored with scan observations."""
+        return {
+            "source": self.source,
+            "recorded": bool(self.recorded),
+            "rider_state": self.rider_state,
+            "rider_track_id": self.rider_track_id,
+            "rider_box": [round(float(v), 2) for v in self.rider_box] if self.rider_box else None,
+            "nearby_motorcycles": [o.as_dict() for o in self.motorcycles],
+            "nearby_riders": [o.as_dict() for o in self.riders],
+            "truncated": self.truncated,
+            "truncated_lists": self.truncated_lists(),
+        }
+
+    def rider_association(self) -> RiderAssociation:
+        """Rider association taken from the main detector, never from the scan."""
+        if self.rider_state == STATE_ASSOCIATED and self.rider_box is not None:
+            return RiderAssociation(
+                state=STATE_ASSOCIATED,
+                rider_track_id=self.rider_track_id,
+                rider_box=self.rider_box,
+                head_region=rider_head_region(self.rider_box),
+                confidence=1.0,
+                source=self.source,
+            )
+        if self.rider_state == STATE_AMBIGUOUS:
+            return RiderAssociation(
+                state=STATE_AMBIGUOUS,
+                reasons=self.rider_reasons or ("multiple_riders_overlap_motorcycle",),
+                source=self.source,
+            )
+        if self.rider_state == RIDER_STATE_UNRECORDED:
+            reasons: tuple[str, ...] = ("main_detector_rider_state_not_recorded",)
+        elif self.rider_state == STATE_ASSOCIATED:
+            reasons = ("main_detector_rider_box_missing",)
+        else:
+            reasons = self.rider_reasons or ("no_main_detector_rider_for_motorcycle",)
+        return RiderAssociation(state=STATE_UNASSOCIATED, reasons=reasons, source=self.source)
+
+    @classmethod
+    def from_frame(cls, frame: Mapping[str, Any]) -> "MainDetectorContext":
+        """Rebuild the context from a stored frame, including pre-context rows."""
+        rider_box = box_from_dict(frame.get("rider_bbox"))
+        raw = frame.get("main_context")
+        if not isinstance(raw, Mapping):
+            # Older rows stored ``rider_bbox`` only when the rider was
+            # associated, so a box implies association; its absence is unknown.
+            return cls(
+                source=CONTEXT_SOURCE_LEGACY,
+                rider_state=STATE_ASSOCIATED if rider_box else RIDER_STATE_UNRECORDED,
+                rider_box=rider_box,
+                recorded=False,
+            )
+        rider_raw = raw.get("rider") if isinstance(raw.get("rider"), Mapping) else {}
+        state = str(rider_raw.get("state") or "").strip().lower()
+        if state not in _RIDER_STATES:
+            state = RIDER_STATE_UNRECORDED
+        reasons = rider_raw.get("reasons")
+        motorcycles_raw = raw.get("motorcycles")
+        riders_raw = raw.get("riders")
+        motorcycles = tuple(
+            o for o in (ContextObject.from_dict(r) for r in (motorcycles_raw or [])) if o
+        ) if isinstance(motorcycles_raw, list) else ()
+        riders = tuple(
+            o for o in (ContextObject.from_dict(r) for r in (riders_raw or [])) if o
+        ) if isinstance(riders_raw, list) else ()
+        motorcycles_truncated, riders_truncated = _stored_truncation(raw)
+        return cls(
+            source=str(raw.get("source") or CONTEXT_SOURCE_MAIN),
+            rider_state=state,
+            rider_box=rider_box if state == STATE_ASSOCIATED else None,
+            rider_track_id=_track_id_of(rider_raw) if state == STATE_ASSOCIATED else None,
+            rider_reasons=tuple(str(r) for r in reasons) if isinstance(reasons, list) else (),
+            target_track_id=_track_id_of({"track_id": raw.get("target_track_id")}),
+            motorcycles=motorcycles,
+            riders=riders,
+            motorcycles_truncated=motorcycles_truncated,
+            riders_truncated=riders_truncated,
+            # A malformed context list cannot certify that neighbours were checked.
+            recorded=isinstance(motorcycles_raw, list) and isinstance(riders_raw, list),
+        )
+
+
+def _stored_truncation(raw: Mapping[str, Any]) -> tuple[bool, bool]:
+    """Per-list truncation from stored context, failing closed.
+
+    A valid boolean in ``truncated_lists`` wins for that list. Otherwise the
+    generic ``truncated`` flag applies to both lists (v1 rows). When neither is
+    a real boolean the list is treated as truncated: completeness is unproven.
+    """
+    per_list = raw.get("truncated_lists")
+    per_list = per_list if isinstance(per_list, Mapping) else {}
+    generic = raw.get("truncated")
+    fallback = generic if isinstance(generic, bool) else True
+
+    def flag(key: str) -> bool:
+        value = per_list.get(key)
+        return value if isinstance(value, bool) else fallback
+
+    return flag("motorcycles"), flag("riders")
+
+
+def build_main_context(
+    target: Mapping[str, Any],
+    rider: RiderAssociation,
+    detections: Sequence[Mapping[str, Any]],
+    crop: CropRect,
+    *,
+    max_objects: int = MAX_CONTEXT_OBJECTS,
+) -> MainDetectorContext:
+    """Capture nearby main-detector motorcycles/riders for one selected frame.
+
+    Anything intersecting the padded crop can contribute a helmet or mirror to
+    the crop, so it is recorded (bounded, largest overlap first). Generic
+    ``person`` is never recorded as a rider.
+    """
+    crop_box = crop.as_box()
+    target_id = _track_id_of(target)
+    motorcycles: list[tuple[float, ContextObject]] = []
+    riders: list[tuple[float, ContextObject]] = []
+    for det in detections:
+        if det is target:
+            continue
+        label = str(det.get("class_label") or "").strip().lower()
+        if label not in (YOLO_CLASS_MOTORCYCLE, YOLO_CLASS_RIDER):
+            continue
+        box = box_of(det)
+        overlap = intersection_area(box, crop_box)
+        if box_area(box) <= 0 or overlap <= 0:
+            continue
+        tid = _track_id_of(det)
+        obj = ContextObject(box=box, track_id=tid, confidence=float(det.get("confidence") or 0.0))
+        if label == YOLO_CLASS_MOTORCYCLE:
+            if target_id is not None and tid == target_id:
+                continue
+            motorcycles.append((overlap, obj))
+        else:
+            if (
+                rider.state == STATE_ASSOCIATED
+                and rider.rider_box == box
+                and rider.rider_track_id == tid
+            ):
+                continue
+            riders.append((overlap, obj))
+    motorcycles.sort(key=lambda item: item[0], reverse=True)
+    riders.sort(key=lambda item: item[0], reverse=True)
+    limit = max(0, int(max_objects))
+    return MainDetectorContext(
+        source=CONTEXT_SOURCE_MAIN,
+        rider_state=rider.state,
+        rider_box=rider.rider_box if rider.state == STATE_ASSOCIATED else None,
+        rider_track_id=rider.rider_track_id if rider.state == STATE_ASSOCIATED else None,
+        rider_reasons=tuple(rider.reasons),
+        target_track_id=target_id,
+        motorcycles=tuple(o for _, o in motorcycles[:limit]),
+        riders=tuple(o for _, o in riders[:limit]),
+        motorcycles_truncated=len(motorcycles) > limit,
+        riders_truncated=len(riders) > limit,
+        recorded=True,
     )
 
 
@@ -980,11 +1338,11 @@ class _FrameSlot:
     scene_path: str | None = None
     crop_path: str | None = None
     size_bytes: int = 0
+    main_context: MainDetectorContext | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        box = self.detection_box
         rider = self.rider_box
-        return {
+        out = {
             "index": self.frame_index,
             "frame_number": self.frame_number,
             "timestamp_sec": round(float(self.timestamp_sec), 3),
@@ -993,26 +1351,15 @@ class _FrameSlot:
             "crop": self.crop.as_dict(),
             "scan_scale_x": round(float(self.scale_x), 6),
             "scan_scale_y": round(float(self.scale_y), 6),
-            "detection_bbox": {
-                "x": round(float(box[0]), 2),
-                "y": round(float(box[1]), 2),
-                "w": round(float(box[2] - box[0]), 2),
-                "h": round(float(box[3] - box[1]), 2),
-            },
-            "rider_bbox": (
-                {
-                    "x": round(float(rider[0]), 2),
-                    "y": round(float(rider[1]), 2),
-                    "w": round(float(rider[2] - rider[0]), 2),
-                    "h": round(float(rider[3] - rider[1]), 2),
-                }
-                if rider
-                else None
-            ),
+            "detection_bbox": bbox_dict(self.detection_box),
+            "rider_bbox": bbox_dict(rider) if rider else None,
             "score": self.score.as_dict(),
             "size_bytes": int(self.size_bytes),
             "overlay_path": None,
         }
+        if self.main_context is not None:
+            out["main_context"] = self.main_context.as_dict()
+        return out
 
 
 @dataclass
@@ -1177,7 +1524,15 @@ class MotorcycleDetailCollector:
                 conf_floor=self.conf_floor,
             )
             self._consider(
-                occ, frame, det, crop, rider, score, int(frame_number), float(timestamp_sec)
+                occ,
+                frame,
+                det,
+                crop,
+                rider,
+                score,
+                int(frame_number),
+                float(timestamp_sec),
+                detections=detections,
             )
 
     def _consider(
@@ -1190,6 +1545,8 @@ class MotorcycleDetailCollector:
         score: FrameScore,
         frame_number: int,
         timestamp_sec: float,
+        *,
+        detections: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         target: _FrameSlot | None = None
         replace = False
@@ -1225,6 +1582,8 @@ class MotorcycleDetailCollector:
             rider_box=rider.rider_box,
             scale_x=scale_x,
             scale_y=scale_y,
+            # Only built for frames that win a slot, so context work stays bounded.
+            main_context=build_main_context(det, rider, detections, crop),
         )
         if not self._write_evidence(occ, slot, frame):
             self.stats["evidence_write_failures"] += 1

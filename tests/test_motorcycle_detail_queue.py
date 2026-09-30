@@ -14,11 +14,7 @@ import pytest
 
 from core.motorcycle_detail import DETAIL_SELECTOR_VERSION
 
-EXPECTED_15 = (
-    "car", "van", "jeepney", "tricycle", "autorickshaw", "bus", "truck",
-    "pickup_truck", "motorcycle", "bicycle", "person", "rider",
-    "helmet_acceptable", "helmet_nut_shell", "side_mirror",
-)
+DETAIL_3 = ("helmet_nut_shell", "helmet_acceptable", "side_mirror")
 
 
 def _resolve(stored_path):
@@ -210,18 +206,18 @@ class TestScanTransitions:
         test_db.claim_motorcycle_detail_scans(10)
         test_db.finish_motorcycle_detail_scan(
             candidate_id=candidate_id,
-            observations_json=json.dumps({"scan": {"model": "YOLOv8m:mock"}}),
+            observations_json=json.dumps({"scan": {"model": "md3c:mock"}}),
             association_json=json.dumps({"rider": {"state": "associated"}}),
             uncertainty_json=json.dumps(["mirror:absence_not_proven_unknown"]),
-            scan_model="YOLOv8m:mock:abc123",
-            scan_class_map_json=json.dumps(list(EXPECTED_15)),
+            scan_model="md3c:mock:abc123",
+            scan_class_map_json=json.dumps(list(DETAIL_3)),
             scan_seconds=0.25,
         )
         row = test_db.get_motorcycle_detail_candidate(candidate_id)
         assert row["scan_state"] == "ready"
         assert row["scanned_at"] is not None
-        assert json.loads(row["observations_json"])["scan"]["model"] == "YOLOv8m:mock"
-        assert json.loads(row["scan_class_map_json"])[0] == "car"
+        assert json.loads(row["observations_json"])["scan"]["model"] == "md3c:mock"
+        assert json.loads(row["scan_class_map_json"])[0] == "helmet_nut_shell"
 
     def test_restart_recovers_abandoned_scans_to_queued(self, test_db, video_row):
         candidate_id = _seed_candidate(test_db, video_id=video_row)
@@ -329,8 +325,8 @@ class TestHumanOutcomes:
             observations_json=json.dumps({"association": {"mirror": {"state": "none_visible"}}}),
             association_json=json.dumps({"mirror": {"state": "none_visible"}}),
             uncertainty_json=json.dumps(["mirror:absence_not_proven_unknown"]),
-            scan_model="YOLOv8m:mock",
-            scan_class_map_json=json.dumps(list(EXPECTED_15)),
+            scan_model="md3c:mock",
+            scan_class_map_json=json.dumps(list(DETAIL_3)),
         )
         with test_db.db_session() as conn:
             violations = conn.execute("SELECT COUNT(*) AS n FROM violations").fetchone()["n"]

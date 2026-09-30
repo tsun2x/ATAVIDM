@@ -22,17 +22,18 @@ EXPECTED_15 = (
     "pickup_truck", "motorcycle", "bicycle", "person", "rider",
     "helmet_acceptable", "helmet_nut_shell", "side_mirror",
 )
+DETAIL_3 = ("helmet_nut_shell", "helmet_acceptable", "side_mirror")
 
 
 def _model(names):
-    return SimpleNamespace(names=names)
+    return SimpleNamespace(names=names, task="detect")
 
 
 def _ok_checkpoint(loader_calls=None):
     def loader(path):
         if loader_calls is not None:
             loader_calls.append(path)
-        return _model({i: n for i, n in enumerate(EXPECTED_15)})
+        return _model({i: n for i, n in enumerate(DETAIL_3)})
 
     return loader
 
@@ -47,20 +48,31 @@ def _clear_model_cache():
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint resolution and the exact 15-class contract
+# Checkpoint resolution and the exact three-class detail contract
 # ---------------------------------------------------------------------------
 
 
 class TestCheckpointGate:
-    def test_exact_fifteen_class_order_is_accepted(self, tmp_path):
+    def test_exact_three_class_detail_order_is_accepted(self, tmp_path):
         from core.motorcycle_detail_scan import load_detail_checkpoint
 
         weights = tmp_path / "detail.pt"
         weights.write_bytes(b"mock-weights")
         cp = load_detail_checkpoint(str(weights), model_loader=_ok_checkpoint())
         assert cp.ok is True
-        assert cp.class_names == EXPECTED_15
-        assert cp.identity.startswith("YOLOv8m:detail.pt:")
+        assert cp.class_names == DETAIL_3
+        assert cp.identity.startswith("md3c:detail.pt:")
+        assert not cp.identity.startswith("YOLOv8m")
+
+    def test_main_fifteen_class_checkpoint_is_not_a_detail_checkpoint(self, tmp_path):
+        from core.motorcycle_detail_scan import load_detail_checkpoint
+
+        weights = tmp_path / "main.pt"
+        weights.write_bytes(b"mock")
+        loader = lambda path: _model({i: n for i, n in enumerate(EXPECTED_15)})  # noqa: E731
+        cp = load_detail_checkpoint(str(weights), model_loader=loader)
+        assert cp.ok is False
+        assert "wrong_class_count" in cp.reason
 
     def test_missing_designation_fails_closed(self):
         from core.motorcycle_detail_scan import load_detail_checkpoint
@@ -96,12 +108,13 @@ class TestCheckpointGate:
 
         weights = tmp_path / "swapped.pt"
         weights.write_bytes(b"mock")
-        names = list(EXPECTED_15)
-        names[12], names[13] = names[13], names[12]
+        names = list(DETAIL_3)
+        names[0], names[1] = names[1], names[0]
         loader = lambda path: _model({i: n for i, n in enumerate(names)})  # noqa: E731
         cp = load_detail_checkpoint(str(weights), model_loader=loader)
         assert cp.ok is False
         assert "detail_class_map_rejected" in cp.reason
+        assert "reordered_names" in cp.reason
 
     def test_legacy_ten_class_checkpoint_is_rejected(self, tmp_path):
         from core.motorcycle_detail_scan import load_detail_checkpoint
@@ -129,8 +142,8 @@ class TestCheckpointGate:
 
         weights = tmp_path / "renamed.pt"
         weights.write_bytes(b"mock")
-        names = list(EXPECTED_15)
-        names[11] = "cyclist"  # 'rider' renamed
+        names = list(DETAIL_3)
+        names[2] = "mirror"  # 'side_mirror' renamed
         loader = lambda path: _model({i: n for i, n in enumerate(names)})  # noqa: E731
         cp = load_detail_checkpoint(str(weights), model_loader=loader)
         assert cp.ok is False
@@ -139,9 +152,9 @@ class TestCheckpointGate:
     def test_validate_helper_reports_exact_order(self):
         from core.motorcycle_detail_scan import validate_detail_class_map
 
-        names, error = validate_detail_class_map({i: n for i, n in enumerate(EXPECTED_15)})
-        assert error is None and names == EXPECTED_15
-        swapped = list(EXPECTED_15)
+        names, error = validate_detail_class_map({i: n for i, n in enumerate(DETAIL_3)})
+        assert error is None and names == DETAIL_3
+        swapped = list(DETAIL_3)
         swapped[0], swapped[1] = swapped[1], swapped[0]
         _, error = validate_detail_class_map({i: n for i, n in enumerate(swapped)})
         assert error is not None
@@ -269,7 +282,7 @@ def _row(crop_path, *, crop, scale_x=1.0, scale_y=1.0, source_w=640, source_h=48
 def _mock_scanner(predictor):
     """Scanner with a mocked checkpoint and a mocked crop predictor."""
     checkpoint = DetailCheckpoint(
-        path="mock", class_names=EXPECTED_15, ok=True, identity="YOLOv8m:mock"
+        path="mock", class_names=DETAIL_3, ok=True, identity="md3c:mock"
     )
     return MotorcycleDetailScanner(
         checkpoint_loader=lambda: checkpoint,
@@ -441,7 +454,7 @@ class _FakeAdapter:
 
 def _scanner_with(adapter, predictor, **kwargs):
     checkpoint = DetailCheckpoint(
-        path="mock", class_names=EXPECTED_15, ok=True, identity="YOLOv8m:mock"
+        path="mock", class_names=DETAIL_3, ok=True, identity="md3c:mock"
     )
     kwargs.setdefault("checkpoint_fingerprint", lambda: "fp-1")
     kwargs.setdefault("gpu_wait_sec", 0.0)
@@ -670,7 +683,7 @@ class TestCheckpointFingerprint:
             path="", class_names=(), ok=False, identity="unavailable", reason="not_designated"
         )
         ready = DetailCheckpoint(
-            path="mock", class_names=EXPECTED_15, ok=True, identity="YOLOv8m:mock"
+            path="mock", class_names=DETAIL_3, ok=True, identity="md3c:mock"
         )
         scanner = MotorcycleDetailScanner(
             adapter=adapter,
@@ -710,7 +723,7 @@ class TestCheckpointFingerprint:
 
         def model_loader(path):
             loads.append(path)
-            return _model({i: n for i, n in enumerate(EXPECTED_15)})
+            return _model({i: n for i, n in enumerate(DETAIL_3)})
 
         first = load_detail_checkpoint(str(weights), model_loader=model_loader)
         assert first.ok
@@ -736,7 +749,7 @@ class TestCheckpointFingerprint:
 
         def model_loader(path):
             loads.append(path)
-            return _model({i: n for i, n in enumerate(EXPECTED_15)})
+            return _model({i: n for i, n in enumerate(DETAIL_3)})
 
         first = cached_model(str(weights), model_loader)
         second = cached_model(str(weights), model_loader)

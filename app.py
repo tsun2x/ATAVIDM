@@ -2253,11 +2253,25 @@ def api_dismiss_review(review_id: int):
 
 def _detail_scan_gate() -> dict[str, Any]:
     """Non-loading view of the designated detail checkpoint (validated at scan time)."""
+    from core.motorcycle_detail_contract import (
+        DETAIL_CONTRACT_VERSION,
+        DETAIL_MODEL_CLASSES,
+        DETAIL_MODEL_KIND,
+    )
     from core.motorcycle_detail_scan import designated_weights_path
 
     path = designated_weights_path()
     exists = bool(path and Path(path).is_file())
-    return {"configured": bool(path), "path": path or None, "exists": exists}
+    return {
+        "configured": bool(path),
+        "path": path or None,
+        "exists": exists,
+        "contract": {
+            "version": DETAIL_CONTRACT_VERSION,
+            "model_kind": DETAIL_MODEL_KIND,
+            "classes": list(DETAIL_MODEL_CLASSES),
+        },
+    }
 
 
 def _detail_json(raw: Any, default: Any) -> Any:

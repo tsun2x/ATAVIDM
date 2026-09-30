@@ -36,9 +36,14 @@
         <p class="small text-muted mb-1" id="detailQueueStatus" aria-live="polite">
             Showing {{ detail_items|length }} on this page of {{ detail_total }} {{ detail_outcome }} candidates.
         </p>
-        <p class="small text-warning mb-0">
+        <p class="small text-warning mb-1">
             <i class="bi bi-info-circle me-1"></i>
             This queue records observations only. It has <strong>no confirm action</strong> and can never create a violation case.
+        </p>
+        <p class="small text-muted mb-0" id="detailContractNote">
+            Detail model contract: a separate three-class checkpoint with class IDs
+            {% for name in detail_gate.contract.classes %}<code>{{ loop.index0 }}={{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+            Rider and motorcycle attribution comes from the main detector; a missing detection is unknown, not proof of absence.
         </p>
     </div>
 </div>
@@ -47,8 +52,10 @@
 <div class="alert alert-secondary py-2 small" role="status">
     Detail checkpoint: not designated. Crop scans stay queued and fail closed until
     <code>TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS</code> (or the
-    <code>motorcycle_detail_weights</code> system setting) points to a checkpoint whose class
-    map matches the 15-class object roster in exact ID order.
+    <code>motorcycle_detail_weights</code> system setting) points to a separate three-class
+    motorcycle detail checkpoint whose class map is exactly
+    {% for name in detail_gate.contract.classes %}<code>{{ loop.index0 }}={{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    The main 15-class object checkpoint and any other ID order are rejected; class IDs are never relabeled.
 </div>
 {% elif not detail_gate.exists %}
 <div class="alert alert-danger py-2 small" role="status">
@@ -101,6 +108,13 @@
                                 {{ item.scan_state }}
                             </span>
                             {% if item.scan_error %}<div class="small text-muted">{{ item.scan_error }}</div>{% endif %}
+                            {% if item.scan_state == 'ready' and item.association.helmet is mapping %}
+                            <div class="small text-muted">
+                                Rider: {{ (item.association.rider or {}).state or 'unknown' }} ·
+                                Helmet: {{ item.association.helmet.state or 'unknown' }} ·
+                                Mirror: {{ (item.association.mirror or {}).state or 'unknown' }}
+                            </div>
+                            {% endif %}
                         </td>
                         <td class="small">{{ '%.2f'|format(item.frame_score or 0) }}</td>
                         <td>

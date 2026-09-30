@@ -1,16 +1,24 @@
 """Queued second YOLOv8 pass over motorcycle detail crops.
 
 The detail pass scans the bounded crops selected by
-:mod:`core.motorcycle_detail` and records helmet / side-mirror observations for a
-**separate human-review queue**. Hard boundaries:
+:mod:`core.motorcycle_detail` with a **separate three-class detail checkpoint**
+and records helmet / side-mirror observations for a **separate human-review
+queue**. Hard boundaries:
 
 - The scan can supply evidence or raise a review flag. It never declares,
   confirms, or creates a violation, and it never writes to ``violations`` or
-  ``review_queue``.
-- The designated checkpoint's **exact 15-class ID order** is validated before
-  the first crop is scanned. A missing, unreadable, reordered, renamed, or
-  mis-sized class map fails closed: no crop is scanned and no observation is
-  produced.
+  ``review_queue``. Its output never reaches the main tracker or
+  ``core.violation_engine``.
+- The designated checkpoint's **exact three-class ID order**
+  (:data:`core.motorcycle_detail_contract.DETAIL_MODEL_CLASSES`) is validated
+  before the first crop is scanned. A missing, unreadable, reordered, renamed,
+  duplicated, or mis-sized class map fails closed: no crop is scanned and no
+  observation is produced. The main 15-class object checkpoint is not a detail
+  checkpoint and is rejected here.
+- The detail model outputs only ``helmet_nut_shell``, ``helmet_acceptable``,
+  and ``side_mirror``. Rider and motorcycle attribution uses the main
+  detector's context stored with each selected frame
+  (:class:`core.motorcycle_detail.MainDetectorContext`).
 - Crop inference holds the **shared GPU reservation**
   (:mod:`core.gpu_inference_slot`) for the whole batch, so it cannot overlap
   an uploaded-video job, a manual scan, or a live camera frame. The cheap
@@ -42,27 +50,36 @@ from typing import Any
 import cv2
 
 from core.detection_config import (
-    MODEL_FAMILY,
-    OBJECT_DETECTOR_CLASSES,
     YOLO_CLASS_HELMET,
     YOLO_CLASS_HELMET_ACCEPTABLE,
     YOLO_CLASS_HELMET_NUT_SHELL,
     YOLO_CLASS_MOTORCYCLE,
     YOLO_CLASS_RIDER,
     YOLO_CLASS_SIDE_MIRROR,
-    validate_object_class_map,
+    ordered_class_names,
 )
 from core.gpu_inference_slot import PRIORITY_DETAIL_SCAN
 from core.motorcycle_detail import (
     MAX_FRAMES_PER_OCCURRENCE,
     AttributeAssociation,
     CropRect,
+    MainDetectorContext,
     RiderAssociation,
     associate_helmet,
     associate_mirrors,
     associate_rider,
+    box_from_dict,
     map_box_from_crop,
     padded_crop_rect,
+)
+from core.motorcycle_detail_contract import (
+    DETAIL_CONTRACT_VERSION,
+    DETAIL_IDENTITY_PREFIX,
+    DETAIL_MODEL_CLASSES,
+    DETAIL_MODEL_KIND,
+    check_detail_class_map,
+    check_detail_task,
+    detail_architecture_hint,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,9 +114,21 @@ class DetailCheckpoint:
     ok: bool = False
     reason: str | None = None
     identity: str | None = None
+    architecture: str | None = None
 
     def class_map_ids(self) -> list[str]:
         return list(self.class_names)
+
+    def describe(self) -> dict[str, Any]:
+        """Model identity block stored with every scan's observations."""
+        return {
+            "model": self.identity,
+            "model_kind": DETAIL_MODEL_KIND,
+            "architecture": self.architecture or "unverified",
+            "contract": DETAIL_CONTRACT_VERSION,
+            "class_names": list(self.class_names),
+            "class_map": {str(i): name for i, name in enumerate(self.class_names)},
+        }
 
 
 def designated_weights_path() -> str | None:
@@ -181,21 +210,17 @@ def designated_weights_fingerprint() -> str:
 
 
 def validate_detail_class_map(
-    raw_map: Any, *, expected: Sequence[str] = OBJECT_DETECTOR_CLASSES
+    raw_map: Any, *, expected: Sequence[str] = DETAIL_MODEL_CLASSES
 ) -> tuple[tuple[str, ...], str | None]:
-    """Validate a checkpoint's ID->name map against the 15-class object roster.
+    """Validate a checkpoint's ID->name map against the three-class detail contract.
 
     Returns ``(class_names, error)``. Any error is fatal for the scan: the caller
     must not scan a single crop with an unverified class map.
     """
-    report = validate_object_class_map(raw_map, expected=expected, require_roster=True)
+    report = check_detail_class_map(raw_map, expected=expected)
     if not report.ok:
-        return (), report.summary
-    if not report.is_object_roster:
-        return (), "Checkpoint is not a 15-class object-roster checkpoint."
-    if not report.order_known:
-        return (), "Checkpoint class map has no observable ID order."
-    return tuple(report.actual), None
+        return (), f"{report.code}: {report.reason}"
+    return report.class_names, None
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +268,10 @@ def load_detail_checkpoint(
 ) -> DetailCheckpoint:
     """Resolve and strictly validate the designated detail checkpoint.
 
-    Fails closed on: no designation, missing file, unreadable checkpoint, or a
-    class map that does not reproduce the exact 15-class object roster order.
+    Fails closed on: no designation, missing file, unreadable checkpoint, task
+    metadata that is missing, malformed, or not ``detect``, or a class map that
+    does not reproduce the exact three-class detail order. No crop is touched
+    by this function.
     """
     resolved = path if path is not None else designated_weights_path()
     if not resolved:
@@ -255,18 +282,27 @@ def load_detail_checkpoint(
     try:
         model = cached_model(str(candidate), model_loader)
         raw_map = getattr(model, "names", None)
+        task = getattr(model, "task", None)
     except Exception as exc:  # unreadable / corrupt checkpoint
         logger.exception("detail checkpoint load failed: %s", candidate)
         return DetailCheckpoint(str(candidate), ok=False, reason=f"detail_checkpoint_unreadable:{exc}")
+    task_error = check_detail_task(task)
+    if task_error:
+        return DetailCheckpoint(str(candidate), ok=False, reason=task_error)
     class_names, error = validate_detail_class_map(raw_map)
     if error:
         return DetailCheckpoint(str(candidate), ok=False, reason=f"detail_class_map_rejected:{error}")
     try:
-        identity = f"{MODEL_FAMILY}:{candidate.name}:{_file_identity(candidate)}"
+        identity = f"{DETAIL_IDENTITY_PREFIX}:{candidate.name}:{_file_identity(candidate)}"
     except OSError as exc:
         return DetailCheckpoint(str(candidate), ok=False, reason=f"detail_checkpoint_unreadable:{exc}")
     return DetailCheckpoint(
-        path=str(candidate), class_names=class_names, ok=True, reason=None, identity=identity
+        path=str(candidate),
+        class_names=class_names,
+        ok=True,
+        reason=None,
+        identity=identity,
+        architecture=detail_architecture_hint(model),
     )
 
 
@@ -280,7 +316,7 @@ class UltralyticsCropPredictor:
 
     def __init__(self, model: Any, class_names: Sequence[str], *, conf: float) -> None:
         self._model = model
-        self._known = {str(n).strip().lower() for n in class_names}
+        self._class_names = tuple(str(n).strip().lower() for n in class_names)
         self._conf = float(conf)
 
     def predict(self, image: Any) -> list[dict[str, Any]]:
@@ -288,16 +324,19 @@ class UltralyticsCropPredictor:
         if not results:
             return []
         result = results[0]
+        names = getattr(result, "names", None)
+        if names is not None and ordered_class_names(names) != self._class_names:
+            # The loaded model no longer matches the validated contract.
+            raise DetailScanError("detail_result_class_map_mismatch")
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
             return []
-        names = getattr(result, "names", None) or {}
         out: list[dict[str, Any]] = []
         for box in boxes:
             cls_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else -1
-            label = str(names.get(cls_id, cls_id)).strip().lower()
-            if label not in self._known:
-                continue
+            if not 0 <= cls_id < len(self._class_names):
+                raise DetailScanError("detail_result_class_id_out_of_range")
+            label = self._class_names[cls_id]
             xyxy = box.xyxy[0].tolist() if getattr(box, "xyxy", None) is not None else [0, 0, 0, 0]
             x1, y1, x2, y2 = (float(v) for v in xyxy)
             confidence = float(box.conf[0]) if getattr(box, "conf", None) is not None else 0.0
@@ -333,6 +372,9 @@ _OVERLAY_COLORS = {
     "helmet_nut_shell": (40, 40, 220),
     "helmet": (140, 140, 200),
     "side_mirror": (220, 90, 180),
+    "main:motorcycle": (246, 130, 59),
+    "main:rider": (60, 200, 60),
+    "main:other_motorcycle": (0, 165, 255),
 }
 _OVERLAY_DEFAULT_COLOR = (200, 200, 200)
 
@@ -401,13 +443,20 @@ class ScanAssociations:
     mirror: AttributeAssociation
     uncertainty: list[str] = field(default_factory=list)
     motorcycle_box: tuple[float, float, float, float] | None = None
+    context: MainDetectorContext | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "rider": self.rider.as_dict(),
             "helmet": self.helmet.as_dict(),
             "mirror": self.mirror.as_dict(),
         }
+        if self.context is not None:
+            out["motorcycle_box"] = (
+                [round(float(v), 2) for v in self.motorcycle_box] if self.motorcycle_box else None
+            )
+            out["context"] = self.context.summary()
+        return out
 
 
 def associate_scan_detections(
@@ -416,6 +465,7 @@ def associate_scan_detections(
     motorcycle_box: Sequence[float],
     frame_w: int,
     frame_h: int,
+    main_context: MainDetectorContext | None = None,
 ) -> ScanAssociations:
     """Associate scan detections from one frame into review observations.
 
@@ -424,17 +474,18 @@ def associate_scan_detections(
     crop can cut the motorcycle itself. Rider/helmet/mirror attribution uses the
     spatial rules in :mod:`core.motorcycle_detail` and reports ambiguity instead
     of guessing.
+
+    With ``main_context`` (the three-class detail path) the rider comes only
+    from the main detector's stored association, and the main detector's nearby
+    motorcycles/riders are treated as known *different* objects. Scan output is
+    only ever used for helmet and mirror labels.
     """
-    primary = {
-        "class_label": "motorcycle",
-        "confidence": 1.0,
-        "bbox_x": float(motorcycle_box[0]),
-        "bbox_y": float(motorcycle_box[1]),
-        "bbox_w": max(0.0, float(motorcycle_box[2]) - float(motorcycle_box[0])),
-        "bbox_h": max(0.0, float(motorcycle_box[3]) - float(motorcycle_box[1])),
-        "track_id": None,
-    }
     del frame_w, frame_h  # reserved for future frame-edge reasoning
+    if main_context is not None:
+        return _associate_with_main_context(
+            detections, motorcycle_box=motorcycle_box, context=main_context
+        )
+    primary = _primary_detection(_as_box(motorcycle_box))
     riders = [d for d in detections if d.get("class_label") == YOLO_CLASS_RIDER]
     helmets = [
         d
@@ -448,7 +499,34 @@ def associate_scan_detections(
     rider = associate_rider(primary, riders)
     helmet = associate_helmet(primary, rider, helmets)
     mirror = associate_mirrors(primary, mirrors, motorcycles_in_frame=motorcycles)
+    return ScanAssociations(
+        rider=rider,
+        helmet=helmet,
+        mirror=mirror,
+        uncertainty=_association_uncertainty(rider, helmet, mirror),
+        motorcycle_box=_as_box(motorcycle_box),
+    )
 
+
+def _as_box(values: Sequence[float]) -> tuple[float, float, float, float]:
+    return (float(values[0]), float(values[1]), float(values[2]), float(values[3]))
+
+
+def _primary_detection(box: tuple[float, float, float, float]) -> dict[str, Any]:
+    return {
+        "class_label": YOLO_CLASS_MOTORCYCLE,
+        "confidence": 1.0,
+        "bbox_x": box[0],
+        "bbox_y": box[1],
+        "bbox_w": max(0.0, box[2] - box[0]),
+        "bbox_h": max(0.0, box[3] - box[1]),
+        "track_id": None,
+    }
+
+
+def _association_uncertainty(
+    rider: RiderAssociation, helmet: AttributeAssociation, mirror: AttributeAssociation
+) -> list[str]:
     uncertainty: list[str] = []
     for state, association in (("rider", rider), ("helmet", helmet), ("mirror", mirror)):
         for reason in association.reasons:
@@ -457,17 +535,57 @@ def associate_scan_detections(
         uncertainty.append("helmet:no_observation_does_not_prove_absence")
     if mirror.state == "none_visible":
         uncertainty.append("mirror:absence_not_proven_unknown")
+    return uncertainty
+
+
+def _associate_with_main_context(
+    detections: Sequence[Mapping[str, Any]],
+    *,
+    motorcycle_box: Sequence[float],
+    context: MainDetectorContext,
+) -> ScanAssociations:
+    box = _as_box(motorcycle_box)
+    primary = _primary_detection(box)
+    helmets = [
+        d
+        for d in detections
+        if d.get("class_label")
+        in (YOLO_CLASS_HELMET_ACCEPTABLE, YOLO_CLASS_HELMET_NUT_SHELL, YOLO_CLASS_HELMET)
+    ]
+    mirrors = [d for d in detections if d.get("class_label") == YOLO_CLASS_SIDE_MIRROR]
+    scan_motorcycles = [d for d in detections if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
+
+    rider = context.rider_association()
+    helmet = associate_helmet(
+        primary,
+        rider,
+        helmets,
+        other_riders=[o.box for o in context.riders],
+        other_riders_complete=context.riders_complete,
+    )
+    mirror = associate_mirrors(
+        primary,
+        mirrors,
+        motorcycles_in_frame=scan_motorcycles,
+        known_other_motorcycles=[o.box for o in context.motorcycles],
+        other_motorcycles_complete=context.motorcycles_complete,
+    )
+    uncertainty = _association_uncertainty(rider, helmet, mirror)
+    if not context.recorded:
+        uncertainty.append("context:nearby_motorcycles_not_recorded_for_this_row")
+        uncertainty.append("context:nearby_riders_not_recorded_for_this_row")
+    else:
+        if context.motorcycles_truncated:
+            uncertainty.append("context:nearby_motorcycles_truncated")
+        if context.riders_truncated:
+            uncertainty.append("context:nearby_riders_truncated")
     return ScanAssociations(
         rider=rider,
         helmet=helmet,
         mirror=mirror,
         uncertainty=uncertainty,
-        motorcycle_box=(
-            float(motorcycle_box[0]),
-            float(motorcycle_box[1]),
-            float(motorcycle_box[2]),
-            float(motorcycle_box[3]),
-        ),
+        motorcycle_box=box,
+        context=context,
     )
 
 
@@ -804,8 +922,12 @@ class MotorcycleDetailScanner:
             if crop is None:
                 raise DetailScanError("candidate_frame_crop_missing")
             image = self._read_crop_image(frame, crop)
+            motorcycle_box = self._reference_motorcycle_box(frame)
+            context = MainDetectorContext.from_frame(frame)
             scale_x = float(frame.get("scan_scale_x") or 1.0)
             scale_y = float(frame.get("scan_scale_y") or 1.0)
+            if scale_x <= 0 or scale_y <= 0:
+                raise DetailScanError("candidate_scan_scale_invalid")
             scan_image = self._apply_scan_scale(image, scale_x=scale_x, scale_y=scale_y)
             raw = predictor(scan_image)
             mapped: list[tuple[dict[str, Any], tuple[float, float, float, float]]] = []
@@ -823,12 +945,12 @@ class MotorcycleDetailScanner:
                 to_pipeline_detection(det["class_label"], det["confidence"], box)
                 for det, box in mapped
             ]
-            motorcycle_box = self._reference_motorcycle_box(frame, detections)
             association = associate_scan_detections(
                 detections,
                 motorcycle_box=motorcycle_box,
                 frame_w=source_w,
                 frame_h=source_h,
+                main_context=context,
             )
             frame_uncertainty = list(association.uncertainty)
             if scale_x != 1.0 or scale_y != 1.0:
@@ -842,13 +964,21 @@ class MotorcycleDetailScanner:
                 frame_uncertainty.append("crop_clamped_at_frame_edge")
             uncertainty.extend(frame_uncertainty)
 
-            local_boxes = [
-                (box[0] - crop.x, box[1] - crop.y, box[2] - crop.x, box[3] - crop.y)
-                for _, box in mapped
-            ]
+            def _local(box: Sequence[float]) -> tuple[float, float, float, float]:
+                return (box[0] - crop.x, box[1] - crop.y, box[2] - crop.x, box[3] - crop.y)
+
+            main_boxes = [_local(motorcycle_box)]
+            main_labels = ["main:motorcycle"]
+            if context.rider_box is not None:
+                main_boxes.append(_local(context.rider_box))
+                main_labels.append("main:rider")
+            for other in context.motorcycles:
+                main_boxes.append(_local(other.box))
+                main_labels.append("main:other_motorcycle")
+            overlay = draw_mapped_boxes(image, main_boxes, labels=main_labels)
             overlay = draw_mapped_boxes(
-                image,
-                local_boxes,
+                overlay,
+                [_local(box) for _, box in mapped],
                 labels=[str(det["class_label"]) for det, _ in mapped],
                 confidences=[float(det["confidence"]) for det, _ in mapped],
             )
@@ -887,10 +1017,11 @@ class MotorcycleDetailScanner:
         uncertainty = list(dict.fromkeys(uncertainty))
         observations = {
             "scan": {
-                "model": checkpoint.identity,
-                "class_names": list(checkpoint.class_names),
+                **checkpoint.describe(),
                 "conf": self.conf,
                 "frames_scanned": len(frame_records),
+                "attribution_source": "main_detector",
+                "review_only": True,
             },
             "frames": frame_records,
             "association": primary_assoc.as_dict(),
@@ -966,29 +1097,9 @@ class MotorcycleDetailScanner:
         return cv2.resize(image, target, interpolation=cv2.INTER_LINEAR)
 
     @staticmethod
-    def _reference_motorcycle_box(
-        frame: Mapping[str, Any], detections: Sequence[Mapping[str, Any]]
-    ) -> tuple[float, float, float, float]:
-        from core.motorcycle_detail import box_iou, box_of
-
-        stored_box: tuple[float, float, float, float] | None = None
-        stored = frame.get("detection_bbox")
-        if isinstance(stored, dict):
-            try:
-                x = float(stored["x"])
-                y = float(stored["y"])
-                stored_box = (x, y, x + float(stored["w"]), y + float(stored["h"]))
-            except (KeyError, TypeError, ValueError):
-                stored_box = None
-        scanned = [d for d in detections if str(d.get("class_label")) == "motorcycle"]
-        if stored_box is not None:
-            for det in scanned:
-                if box_iou(box_of(det), stored_box) >= 0.2:
-                    return box_of(det)
-            return stored_box
-        if scanned:
-            best = max(
-                scanned, key=lambda d: float(d.get("bbox_w") or 0) * float(d.get("bbox_h") or 0)
-            )
-            return box_of(best)
-        raise DetailScanError("candidate_motorcycle_reference_missing")
+    def _reference_motorcycle_box(frame: Mapping[str, Any]) -> tuple[float, float, float, float]:
+        """The main detector's stored target motorcycle box (never a scan box)."""
+        stored_box = box_from_dict(frame.get("detection_bbox"))
+        if stored_box is None:
+            raise DetailScanError("candidate_motorcycle_reference_missing")
+        return stored_box
