@@ -8,6 +8,7 @@ main detector's class-map metadata (and is skipped when the file is absent).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -518,7 +519,8 @@ def video_id(test_db):
 
 
 def _seed(test_db, video_id, *, occurrence_key="t7g1", frames=(1,), crop=CROP,
-          with_context=True, motorcycles=(), rider=True, context_extra=None):
+          with_context=True, motorcycles=(), rider=True, context_extra=None,
+          frame_context_extra=None):
     import config
 
     root = Path(config.EVIDENCE_FOLDER) / "detail" / "run_1" / occurrence_key
@@ -554,6 +556,7 @@ def _seed(test_db, video_id, *, occurrence_key="t7g1", frames=(1,), crop=CROP,
                 "truncated": False,
             }
             entry["main_context"].update(context_extra or {})
+            entry["main_context"].update((frame_context_extra or {}).get(index, {}))
         entries.append(entry)
     return test_db.upsert_motorcycle_detail_candidate(
         video_id=video_id,
@@ -1134,3 +1137,589 @@ class TestTruncatedContextFailsClosed:
         assert association["context"]["truncated_lists"] == {"motorcycles": True, "riders": False}
         assert "context:nearby_motorcycles_truncated" in json.loads(row["uncertainty_json"])
         assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
+
+
+DETAIL_4 = DETAIL_3 + ("no_helmet",)
+
+
+def _ok_4c_checkpoint():
+    return DetailCheckpoint(
+        path="mock4",
+        class_names=DETAIL_4,
+        ok=True,
+        identity="md4c:mock4",
+        architecture="yolov8n",
+        contract_version="md-detail-4c-v1",
+        model_kind="motorcycle_detail_4class",
+        identity_prefix="md4c",
+    )
+
+
+class TestFourClassContract:
+    def test_both_exact_orders_resolve_and_keep_their_identity(self):
+        from core.motorcycle_detail_contract import resolve_detail_contract
+
+        three = resolve_detail_contract(_map(DETAIL_3))
+        four = resolve_detail_contract(_map(DETAIL_4))
+        assert three.ok and three.version == "md-detail-3c-v1"
+        assert three.identity_prefix == "md3c" and three.class_names == DETAIL_3
+        assert four.ok and four.version == "md-detail-4c-v1"
+        assert four.identity_prefix == "md4c"
+        assert four.class_map()["3"] == "no_helmet"
+        assert "no_helmet" not in three.class_names
+
+    @pytest.mark.parametrize(
+        ("names", "code"),
+        [
+            (PILOT_3, "reordered_names"),
+            (MAIN_15, "wrong_class_count"),
+            (("helmet_nut_shell", "helmet_acceptable", "side_mirror", "person"), "renamed_names"),
+            (("no_helmet", "helmet_nut_shell", "helmet_acceptable", "side_mirror"), "reordered_names"),
+            (("side_mirror", "helmet_nut_shell", "helmet_acceptable", "no_helmet"), "reordered_names"),
+            (("helmet_nut_shell", "helmet_acceptable", "side_mirror", "no_helmet", "rider"), "wrong_class_count"),
+            (("helmet_nut_shell", "helmet_nut_shell", "side_mirror", "no_helmet"), "duplicate_names"),
+            (None, "missing"),
+            ({}, "malformed"),
+            ({0: "helmet_nut_shell", 1: "helmet_acceptable", 3: "side_mirror"}, "non_contiguous_class_ids"),
+        ],
+    )
+    def test_bad_maps_are_rejected_with_a_visible_reason(self, names, code):
+        from core.motorcycle_detail_contract import resolve_detail_contract
+
+        if names is None or names == {} or isinstance(names, dict):
+            raw = names
+        else:
+            raw = _map(names)
+        report = resolve_detail_contract(raw)
+        assert not report.ok
+        assert report.code == code
+        assert report.reason
+        if code == "reordered_names" and names is not None and tuple(names[:3]) == PILOT_3:
+            assert "pilot" in report.reason and "never relabeled" in report.reason
+
+    def test_class_id_3_is_no_helmet_only_on_a_four_class_checkpoint(self):
+        boxes = [
+            SimpleNamespace(cls=np.array([3]), conf=np.array([0.66]), xyxy=np.array([[4.0, 5.0, 14.0, 16.0]]))
+        ]
+        model = SimpleNamespace(predict=lambda **kwargs: [SimpleNamespace(names=_map(DETAIL_4), boxes=boxes)])
+        out = UltralyticsCropPredictor(model, DETAIL_4, conf=0.25).predict(np.zeros((8, 8, 3), np.uint8))
+        assert out[0]["class_label"] == "no_helmet"
+        three = SimpleNamespace(predict=lambda **kwargs: [SimpleNamespace(names=_map(DETAIL_3), boxes=boxes)])
+        with pytest.raises(DetailScanError, match="out_of_range"):
+            UltralyticsCropPredictor(three, DETAIL_3, conf=0.25).predict(np.zeros((8, 8, 3), np.uint8))
+        mismatched = SimpleNamespace(predict=lambda **kwargs: [SimpleNamespace(names=_map(DETAIL_4), boxes=boxes)])
+        with pytest.raises(DetailScanError, match="class_map_mismatch"):
+            UltralyticsCropPredictor(mismatched, DETAIL_3, conf=0.25).predict(np.zeros((8, 8, 3), np.uint8))
+
+    def test_four_class_checkpoint_identity_is_not_described_as_three_class(self, tmp_path):
+        weights = tmp_path / "detail4.pt"
+        weights.write_bytes(b"four-class")
+        cp = load_detail_checkpoint(str(weights), model_loader=lambda path: _model(_map(DETAIL_4)))
+        assert cp.ok, cp.reason
+        assert cp.identity.startswith("md4c:detail4.pt:")
+        assert cp.contract_version == "md-detail-4c-v1"
+        assert cp.model_kind == "motorcycle_detail_4class"
+        described = cp.describe()
+        assert described["contract"] == "md-detail-4c-v1"
+        assert described["identity_prefix"] == "md4c"
+        assert described["class_map"]["3"] == "no_helmet"
+        assert "motorcycle_detail_3class" not in json.dumps(described)
+
+    def test_no_helmet_is_a_positive_main_rider_head_observation(self):
+        from core.detection_config import OBJECT_DETECTOR_CLASSES
+
+        assert "no_helmet" not in OBJECT_DETECTOR_CLASSES
+        result = _assoc([("no_helmet", HELMET_SRC)], _ctx())
+        assert result.rider.source == "main_detector"
+        assert result.rider.rider_track_id == 11
+        assert result.helmet.state == "uncovered_head"
+        assert [o.label for o in result.helmet.observations] == ["no_helmet"]
+        assert result.helmet.state != "unknown"
+
+    def test_missing_detection_stays_unknown_on_both_contracts(self):
+        result = _assoc([], _ctx())
+        assert result.helmet.state == "unknown"
+        assert result.helmet.observations == ()
+        assert "helmet:no_observation_does_not_prove_absence" in result.uncertainty
+
+    def test_person_is_not_the_rider_for_an_uncovered_head(self):
+        unowned = _assoc(
+            [("person", RIDER), ("no_helmet", HELMET_SRC)],
+            _ctx(rider_state="unassociated"),
+        )
+        assert unowned.rider.state == "unassociated"
+        assert unowned.helmet.state == "unknown"
+        owned = _assoc([("person", RIDER), ("rider", RIDER), ("no_helmet", HELMET_SRC)], _ctx())
+        assert owned.rider.source == "main_detector"
+        assert owned.rider.rider_track_id == 11
+        assert owned.helmet.state == "uncovered_head"
+
+    def test_nearby_rider_truncated_context_and_clipped_box_are_not_definite(self):
+        pillion = (140.0, 55.0, 180.0, 140.0)
+        shared = _assoc([("no_helmet", HELMET_SRC)], _ctx(riders=[pillion]))
+        assert shared.helmet.state == "ambiguous"
+        assert shared.helmet.observations == ()
+        truncated = _assoc(
+            [("no_helmet", HELMET_SRC)],
+            _ctx(truncated=True, truncated_lists={"motorcycles": False, "riders": True}),
+        )
+        assert truncated.helmet.state == "ambiguous"
+        assert truncated.helmet.state != "uncovered_head"
+        clipped = to_pipeline_detection("no_helmet", 0.9, HELMET_SRC)
+        clipped["evidence_limited"] = True
+        limited = associate_scan_detections(
+            [clipped], motorcycle_box=BIKE, frame_w=FRAME_W, frame_h=FRAME_H, main_context=_ctx()
+        )
+        assert limited.helmet.state == "ambiguous"
+        assert limited.helmet.observations[0].label == "no_helmet"
+        assert "uncovered_head_box_clipped_or_unclear" in limited.helmet.reasons
+
+    def test_contradictory_head_labels_stay_ambiguous_and_keep_both_boxes(self):
+        detections = [
+            to_pipeline_detection("helmet_nut_shell", 0.99, HELMET_SRC),
+            to_pipeline_detection("no_helmet", 0.4, (148.0, 60.0, 172.0, 84.0)),
+        ]
+        result = associate_scan_detections(
+            detections, motorcycle_box=BIKE, frame_w=FRAME_W, frame_h=FRAME_H, main_context=_ctx()
+        )
+        assert result.helmet.state == "ambiguous"
+        labels = {o.label for o in result.helmet.observations}
+        assert labels == {"helmet_nut_shell", "no_helmet"}
+        assert "contradictory_head_labels" in result.helmet.reasons
+
+    def test_scan_maps_no_helmet_and_keeps_frame_conflicts_ambiguous(
+        self, test_db, video_id, evidence_root
+    ):
+        candidate_id = _seed(test_db, video_id, frames=(1, 2))
+        calls = []
+
+        def predictor(image):
+            calls.append(1)
+            label = "helmet_acceptable" if len(calls) == 1 else "no_helmet"
+            return [{"class_label": label, "confidence": 0.8, "bbox": _to_crop(HELMET_SRC)}]
+
+        report = _scanner(test_db, predictor, loader=_ok_4c_checkpoint).run_once()
+        assert report["ready"] == 1 and len(calls) == 2
+        row = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert row["scan_model"] == "md4c:mock4"
+        assert json.loads(row["scan_class_map_json"]) == list(DETAIL_4)
+        observations = json.loads(row["observations_json"])
+        assert observations["scan"]["contract"] == "md-detail-4c-v1"
+        assert observations["scan"]["model_kind"] == "motorcycle_detail_4class"
+        assert observations["scan"]["no_helmet_policy"] == "positive_visible_uncovered_head_review_only"
+        assert observations["frames"][0]["association"]["helmet"]["state"] == "acceptable"
+        uncovered = observations["frames"][1]["detections"][0]
+        assert uncovered["class_label"] == "no_helmet"
+        assert uncovered["class_id"] == 3
+        assert uncovered["contract"] == "md-detail-4c-v1"
+        assert uncovered["source_bbox"] == [pytest.approx(v) for v in HELMET_SRC]
+        summary = json.loads(row["association_json"])
+        assert summary["helmet"]["state"] == "ambiguous"
+        assert "contradictory_helmet_observations_across_frames" in summary["helmet"]["reasons"]
+        assert {o["label"] for o in summary["helmet"]["observations"]} == {"helmet_acceptable", "no_helmet"}
+        assert "helmet:contradictory_helmet_observations_across_frames" in json.loads(row["uncertainty_json"])
+        assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
+
+    def test_edge_no_helmet_box_is_clamped_and_not_a_definite_attribution(
+        self, test_db, video_id, evidence_root
+    ):
+        edge = {"x": 0, "y": 0, "w": 220, "h": 210}
+        candidate_id = _seed(test_db, video_id, crop=edge)
+
+        def predictor(image):
+            return [{"class_label": "no_helmet", "confidence": 0.7, "bbox": (145.0, -15.0, 175.0, 85.0)}]
+
+        _scanner(test_db, predictor, loader=_ok_4c_checkpoint).run_once()
+        observations = json.loads(test_db.get_motorcycle_detail_candidate(candidate_id)["observations_json"])
+        detection = observations["frames"][0]["detections"][0]
+        assert detection["class_id"] == 3
+        assert detection["source_bbox"][0] == pytest.approx(145.0)
+        assert detection["source_bbox"][1] == 0.0
+        assert detection["evidence_limited"] is True
+        assert observations["frames"][0]["association"]["helmet"]["state"] == "ambiguous"
+
+    def test_rejected_four_class_map_reads_zero_crops(self, test_db, video_id, evidence_root, tmp_path):
+        candidate_id = _seed(test_db, video_id)
+        weights = tmp_path / "mixed.pt"
+        weights.write_bytes(b"weights")
+        calls, factory_calls, crop_reads = [], [], []
+        original = MotorcycleDetailScanner._read_crop_image
+
+        def _counting_reader(*args, **kwargs):
+            crop_reads.append(args)
+            return original(*args, **kwargs)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(MotorcycleDetailScanner, "_read_crop_image", staticmethod(_counting_reader))
+        try:
+            scanner = _scanner(
+                test_db,
+                _three_class_predictor(calls),
+                loader=lambda: load_detail_checkpoint(
+                    str(weights),
+                    model_loader=lambda p: _model(_map(("helmet_nut_shell", "no_helmet", "side_mirror", "helmet_acceptable"))),
+                ),
+                factory_calls=factory_calls,
+            )
+            report = scanner.run_once()
+        finally:
+            monkeypatch.undo()
+        assert report["skipped"] == "detail_checkpoint_unavailable"
+        assert "reordered_names" in report["gate_reason"]
+        assert calls == [] and factory_calls == [] and crop_reads == []
+        row = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert row["scan_state"] == "queued" and row["scan_attempts"] == 0
+
+    def test_four_class_scan_and_human_outcomes_write_zero_violations(
+        self, test_db, video_id, evidence_root, app_workers
+    ):
+        ids = [_seed(test_db, video_id, occurrence_key=f"t{k}g1") for k in (17, 18, 19)]
+        baseline = _protected_counts(test_db)
+
+        def predictor(image):
+            return [{"class_label": "no_helmet", "confidence": 0.8, "bbox": _to_crop(HELMET_SRC)}]
+
+        report = _scanner(test_db, predictor, loader=_ok_4c_checkpoint, batch_limit=3).run_once()
+        assert report["ready"] == 3
+        for candidate_id in ids:
+            association = json.loads(test_db.get_motorcycle_detail_candidate(candidate_id)["association_json"])
+            assert association["helmet"]["state"] == "uncovered_head"
+        assert _protected_counts(test_db) == baseline
+        client = _enforcer_client("md4_enforcer", "md4-enforcer-pass")
+        for candidate_id, outcome in zip(ids, ("reviewed", "dismissed", "uncertain")):
+            response = client.post(
+                f"/api/motorcycle-detail-review/{candidate_id}/outcome", json={"outcome": outcome}
+            )
+            assert response.status_code == 200
+        assert _protected_counts(test_db) == baseline
+        assert test_db.count_review_pending() == 0
+
+    def test_page_shows_both_contracts_and_old_rows_remain_readable(
+        self, test_db, video_id, evidence_root, app_workers
+    ):
+        old_id = _seed(test_db, video_id, occurrence_key="t4g1", with_context=False)
+        test_db.claim_motorcycle_detail_scans(10)
+        test_db.finish_motorcycle_detail_scan(
+            candidate_id=old_id,
+            observations_json=json.dumps({"scan": {"model": "md3c:old.pt:abc", "contract": "md-detail-3c-v1"}}),
+            association_json=json.dumps({"helmet": {"state": "unknown"}, "rider": {"state": "unassociated"}}),
+            uncertainty_json=json.dumps(["helmet:no_observation_does_not_prove_absence"]),
+            scan_model="md3c:old.pt:abc",
+            scan_class_map_json=json.dumps(list(DETAIL_3)),
+        )
+        client = _enforcer_client("md4_page", "md4-page-password")
+        body = client.get("/motorcycle-detail-review?outcome=all").get_data(as_text=True)
+        assert "three-class" in body and "four-class" in body
+        assert "md-detail-4c-v1" in body and "3=no_helmet" in body
+        assert "Uncovered head observed" in body
+        assert "15-class object roster" not in body
+        payload = client.get("/api/motorcycle-detail-review?outcome=all").get_json()
+        assert payload["gate"]["contract"]["version"] == "md-detail-3c-v1"
+        assert payload["gate"]["contract"]["classes"] == list(DETAIL_3)
+        versions = [item["version"] for item in payload["gate"]["supported_contracts"]]
+        assert versions == ["md-detail-3c-v1", "md-detail-4c-v1"]
+        old = next(item for item in payload["items"] if item["id"] == old_id)
+        assert old["scan_class_map"] == list(DETAIL_3)
+        assert old["association"]["helmet"]["state"] == "unknown"
+        assert old["can_confirm"] is False
+
+
+# ---------------------------------------------------------------------------
+# Top-level helmet summary aggregates every selected frame
+# ---------------------------------------------------------------------------
+
+PILLION = (140.0, 55.0, 180.0, 140.0)  # second rider whose head region holds HELMET_SRC
+SECOND_HEAD_SRC = (148.0, 60.0, 172.0, 84.0)
+_PILLION_CONTEXT = {"riders": [{"track_id": 30, "confidence": 0.9, "bbox": _xywh(PILLION)}]}
+_DEFINITE = ("acceptable", "nut_shell", "uncovered_head")
+
+# Per-frame scenario -> (detail detections, per-frame main-context override).
+_FRAME_SPECS = {
+    "unknown": ([], None),
+    "acceptable": ([("helmet_acceptable", HELMET_SRC)], None),
+    "nut_shell": ([("helmet_nut_shell", HELMET_SRC)], None),
+    "uncovered_head": ([("no_helmet", HELMET_SRC)], None),
+    # Helmet on a head shared with another main-detector rider: unattributed.
+    "ambiguous": ([("helmet_acceptable", HELMET_SRC)], _PILLION_CONTEXT),
+    # Helmet label and uncovered head on the same head (four-class only).
+    "ambiguous_labels": ([("helmet_nut_shell", HELMET_SRC), ("no_helmet", SECOND_HEAD_SRC)], None),
+}
+
+
+def _frame_state(scenario):
+    return "ambiguous" if scenario.startswith("ambiguous") else scenario
+
+
+def _scan_frames(test_db, video_id, scenarios, *, four_class, occurrence_key="t7g1"):
+    frames = tuple(range(1, len(scenarios) + 1))
+    per_frame_context = {
+        index: _FRAME_SPECS[name][1]
+        for index, name in zip(frames, scenarios)
+        if _FRAME_SPECS[name][1]
+    }
+    candidate_id = _seed(
+        test_db, video_id, occurrence_key=occurrence_key, frames=frames,
+        frame_context_extra=per_frame_context,
+    )
+    calls = []
+
+    def predictor(image):
+        detections = _FRAME_SPECS[scenarios[len(calls)]][0]
+        calls.append(1)
+        return [{"class_label": label, "confidence": 0.8, "bbox": _to_crop(box)} for label, box in detections]
+
+    loader = _ok_4c_checkpoint if four_class else _ok_checkpoint
+    report = _scanner(test_db, predictor, loader=loader).run_once()
+    assert report["ready"] == 1 and len(calls) == len(scenarios)
+    return candidate_id, test_db.get_motorcycle_detail_candidate(candidate_id)
+
+
+def _rendered_helmet(body):
+    match = re.search(r"Helmet:\s*(.*?)\s*·", body, re.S)
+    assert match, "review row does not render a helmet state"
+    return match.group(1).strip()
+
+
+def _function_frame(scenario):
+    detections, extra = _FRAME_SPECS[scenario]
+    return _assoc(detections, _ctx(riders=[PILLION]) if extra else _ctx())
+
+
+def _function_summary(scenarios):
+    """Mirror the scanner: the primary (first) frame unless a summary is returned."""
+    from core.motorcycle_detail_scan import _reconcile_helmet_across_frames
+
+    associations = [_function_frame(name) for name in scenarios]
+    before = [a.as_dict() for a in associations]
+    reconciled, reason = _reconcile_helmet_across_frames(associations)
+    assert [a.as_dict() for a in associations] == before
+    summary = reconciled if reconciled is not None else associations[0].helmet
+    return summary, reason, associations
+
+
+_TWO_FRAME_TABLE = [
+    # (selected-frame scenarios in scan order; first is primary, top-level state, four-class)
+    (("unknown", "unknown"), "unknown", False),
+    (("unknown", "unknown"), "unknown", True),
+    (("unknown", "uncovered_head"), "uncovered_head", True),
+    (("uncovered_head", "unknown"), "uncovered_head", True),
+    (("unknown", "acceptable"), "acceptable", False),
+    (("acceptable", "unknown"), "acceptable", False),
+    (("unknown", "nut_shell"), "nut_shell", False),
+    (("nut_shell", "unknown"), "nut_shell", True),
+    (("unknown", "ambiguous"), "ambiguous", False),
+    (("ambiguous", "unknown"), "ambiguous", False),
+    (("unknown", "ambiguous_labels"), "ambiguous", True),
+    (("ambiguous_labels", "unknown"), "ambiguous", True),
+    (("ambiguous", "ambiguous_labels"), "ambiguous", True),
+    (("acceptable", "acceptable"), "acceptable", False),
+    (("uncovered_head", "uncovered_head"), "uncovered_head", True),
+    (("acceptable", "nut_shell"), "ambiguous", False),
+    (("nut_shell", "acceptable"), "ambiguous", False),
+    (("acceptable", "uncovered_head"), "ambiguous", True),
+    (("uncovered_head", "acceptable"), "ambiguous", True),
+    (("nut_shell", "uncovered_head"), "ambiguous", True),
+    (("acceptable", "ambiguous"), "ambiguous", False),
+    (("ambiguous", "acceptable"), "ambiguous", False),
+    (("uncovered_head", "ambiguous"), "ambiguous", True),
+    (("ambiguous", "uncovered_head"), "ambiguous", True),
+    (("ambiguous_labels", "nut_shell"), "ambiguous", True),
+]
+
+_THREE_FRAME_TABLE = [
+    (("unknown", "unknown", "unknown"), "unknown"),
+    (("unknown", "uncovered_head", "unknown"), "uncovered_head"),
+    (("unknown", "unknown", "ambiguous"), "ambiguous"),
+    (("acceptable", "unknown", "acceptable"), "acceptable"),
+    (("unknown", "nut_shell", "ambiguous"), "ambiguous"),
+    (("uncovered_head", "unknown", "nut_shell"), "ambiguous"),
+    (("ambiguous", "unknown", "ambiguous_labels"), "ambiguous"),
+    (("nut_shell", "uncovered_head", "acceptable"), "ambiguous"),
+]
+
+
+def _check_summary_against_frames(summary, frame_helmets, expected):
+    """Shared assertions on a top-level summary built from per-frame helmet dicts."""
+    states = [f["state"] for f in frame_helmets]
+    assert summary["state"] == expected
+    if expected == "unknown":
+        assert set(states) == {"unknown"}
+        assert summary == frame_helmets[0]
+        return
+    contributing = [f for f in frame_helmets if f["state"] != "unknown"]
+    summary_labels = {o["label"] for o in summary["observations"]}
+    for frame in contributing:
+        assert {o["label"] for o in frame["observations"]} <= summary_labels
+        assert set(frame["reasons"]) <= set(summary["reasons"])
+    definite = {s for s in states if s in _DEFINITE}
+    conflict = len(definite) > 1 or (definite and "ambiguous" in states)
+    if conflict:
+        assert "contradictory_helmet_observations_across_frames" in summary["reasons"]
+    else:
+        assert "contradictory_helmet_observations_across_frames" not in summary["reasons"]
+    if "unknown" in states:
+        assert "evidence_on_some_selected_frames_only" in summary["reasons"]
+    if expected == "ambiguous":
+        assert summary["reasons"]
+
+
+class TestCrossFrameHelmetSummary:
+    def test_unknown_primary_then_uncovered_head_reaches_saved_json_and_reviewer(
+        self, test_db, video_id, evidence_root, app_workers
+    ):
+        candidate_id, row = _scan_frames(
+            test_db, video_id, ("unknown", "uncovered_head"), four_class=True
+        )
+        observations = json.loads(row["observations_json"])
+        frames = observations["frames"]
+        assert row["frame_number"] == frames[0]["frame_number"] == 10
+        assert frames[0]["detections"] == []
+        assert frames[0]["association"]["helmet"]["state"] == "unknown"
+        assert frames[0]["association"]["helmet"]["observations"] == []
+        assert frames[1]["association"]["helmet"]["state"] == "uncovered_head"
+        assert frames[1]["detections"][0]["class_label"] == "no_helmet"
+        assert frames[1]["detections"][0]["class_id"] == 3
+
+        summary = json.loads(row["association_json"])
+        assert summary == observations["association"]
+        assert summary["helmet"]["state"] == "uncovered_head"
+        assert [o["label"] for o in summary["helmet"]["observations"]] == ["no_helmet"]
+        assert summary["helmet"]["observations"][0]["box"] == [pytest.approx(v) for v in HELMET_SRC]
+        assert "evidence_on_some_selected_frames_only" in summary["helmet"]["reasons"]
+        uncertainty = json.loads(row["uncertainty_json"])
+        assert "helmet:evidence_on_some_selected_frames_only" in uncertainty
+        assert "helmet:no_observation_does_not_prove_absence" in uncertainty
+
+        client = _enforcer_client("md_xf_uncovered", "md-xf-uncovered-pass")
+        item = next(
+            i for i in client.get("/api/motorcycle-detail-review?outcome=all").get_json()["items"]
+            if i["id"] == candidate_id
+        )
+        assert item["association"]["helmet"]["state"] == "uncovered_head"
+        assert item["can_confirm"] is False
+        body = client.get("/motorcycle-detail-review?outcome=all").get_data(as_text=True)
+        assert _rendered_helmet(body) == "Uncovered head observed (review only)"
+        assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
+
+    @pytest.mark.parametrize(
+        "scenarios,four_class,frame_reason",
+        [
+            (("unknown", "ambiguous"), False, "helmet_in_other_rider_head_region_unattributed"),
+            (("unknown", "ambiguous_labels"), True, "contradictory_head_labels"),
+        ],
+        ids=["three-class-shared-head", "four-class-contradictory-labels"],
+    )
+    def test_unknown_primary_then_ambiguous_reaches_saved_json_and_reviewer(
+        self, test_db, video_id, evidence_root, app_workers, scenarios, four_class, frame_reason
+    ):
+        candidate_id, row = _scan_frames(test_db, video_id, scenarios, four_class=four_class)
+        observations = json.loads(row["observations_json"])
+        frames = observations["frames"]
+        assert frames[0]["association"]["helmet"]["state"] == "unknown"
+        later = frames[1]["association"]["helmet"]
+        assert later["state"] == "ambiguous"
+        assert frame_reason in later["reasons"]
+
+        summary = json.loads(row["association_json"])
+        assert summary == observations["association"]
+        helmet = summary["helmet"]
+        assert helmet["state"] == "ambiguous"
+        assert frame_reason in helmet["reasons"]
+        assert "evidence_on_some_selected_frames_only" in helmet["reasons"]
+        assert helmet["observations"] == later["observations"]
+        assert "helmet:evidence_on_some_selected_frames_only" in json.loads(row["uncertainty_json"])
+
+        client = _enforcer_client("md_xf_ambiguous", "md-xf-ambiguous-pass")
+        item = next(
+            i for i in client.get("/api/motorcycle-detail-review?outcome=all").get_json()["items"]
+            if i["id"] == candidate_id
+        )
+        assert item["association"]["helmet"]["state"] == "ambiguous"
+        body = client.get("/motorcycle-detail-review?outcome=all").get_data(as_text=True)
+        assert _rendered_helmet(body) == "ambiguous"
+        assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
+
+    @pytest.mark.parametrize(
+        "scenarios,expected,four_class",
+        _TWO_FRAME_TABLE,
+        ids=["-".join(s) + ("-4c" if fc else "-3c") for s, _e, fc in _TWO_FRAME_TABLE],
+    )
+    def test_scanned_summary_follows_the_aggregation_table(
+        self, test_db, video_id, evidence_root, scenarios, expected, four_class
+    ):
+        _candidate_id, row = _scan_frames(test_db, video_id, scenarios, four_class=four_class)
+        observations = json.loads(row["observations_json"])
+        frame_helmets = [f["association"]["helmet"] for f in observations["frames"]]
+        assert [f["state"] for f in frame_helmets] == [_frame_state(s) for s in scenarios]
+        for scenario, frame in zip(scenarios, observations["frames"]):
+            if scenario == "unknown":
+                assert frame["detections"] == []
+                assert frame["association"]["helmet"]["observations"] == []
+        summary = json.loads(row["association_json"])
+        assert summary == observations["association"]
+        _check_summary_against_frames(summary["helmet"], frame_helmets, expected)
+        uncertainty = json.loads(row["uncertainty_json"])
+        if "contradictory_helmet_observations_across_frames" in summary["helmet"]["reasons"]:
+            assert "helmet:contradictory_helmet_observations_across_frames" in uncertainty
+        if not four_class:
+            assert observations["scan"]["contract"] == "md-detail-3c-v1"
+            assert observations["scan"]["no_helmet_policy"] == "class_not_in_contract"
+            assert "uncovered_head" not in [f["state"] for f in frame_helmets]
+            assert summary["helmet"]["state"] != "uncovered_head"
+        assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
+
+    @pytest.mark.parametrize(
+        "scenarios,expected",
+        [(s, e) for s, e, _fc in _TWO_FRAME_TABLE] + _THREE_FRAME_TABLE,
+        ids=["-".join(s) for s, _e, _fc in _TWO_FRAME_TABLE] + ["-".join(s) for s, _e in _THREE_FRAME_TABLE],
+    )
+    def test_aggregation_covers_every_selected_frame(self, scenarios, expected):
+        summary, reason, associations = _function_summary(scenarios)
+        frame_helmets = [a.helmet.as_dict() for a in associations]
+        assert [f["state"] for f in frame_helmets] == [_frame_state(s) for s in scenarios]
+        _check_summary_against_frames(summary.as_dict(), frame_helmets, expected)
+        if reason is not None:
+            assert reason in summary.reasons
+
+    def test_no_detection_on_every_frame_stays_unknown_on_both_contracts(
+        self, test_db, video_id, evidence_root
+    ):
+        for four_class, key in ((False, "t31g1"), (True, "t32g1")):
+            _candidate_id, row = _scan_frames(
+                test_db, video_id, ("unknown", "unknown"), four_class=four_class, occurrence_key=key
+            )
+            summary = json.loads(row["association_json"])
+            assert summary["helmet"]["state"] == "unknown"
+            assert summary["helmet"]["observations"] == []
+            uncertainty = json.loads(row["uncertainty_json"])
+            assert "helmet:no_observation_does_not_prove_absence" in uncertainty
+            assert not any("selected_frames" in u for u in uncertainty)
+
+    def test_cross_frame_scans_and_every_human_outcome_write_zero_protected_rows(
+        self, test_db, video_id, evidence_root, app_workers
+    ):
+        baseline = _protected_counts(test_db)
+        assert set(baseline.values()) == {0}
+        ids = []
+        for scenarios, key in (
+            (("unknown", "uncovered_head"), "t41g1"),
+            (("unknown", "ambiguous_labels"), "t42g1"),
+            (("acceptable", "uncovered_head"), "t43g1"),
+        ):
+            candidate_id, _row = _scan_frames(
+                test_db, video_id, scenarios, four_class=True, occurrence_key=key
+            )
+            ids.append(candidate_id)
+            assert _protected_counts(test_db) == baseline
+        client = _enforcer_client("md_xf_outcomes", "md-xf-outcomes-pass")
+        for candidate_id, outcome in zip(ids, ("reviewed", "dismissed", "uncertain")):
+            response = client.post(
+                f"/api/motorcycle-detail-review/{candidate_id}/outcome", json={"outcome": outcome}
+            )
+            assert response.status_code == 200, response.get_data(as_text=True)
+            assert test_db.get_motorcycle_detail_candidate(candidate_id)["human_outcome"] == outcome
+        assert client.post(
+            f"/api/motorcycle-detail-review/{ids[0]}/outcome", json={"outcome": "confirmed"}
+        ).status_code == 400
+        assert _protected_counts(test_db) == baseline
+        assert test_db.count_review_pending() == 0

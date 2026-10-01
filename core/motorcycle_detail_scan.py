@@ -1,24 +1,27 @@
 """Queued second YOLOv8 pass over motorcycle detail crops.
 
 The detail pass scans the bounded crops selected by
-:mod:`core.motorcycle_detail` with a **separate three-class detail checkpoint**
-and records helmet / side-mirror observations for a **separate human-review
-queue**. Hard boundaries:
+:mod:`core.motorcycle_detail` with a **separate detail checkpoint**
+(``md-detail-3c-v1`` or ``md-detail-4c-v1``) and records helmet / side-mirror
+observations for a **separate human-review queue**. A four-class checkpoint may
+also record ``no_helmet`` as a positive uncovered-head observation for human
+review. Hard boundaries:
 
 - The scan can supply evidence or raise a review flag. It never declares,
   confirms, or creates a violation, and it never writes to ``violations`` or
   ``review_queue``. Its output never reaches the main tracker or
   ``core.violation_engine``.
-- The designated checkpoint's **exact three-class ID order**
-  (:data:`core.motorcycle_detail_contract.DETAIL_MODEL_CLASSES`) is validated
-  before the first crop is scanned. A missing, unreadable, reordered, renamed,
-  duplicated, or mis-sized class map fails closed: no crop is scanned and no
-  observation is produced. The main 15-class object checkpoint is not a detail
-  checkpoint and is rejected here.
-- The detail model outputs only ``helmet_nut_shell``, ``helmet_acceptable``,
-  and ``side_mirror``. Rider and motorcycle attribution uses the main
-  detector's context stored with each selected frame
-  (:class:`core.motorcycle_detail.MainDetectorContext`).
+- The designated checkpoint is validated against the two explicit ordered
+  contracts before the first crop is scanned. A missing, unreadable, reordered,
+  renamed, duplicated, or other class map fails closed: no crop is scanned and
+  no observation is produced. The main 15-class object checkpoint is not a
+  detail checkpoint and is rejected here. A three-class checkpoint cannot emit
+  ``no_helmet``.
+- The detail model outputs only the classes in the selected contract. Rider
+  and motorcycle attribution uses the main detector's context stored with each
+  selected frame (:class:`core.motorcycle_detail.MainDetectorContext`).
+  ``no_helmet`` is a positive visible-head observation, never an inferred
+  absence, and it never creates a violation.
 - Crop inference holds the **shared GPU reservation**
   (:mod:`core.gpu_inference_slot`) for the whole batch, so it cannot overlap
   an uploaded-video job, a manual scan, or a live camera frame. The cheap
@@ -60,7 +63,12 @@ from core.detection_config import (
 )
 from core.gpu_inference_slot import PRIORITY_DETAIL_SCAN
 from core.motorcycle_detail import (
+    HELMET_ACCEPTABLE,
+    HELMET_NUT_SHELL,
+    HELMET_UNCOVERED,
+    HELMET_UNKNOWN,
     MAX_FRAMES_PER_OCCURRENCE,
+    STATE_AMBIGUOUS,
     AttributeAssociation,
     CropRect,
     MainDetectorContext,
@@ -73,13 +81,19 @@ from core.motorcycle_detail import (
     padded_crop_rect,
 )
 from core.motorcycle_detail_contract import (
+    DETAIL_CLASS_NO_HELMET,
     DETAIL_CONTRACT_VERSION,
+    DETAIL_CONTRACT_VERSION_4C,
     DETAIL_IDENTITY_PREFIX,
+    DETAIL_IDENTITY_PREFIX_4C,
     DETAIL_MODEL_CLASSES,
+    DETAIL_MODEL_CLASSES_4C,
     DETAIL_MODEL_KIND,
+    DETAIL_MODEL_KIND_4C,
     check_detail_class_map,
     check_detail_task,
     detail_architecture_hint,
+    resolve_detail_contract,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +119,17 @@ class DetailScanError(RuntimeError):
     """One candidate could not be scanned (crop read, inference, or decode)."""
 
 
+_DEFINITE_HELMET_STATES = frozenset({HELMET_ACCEPTABLE, HELMET_NUT_SHELL, HELMET_UNCOVERED})
+_HEAD_LABELS = frozenset(
+    {
+        YOLO_CLASS_HELMET_ACCEPTABLE,
+        YOLO_CLASS_HELMET_NUT_SHELL,
+        YOLO_CLASS_HELMET,
+        DETAIL_CLASS_NO_HELMET,
+    }
+)
+
+
 @dataclass(frozen=True)
 class DetailCheckpoint:
     """A validated designative checkpoint for the crop pass."""
@@ -115,17 +140,45 @@ class DetailCheckpoint:
     reason: str | None = None
     identity: str | None = None
     architecture: str | None = None
+    contract_version: str | None = None
+    model_kind: str | None = None
+    identity_prefix: str | None = None
 
     def class_map_ids(self) -> list[str]:
         return list(self.class_names)
 
+    def _selected_contract(self) -> tuple[str | None, str | None, str | None]:
+        """Version, kind, and prefix actually selected for this checkpoint.
+
+        Explicit fields win. A caller that only stored the class tuple (older
+        tests and in-process checkpoints) is labelled from that tuple, so a
+        three-class scan is never described as four-class or the reverse.
+        """
+        version, kind, prefix = self.contract_version, self.model_kind, self.identity_prefix
+        names = tuple(self.class_names)
+        if names == DETAIL_MODEL_CLASSES_4C:
+            return (
+                version or DETAIL_CONTRACT_VERSION_4C,
+                kind or DETAIL_MODEL_KIND_4C,
+                prefix or DETAIL_IDENTITY_PREFIX_4C,
+            )
+        if names == DETAIL_MODEL_CLASSES:
+            return (
+                version or DETAIL_CONTRACT_VERSION,
+                kind or DETAIL_MODEL_KIND,
+                prefix or DETAIL_IDENTITY_PREFIX,
+            )
+        return version, kind, prefix
+
     def describe(self) -> dict[str, Any]:
         """Model identity block stored with every scan's observations."""
+        version, kind, prefix = self._selected_contract()
         return {
             "model": self.identity,
-            "model_kind": DETAIL_MODEL_KIND,
+            "model_kind": kind,
             "architecture": self.architecture or "unverified",
-            "contract": DETAIL_CONTRACT_VERSION,
+            "contract": version,
+            "identity_prefix": prefix,
             "class_names": list(self.class_names),
             "class_map": {str(i): name for i, name in enumerate(self.class_names)},
         }
@@ -212,7 +265,11 @@ def designated_weights_fingerprint() -> str:
 def validate_detail_class_map(
     raw_map: Any, *, expected: Sequence[str] = DETAIL_MODEL_CLASSES
 ) -> tuple[tuple[str, ...], str | None]:
-    """Validate a checkpoint's ID->name map against the three-class detail contract.
+    """Validate a checkpoint's ID->name map against one detail roster.
+
+    ``expected`` defaults to the three-class contract. The scan gate uses
+    :func:`core.motorcycle_detail_contract.resolve_detail_contract` so a
+    checkpoint is accepted only when it matches one of the two explicit orders.
 
     Returns ``(class_names, error)``. Any error is fatal for the scan: the caller
     must not scan a single crop with an unverified class map.
@@ -270,8 +327,8 @@ def load_detail_checkpoint(
 
     Fails closed on: no designation, missing file, unreadable checkpoint, task
     metadata that is missing, malformed, or not ``detect``, or a class map that
-    does not reproduce the exact three-class detail order. No crop is touched
-    by this function.
+    does not reproduce ``md-detail-3c-v1`` or ``md-detail-4c-v1`` exactly. No
+    crop is touched by this function.
     """
     resolved = path if path is not None else designated_weights_path()
     if not resolved:
@@ -289,20 +346,27 @@ def load_detail_checkpoint(
     task_error = check_detail_task(task)
     if task_error:
         return DetailCheckpoint(str(candidate), ok=False, reason=task_error)
-    class_names, error = validate_detail_class_map(raw_map)
-    if error:
-        return DetailCheckpoint(str(candidate), ok=False, reason=f"detail_class_map_rejected:{error}")
+    resolved = resolve_detail_contract(raw_map)
+    if not resolved.ok:
+        return DetailCheckpoint(
+            str(candidate),
+            ok=False,
+            reason=f"detail_class_map_rejected:{resolved.code}: {resolved.reason}",
+        )
     try:
-        identity = f"{DETAIL_IDENTITY_PREFIX}:{candidate.name}:{_file_identity(candidate)}"
+        identity = f"{resolved.identity_prefix}:{candidate.name}:{_file_identity(candidate)}"
     except OSError as exc:
         return DetailCheckpoint(str(candidate), ok=False, reason=f"detail_checkpoint_unreadable:{exc}")
     return DetailCheckpoint(
         path=str(candidate),
-        class_names=class_names,
+        class_names=resolved.class_names,
         ok=True,
         reason=None,
         identity=identity,
         architecture=detail_architecture_hint(model),
+        contract_version=resolved.version,
+        model_kind=resolved.model_kind,
+        identity_prefix=resolved.identity_prefix,
     )
 
 
@@ -372,6 +436,7 @@ _OVERLAY_COLORS = {
     "helmet_nut_shell": (40, 40, 220),
     "helmet": (140, 140, 200),
     "side_mirror": (220, 90, 180),
+    "no_helmet": (255, 255, 0),
     "main:motorcycle": (246, 130, 59),
     "main:rider": (60, 200, 60),
     "main:other_motorcycle": (0, 165, 255),
@@ -487,12 +552,7 @@ def associate_scan_detections(
         )
     primary = _primary_detection(_as_box(motorcycle_box))
     riders = [d for d in detections if d.get("class_label") == YOLO_CLASS_RIDER]
-    helmets = [
-        d
-        for d in detections
-        if d.get("class_label")
-        in (YOLO_CLASS_HELMET_ACCEPTABLE, YOLO_CLASS_HELMET_NUT_SHELL, YOLO_CLASS_HELMET)
-    ]
+    helmets = [d for d in detections if d.get("class_label") in _HEAD_LABELS]
     mirrors = [d for d in detections if d.get("class_label") == YOLO_CLASS_SIDE_MIRROR]
     motorcycles = [d for d in detections if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
 
@@ -546,12 +606,7 @@ def _associate_with_main_context(
 ) -> ScanAssociations:
     box = _as_box(motorcycle_box)
     primary = _primary_detection(box)
-    helmets = [
-        d
-        for d in detections
-        if d.get("class_label")
-        in (YOLO_CLASS_HELMET_ACCEPTABLE, YOLO_CLASS_HELMET_NUT_SHELL, YOLO_CLASS_HELMET)
-    ]
+    helmets = [d for d in detections if d.get("class_label") in _HEAD_LABELS]
     mirrors = [d for d in detections if d.get("class_label") == YOLO_CLASS_SIDE_MIRROR]
     scan_motorcycles = [d for d in detections if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
 
@@ -588,6 +643,102 @@ def _associate_with_main_context(
         context=context,
     )
 
+
+HELMET_FRAMES_CONFLICT = "contradictory_helmet_observations_across_frames"
+HELMET_FRAMES_PARTIAL = "evidence_on_some_selected_frames_only"
+
+
+def _reconcile_helmet_across_frames(
+    associations: Sequence[ScanAssociations],
+) -> tuple[AttributeAssociation | None, str | None]:
+    """Summarise helmet evidence from every selected frame for the review row.
+
+    Returns ``(summary, reason)``; ``summary`` is ``None`` when the primary
+    frame already represents every frame (all ``unknown``, or one shared
+    definite state on every frame). ``reason`` is the uncertainty note for the
+    summary, or ``None`` when there is nothing extra to note.
+
+    * Different definite states, or a definite state plus an ``ambiguous``
+      frame: ``ambiguous``.
+    * Otherwise any ``ambiguous`` frame: ``ambiguous``.
+    * One definite state plus ``unknown`` frames: that definite state.
+
+    A frame with no relevant detection (``unknown``) never establishes absence
+    and never overrides positive or ambiguous evidence from another frame.
+    Only frames that contributed evidence supply observations and reasons.
+    """
+    if len(associations) < 2:
+        return None, None
+    states = [a.helmet.state for a in associations]
+    contributing = [a.helmet for a in associations if a.helmet.state != HELMET_UNKNOWN]
+    if not contributing:
+        return None, None
+    definite = {s for s in states if s in _DEFINITE_HELMET_STATES}
+    has_ambiguous = STATE_AMBIGUOUS in states
+    partial = HELMET_UNKNOWN in states
+    if len(definite) > 1 or (definite and has_ambiguous):
+        state, reason = STATE_AMBIGUOUS, HELMET_FRAMES_CONFLICT
+    elif has_ambiguous:
+        state, reason = STATE_AMBIGUOUS, (HELMET_FRAMES_PARTIAL if partial else None)
+    else:
+        if not partial:
+            return None, None
+        state, reason = next(iter(definite)), HELMET_FRAMES_PARTIAL
+    reasons: list[str] = [reason] if reason else []
+    if partial and HELMET_FRAMES_PARTIAL not in reasons:
+        reasons.append(HELMET_FRAMES_PARTIAL)
+    observations = []
+    seen: set[tuple[Any, ...]] = set()
+    for helmet in contributing:
+        for obs in helmet.observations:
+            key = (obs.label, tuple(round(float(v), 2) for v in obs.box))
+            if key in seen:
+                continue
+            seen.add(key)
+            observations.append(obs)
+        for item in helmet.reasons:
+            if item not in reasons:
+                reasons.append(item)
+    return (
+        AttributeAssociation(
+            state=state,
+            observations=tuple(observations),
+            reasons=tuple(reasons),
+        ),
+        reason,
+    )
+
+
+def _uncovered_box_is_limited(
+    raw_box: Sequence[float],
+    mapped_box: Sequence[float],
+    crop: CropRect,
+    image_shape: Sequence[int],
+    source_w: int,
+    source_h: int,
+) -> bool:
+    """True when a ``no_helmet`` box is clipped by the crop or the source frame.
+
+    A clipped or edge-cut head is not a definite uncovered-head attribution.
+    This is a geometric check of the box already produced by the model; it does
+    not introduce a confidence threshold.
+    """
+    height = int(image_shape[0])
+    width = int(image_shape[1])
+    x1, y1, x2, y2 = (float(v) for v in raw_box)
+    if x1 < -0.5 or y1 < -0.5 or x2 > width + 0.5 or y2 > height + 0.5:
+        return True
+    mx1, my1, mx2, my2 = (float(v) for v in mapped_box)
+    if mx1 <= 0.5 or my1 <= 0.5 or mx2 >= source_w - 0.5 or my2 >= source_h - 0.5:
+        return True
+    if (
+        mx1 <= crop.x + 0.5
+        or my1 <= crop.y + 0.5
+        or mx2 >= (crop.x + crop.w) - 0.5
+        or my2 >= (crop.y + crop.h) - 0.5
+    ):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +1068,8 @@ class MotorcycleDetailScanner:
         frame_records: list[dict[str, Any]] = []
         uncertainty: list[str] = []
         primary_assoc: ScanAssociations | None = None
+        frame_assocs: list[ScanAssociations] = []
+        contract_meta = checkpoint.describe()
         for frame in frames:
             crop = self._frame_crop(frame, source_w, source_h)
             if crop is None:
@@ -930,7 +1083,7 @@ class MotorcycleDetailScanner:
                 raise DetailScanError("candidate_scan_scale_invalid")
             scan_image = self._apply_scan_scale(image, scale_x=scale_x, scale_y=scale_y)
             raw = predictor(scan_image)
-            mapped: list[tuple[dict[str, Any], tuple[float, float, float, float]]] = []
+            mapped: list[tuple[dict[str, Any], tuple[float, float, float, float], bool]] = []
             for det in raw:
                 source_box = map_box_from_crop(
                     tuple(det["bbox"]),
@@ -940,11 +1093,24 @@ class MotorcycleDetailScanner:
                     source_w=source_w,
                     source_h=source_h,
                 )
-                mapped.append((det, source_box))
-            detections = [
-                to_pipeline_detection(det["class_label"], det["confidence"], box)
-                for det, box in mapped
-            ]
+                limited = (
+                    str(det.get("class_label") or "") == DETAIL_CLASS_NO_HELMET
+                    and _uncovered_box_is_limited(
+                        tuple(det["bbox"]),
+                        source_box,
+                        crop,
+                        scan_image.shape,
+                        source_w,
+                        source_h,
+                    )
+                )
+                mapped.append((det, source_box, limited))
+            detections = []
+            for det, box, limited in mapped:
+                pipeline = to_pipeline_detection(det["class_label"], det["confidence"], box)
+                if limited:
+                    pipeline["evidence_limited"] = True
+                detections.append(pipeline)
             association = associate_scan_detections(
                 detections,
                 motorcycle_box=motorcycle_box,
@@ -978,9 +1144,9 @@ class MotorcycleDetailScanner:
             overlay = draw_mapped_boxes(image, main_boxes, labels=main_labels)
             overlay = draw_mapped_boxes(
                 overlay,
-                [_local(box) for _, box in mapped],
-                labels=[str(det["class_label"]) for det, _ in mapped],
-                confidences=[float(det["confidence"]) for det, _ in mapped],
+                [_local(box) for _, box, _limited in mapped],
+                labels=[str(det["class_label"]) for det, _box, _limited in mapped],
+                confidences=[float(det["confidence"]) for det, _box, _limited in mapped],
             )
             from core.evidence import save_detail_overlay
 
@@ -997,31 +1163,52 @@ class MotorcycleDetailScanner:
                 "scan_scale_y": scale_y,
                 "crop": crop.as_dict(),
                 "overlay_path": overlay_path,
+                "contract": contract_meta.get("contract"),
+                "class_map": contract_meta.get("class_map"),
                 "detections": [
                     {
                         "class_label": det["class_label"],
+                        "class_id": (
+                            checkpoint.class_names.index(str(det["class_label"]))
+                            if str(det["class_label"]) in checkpoint.class_names
+                            else None
+                        ),
                         "confidence": round(float(det["confidence"]), 4),
                         "source_bbox": [round(float(v), 2) for v in box],
+                        "contract": contract_meta.get("contract"),
+                        "evidence_limited": limited,
                     }
-                    for det, box in mapped
+                    for det, box, limited in mapped
                 ],
                 "association": association.as_dict(),
                 "uncertainty": frame_uncertainty,
             }
             frame_records.append(frame_record)
+            frame_assocs.append(association)
             if primary_assoc is None or frame.get("frame_number") == primary_number:
                 primary_assoc = association
 
         if primary_assoc is None:  # pragma: no cover - frames is non-empty
             raise DetailScanError("candidate_association_failed")
+        reconciled, summary_reason = _reconcile_helmet_across_frames(frame_assocs)
+        if reconciled is not None:
+            primary_assoc.helmet = reconciled
+            if summary_reason is not None:
+                uncertainty.append(f"helmet:{summary_reason}")
         uncertainty = list(dict.fromkeys(uncertainty))
+        no_helmet_policy = (
+            "positive_visible_uncovered_head_review_only"
+            if contract_meta.get("contract") == DETAIL_CONTRACT_VERSION_4C
+            else "class_not_in_contract"
+        )
         observations = {
             "scan": {
-                **checkpoint.describe(),
+                **contract_meta,
                 "conf": self.conf,
                 "frames_scanned": len(frame_records),
                 "attribution_source": "main_detector",
                 "review_only": True,
+                "no_helmet_policy": no_helmet_policy,
             },
             "frames": frame_records,
             "association": primary_assoc.as_dict(),

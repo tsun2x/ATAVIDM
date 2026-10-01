@@ -2253,24 +2253,33 @@ def api_dismiss_review(review_id: int):
 
 def _detail_scan_gate() -> dict[str, Any]:
     """Non-loading view of the designated detail checkpoint (validated at scan time)."""
-    from core.motorcycle_detail_contract import (
-        DETAIL_CONTRACT_VERSION,
-        DETAIL_MODEL_CLASSES,
-        DETAIL_MODEL_KIND,
-    )
+    from core.motorcycle_detail_contract import SUPPORTED_DETAIL_CONTRACTS
     from core.motorcycle_detail_scan import designated_weights_path
 
     path = designated_weights_path()
     exists = bool(path and Path(path).is_file())
+    supported = [
+        {
+            "version": spec.version,
+            "model_kind": spec.model_kind,
+            "identity_prefix": spec.identity_prefix,
+            "classes": list(spec.classes),
+        }
+        for spec in SUPPORTED_DETAIL_CONTRACTS
+    ]
+    # ``contract`` stays the original three-class gate field. Both accepted
+    # contracts are advertised on ``supported_contracts`` so older clients that
+    # read ``gate.contract`` still see md-detail-3c-v1.
     return {
         "configured": bool(path),
         "path": path or None,
         "exists": exists,
         "contract": {
-            "version": DETAIL_CONTRACT_VERSION,
-            "model_kind": DETAIL_MODEL_KIND,
-            "classes": list(DETAIL_MODEL_CLASSES),
+            "version": supported[0]["version"],
+            "model_kind": supported[0]["model_kind"],
+            "classes": supported[0]["classes"],
         },
+        "supported_contracts": supported,
     }
 
 

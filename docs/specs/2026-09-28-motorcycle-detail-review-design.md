@@ -54,9 +54,13 @@ The detail checkpoint is **designated explicitly**:
 - the `motorcycle_detail_weights` system setting.
 
 Nothing defaults to a training candidate. The detail model is a **separate
-three-class crop detector**, not the main 15-class object checkpoint. Its
-contract lives in `core/motorcycle_detail_contract.py`
-(`DETAIL_CONTRACT_VERSION = "md-detail-3c-v1"`):
+crop detector**, not the main 15-class object checkpoint. `load_detail_checkpoint`
+accepts only the two explicit contracts in `core/motorcycle_detail_contract.py`.
+`gate.contract` remains the three-class contract for existing clients.
+`gate.supported_contracts` lists both.
+
+`md-detail-3c-v1` (`DETAIL_CONTRACT_VERSION`, identity prefix `md3c`,
+`motorcycle_detail_3class`):
 
 | ID | Class |
 |---|---|
@@ -64,14 +68,37 @@ contract lives in `core/motorcycle_detail_contract.py`
 | 1 | `helmet_acceptable` |
 | 2 | `side_mirror` |
 
-This is the order declared by the Sept 30 draft dataset's `data.yaml`. The
-exploratory YOLOv8n pilots were trained with `0=side_mirror,
+This is the order declared by the Sept 30 draft dataset's `data.yaml`. A
+three-class checkpoint cannot emit `no_helmet`. No helmet-class detection stays
+`unknown`; the scanner does not infer an uncovered head.
+
+`md-detail-4c-v1` (`DETAIL_CONTRACT_VERSION_4C`, identity prefix `md4c`,
+`motorcycle_detail_4class`) keeps that order and appends one class:
+
+| ID | Class |
+|---|---|
+| 0 | `helmet_nut_shell` |
+| 1 | `helmet_acceptable` |
+| 2 | `side_mirror` |
+| 3 | `no_helmet` |
+
+`no_helmet` is a **positive** observation of a visible uncovered head, shown to
+reviewers as “Uncovered head observed”. It is review evidence that requires
+human verification. It is not a confirmed no-helmet violation, not a compliance
+decision, and it never creates or feeds a violation, case, or ordinary
+`review_queue` row. If `no_helmet` and a helmet class plausibly describe the
+same rider's head, or selected frames disagree, the summary stays `ambiguous`
+and the boxes are kept. A clipped or unclear head box, a missing rider, another
+rider who could own the box, or truncated/unrecorded nearby-rider context is
+not a definite uncovered-head attribution.
+
+The exploratory YOLOv8n pilots were trained with `0=side_mirror,
 1=helmet_nut_shell, 2=helmet_acceptable`; that order is rejected, and IDs are
 never relabeled to make a checkpoint fit.
 
-Before the first crop is scanned, `load_detail_checkpoint` validates the
-checkpoint with `check_detail_class_map` (contiguous IDs from 0, exact count,
-exact names, exact order):
+Before the first crop is scanned, `load_detail_checkpoint` resolves the map
+with `resolve_detail_contract` (contiguous IDs from 0, exact count, exact
+names, exact order, task exactly `detect`):
 
 | Condition | Result |
 |---|---|
@@ -82,7 +109,8 @@ exact names, exact order):
 | Task metadata not a string | `queued` + `detail_checkpoint_task_malformed:<type>` |
 | Any task other than exactly `detect` (e.g. `classify`, `segment`) | `queued` + `detail_checkpoint_wrong_task:<task>` |
 | Missing / malformed / non-contiguous / duplicate / wrong count / renamed / reordered map (includes the main 15-class roster and the pilot order) | `queued` + `detail_class_map_rejected:<code>: <reason>` |
-| Exact three-class ID order | scan proceeds; identity = `md3c:<file>:<sha256[:12]>` |
+| Exact `md-detail-3c-v1` order | scan proceeds; identity = `md3c:<file>:<sha256[:12]>` |
+| Exact `md-detail-4c-v1` order | scan proceeds; identity = `md4c:<file>:<sha256[:12]>` |
 
 At inference, `UltralyticsCropPredictor` re-checks `result.names` against the
 validated map and rejects out-of-range class IDs, so a mismatched result fails
@@ -157,6 +185,34 @@ vehicle box), bottom 12 %, unioned with the associated rider box, grown to a
 - No mirror observation → `none_visible` **plus** an explicit
   `mirror:absence_not_proven_unknown` uncertainty reason. Absence is never
   proven.
+- `no_helmet` (four-class contract only) attaches to the same head region as a
+  helmet box, and only to the main detector's associated `rider`. It is not
+  inferred when the class is absent. A contradictory helmet label on that head,
+  or across the selected frames, stays `ambiguous`. A box clipped by the crop
+  or the source frame is not a definite uncovered-head attribution.
+
+## 5b. Proposed four-class dataset — not created
+
+Do not modify the September 30 three-class derivative, its scripts, or the
+historical pilot weights. That draft is not training-ready, and its test split
+is not threshold evidence. WMSU stays untouched for unseen-location evaluation.
+
+A later dataset, proposed as `md-detail-4c-v1`, would use the ordered names
+above. Annotation policy (approved, not yet executed):
+
+- label `no_helmet` only when an uncovered head is clearly visible and
+  attributable to a motorcycle rider, with a box around the visible head;
+- mark the example uncertain or exclude it when the head is tiny, blurred,
+  occluded, clipped by the image or crop, or hard to associate with a rider;
+- never derive a positive label from a missing helmet box;
+- review conflicting helmet labels and hard negatives.
+
+Before any training run or checkpoint designation: human review of source
+boxes, whole-capture-group split independence, a labeled development set for
+thresholds and conflict analysis, and WMSU kept held out. Latency, GPU memory,
+queue volume, and reviewer workload for this four-class contract are
+**unmeasured** until a representative measurement is actually run. No
+checkpoint is activated by accepting the contract in application code.
 
 ## 6. State model
 

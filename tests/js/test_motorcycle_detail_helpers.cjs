@@ -45,6 +45,54 @@ assert.deepStrictEqual(detailUi.uncertaintyList({}), []);
 // Helmet attribution shared with another rider stays ambiguous, never decided.
 assert.strictEqual(detailUi.describeHelmet({ state: "ambiguous" }),
     "ambiguous: helmet may belong to another rider");
+assert.ok(detailUi.describeHelmet({ state: "uncovered_head" }).startsWith("Uncovered head observed"));
+assert.ok(detailUi.describeHelmet({ state: "uncovered_head" }).includes("not a confirmed no-helmet violation"));
+assert.ok(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["contradictory_head_labels"]
+}).startsWith("ambiguous:"));
+assert.ok(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["contradictory_helmet_observations_across_frames"]
+}).includes("ambiguous"));
+assert.ok(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["uncovered_head_box_clipped_or_unclear"]
+}).includes("ambiguous"));
+
+// Cross-frame summaries: evidence from a later selected frame keeps the
+// review-only wording, and an ambiguous later frame stays visibly ambiguous.
+const laterUncovered = detailUi.describeHelmet({
+    state: "uncovered_head",
+    reasons: ["evidence_on_some_selected_frames_only"]
+});
+assert.ok(laterUncovered.startsWith("Uncovered head observed"));
+assert.ok(laterUncovered.includes("not a confirmed no-helmet violation"));
+assert.strictEqual(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["evidence_on_some_selected_frames_only", "helmet_in_other_rider_head_region_unattributed"]
+}), "ambiguous: helmet may belong to another rider");
+assert.strictEqual(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["evidence_on_some_selected_frames_only", "contradictory_head_labels"]
+}), "ambiguous: conflicting head observations; human verification required");
+assert.strictEqual(detailUi.describeHelmet({
+    state: "ambiguous",
+    reasons: ["contradictory_helmet_observations_across_frames", "evidence_on_some_selected_frames_only"]
+}), "ambiguous: conflicting head observations; human verification required");
+assert.strictEqual(
+    detailUi.formatClassMap(["helmet_nut_shell", "helmet_acceptable", "side_mirror", "no_helmet"]),
+    "0=helmet_nut_shell, 1=helmet_acceptable, 2=side_mirror, 3=no_helmet"
+);
+const fourClass = detailUi.describeModel({
+    model: "md4c:best.pt:abc123def456",
+    model_kind: "motorcycle_detail_4class",
+    architecture: "yolov8n",
+    contract: "md-detail-4c-v1"
+}, {});
+assert.ok(fourClass.includes("motorcycle_detail_4class"));
+assert.ok(fourClass.includes("md-detail-4c-v1"));
+assert.ok(!fourClass.includes("motorcycle_detail_3class"));
 assert.strictEqual(detailUi.describeRider({ state: "associated", source: "main_detector" }),
     "rider associated (main detector)");
 

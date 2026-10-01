@@ -1,21 +1,35 @@
-"""Class-map contract for the separate three-class motorcycle detail checkpoint.
+"""Class-map contracts for the separate motorcycle detail checkpoint.
 
-The detail pass scans padded motorcycle crops for three *attribute* labels only.
+The detail pass scans padded motorcycle crops for attribute labels only.
 It is not the main object detector: the main YOLOv8m/ByteTrack checkpoint keeps
 its own ordered 15-class contract (``core.detection_config.OBJECT_DETECTOR_CLASSES``
 and ``core.detector.enforce_object_class_contract``), and nothing here changes it.
 
-Declared detail ID order (``DETAIL_MODEL_CLASSES``)::
+Two explicit contracts are accepted, and only those. IDs are never relabeled
+to make a checkpoint fit a different order.
+
+``md-detail-3c-v1`` (``DETAIL_MODEL_CLASSES``), the September 30 three-class
+annotation working copy
+(``dataset/derived/tavidm_nut_shell_side_mirror_annotations_20260930``)::
 
     0 = helmet_nut_shell
     1 = helmet_acceptable
     2 = side_mirror
 
-This is the order declared by the September 30 three-class annotation working
-copy (``dataset/derived/tavidm_nut_shell_side_mirror_annotations_20260930``).
+``md-detail-4c-v1`` (``DETAIL_MODEL_CLASSES_4C``) keeps that order and appends
+one positive class::
+
+    0 = helmet_nut_shell
+    1 = helmet_acceptable
+    2 = side_mirror
+    3 = no_helmet
+
+``no_helmet`` means a visible uncovered head was observed. A three-class
+checkpoint cannot emit it. No helmet-class detection is ``unknown``, never an
+inferred uncovered head.
+
 The exploratory YOLOv8n pilots use a different order
-(``PILOT_DETAIL_CLASS_ORDER``) and are rejected with a visible reason; the
-application never relabels a checkpoint's class IDs.
+(``PILOT_DETAIL_CLASS_ORDER``) and are rejected with a visible reason.
 
 The detail model cannot output ``rider`` or ``motorcycle``. Rider and target
 motorcycle attribution always comes from the main detector's stored context
@@ -51,12 +65,50 @@ DETAIL_MODEL_CLASSES: tuple[str, ...] = (
 )
 DETAIL_CLASS_COUNT = len(DETAIL_MODEL_CLASSES)
 
+# Positive observation of a visible uncovered head. This name is not part of
+# the main 15-class object roster and must not be added there.
+DETAIL_CLASS_NO_HELMET = "no_helmet"
+DETAIL_CONTRACT_VERSION_4C = "md-detail-4c-v1"
+DETAIL_MODEL_KIND_4C = "motorcycle_detail_4class"
+DETAIL_IDENTITY_PREFIX_4C = "md4c"
+DETAIL_MODEL_CLASSES_4C: tuple[str, ...] = DETAIL_MODEL_CLASSES + (DETAIL_CLASS_NO_HELMET,)
+DETAIL_CLASS_COUNT_4C = len(DETAIL_MODEL_CLASSES_4C)
+
 # Order used by the exploratory full-frame and crop YOLOv8n pilots
 # (``dataset/training_runs/tavidm_motorcycle_detail*_yolov8n_20260930``).
 PILOT_DETAIL_CLASS_ORDER: tuple[str, ...] = (
     YOLO_CLASS_SIDE_MIRROR,
     YOLO_CLASS_HELMET_NUT_SHELL,
     YOLO_CLASS_HELMET_ACCEPTABLE,
+)
+
+
+@dataclass(frozen=True)
+class DetailContractSpec:
+    """One accepted detail checkpoint contract. Order is the contract."""
+
+    version: str
+    model_kind: str
+    identity_prefix: str
+    classes: tuple[str, ...]
+
+
+DETAIL_CONTRACT_3C = DetailContractSpec(
+    version=DETAIL_CONTRACT_VERSION,
+    model_kind=DETAIL_MODEL_KIND,
+    identity_prefix=DETAIL_IDENTITY_PREFIX,
+    classes=DETAIL_MODEL_CLASSES,
+)
+DETAIL_CONTRACT_4C = DetailContractSpec(
+    version=DETAIL_CONTRACT_VERSION_4C,
+    model_kind=DETAIL_MODEL_KIND_4C,
+    identity_prefix=DETAIL_IDENTITY_PREFIX_4C,
+    classes=DETAIL_MODEL_CLASSES_4C,
+)
+# The only maps a checkpoint may match. Nothing else is accepted or relabeled.
+SUPPORTED_DETAIL_CONTRACTS: tuple[DetailContractSpec, ...] = (
+    DETAIL_CONTRACT_3C,
+    DETAIL_CONTRACT_4C,
 )
 
 # The only accepted Ultralytics task. Missing/blank/non-string metadata is not
@@ -154,7 +206,11 @@ def check_detail_class_map(
             reason="class names do not match the detail contract: " + "; ".join(parts),
         )
     if ordered != roster:
-        pilot = " (exploratory pilot order; IDs are never relabeled)" if ordered == PILOT_DETAIL_CLASS_ORDER else ""
+        pilot_order = (
+            ordered == PILOT_DETAIL_CLASS_ORDER
+            or tuple(ordered[: len(PILOT_DETAIL_CLASS_ORDER)]) == PILOT_DETAIL_CLASS_ORDER
+        )
+        pilot = " (exploratory pilot order; IDs are never relabeled)" if pilot_order else ""
         return DetailClassMapReport(
             ok=False,
             class_names=ordered,
@@ -176,6 +232,87 @@ def check_detail_class_map(
             ),
         )
     return DetailClassMapReport(ok=True, class_names=ordered)
+
+
+@dataclass(frozen=True)
+class ResolvedDetailContract:
+    """The one supported contract a checkpoint matched, or a visible rejection."""
+
+    ok: bool
+    version: str | None = None
+    model_kind: str | None = None
+    identity_prefix: str | None = None
+    class_names: tuple[str, ...] = ()
+    code: str | None = None
+    reason: str | None = None
+
+    def class_map(self) -> dict[str, str]:
+        return {str(i): name for i, name in enumerate(self.class_names)}
+
+
+_STRUCTURAL_MAP_CODES = frozenset(
+    {"missing", "malformed", "non_contiguous_class_ids", "duplicate_names"}
+)
+
+
+def resolve_detail_contract(raw_map: Any) -> ResolvedDetailContract:
+    """Match a checkpoint map to exactly one supported detail contract.
+
+    ``md-detail-3c-v1`` and ``md-detail-4c-v1`` are tried as whole ordered
+    rosters. A map that matches neither is rejected. A three-class map is never
+    described as four-class, and a four-class map is never described as
+    three-class. This function does not relabel IDs.
+    """
+    reports = [
+        (spec, check_detail_class_map(raw_map, expected=spec.classes))
+        for spec in SUPPORTED_DETAIL_CONTRACTS
+    ]
+    matched = [(spec, report) for spec, report in reports if report.ok]
+    if len(matched) == 1:
+        spec, report = matched[0]
+        return ResolvedDetailContract(
+            ok=True,
+            version=spec.version,
+            model_kind=spec.model_kind,
+            identity_prefix=spec.identity_prefix,
+            class_names=report.class_names,
+        )
+    if len(matched) > 1:  # pragma: no cover - the two rosters have different lengths
+        return ResolvedDetailContract(
+            ok=False,
+            code="ambiguous_contract",
+            reason="checkpoint class map matches more than one detail contract",
+        )
+    for _spec, report in reports:
+        if report.code in _STRUCTURAL_MAP_CODES:
+            return ResolvedDetailContract(
+                ok=False,
+                class_names=report.class_names,
+                code=report.code,
+                reason=report.reason,
+            )
+    parsed = reports[0][1].class_names
+    for spec, report in reports:
+        if parsed and len(parsed) == len(spec.classes):
+            return ResolvedDetailContract(
+                ok=False,
+                class_names=report.class_names,
+                code=report.code,
+                reason=report.reason,
+            )
+    accepted = " or ".join(
+        f"exactly {len(spec.classes)} ({_format_order(spec.classes)})"
+        for spec in SUPPORTED_DETAIL_CONTRACTS
+    )
+    return ResolvedDetailContract(
+        ok=False,
+        class_names=parsed,
+        code="wrong_class_count",
+        reason=(
+            f"class map has {len(parsed)} classes; accepted motorcycle detail "
+            f"contracts require {accepted}"
+        ),
+    )
 
 
 def detail_architecture_hint(model: Any) -> str | None:

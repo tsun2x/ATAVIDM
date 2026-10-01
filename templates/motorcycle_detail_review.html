@@ -41,9 +41,15 @@
             This queue records observations only. It has <strong>no confirm action</strong> and can never create a violation case.
         </p>
         <p class="small text-muted mb-0" id="detailContractNote">
-            Detail model contract: a separate three-class checkpoint with class IDs
+            Detail model contracts: a separate three-class checkpoint
+            (<code>{{ detail_gate.contract.version }}</code>) with class IDs
             {% for name in detail_gate.contract.classes %}<code>{{ loop.index0 }}={{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
-            Rider and motorcycle attribution comes from the main detector; a missing detection is unknown, not proof of absence.
+            {% for spec in detail_gate.supported_contracts if spec.version != detail_gate.contract.version %}
+            A separate four-class checkpoint (<code>{{ spec.version }}</code>, prefix <code>{{ spec.identity_prefix }}</code>) with class IDs
+            {% for name in spec.classes %}<code>{{ loop.index0 }}={{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+            Class <code>no_helmet</code> means “Uncovered head observed” — review evidence requiring human verification, not a confirmed no-helmet violation or a compliance decision.
+            {% endfor %}
+            Rider and motorcycle attribution comes from the main detector; a missing detection is unknown, not proof of absence. Ambiguous cases stay marked ambiguous.
         </p>
     </div>
 </div>
@@ -53,9 +59,8 @@
     Detail checkpoint: not designated. Crop scans stay queued and fail closed until
     <code>TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS</code> (or the
     <code>motorcycle_detail_weights</code> system setting) points to a separate three-class
-    motorcycle detail checkpoint whose class map is exactly
-    {% for name in detail_gate.contract.classes %}<code>{{ loop.index0 }}={{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
-    The main 15-class object checkpoint and any other ID order are rejected; class IDs are never relabeled.
+    or four-class motorcycle detail checkpoint whose class map is exactly one of the contracts above.
+    The main object checkpoint and any other ID order are rejected; class IDs are never relabeled.
 </div>
 {% elif not detail_gate.exists %}
 <div class="alert alert-danger py-2 small" role="status">
@@ -109,10 +114,18 @@
                             </span>
                             {% if item.scan_error %}<div class="small text-muted">{{ item.scan_error }}</div>{% endif %}
                             {% if item.scan_state == 'ready' and item.association.helmet is mapping %}
+                            {% set helmet_state = item.association.helmet.state or 'unknown' %}
                             <div class="small text-muted">
                                 Rider: {{ (item.association.rider or {}).state or 'unknown' }} ·
-                                Helmet: {{ item.association.helmet.state or 'unknown' }} ·
-                                Mirror: {{ (item.association.mirror or {}).state or 'unknown' }}
+                                Helmet:
+                                {% if helmet_state == 'uncovered_head' %}
+                                Uncovered head observed (review only)
+                                {% elif helmet_state == 'ambiguous' %}
+                                ambiguous
+                                {% else %}
+                                {{ helmet_state }}
+                                {% endif %}
+                                · Mirror: {{ (item.association.mirror or {}).state or 'unknown' }}
                             </div>
                             {% endif %}
                         </td>

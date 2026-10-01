@@ -160,6 +160,56 @@ class TestCheckpointGate:
         assert error is not None
 
 
+class TestFourClassCheckpointGate:
+    DETAIL_4 = DETAIL_3 + ("no_helmet",)
+
+    def test_exact_four_class_order_is_accepted_as_md4c(self, tmp_path):
+        from core.motorcycle_detail_scan import load_detail_checkpoint
+
+        weights = tmp_path / "detail4.pt"
+        weights.write_bytes(b"four")
+        cp = load_detail_checkpoint(
+            str(weights), model_loader=lambda path: _model({i: n for i, n in enumerate(self.DETAIL_4)})
+        )
+        assert cp.ok, cp.reason
+        assert cp.class_names == self.DETAIL_4
+        assert cp.identity.startswith("md4c:detail4.pt:")
+        assert cp.describe()["contract"] == "md-detail-4c-v1"
+        assert cp.describe()["model_kind"] == "motorcycle_detail_4class"
+        assert not cp.identity.startswith("md3c")
+
+    def test_three_class_checkpoint_is_still_md3c(self, tmp_path):
+        from core.motorcycle_detail_scan import load_detail_checkpoint
+
+        weights = tmp_path / "detail.pt"
+        weights.write_bytes(b"three")
+        cp = load_detail_checkpoint(str(weights), model_loader=_ok_checkpoint())
+        assert cp.ok and cp.identity.startswith("md3c:")
+        assert cp.describe()["contract"] == "md-detail-3c-v1"
+        assert cp.describe()["model_kind"] == "motorcycle_detail_3class"
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ("side_mirror", "helmet_nut_shell", "helmet_acceptable"),
+            ("helmet_nut_shell", "helmet_acceptable", "side_mirror", "rider"),
+            ("no_helmet", "helmet_nut_shell", "helmet_acceptable", "side_mirror"),
+            ("helmet_nut_shell", "helmet_acceptable", "no_helmet", "side_mirror"),
+        ],
+    )
+    def test_pilot_mixed_and_reordered_maps_fail_before_identity(self, tmp_path, names):
+        from core.motorcycle_detail_scan import load_detail_checkpoint
+
+        weights = tmp_path / "bad.pt"
+        weights.write_bytes(b"bad")
+        cp = load_detail_checkpoint(
+            str(weights), model_loader=lambda path: _model({i: n for i, n in enumerate(names)})
+        )
+        assert cp.ok is False
+        assert cp.identity is None
+        assert "detail_class_map_rejected" in cp.reason
+
+
 # ---------------------------------------------------------------------------
 # Association of scan detections (mapped into source space)
 # ---------------------------------------------------------------------------

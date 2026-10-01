@@ -329,3 +329,83 @@ class TestScanNowEndpoint:
         assert response.status_code == 200
         assert response.get_json()["report"]["ready"] == 1
         assert len(calls) == 1
+
+
+class TestFourClassReviewContract:
+    def test_gate_adds_supported_contracts_without_replacing_the_three_class_field(
+        self, detail_enforcer, seeded
+    ):
+        payload = detail_enforcer.get("/api/motorcycle-detail-review").get_json()
+        assert payload["gate"]["contract"]["version"] == "md-detail-3c-v1"
+        assert payload["gate"]["contract"]["classes"] == [
+            "helmet_nut_shell", "helmet_acceptable", "side_mirror"
+        ]
+        supported = payload["gate"]["supported_contracts"]
+        assert [item["version"] for item in supported] == ["md-detail-3c-v1", "md-detail-4c-v1"]
+        assert supported[1]["identity_prefix"] == "md4c"
+        assert supported[1]["classes"][3] == "no_helmet"
+        assert supported[0]["classes"] == payload["gate"]["contract"]["classes"]
+
+    def test_old_rows_and_uncovered_head_outcomes_write_no_violation(
+        self, detail_enforcer, seeded, test_db
+    ):
+        _, candidate_id = seeded
+        test_db.claim_motorcycle_detail_scans(10)
+        test_db.finish_motorcycle_detail_scan(
+            candidate_id=candidate_id,
+            observations_json=json.dumps(
+                {
+                    "scan": {
+                        "model": "md4c:row.pt:abc",
+                        "contract": "md-detail-4c-v1",
+                        "model_kind": "motorcycle_detail_4class",
+                        "class_map": {
+                            "0": "helmet_nut_shell",
+                            "1": "helmet_acceptable",
+                            "2": "side_mirror",
+                            "3": "no_helmet",
+                        },
+                    },
+                    "frames": [{
+                        "index": 1,
+                        "detections": [{
+                            "class_label": "no_helmet",
+                            "class_id": 3,
+                            "confidence": 0.8,
+                            "source_bbox": [1, 2, 3, 4],
+                        }],
+                    }],
+                }
+            ),
+            association_json=json.dumps(
+                {
+                    "rider": {"state": "associated", "source": "main_detector", "rider_track_id": 11},
+                    "helmet": {
+                        "state": "uncovered_head",
+                        "observations": [{"label": "no_helmet", "confidence": 0.8, "box": [1, 2, 3, 4]}],
+                        "reasons": [],
+                    },
+                    "mirror": {"state": "none_visible"},
+                }
+            ),
+            uncertainty_json="[]",
+            scan_model="md4c:row.pt:abc",
+            scan_class_map_json=json.dumps(
+                ["helmet_nut_shell", "helmet_acceptable", "side_mirror", "no_helmet"]
+            ),
+        )
+        payload = detail_enforcer.get("/api/motorcycle-detail-review?outcome=all").get_json()
+        item = payload["items"][0]
+        assert item["scan_model"].startswith("md4c:")
+        assert item["association"]["helmet"]["state"] == "uncovered_head"
+        assert item["observations"]["frames"][0]["detections"][0]["class_id"] == 3
+        assert item["can_confirm"] is False
+        for outcome in ("reviewed", "uncertain", "dismissed"):
+            response = detail_enforcer.post(
+                f"/api/motorcycle-detail-review/{candidate_id}/outcome", json={"outcome": outcome}
+            )
+            assert response.status_code == 200
+        with test_db.db_session() as conn:
+            assert conn.execute("SELECT COUNT(*) AS n FROM violations").fetchone()["n"] == 0
+            assert conn.execute("SELECT COUNT(*) AS n FROM review_queue").fetchone()["n"] == 0
+            assert conn.execute("SELECT COUNT(*) AS n FROM case_action_events").fetchone()["n"] == 0

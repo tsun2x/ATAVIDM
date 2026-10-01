@@ -45,6 +45,7 @@ from core.detection_config import (
     YOLO_CLASS_RIDER,
     YOLO_CLASS_SIDE_MIRROR,
 )
+from core.motorcycle_detail_contract import DETAIL_CLASS_NO_HELMET
 from core.tracker import TRACK_EXPIRY_SEC
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,18 @@ STATE_UNASSOCIATED = "unassociated"
 # Helmet *states* as reported to reviewers (not detector label names).
 HELMET_ACCEPTABLE = "acceptable"
 HELMET_NUT_SHELL = "nut_shell"
+HELMET_UNCOVERED = "uncovered_head"
 HELMET_UNKNOWN = "unknown"
+# Detector labels that are a helmet observation. ``no_helmet`` is not in this set:
+# it is a positive uncovered-head observation, not the absence of a helmet box.
+_HELMET_CLASS_LABELS = frozenset(
+    {
+        YOLO_CLASS_HELMET_ACCEPTABLE,
+        YOLO_CLASS_HELMET_NUT_SHELL,
+        YOLO_CLASS_HELMET,
+    }
+)
+_HEAD_OBSERVATION_LABELS = _HELMET_CLASS_LABELS | {DETAIL_CLASS_NO_HELMET}
 MIRROR_UNKNOWN = "unknown"
 MIRROR_BOTH = "both_visible"
 MIRROR_ONE_LEFT = "one_left"
@@ -600,6 +612,13 @@ def associate_helmet(
     never recorded, so an omitted rider could own any helmet in the head region:
     such helmets are left unattributed (``ambiguous``). With no helmet in the
     head region the state stays ``unknown``.
+
+    ``no_helmet`` is a positive observation of a visible uncovered head. It is
+    attributed only when it sits in the associated main-detector rider's head
+    region, the neighbour list is complete, and the box is not flagged
+    ``evidence_limited`` (clipped or unclear). A ``no_helmet`` box together with
+    a helmet-class box on that same head is ``ambiguous``; both observations are
+    kept. No detection at all stays ``unknown`` — absence is never inferred.
     """
     if rider.state != STATE_ASSOCIATED or rider.head_region is None:
         reason = "rider_ambiguous" if rider.state == STATE_AMBIGUOUS else "rider_not_associated"
@@ -611,11 +630,7 @@ def associate_helmet(
     observations: list[AttributeObservation] = []
     for det in helmets:
         label = str(det.get("class_label") or "").strip().lower()
-        if label not in (
-            YOLO_CLASS_HELMET_ACCEPTABLE,
-            YOLO_CLASS_HELMET_NUT_SHELL,
-            YOLO_CLASS_HELMET,
-        ):
+        if label not in _HEAD_OBSERVATION_LABELS:
             continue
         hbox = box_of(det)
         if box_area(hbox) <= 0:
@@ -631,11 +646,13 @@ def associate_helmet(
             if any(_point_in_box(centre, other) for other in other_heads):
                 shared += 1
                 continue
+            limited = bool(det.get("evidence_limited")) and label == DETAIL_CLASS_NO_HELMET
             observations.append(
                 AttributeObservation(
                     label=label,
                     confidence=float(det.get("confidence") or 0.0),
                     box=hbox,
+                    reasons=("box_clipped_or_unclear",) if limited else (),
                 )
             )
     shared_reasons: tuple[str, ...] = (
@@ -649,9 +666,25 @@ def associate_helmet(
     if not observations:
         if shared:
             return AttributeAssociation(state=STATE_AMBIGUOUS, reasons=shared_reasons)
-        # No helmet label in the head region: UNKNOWN, never "no helmet".
+        # No head label in the head region: UNKNOWN, never an inferred uncovered head.
         return AttributeAssociation(state=HELMET_UNKNOWN, reasons=("no_helmet_observation",))
     labels = {o.label for o in observations}
+    helmet_labels = labels & _HELMET_CLASS_LABELS
+    uncovered = [o for o in observations if o.label == DETAIL_CLASS_NO_HELMET]
+    if uncovered and helmet_labels:
+        # Keep every box. Do not pick the higher-confidence label.
+        return AttributeAssociation(
+            state=STATE_AMBIGUOUS,
+            observations=tuple(observations),
+            reasons=("contradictory_head_labels",) + shared_reasons,
+        )
+    clear_uncovered = [o for o in uncovered if "box_clipped_or_unclear" not in o.reasons]
+    if uncovered and not clear_uncovered:
+        return AttributeAssociation(
+            state=STATE_AMBIGUOUS,
+            observations=tuple(observations),
+            reasons=("uncovered_head_box_clipped_or_unclear",) + shared_reasons,
+        )
     if YOLO_CLASS_HELMET_NUT_SHELL in labels:
         return AttributeAssociation(
             state=HELMET_NUT_SHELL, observations=tuple(observations), reasons=shared_reasons
@@ -659,6 +692,17 @@ def associate_helmet(
     if YOLO_CLASS_HELMET_ACCEPTABLE in labels:
         return AttributeAssociation(
             state=HELMET_ACCEPTABLE, observations=tuple(observations), reasons=shared_reasons
+        )
+    if clear_uncovered:
+        # A detail-model rider/person box is never the owner of this observation.
+        if rider.source != CONTEXT_SOURCE_MAIN:
+            return AttributeAssociation(
+                state=STATE_AMBIGUOUS,
+                observations=tuple(observations),
+                reasons=("uncovered_head_requires_main_detector_rider",) + shared_reasons,
+            )
+        return AttributeAssociation(
+            state=HELMET_UNCOVERED, observations=tuple(observations), reasons=shared_reasons
         )
     return AttributeAssociation(
         state=HELMET_UNKNOWN,

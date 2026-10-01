@@ -15,11 +15,25 @@ function escapeHtml(value) {
 
 function describeHelmet(association) {
     if (!association) return "not scanned yet";
+    const reasons = Array.isArray(association.reasons) ? association.reasons : [];
     switch (association.state) {
         case "acceptable": return "helmet detected (acceptable shape)";
         case "nut_shell": return "nut-shell / substandard helmet shape";
+        case "uncovered_head":
+            return "Uncovered head observed — review evidence requiring human verification; not a confirmed no-helmet violation or compliance decision";
         case "unknown": return "helmet unknown — absence is not proven";
-        case "ambiguous": return "ambiguous: helmet may belong to another rider";
+        case "ambiguous":
+            if (reasons.indexOf("contradictory_head_labels") >= 0 ||
+                reasons.indexOf("contradictory_helmet_observations_across_frames") >= 0) {
+                return "ambiguous: conflicting head observations; human verification required";
+            }
+            if (reasons.indexOf("uncovered_head_box_clipped_or_unclear") >= 0) {
+                return "ambiguous: uncovered-head box is clipped or unclear";
+            }
+            if (reasons.indexOf("nearby_rider_context_incomplete_helmet_unattributed") >= 0) {
+                return "ambiguous: nearby rider context is incomplete";
+            }
+            return "ambiguous: helmet may belong to another rider";
         default: return String(association.state);
     }
 }
@@ -137,7 +151,12 @@ function buildEvidenceMarkup(item) {
                 const bbox = Array.isArray(d.source_bbox)
                     ? " at [" + d.source_bbox.map(function (v) { return Math.round(Number(v)); }).join(", ") + "]"
                     : "";
-                return "<li>" + escapeHtml(String(d.class_label) + conf + bbox) + "</li>";
+                let text = String(d.class_label) + conf + bbox;
+                if (d.class_label === "no_helmet") {
+                    text += " — Uncovered head observed (human verification only; not a confirmed violation)";
+                }
+                if (d.evidence_limited) text += " (clipped or unclear)";
+                return "<li>" + escapeHtml(text) + "</li>";
             }).join("") + "</ul>"
             : (frame.overlay_url ? '<p class="small text-muted mb-0 mt-2">No detail detections in this crop (not proof of absence).</p>' : "");
         panes.push(
