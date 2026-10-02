@@ -237,6 +237,38 @@ class TestIllegalParking:
 
         assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
 
+    def test_no_parking_dwell_is_suppressed_when_neighboring_traffic_is_queued(
+        self, rule_params, no_parking_zone
+    ):
+        """A stopped target beside stopped traffic is a queue, not a parking cue."""
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+
+        state = RuleEngineState()
+        target = {
+            "class_label": "car", "track_id": 11, "bbox_x": 120, "bbox_y": 110,
+            "bbox_w": 40, "bbox_h": 20, "confidence": 0.95,
+            "speed_px_per_sec": 0.0, "timestamp_sec": 0.0,
+        }
+        neighbor = {
+            "class_label": "car", "track_id": 12, "bbox_x": 165, "bbox_y": 110,
+            "bbox_w": 40, "bbox_h": 20, "confidence": 0.95,
+            "speed_px_per_sec": 0.0, "timestamp_sec": 0.0,
+        }
+        events = []
+        for frame in range(10):
+            timestamp = frame * 0.6
+            target["timestamp_sec"] = timestamp
+            neighbor["timestamp_sec"] = timestamp
+            events.extend(evaluate_detection_rules(
+                [target, neighbor], state, frame,
+                zones={"no_parking": no_parking_zone},
+                params=rule_params,
+                enabled_violations=(VIOLATION_ILLEGAL_PARKING,),
+                model_classes=("car",),
+            ))
+
+        assert events == []
+
 
 class TestIllegalTerminal:
     def test_illegal_terminal_requires_puv(self, rule_params, no_parking_zone):
@@ -284,6 +316,91 @@ class TestIllegalTerminal:
             jeepney["timestamp_sec"] = 5.0 + frame * 0.6
             events.extend(check_illegal_terminal([jeepney], no_parking_zone, state, frame, params))
         assert any(e.violation_type == VIOLATION_ILLEGAL_TERMINAL for e in events)
+
+    def test_nearby_person_walking_toward_jeepney_is_not_boarding_evidence(
+        self, rule_params, no_parking_zone
+    ):
+        """Approach direction alone must not turn a passing pedestrian into a passenger."""
+        from core.scene_annotation import load_scene_annotation
+        from core.violation_engine import RuleEngineState, check_illegal_terminal
+
+        params = dict(rule_params)
+        params["loading_dwell_sec"] = 0.5
+        params["_rule_scene"] = load_scene_annotation({
+            "schema_version": 2,
+            "zones": [{"id": "loading", "type": "loading_unloading", "points": no_parking_zone}],
+            "activity_regions": [{
+                "id": "boarding", "type": "boarding_alighting",
+                "points": [[75, 75], [225, 75], [225, 175], [75, 175]],
+            }],
+            "lanes": [], "flow_arrows": [], "threshold_lines": [],
+            "markings": [], "signs": [],
+        }).to_rule_context()
+        jeepney = {
+            "class_label": "jeepney", "track_id": 2, "bbox_x": 120, "bbox_y": 110,
+            "bbox_w": 40, "bbox_h": 20, "confidence": 0.95,
+            "speed_px_per_sec": 0.0,
+        }
+        pedestrian = {
+            "class_label": "person", "track_id": 3, "bbox_x": 90, "bbox_y": 120,
+            "bbox_w": 10, "bbox_h": 20, "confidence": 0.95,
+            "speed_px_per_sec": 0.0, "direction_degrees": 0.0,
+        }
+        state = RuleEngineState()
+        events = []
+        for frame in range(10):
+            timestamp = frame * 0.6
+            jeepney["timestamp_sec"] = timestamp
+            pedestrian["timestamp_sec"] = timestamp
+            events.extend(check_illegal_terminal(
+                [jeepney], no_parking_zone, state, frame, params,
+                all_tracked=[jeepney, pedestrian],
+            ))
+
+        assert events == []
+
+    def test_tracked_person_entering_jeepney_in_loading_zone_creates_review_candidate(
+        self, rule_params, no_parking_zone
+    ):
+        from core.scene_annotation import load_scene_annotation
+        from core.violation_engine import RuleEngineState, check_illegal_terminal
+
+        params = dict(rule_params)
+        params["_rule_scene"] = load_scene_annotation({
+            "schema_version": 2,
+            "zones": [{"id": "loading", "type": "loading_unloading", "points": no_parking_zone}],
+            "activity_regions": [{
+                "id": "boarding", "type": "boarding_alighting",
+                "points": [[75, 75], [225, 75], [225, 175], [75, 175]],
+            }],
+            "lanes": [], "flow_arrows": [], "threshold_lines": [],
+            "markings": [], "signs": [],
+        }).to_rule_context()
+        jeepney = {
+            "class_label": "jeepney", "track_id": 2, "bbox_x": 120, "bbox_y": 110,
+            "bbox_w": 40, "bbox_h": 20, "confidence": 0.95,
+            "speed_px_per_sec": 0.0,
+        }
+        pedestrian = {
+            "class_label": "person", "track_id": 3, "bbox_x": 100, "bbox_y": 112,
+            "bbox_w": 10, "bbox_h": 16, "confidence": 0.95,
+            "speed_px_per_sec": 0.0,
+        }
+        state = RuleEngineState()
+        check_illegal_terminal(
+            [jeepney], no_parking_zone, state, 0, params,
+            all_tracked=[jeepney, pedestrian],
+        )
+        jeepney["timestamp_sec"] = pedestrian["timestamp_sec"] = 0.5
+        pedestrian["bbox_x"] = 125
+        events = check_illegal_terminal(
+            [jeepney], no_parking_zone, state, 1, params,
+            all_tracked=[jeepney, pedestrian],
+        )
+
+        assert len(events) == 1
+        assert events[0].violation_type == VIOLATION_ILLEGAL_TERMINAL
+        assert events[0].outcome == "review"
 
 
 class TestTruckBanApplicability:

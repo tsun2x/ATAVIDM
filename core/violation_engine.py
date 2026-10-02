@@ -629,6 +629,7 @@ def check_substandard_helmet(
                 f"Motorcycle track #{track_id}: nut-shell/substandard helmet form "
                 f"persisted >={VIOLATION_PERSISTENCE_SEC}s.",
                 score,
+                outcome="review",
             )
         state.note_condition(VIOLATION_SUBSTANDARD_HELMET, track_id, condition, ts)
     return events
@@ -922,15 +923,30 @@ def check_illegal_parking(
     frame_number: int,
     params: dict[str, Any],
     geometry: GeometryProfile | None = None,
+    *,
+    all_vehicles: list[dict[str, Any]] | None = None,
 ) -> list[ViolationEvent]:
     """Illegal Parking — distinct from Illegal Terminal.
 
-    Stationary dwell alone is not proof of parking; without richer parking
-    context this remains a PARTIAL zone-dwell proxy (review outcome).
+    The dwell must begin in the no-parking zone. Nearby stopped traffic resets
+    the dwell as a queue-like hard negative. This remains a review candidate:
+    video context cannot establish every legal exception.
     """
     if not _rule_allowed(state, VIOLATION_ILLEGAL_PARKING):
         return []
     # Stopping briefly must not prove Illegal Parking — use parking_dwell only.
+    surrounding = all_vehicles if all_vehicles is not None else vehicles
+
+    def not_in_queue(det: dict[str, Any]) -> TriState:
+        if _has_nearby_stationary_traffic(
+            det,
+            surrounding,
+            float(params["stationary_px"]),
+            geometry,
+        ):
+            return TriState.FALSE
+        return TriState.TRUE
+
     return _check_zone_dwell(
         vehicles,
         polygon,
@@ -942,9 +958,10 @@ def check_illegal_parking(
         dwell_sec=float(params.get("parking_dwell_sec", 30.0)),
         reason_template=(
             "Vehicle track #{track_id} stationary in No Parking Zone for "
-            ">={dwell}s (Illegal Parking proxy — parking-like context incomplete; review)."
+            ">={dwell}s without nearby stopped traffic (possible Illegal Parking; review)."
         ),
         geometry=geometry,
+        require_extra=not_in_queue,
         outcome="review",
     )
 
@@ -1009,30 +1026,86 @@ def check_illegal_terminal(
         if not in_activity:
             return TriState.UNKNOWN
 
-        # Person/vehicle overlap alone is insufficient — need approach geometry.
+        # A pedestrian approaching a PUV is not boarding evidence. Require a
+        # tracked person to cross the vehicle-box boundary between consecutive
+        # frames while the PUV is in an annotated boarding/alighting area.
+        pair_state = state.contextual.setdefault("_terminal_transitions", {})
+        timestamp = float(det.get("timestamp_sec", 0.0))
+        max_gap = max(0.5, float(params.get("terminal_transition_max_gap_sec", 1.5)))
+        for key, sample in list(pair_state.items()):
+            if timestamp - float(sample.get("timestamp_sec", timestamp)) > max_gap:
+                pair_state.pop(key, None)
         evidence = 0
+        transitioned_people: list[int] = []
         for person in frame_persons:
-            if not _boxes_overlap(det, person):
-                # Near-boundary approach still counts when heading toward vehicle.
-                px = float(person["bbox_x"] + person["bbox_w"] / 2)
-                py = float(person["bbox_y"] + person["bbox_h"] / 2)
-                dist = _math.hypot(cx - px, cy - py)
-                if dist > max(float(det["bbox_w"]), float(det["bbox_h"])) * 1.2:
-                    continue
-            p_heading = person.get("direction_degrees")
-            if p_heading is None:
-                continue
+            pair_key = (int(det["track_id"]), int(person["track_id"]))
+            overlaps = _boxes_overlap(det, person)
+            previous = pair_state.get(pair_key)
             px = float(person["bbox_x"] + person["bbox_w"] / 2)
             py = float(person["bbox_y"] + person["bbox_h"] / 2)
-            toward = _math.degrees(_math.atan2(cy - py, cx - px)) % 360.0
-            if angle_difference(float(p_heading), toward) <= 45.0:
-                evidence += 1
-        if evidence > 0:
+            distance = _math.hypot(cx - px, cy - py)
+            if (
+                previous is not None
+                and timestamp - float(previous["timestamp_sec"]) <= max_gap
+                and bool(previous["overlaps"]) != overlaps
+            ):
+                # Entering the PUV box indicates boarding; leaving indicates
+                # alighting only when the tracked person's distance changes in
+                # the matching direction, reducing bbox jitter as a trigger.
+                delta = distance - float(previous["distance"])
+                min_delta = max(float(person["bbox_w"]), float(person["bbox_h"])) * 0.15
+                entering = not bool(previous["overlaps"]) and overlaps and delta <= -min_delta
+                leaving = bool(previous["overlaps"]) and not overlaps and delta >= min_delta
+                if entering or leaving:
+                    evidence += 1
+                    transitioned_people.append(int(person["track_id"]))
+            pair_state[pair_key] = {
+                "overlaps": overlaps,
+                "timestamp_sec": timestamp,
+                "distance": distance,
+            }
+        if evidence:
+            det["_terminal_transition_people"] = transitioned_people
             return TriState.TRUE
         return TriState.UNKNOWN
 
-    return _check_zone_dwell(
-        vehicles,
+    # Explicit compatibility flags retain their dwell behavior. Geometric
+    # boarding/alighting transitions are already the event evidence, so emit a
+    # review candidate at the transition instead of demanding a second dwell.
+    events: list[ViolationEvent] = []
+    for det in vehicles:
+        activity = _terminal_activity(det)
+        in_loading_zone = _in_zone(
+            det, polygon, state, "illegal_terminal", policy=POLICY_STATIONARY
+        )
+        if (
+            activity.is_true()
+            and in_loading_zone
+            and _is_stationary(det, float(params["stationary_px"]), geometry)
+            and det.get("_terminal_transition_people")
+        ):
+            score = score_from_persistence(
+                detection_confidence=float(det.get("confidence", 0.0)),
+                elapsed_sec=0.0,
+                required_sec=float(params.get("loading_dwell_sec", 8.0)),
+                geometry_stability=0.7,
+                contextual_availability=0.8,
+            )
+            _emit(
+                state, events, VIOLATION_ILLEGAL_TERMINAL, det, frame_number,
+                "Tracked passenger boarding/alighting transition in No Loading zone; manual review required.",
+                score, outcome="review",
+            )
+        det.pop("_terminal_transition_people", None)
+
+    explicit = [
+        det for det in vehicles
+        if det.get("terminal_passenger_activity") in (True, False)
+    ]
+    if not explicit:
+        return events
+    events.extend(_check_zone_dwell(
+        explicit,
         polygon,
         state,
         frame_number,
@@ -1048,7 +1121,8 @@ def check_illegal_terminal(
         geometry=geometry,
         require_extra=_terminal_activity,
         outcome="review",
-    )
+    ))
+    return events
 
 
 def check_obstruction(
@@ -1766,7 +1840,13 @@ def evaluate_detection_rules(
     if zones.get("no_parking") and VIOLATION_ILLEGAL_PARKING in enabled_set:
         events.extend(
             check_illegal_parking(
-                vehicles, zones["no_parking"], state, frame_number, merged, geometry
+                vehicles,
+                zones["no_parking"],
+                state,
+                frame_number,
+                merged,
+                geometry,
+                all_vehicles=vehicles,
             )
         )
     if zones.get("active_lane"):

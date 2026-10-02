@@ -255,6 +255,25 @@ class TestRiderOnlyGate6:
             == []
         )
 
+    def test_nut_shell_detection_is_sent_for_manual_review(self):
+        state = RuleEngineState()
+        classes = ("motorcycle", "rider", "helmet_acceptable", "helmet_nut_shell")
+        mc = _det(track_id=1, class_label="motorcycle", bbox_x=100, bbox_y=100, bbox_w=80, bbox_h=60)
+        rider = _det(track_id=2, class_label="rider", bbox_x=110, bbox_y=90, bbox_w=40, bbox_h=50)
+        nut_shell = _det(track_id=3, class_label="helmet_nut_shell", bbox_x=115, bbox_y=90, bbox_w=24, bbox_h=20)
+        events = []
+        for t in (0.0, 1.0, 2.0):
+            mc["timestamp_sec"] = rider["timestamp_sec"] = nut_shell["timestamp_sec"] = t
+            events.extend(
+                check_substandard_helmet(
+                    [mc, rider, nut_shell], state, int(t), model_classes=classes
+                )
+            )
+
+        assert len(events) == 1
+        assert events[0].violation_type == VIOLATION_SUBSTANDARD_HELMET
+        assert events[0].outcome == "review"
+
     def test_missing_rider_capability_fail_closed(self):
         state = RuleEngineState()
         classes = ("motorcycle", "person", "helmet")
