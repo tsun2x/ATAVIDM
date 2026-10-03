@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SQLITE_PATH = "database/tavidm.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -24,6 +29,22 @@ VIOLATION_SORT_OPTIONS = {
 
 class TemporalEvidenceNotReady(ValueError):
     """Review confirmation blocked until temporal evidence is finalized."""
+
+
+class ReviewDecisionAlreadyRecorded(ValueError):
+    """The review already has a human decision. Nothing was written."""
+
+    def __init__(self, review_id: int) -> None:
+        super().__init__(f"Review item {review_id} already has a human decision")
+        self.review_id = int(review_id)
+
+
+class MigrationError(RuntimeError):
+    """A schema migration failed or found inconsistent data. Its changes were rolled back."""
+
+
+_REVIEW_WRITE = threading.local()
+_SAVEPOINT_IDS = itertools.count(1)
 
 
 def get_db_path() -> str:
@@ -65,12 +86,56 @@ def close_connection(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def db_session() -> Generator[sqlite3.Connection, None, None]:
+    shared = getattr(_REVIEW_WRITE, "conn", None)
+    if shared is not None:
+        # Inside review_write_transaction(): join it. The savepoint keeps this
+        # helper all-or-nothing, and the outer transaction decides the commit.
+        name = f"tavidm_sp_{next(_SAVEPOINT_IDS)}"
+        shared.execute(f"SAVEPOINT {name}")
+        try:
+            yield shared
+        except BaseException:
+            shared.execute(f"ROLLBACK TO {name}")
+            shared.execute(f"RELEASE {name}")
+            raise
+        shared.execute(f"RELEASE {name}")
+        return
     conn = get_connection()
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def review_write_transaction() -> Generator[sqlite3.Connection, None, None]:
+    """Hold the database write lock for one review decision or case write.
+
+    ``BEGIN IMMEDIATE`` takes the write lock before the first read, so every
+    read inside sees the latest committed decision state and no other writer
+    can commit until this block ends. Adapter calls made on this thread inside
+    the block join the same transaction. Nested use becomes a savepoint.
+    """
+    if getattr(_REVIEW_WRITE, "conn", None) is not None:
+        with db_session() as conn:
+            yield conn
+        return
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _REVIEW_WRITE.conn = conn
+        try:
+            yield conn
+        finally:
+            _REVIEW_WRITE.conn = None
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
         conn.close()
@@ -143,6 +208,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_009(conn)
     _apply_migration_010(conn)
     _apply_migration_011(conn)
+    _apply_migration_012(conn)
+    _apply_migration_013(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -191,6 +258,314 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_reports_generated_at ON reports(generated_at);
         """
     )
+
+
+def _apply_migration_012(conn: sqlite3.Connection) -> None:
+    """Additive append-only review_decisions table. No existing table is altered."""
+    migration = Path(__file__).parent / "migrations" / "012_review_decisions.sql"
+    if migration.is_file():
+        conn.executescript(migration.read_text(encoding="utf-8"))
+
+
+def _review_decisions_need_retention_rebuild(conn: sqlite3.Connection) -> bool:
+    """True when decisions still depend on a live review_queue row."""
+    if not _table_exists(conn, "review_decisions"):
+        return False
+    if not _column_exists(conn, "review_decisions", "source_video_id"):
+        return True
+    ddl = _table_create_sql(conn, "review_decisions").lower()
+    return "references review_queue" in ddl
+
+
+def _apply_migration_013(conn: sqlite3.Connection) -> None:
+    """Keep review decisions after the queue row is removed.
+
+    Migration 012 required ``review_id`` to reference ``review_queue``. That
+    foreign key blocks permitted reprocessing and video deletion, and the
+    append-only triggers reject both cascading deletes and ``ON DELETE SET NULL``.
+    This rebuild copies every decision, drops only that queue foreign key, and
+    backfills source provenance from the queue row when it still exists.
+    Databases created from the current schema already have this shape.
+
+    The rebuild runs as one explicit transaction, one statement at a time.
+    ``executescript()`` is not used because it commits a pending transaction
+    first and then autocommits each statement, so an interruption could leave
+    a half-built state. On any failure everything rolls back, foreign keys are
+    turned back on, and ``MigrationError`` is raised. A leftover
+    ``review_decisions__retained`` table from an earlier interrupted run is
+    reconciled first (see ``_resolve_interrupted_013``).
+    """
+    has_retained = _table_exists(conn, _RETAINED_DECISIONS_TABLE)
+    if not has_retained and not _review_decisions_need_retention_rebuild(conn):
+        if not _table_exists(conn, "review_decisions"):
+            return
+        if not _missing_review_decision_protections(conn):
+            return
+    # PRAGMA foreign_keys is ignored inside an open transaction, so finish the
+    # caller's pending work before switching enforcement off.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        if conn.execute("PRAGMA foreign_keys").fetchone()[0]:
+            raise MigrationError(
+                "Migration 013 could not turn off foreign keys for the rebuild."
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _rebuild_review_decisions(conn)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            if isinstance(exc, MigrationError):
+                raise
+            raise MigrationError(
+                "Migration 013 (review_decisions retention rebuild) failed and was "
+                f"rolled back: {exc}"
+            ) from exc
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    if not conn.execute("PRAGMA foreign_keys").fetchone()[0]:
+        raise MigrationError("Foreign-key enforcement was not restored after migration 013.")
+
+
+_RETAINED_DECISIONS_TABLE = "review_decisions__retained"
+
+# Columns shared by the migration-012 shape and the current shape.
+_DECISION_AUDIT_COLUMNS = (
+    "id",
+    "review_id",
+    "decision",
+    "original_violation_type",
+    "selected_canonical_rule",
+    "reason",
+    "reviewer_user_id",
+    "decided_at",
+    "evidence_refs_json",
+    "policy_refs_json",
+    "idempotency_key",
+    "created_at",
+)
+
+_REVIEW_DECISION_PROTECTIONS = (
+    (
+        "idx_review_decisions_one_per_review",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_one_per_review "
+        "ON review_decisions(review_id)",
+    ),
+    (
+        "idx_review_decisions_idempotency",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_idempotency "
+        "ON review_decisions(review_id, idempotency_key)",
+    ),
+    (
+        "idx_review_decisions_decision",
+        "CREATE INDEX IF NOT EXISTS idx_review_decisions_decision "
+        "ON review_decisions(decision, id)",
+    ),
+    (
+        "review_decisions_no_update",
+        "CREATE TRIGGER IF NOT EXISTS review_decisions_no_update "
+        "BEFORE UPDATE ON review_decisions BEGIN "
+        "SELECT RAISE(ABORT, 'review_decisions is append-only'); END",
+    ),
+    (
+        "review_decisions_no_delete",
+        "CREATE TRIGGER IF NOT EXISTS review_decisions_no_delete "
+        "BEFORE DELETE ON review_decisions BEGIN "
+        "SELECT RAISE(ABORT, 'review_decisions is append-only'); END",
+    ),
+)
+
+
+def _decision_audit_rows(conn: sqlite3.Connection, table: str) -> dict[int, tuple]:
+    columns = ", ".join(_DECISION_AUDIT_COLUMNS)
+    rows = conn.execute(f"SELECT {columns} FROM {table} ORDER BY id").fetchall()
+    return {int(row[0]): tuple(row) for row in rows}
+
+
+def _rows_not_in(inner: dict[int, tuple], outer: dict[int, tuple]) -> list[int]:
+    """Ids in ``inner`` that are missing from ``outer`` or differ there."""
+    return sorted(rid for rid, row in inner.items() if outer.get(rid) != row)
+
+
+def _missing_review_decision_protections(conn: sqlite3.Connection) -> list[str]:
+    present = {
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE tbl_name = 'review_decisions' AND type IN ('index', 'trigger')
+            """
+        ).fetchall()
+    }
+    return [name for name, _ddl in _REVIEW_DECISION_PROTECTIONS if name not in present]
+
+
+def _resolve_interrupted_013(conn: sqlite3.Connection) -> dict[int, tuple] | None:
+    """Reconcile a retained table left by an interrupted earlier rebuild.
+
+    Earlier code ran the rebuild with autocommit statements, so any of these
+    can be on disk:
+
+    - the retained table exists next to the original (stopped before DROP);
+      its rows are copies, so it is dropped once every row is verified to be
+      present unchanged in the original;
+    - the original is gone (stopped after DROP); the retained table is the
+      only history and is renamed into place;
+    - the original was re-created empty by migration 012 on the next start;
+      it is dropped only when every row it holds is present unchanged in the
+      retained table, which is then renamed into place.
+
+    Any other combination means both tables hold history the other lacks.
+    That raises ``MigrationError`` without changing either table.
+
+    Returns the audit rows the live table must hold when the retained copy
+    became the live table, else ``None``.
+    """
+    retained = _decision_audit_rows(conn, _RETAINED_DECISIONS_TABLE)
+    if not _table_exists(conn, "review_decisions"):
+        logger.warning(
+            "Migration 013 recovery: review_decisions is missing; restoring it from "
+            "%s (%d decision row(s)).",
+            _RETAINED_DECISIONS_TABLE,
+            len(retained),
+        )
+        conn.execute(f"ALTER TABLE {_RETAINED_DECISIONS_TABLE} RENAME TO review_decisions")
+        return retained
+    live = _decision_audit_rows(conn, "review_decisions")
+    retained_only = _rows_not_in(retained, live)
+    if not retained_only:
+        logger.warning(
+            "Migration 013 recovery: dropping leftover %s (%d row(s)); every row is "
+            "present unchanged in review_decisions (%d row(s)).",
+            _RETAINED_DECISIONS_TABLE,
+            len(retained),
+            len(live),
+        )
+        conn.execute(f"DROP TABLE {_RETAINED_DECISIONS_TABLE}")
+        return None
+    live_only = _rows_not_in(live, retained)
+    if not live_only and _review_decisions_need_retention_rebuild(conn):
+        logger.warning(
+            "Migration 013 recovery: review_decisions was re-created after an "
+            "interrupted rebuild (%d row(s), all present in %s); restoring the "
+            "retained copy (%d row(s)).",
+            len(live),
+            _RETAINED_DECISIONS_TABLE,
+            len(retained),
+        )
+        conn.execute("DROP TABLE review_decisions")
+        conn.execute(f"ALTER TABLE {_RETAINED_DECISIONS_TABLE} RENAME TO review_decisions")
+        return retained
+    raise MigrationError(
+        "Migration 013 stopped: review_decisions and "
+        f"{_RETAINED_DECISIONS_TABLE} both hold decision history the other lacks. "
+        f"Ids only in or changed in review_decisions: {live_only[:10]}"
+        f"{' ...' if len(live_only) > 10 else ''}; ids only in or changed in "
+        f"{_RETAINED_DECISIONS_TABLE}: {retained_only[:10]}"
+        f"{' ...' if len(retained_only) > 10 else ''}. Neither table was changed. "
+        "Reconcile them manually before starting the application again."
+    )
+
+
+def _rebuild_review_decisions(conn: sqlite3.Connection) -> None:
+    """Statements of migration 013. The caller owns the transaction."""
+    expected: dict[int, tuple] | None = None
+    if _table_exists(conn, _RETAINED_DECISIONS_TABLE):
+        expected = _resolve_interrupted_013(conn)
+    if _review_decisions_need_retention_rebuild(conn):
+        expected = _decision_audit_rows(conn, "review_decisions")
+        conn.execute(_RETAINED_DECISIONS_DDL)
+        conn.execute(
+            f"""
+            INSERT INTO {_RETAINED_DECISIONS_TABLE} (
+              id, review_id, decision, original_violation_type, selected_canonical_rule,
+              reason, reviewer_user_id, decided_at, evidence_refs_json, policy_refs_json,
+              idempotency_key, source_video_id, source_track_id, source_processing_run_id,
+              queue_status_at_decision, created_at
+            )
+            SELECT
+              d.id, d.review_id, d.decision, d.original_violation_type,
+              d.selected_canonical_rule, d.reason, d.reviewer_user_id, d.decided_at,
+              d.evidence_refs_json, d.policy_refs_json, d.idempotency_key,
+              q.video_id, q.track_id, q.processing_run_id, q.status, d.created_at
+            FROM review_decisions d
+            LEFT JOIN review_queue q ON q.id = d.review_id
+            """
+        )
+        conn.execute("DROP TABLE review_decisions")
+        conn.execute(f"ALTER TABLE {_RETAINED_DECISIONS_TABLE} RENAME TO review_decisions")
+    for _name, ddl in _REVIEW_DECISION_PROTECTIONS:
+        conn.execute(ddl)
+    _verify_review_decisions_after_013(conn, expected)
+
+
+def _verify_review_decisions_after_013(
+    conn: sqlite3.Connection,
+    expected: dict[int, tuple] | None,
+) -> None:
+    if _table_exists(conn, _RETAINED_DECISIONS_TABLE):
+        raise MigrationError(f"{_RETAINED_DECISIONS_TABLE} still exists after migration 013.")
+    if not _table_exists(conn, "review_decisions") or _review_decisions_need_retention_rebuild(conn):
+        raise MigrationError("review_decisions does not have the retained shape after migration 013.")
+    if expected is not None:
+        actual = _decision_audit_rows(conn, "review_decisions")
+        changed = sorted(set(_rows_not_in(expected, actual)) | set(_rows_not_in(actual, expected)))
+        if changed:
+            raise MigrationError(
+                f"Migration 013 would change decision rows (ids {changed[:10]}); rolled back."
+            )
+    missing = _missing_review_decision_protections(conn)
+    if missing:
+        raise MigrationError(
+            f"Migration 013 could not restore review_decisions protections: {missing}."
+        )
+    broken = conn.execute("PRAGMA foreign_key_check(review_decisions)").fetchall()
+    if broken:
+        raise MigrationError(
+            f"Migration 013 found {len(broken)} review decision row(s) with a missing "
+            f"foreign-key target (rowids {[row[1] for row in broken[:10]]}); rolled back."
+        )
+
+
+_RETAINED_DECISIONS_DDL = """
+            CREATE TABLE review_decisions__retained (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              review_id INTEGER NOT NULL,
+              decision TEXT NOT NULL CHECK(decision IN (
+                'confirm_proposed',
+                'correct_canonical',
+                'no_violation',
+                'insufficient_evidence'
+              )),
+              original_violation_type TEXT NOT NULL,
+              selected_canonical_rule TEXT,
+              reason TEXT NOT NULL,
+              reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+              decided_at TEXT NOT NULL,
+              evidence_refs_json TEXT NOT NULL DEFAULT '{}',
+              policy_refs_json TEXT NOT NULL DEFAULT '{}',
+              idempotency_key TEXT NOT NULL,
+              source_video_id INTEGER,
+              source_track_id INTEGER,
+              source_processing_run_id INTEGER,
+              queue_status_at_decision TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              CHECK (
+                (
+                  decision IN ('confirm_proposed', 'correct_canonical')
+                  AND selected_canonical_rule IS NOT NULL
+                )
+                OR (
+                  decision IN ('no_violation', 'insufficient_evidence')
+                  AND selected_canonical_rule IS NULL
+                )
+              )
+            )
+"""
 
 
 def _apply_migration_011(conn: sqlite3.Connection) -> None:
@@ -822,6 +1197,7 @@ def init_db(force: bool = False) -> None:
         if force:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS review_decisions;
                 DROP TABLE IF EXISTS motorcycle_detail_candidates;
                 DROP TABLE IF EXISTS case_action_events;
                 DROP TABLE IF EXISTS recurrence_reviews;
@@ -2742,6 +3118,8 @@ def create_case_with_materialization_intent(
     contributing_rules: list[str] | tuple[str, ...],
     review_ids: list[int] | tuple[int, ...],
     additional_link_review_ids: list[int] | tuple[int, ...] | None = None,
+    violation_type_override: str | None = None,
+    decision_insert: dict[str, Any] | None = None,
     _fail_after: str | None = None,
 ) -> int:
     """Atomically create a case, confirm/link initial reviews, and record intent.
@@ -2756,13 +3134,20 @@ def create_case_with_materialization_intent(
     rolls back. Later evidence/snapshot completion remains a staged recoverable
     path outside this function.
 
+    ``violation_type_override`` is written only onto the new violation row.
+    The review_queue suggestion is not rewritten.
+
+    ``decision_insert`` appends the human decision in this same transaction.
+    ``_fail_after='review_decision'`` raises after that insert so the case,
+    queue update, and decision all roll back.
+
     ``_fail_after`` is a test-only fault-injection seam; production callers omit it.
     """
     extra_ids = [int(r) for r in (additional_link_review_ids or ()) if int(r) != int(primary_review_id)]
     now_link = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
 
-    with db_session() as conn:
+    with review_write_transaction() as conn:
         row = conn.execute(
             "SELECT * FROM review_queue WHERE id = ?",
             (primary_review_id,),
@@ -2775,6 +3160,18 @@ def create_case_with_materialization_intent(
             raise ValueError(
                 f"Review item {primary_review_id} is not pending (status: {row_status})"
             )
+        if decision_insert is not None and _review_has_decision(
+            conn, int(decision_insert["review_id"])
+        ):
+            raise ReviewDecisionAlreadyRecorded(int(decision_insert["review_id"]))
+        for extra_id in extra_ids:
+            extra = conn.execute(
+                "SELECT status FROM review_queue WHERE id = ?", (extra_id,)
+            ).fetchone()
+            if extra is not None and extra["status"] == "dismissed":
+                raise ValueError(
+                    f"Review item {extra_id} was closed without a case and cannot be linked"
+                )
 
         row_keys = row.keys()
 
@@ -2815,7 +3212,7 @@ def create_case_with_materialization_intent(
             (
                 row["video_id"],
                 row["track_id"],
-                row["violation_type"],
+                violation_type_override or row["violation_type"],
                 _pick("vehicle_class"),
                 row["confidence"],
                 row["frame_number"],
@@ -2911,6 +3308,22 @@ def create_case_with_materialization_intent(
                         ),
                     )
 
+            if decision_insert is not None:
+                _insert_review_decision_row(
+                    conn,
+                    review_id=int(decision_insert["review_id"]),
+                    decision=str(decision_insert["decision"]),
+                    original_violation_type=str(decision_insert["original_violation_type"]),
+                    selected_canonical_rule=decision_insert.get("selected_canonical_rule"),
+                    reason=str(decision_insert["reason"]),
+                    reviewer_user_id=int(decision_insert["reviewer_user_id"]),
+                    evidence_refs=decision_insert.get("evidence_refs") or {},
+                    policy_refs=decision_insert.get("policy_refs") or {},
+                    idempotency_key=str(decision_insert["idempotency_key"]),
+                )
+                if _fail_after == "review_decision":
+                    raise RuntimeError("review decision boom")
+
             if _fail_after == "intent":
                 raise RuntimeError("intent boom")
 
@@ -2950,6 +3363,400 @@ def create_case_with_materialization_intent(
             raise ValueError("case_action_events table does not exist")
 
         return violation_id
+
+
+def _json_object(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value if isinstance(value, dict) else {})
+
+
+def _review_has_decision(conn: sqlite3.Connection, review_id: int) -> bool:
+    if not _table_exists(conn, "review_decisions"):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM review_decisions WHERE review_id = ? LIMIT 1",
+        (int(review_id),),
+    ).fetchone()
+    return row is not None
+
+
+def _insert_review_decision_row(
+    conn: sqlite3.Connection,
+    *,
+    review_id: int,
+    decision: str,
+    original_violation_type: str,
+    selected_canonical_rule: str | None,
+    reason: str,
+    reviewer_user_id: int,
+    evidence_refs: Any,
+    policy_refs: Any,
+    idempotency_key: str,
+) -> int:
+    decided_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    source = conn.execute(
+        """
+        SELECT video_id, track_id, processing_run_id, status
+        FROM review_queue WHERE id = ?
+        """,
+        (int(review_id),),
+    ).fetchone()
+    cursor = conn.execute(
+        """
+        INSERT INTO review_decisions (
+            review_id, decision, original_violation_type, selected_canonical_rule,
+            reason, reviewer_user_id, decided_at, evidence_refs_json,
+            policy_refs_json, idempotency_key,
+            source_video_id, source_track_id, source_processing_run_id,
+            queue_status_at_decision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(review_id),
+            decision,
+            original_violation_type,
+            selected_canonical_rule,
+            reason,
+            int(reviewer_user_id),
+            decided_at,
+            _json_object(evidence_refs),
+            _json_object(policy_refs),
+            idempotency_key,
+            source["video_id"] if source is not None else None,
+            source["track_id"] if source is not None else None,
+            source["processing_run_id"] if source is not None else None,
+            source["status"] if source is not None else None,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_review_decision(review_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        if not _table_exists(conn, "review_decisions"):
+            return None
+        row = conn.execute(
+            """
+            SELECT d.*, u.username AS reviewer_username
+            FROM review_decisions d
+            LEFT JOIN users u ON u.id = d.reviewer_user_id
+            WHERE d.review_id = ?
+            """,
+            (int(review_id),),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_recent_review_decisions(limit: int = 8) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 50))
+    with db_session() as conn:
+        if not _table_exists(conn, "review_decisions"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT d.*, u.username AS reviewer_username, q.status AS review_status,
+                   q.violation_type AS queue_violation_type
+            FROM review_decisions d
+            LEFT JOIN users u ON u.id = d.reviewer_user_id
+            LEFT JOIN review_queue q ON q.id = d.review_id
+            ORDER BY d.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+
+def list_review_queue_by_decision(
+    decision: str,
+    page: int = 1,
+    per_page: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    offset = max(page - 1, 0) * per_page
+    with db_session() as conn:
+        if not _table_exists(conn, "review_decisions"):
+            return [], 0
+        count_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM review_queue q
+            JOIN review_decisions d ON d.review_id = q.id
+            WHERE d.decision = ?
+            """,
+            (decision,),
+        ).fetchone()
+        total = count_row["total"] if count_row else 0
+        rows = conn.execute(
+            """
+            SELECT q.*, d.decision AS human_decision,
+                   d.original_violation_type AS decision_original_violation_type,
+                   d.selected_canonical_rule, d.reason AS decision_reason,
+                   d.reviewer_user_id AS decision_reviewer_user_id,
+                   d.decided_at, d.id AS review_decision_id
+            FROM review_queue q
+            JOIN review_decisions d ON d.review_id = q.id
+            WHERE d.decision = ?
+            ORDER BY d.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (decision, per_page, offset),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows], total
+
+
+def close_review_with_decision(
+    review_id: int,
+    reviewed_by: int,
+    *,
+    decision: str,
+    original_violation_type: str,
+    reason: str,
+    idempotency_key: str,
+    evidence_refs: dict[str, Any],
+    policy_refs: dict[str, Any],
+    _fail_after: str | None = None,
+) -> int:
+    """Close a queue item without a case and append one decision row.
+
+    Status stays inside the existing pending/confirmed/dismissed check.
+    Both no-case dispositions use ``dismissed`` as the queue bucket; the
+    decision value is the visible disposition. The original violation_type
+    is not rewritten. ``_fail_after='decision'`` rolls the status change back.
+    """
+    reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with review_write_transaction() as conn:
+        row = conn.execute(
+            "SELECT status, violation_type FROM review_queue WHERE id = ?",
+            (int(review_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Review item {review_id} not found")
+        if _review_has_decision(conn, int(review_id)):
+            raise ReviewDecisionAlreadyRecorded(int(review_id))
+        if row["status"] != "pending":
+            raise ValueError(
+                f"Review item {review_id} is not pending (status: {row['status']})"
+            )
+        if row["violation_type"] != original_violation_type:
+            raise ValueError("Original suggestion changed before the decision was stored")
+        conn.execute(
+            """
+            UPDATE review_queue
+            SET status = 'dismissed', reviewed_by = ?, reviewed_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (reviewed_by, reviewed_at, int(review_id)),
+        )
+        decision_id = _insert_review_decision_row(
+            conn,
+            review_id=int(review_id),
+            decision=decision,
+            original_violation_type=original_violation_type,
+            selected_canonical_rule=None,
+            reason=reason,
+            reviewer_user_id=reviewed_by,
+            evidence_refs=evidence_refs,
+            policy_refs=policy_refs,
+            idempotency_key=idempotency_key,
+        )
+        if _fail_after == "decision":
+            raise RuntimeError("review decision boom")
+        return decision_id
+
+
+def insert_review_decision(
+    review_id: int,
+    *,
+    decision: str,
+    original_violation_type: str,
+    selected_canonical_rule: str | None,
+    reason: str,
+    reviewer_user_id: int,
+    idempotency_key: str,
+    evidence_refs: dict[str, Any] | None = None,
+    policy_refs: dict[str, Any] | None = None,
+    _conn: sqlite3.Connection | None = None,
+) -> int:
+    """Append one decision. Fails if this review already has one.
+
+    ``_conn`` joins an open transaction so a reused-case confirmation can roll
+    the decision back together with the queue update and case link.
+    """
+    if _conn is not None:
+        return _insert_review_decision_row(
+            _conn,
+            review_id=int(review_id),
+            decision=decision,
+            original_violation_type=original_violation_type,
+            selected_canonical_rule=selected_canonical_rule,
+            reason=reason,
+            reviewer_user_id=reviewer_user_id,
+            evidence_refs=evidence_refs or {},
+            policy_refs=policy_refs or {},
+            idempotency_key=idempotency_key,
+        )
+    with review_write_transaction() as conn:
+        return _insert_review_decision_row(
+            conn,
+            review_id=int(review_id),
+            decision=decision,
+            original_violation_type=original_violation_type,
+            selected_canonical_rule=selected_canonical_rule,
+            reason=reason,
+            reviewer_user_id=reviewer_user_id,
+            evidence_refs=evidence_refs or {},
+            policy_refs=policy_refs or {},
+            idempotency_key=idempotency_key,
+        )
+
+
+def attach_review_decision_to_existing_case(
+    review_id: int,
+    violation_id: int,
+    reviewed_by: int,
+    *,
+    policy_version_id: int,
+    contributing_rules: list[str] | tuple[str, ...],
+    review_ids: list[int] | tuple[int, ...],
+    decision_insert: dict[str, Any],
+    _fail_after: str | None = None,
+) -> None:
+    """Confirm one pending review onto an existing case and store its decision.
+
+    One transaction covers the queue disposition, the review-to-case link, the
+    human decision, and the original materialization intent when the case does
+    not already have one. A failure while inserting the decision rolls the
+    confirmation back. An existing intent, including its policy version, is
+    left unchanged. Later evidence and snapshot writes stay outside this
+    boundary.
+    """
+    reviewed_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+    now_link = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with review_write_transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM review_queue WHERE id = ?",
+            (int(review_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Review item {review_id} not found")
+        row_keys = row.keys()
+        if _review_has_decision(conn, int(review_id)):
+            raise ReviewDecisionAlreadyRecorded(int(review_id))
+        if row["status"] != "pending":
+            raise ValueError(
+                f"Review item {review_id} is not pending (status: {row['status']})"
+            )
+        temporal_tagged = (
+            "evidence_pre_sec" in row_keys and row["evidence_pre_sec"] is not None
+        )
+        has_clip = bool(
+            ("evidence_clip_path" in row_keys and row["evidence_clip_path"])
+            or ("evidence_sequence_dir" in row_keys and row["evidence_sequence_dir"])
+        )
+        episode_closed = (
+            "episode_end_sec" in row_keys and row["episode_end_sec"] is not None
+        )
+        if temporal_tagged and (not has_clip or not episode_closed):
+            raise TemporalEvidenceNotReady(
+                "Temporal evidence is still being finalized; confirmation is blocked "
+                "until the post-roll clip/sequence is written."
+            )
+        if str(row["violation_type"]) != str(decision_insert["original_violation_type"]):
+            raise ValueError("Original suggestion changed before the decision was stored")
+        if _fail_after == "before_review_decision":
+            raise RuntimeError("review decision boom")
+
+        conn.execute(
+            """
+            UPDATE review_queue
+            SET status = 'confirmed', reviewed_by = ?, reviewed_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (reviewed_by, reviewed_at, int(review_id)),
+        )
+        if _table_exists(conn, "case_action_events"):
+            existing_link = conn.execute(
+                """
+                SELECT id FROM case_action_events
+                WHERE violation_id = ? AND review_id = ? AND action_type = ?
+                LIMIT 1
+                """,
+                (int(violation_id), int(review_id), ACTION_REVIEW_CONFIRMED),
+            ).fetchone()
+            if existing_link is None:
+                conn.execute(
+                    """
+                    INSERT INTO case_action_events
+                        (violation_id, review_id, action_type, detail_json,
+                         actor_user_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(violation_id),
+                        int(review_id),
+                        ACTION_REVIEW_CONFIRMED,
+                        json.dumps({"link": "review_to_violation"}),
+                        reviewed_by,
+                        now_link,
+                    ),
+                )
+        insert_review_decision(
+            int(decision_insert["review_id"]),
+            decision=str(decision_insert["decision"]),
+            original_violation_type=str(decision_insert["original_violation_type"]),
+            selected_canonical_rule=decision_insert.get("selected_canonical_rule"),
+            reason=str(decision_insert["reason"]),
+            reviewer_user_id=int(decision_insert["reviewer_user_id"]),
+            idempotency_key=str(decision_insert["idempotency_key"]),
+            evidence_refs=decision_insert.get("evidence_refs") or {},
+            policy_refs=decision_insert.get("policy_refs") or {},
+            _conn=conn,
+        )
+        if _fail_after == "review_decision":
+            raise RuntimeError("review decision boom")
+
+        if _table_exists(conn, "case_action_events"):
+            actions = conn.execute(
+                """
+                SELECT detail_json FROM case_action_events
+                WHERE violation_id = ? AND action_type = ?
+                """,
+                (int(violation_id), ACTION_REVIEW_CONFIRMED),
+            ).fetchall()
+            has_intent = False
+            for action in actions:
+                try:
+                    detail = json.loads(action["detail_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if detail.get("materialization_intent"):
+                    has_intent = True
+                    break
+            if not has_intent:
+                conn.execute(
+                    """
+                    INSERT INTO case_action_events
+                        (violation_id, review_id, action_type, detail_json,
+                         actor_user_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(violation_id),
+                        None,
+                        ACTION_REVIEW_CONFIRMED,
+                        json.dumps(
+                            {
+                                "materialization_intent": True,
+                                "policy_version_id": int(policy_version_id),
+                                "contributing_rules": list(contributing_rules),
+                                "review_ids": [int(item) for item in review_ids],
+                            }
+                        ),
+                        reviewed_by,
+                        now_link,
+                    ),
+                )
 
 
 def dismiss_review_item(review_id: int, reviewed_by: int) -> None:
@@ -4516,6 +5323,21 @@ def can_verify_plate(user_id: int) -> bool:
     if user.get("role") in ENFORCEMENT_ROLES:
         return True
     return user_has_permission(user_id, PERM_VERIFY_PLATE)
+
+
+def can_confirm_plate_identity(user_id: int) -> bool:
+    """True only for an active System Administrator.
+
+    Deliberately narrower than :func:`can_verify_plate`: while the experimental
+    plate demo is in scope, human confirmation of a plate identity is an
+    admin-only action. An explicit ``verify_plate`` grant does **not** widen
+    this. ``ENFORCEMENT_ROLES``, :func:`can_verify_plate`, case confirmation,
+    event-time review, and every other enforcer capability are unchanged.
+    """
+    user = get_user(user_id)
+    if user is None or not _user_account_is_active(user):
+        return False
+    return str(user.get("role") or "") == "admin"
 
 
 def can_confirm_event_time(user_id: int) -> bool:

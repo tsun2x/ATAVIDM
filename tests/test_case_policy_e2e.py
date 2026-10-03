@@ -60,7 +60,13 @@ def inactive(test_db):
     return uid
 
 
-def test_full_review_pipeline_grouped_case(test_db, enforcer, inactive, viewer):
+@pytest.fixture
+def admin(test_db):
+    """Plate confirmation is an active-admin action in the experimental demo."""
+    return test_db.create_user("adm", "hash", role="admin", full_name="Admin")
+
+
+def test_full_review_pipeline_grouped_case(test_db, enforcer, inactive, viewer, admin):
     video = test_db.insert_video("e2e.mp4", "/tmp/e2e.mp4", status="ready")
     park = test_db.insert_review_queue(
         video_id=video,
@@ -107,7 +113,7 @@ def test_full_review_pipeline_grouped_case(test_db, enforcer, inactive, viewer):
     assert viol["vehicle_evidence_path"] == "/tmp/veh.jpg"
     assert viol["plate_evidence_path"] == "/tmp/plate.jpg"
 
-    # Unauthorized / inactive blocked
+    # Unauthorized / inactive / non-admin blocked
     with pytest.raises(PermissionError):
         verify_plate_identity(
             test_db,
@@ -124,16 +130,23 @@ def test_full_review_pipeline_grouped_case(test_db, enforcer, inactive, viewer):
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text="E2E123",
         )
+    # An enforcement officer is no longer allowed to confirm a plate identity.
+    with pytest.raises(PermissionError):
+        verify_plate_identity(
+            test_db,
+            vid,
+            enforcer,
+            plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
+            accepted_plate_text="E2E123",
+        )
 
-    # Authorized plate + event-time review
+    # Authorized plate (admin) + event-time review (enforcer, unchanged)
     verify_plate_identity(
         test_db,
         vid,
-        enforcer,
+        admin,
         plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
         accepted_plate_text="E2E123",
-        candidate_reference="fake-cand",
-        evidence_crop_ref="/tmp/plate.jpg",
     )
     persist_event_time_review(
         test_db,
@@ -177,7 +190,7 @@ def test_full_review_pipeline_grouped_case(test_db, enforcer, inactive, viewer):
     verify_plate_identity(
         test_db,
         prior_vid,
-        enforcer,
+        admin,
         plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
         accepted_plate_text="E2E123",
     )
@@ -257,7 +270,30 @@ def test_flask_case_apis_isolated(client, enforcer_client):
     assert payload["success"] is True
     vid = payload["violation_id"]
 
-    plate = enforcer_client.post(
+    # Plate confirmation is an active-admin action while the experimental plate
+    # demo is in scope. The enforcer is refused, and the spoofed verified_by is
+    # ignored when an administrator does it.
+    plate_forbidden = enforcer_client.post(
+        f"/api/cases/{vid}/plate",
+        json={
+            "plate_status": "verified_readable",
+            "accepted_plate_text": "API999",
+        },
+    )
+    assert plate_forbidden.status_code == 403
+
+    import bcrypt
+
+    admin_password = "case-api-admin-pw"
+    admin_id = db.create_user(
+        "case_api_admin",
+        bcrypt.hashpw(admin_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
+        role="admin",
+        full_name="Case API Admin",
+    )
+    assert admin_id
+    client.post("/login", data={"username": "case_api_admin", "password": admin_password})
+    plate = client.post(
         f"/api/cases/{vid}/plate",
         json={
             "plate_status": "verified_readable",
@@ -268,6 +304,8 @@ def test_flask_case_apis_isolated(client, enforcer_client):
     assert plate.status_code == 200
     assert plate.get_json()["verified_by"] != 999999
 
+    # Event-time review remains an enforcer capability.
+    client.post("/logout")
     evt = enforcer_client.post(
         f"/api/cases/{vid}/event-time",
         json={"event_time": "2026-04-01T08:00:00+08:00"},

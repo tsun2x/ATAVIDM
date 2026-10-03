@@ -201,8 +201,9 @@
             detailField("Status", '<span class="badge status-badge status-' + escapeHtml(v.status) + '">' + escapeHtml(v.status) + "</span>") +
             detailField("Reason Log", escapeHtml(v.reason_log || ""), true) +
             "</div>" +
+            plateMachineSection(v) +
             '<hr><div class="d-flex flex-wrap gap-2" id="caseActionBar">' +
-            '<button type="button" class="btn btn-sm btn-outline-primary" id="btnVerifyPlate">Verify Plate</button>' +
+            plateActionButton(v) +
             '<button type="button" class="btn btn-sm btn-outline-primary" id="btnConfirmEventTime">Confirm Event Time</button>' +
             '<button type="button" class="btn btn-sm btn-success" id="btnConfirmCase">Confirm Case</button>' +
             '<button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintable">Printable Record</button>' +
@@ -213,8 +214,125 @@
         wireCaseActions(v);
     }
 
+    // -- Experimental local plate OCR on the case detail ---------------
+    // Machine state, human-verified identity, and violation decisions are three
+    // separate things. Nothing here changes a review-queue status, and nothing
+    // here accepts a plate without an explicit administrator action.
+    const PLATE_MACHINE_STATES = {
+        disabled: ["Disabled", "secondary", "Experimental local OCR is disabled in this build."],
+        none: ["No attempt", "secondary", "No machine plate attempt is recorded for this case."],
+        queued: ["Queued", "info", "Machine plate attempt is queued on the bounded local inference worker."],
+        processing: ["Processing", "info", "Machine plate attempt is running on the bounded local inference worker."],
+        unavailable: ["Unavailable", "warning", "Local plate OCR artifacts or provider are unavailable. Nothing was downloaded and no fallback provider was used."],
+        failed: ["Failed", "danger", "Local plate OCR failed while running."],
+        no_candidate_detected: ["No candidate detected", "secondary", "No plate candidate was detected in the selected evidence. This does not mean no plate exists."],
+        detected_unreadable: ["Plate detected; text unreadable", "warning", "A plate region was detected and passed the quality gate, but no text could be read."],
+        quality_rejected: ["Quality rejected", "warning", "A plate region was detected but rejected by the quality gate before recognition."],
+        association_uncertain: ["Association uncertain", "danger", "Vehicle-to-plate association is uncertain. Candidate is not eligible for confirmation."],
+        cancelled: ["Cancelled", "secondary", "Collection ended before the machine attempt could complete."],
+        budget_exhausted: ["Budget exhausted", "warning", "The configured scheduling/work budget was exhausted. Partial results, if any, are shown."],
+        candidate_found: ["Machine candidate", "warning", "Machine candidate text below. Unverified until an administrator explicitly confirms it."],
+    };
+
+    function isAdminViewer() {
+        return !!document.body && !!document.body.dataset && document.body.dataset.tavidmRole === "admin";
+    }
+
+    function fmtPlateScore(value) {
+        return (value === null || value === undefined) ? "—" : Number(value).toFixed(2);
+    }
+
+    function plateMachineSection(v) {
+        const machine = v.plate_machine || {};
+        const state = machine.state || "none";
+        const copy = PLATE_MACHINE_STATES[state] || ["Unknown", "secondary", "Unrecognized machine state; no conclusion can be drawn."];
+        let html = '<div class="border rounded p-2 mt-3" id="plateMachineSection">' +
+            '<div class="d-flex flex-wrap justify-content-between align-items-start gap-2">' +
+            "<div><strong>Experimental local OCR</strong> " +
+            '<span class="small text-muted">&mdash; human admin review required</span></div>' +
+            '<span class="badge bg-' + copy[1] + '">' + escapeHtml(copy[0]) + "</span></div>" +
+            '<p class="small text-muted mb-1 mt-2">' + escapeHtml(copy[2]) + "</p>";
+
+        if (machine.association_uncertain) {
+            html += '<p class="small text-danger mb-1">Association uncertain; candidate is not eligible for confirmation.</p>';
+        }
+        const candidates = machine.candidates || [];
+        if (candidates.length) {
+            html += '<p class="small text-muted mb-1">Machine candidates (unverified):</p><div class="d-flex flex-column gap-2">';
+            candidates.forEach(function (candidate) {
+                const cropUrl = (candidate.plate_crop_available && candidate.plate_crop_name && machine.attempt_id)
+                    ? "/api/cases/" + encodeURIComponent(v.db_id) + "/plate-crop/" +
+                      encodeURIComponent(machine.attempt_id) + "/" + encodeURIComponent(candidate.plate_crop_name)
+                    : null;
+                const text = (candidate.ocr_raw === null || candidate.ocr_raw === undefined || candidate.ocr_raw === "")
+                    ? '<span class="text-muted">no text returned</span>'
+                    : "<code>" + escapeHtml(candidate.ocr_raw) + "</code>";
+                html += '<div class="border rounded p-2' +
+                    (candidate.candidate_id === machine.primary_candidate_id ? " border-warning" : "") + '">' +
+                    text +
+                    (candidate.candidate_id === machine.primary_candidate_id ? ' <span class="badge bg-warning text-dark">primary</span>' : "") +
+                    '<p class="small text-muted mb-1">Frame ' + escapeHtml(String(candidate.frame_number)) +
+                    " · t=" + fmtPlateScore(candidate.timestamp_sec) + "s · track #" + escapeHtml(String(candidate.track_id)) +
+                    " · epoch " + escapeHtml(String(candidate.track_identity_epoch)) +
+                    " · vehicle box " + escapeHtml(JSON.stringify(candidate.vehicle_box_in_frame || [])) +
+                    " · plate box " + escapeHtml(JSON.stringify(candidate.plate_box_in_frame || [])) +
+                    " · det " + escapeHtml(candidate.detection_confidence === null || candidate.detection_confidence === undefined ? "—" : (Number(candidate.detection_confidence) * 100).toFixed(1) + "%") +
+                    " · score " + fmtPlateScore(candidate.ocr_scalar_score) + "</p>" +
+                    (cropUrl
+                        ? '<img src="' + escapeHtml(cropUrl) + '" alt="Machine plate candidate crop" class="img-fluid rounded border" style="max-height:110px;">'
+                        : '<p class="small text-muted mb-1">Candidate crop is not available on disk.</p>') +
+                    '<button type="button" class="btn btn-sm btn-outline-primary plate-confirm-candidate mt-2" data-candidate-id="' +
+                    escapeHtml(candidate.candidate_id || "") + '" data-raw="' + escapeHtml(candidate.ocr_raw || "") + '">' +
+                    "Use this candidate text (admin)</button></div>";
+            });
+            html += "</div>";
+            html += '<p class="small text-muted mb-0 mt-2">Scores are raw uncalibrated model values, not probabilities and not an accuracy estimate.</p>';
+        } else if (machine.outcome_is_ambiguous) {
+            html += '<p class="small text-muted mb-0">No candidate text is available. This is an explicit machine outcome, not a statement that no plate exists.</p>';
+        }
+        html += "</div>";
+        return html;
+    }
+
+    function plateActionButton(v) {
+        // Human correction/manual entry stays available to an administrator
+        // whenever the evidence is readable, even with no machine candidate.
+        if (!isAdminViewer()) {
+            return '<button type="button" class="btn btn-sm btn-outline-secondary" disabled title="Plate confirmation is restricted to an active System Administrator">Verify Plate (admin only)</button>';
+        }
+        const machine = v.plate_machine || {};
+        const hasCandidate = (machine.candidates || []).length > 0 && machine.eligible_for_confirmation === true;
+        return '<button type="button" class="btn btn-sm btn-outline-primary" id="btnVerifyPlate"' +
+            (hasCandidate ? "" : ' title="Enter the plate text you can actually read"') + ">Verify Plate</button>";
+    }
+
     function wireCaseActions(v) {
         const id = v.db_id;
+        document.querySelectorAll(".plate-confirm-candidate").forEach(function (button) {
+            button.addEventListener("click", function () {
+                const candidateId = button.getAttribute("data-candidate-id") || "";
+                const suggested = button.getAttribute("data-raw") || "";
+                const accepted = window.prompt(
+                    "Confirm the plate exactly as it is visibly readable (administrator action).\n" +
+                    "Correct the text if the machine read is wrong. Partial text is rejected.",
+                    suggested
+                );
+                if (accepted === null) return;
+                const text = accepted.trim();
+                if (!text) {
+                    postJson("/api/cases/" + id + "/plate", {
+                        plate_status: "unclear",
+                        candidate_id: candidateId,
+                    });
+                    return;
+                }
+                postJson("/api/cases/" + id + "/plate", {
+                    plate_status: "verified_readable",
+                    accepted_plate_text: text,
+                    candidate_id: candidateId,
+                });
+            });
+        });
         document.getElementById("btnVerifyPlate")?.addEventListener("click", function () {
             const text = window.prompt("Accepted plate text (all characters must be visibly readable). Leave blank to mark unclear.");
             const payload = text
@@ -281,16 +399,21 @@
         if (!body) return;
         const sceneImg = evidenceImage(v.evidence_url, "No scene evidence snapshot available.");
         const vehicleImg = evidenceImage(v.vehicle_evidence_url, "No vehicle crop captured for this detection.");
+        const clipPane = v.evidence_clip_url
+            ? '<video controls preload="metadata" class="evidence-preview w-100 rounded" src="' + escapeHtml(v.evidence_clip_url) + '">Your browser does not support evidence video playback.</video>'
+            : '<div class="text-muted py-5"><i class="bi bi-film fs-1 d-block mb-2"></i>No finalized evidence clip available.</div>';
         body.innerHTML =
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
             '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#paneScene" type="button" role="tab">Scene</button></li>' +
             '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneVehicle" type="button" role="tab">Vehicle</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneClip" type="button" role="tab">Clip (3s before / 3s after)</button></li>' +
             "</ul>" +
             '<div class="tab-content">' +
             '<div class="tab-pane fade show active" id="paneScene" role="tabpanel">' + sceneImg +
             "<p class=\"mt-2 text-muted small\">" + escapeHtml(v.id) + " · " + escapeHtml(v.type) + " · Track #" + escapeHtml(v.track_id) + " · " + escapeHtml(v.timestamp) + "</p></div>" +
             '<div class="tab-pane fade" id="paneVehicle" role="tabpanel">' + vehicleImg +
             "<p class=\"mt-2 text-muted small\">Vehicle/object crop. Plate recognition is not performed in this build.</p></div>" +
+            '<div class="tab-pane fade" id="paneClip" role="tabpanel">' + clipPane + "</div>" +
             "</div>";
         evidenceModal.show();
     }

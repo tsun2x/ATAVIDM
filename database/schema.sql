@@ -431,3 +431,59 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_permission_unique_active
   WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_permission_user ON policy_permission_assignments(user_id);
 CREATE INDEX IF NOT EXISTS idx_permission_perm ON policy_permission_assignments(permission);
+
+-- Append-only human review decisions. The queue row keeps the original
+-- system suggestion; this table records the human disposition.
+-- review_id is the historical queue identifier and is intentionally not a
+-- foreign key: permitted result removal and video deletion delete the queue
+-- row, while this audit row stays. ON DELETE CASCADE would destroy history,
+-- and ON DELETE SET NULL would update an append-only row.
+CREATE TABLE IF NOT EXISTS review_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  review_id INTEGER NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN (
+    'confirm_proposed',
+    'correct_canonical',
+    'no_violation',
+    'insufficient_evidence'
+  )),
+  original_violation_type TEXT NOT NULL,
+  selected_canonical_rule TEXT,
+  reason TEXT NOT NULL,
+  reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+  decided_at TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL DEFAULT '{}',
+  policy_refs_json TEXT NOT NULL DEFAULT '{}',
+  idempotency_key TEXT NOT NULL,
+  source_video_id INTEGER,
+  source_track_id INTEGER,
+  source_processing_run_id INTEGER,
+  queue_status_at_decision TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CHECK (
+    (
+      decision IN ('confirm_proposed', 'correct_canonical')
+      AND selected_canonical_rule IS NOT NULL
+    )
+    OR (
+      decision IN ('no_violation', 'insufficient_evidence')
+      AND selected_canonical_rule IS NULL
+    )
+  )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_one_per_review
+  ON review_decisions(review_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_decisions_idempotency
+  ON review_decisions(review_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_review_decisions_decision
+  ON review_decisions(decision, id);
+CREATE TRIGGER IF NOT EXISTS review_decisions_no_update
+BEFORE UPDATE ON review_decisions
+BEGIN
+  SELECT RAISE(ABORT, 'review_decisions is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_decisions_no_delete
+BEFORE DELETE ON review_decisions
+BEGIN
+  SELECT RAISE(ABORT, 'review_decisions is append-only');
+END;

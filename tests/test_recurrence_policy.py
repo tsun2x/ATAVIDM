@@ -54,6 +54,20 @@ def supervisor(test_db, admin):
     return uid
 
 
+def _plate_admin(test_db) -> int:
+    """Resolve an active administrator id for plate confirmation.
+
+    Plate confirmation is restricted to an active System Administrator while
+    the experimental plate demo is in scope. Case confirmation and event-time
+    review deliberately stay with the enforcer in these tests, so this split
+    also proves the restriction is narrow.
+    """
+    for row in test_db.list_users():
+        if row.get("role") == "admin" and row.get("is_active", 1):
+            return int(row["id"])
+    return int(test_db.create_user("plate_admin", "hash", role="admin", full_name="Plate Admin"))
+
+
 def _make_case(
     test_db,
     enforcer,
@@ -90,7 +104,7 @@ def _make_case(
         verify_plate_identity(
             test_db,
             vid,
-            enforcer,
+            _plate_admin(test_db),
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text=plate,
         )

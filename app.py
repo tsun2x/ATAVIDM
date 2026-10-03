@@ -39,7 +39,11 @@ from core.annotated_writer import (
     download_name_for_annotated,
     mime_for_annotated_path,
 )
-from core.detection_config import CANONICAL_VIOLATIONS, MODEL_FAMILY
+from core.detection_config import (
+    CANONICAL_VIOLATIONS,
+    FROZEN_VEHICLE_DETECTOR_CLASSES,
+    MODEL_FAMILY,
+)
 from core.violation_config import (
     ViolationConfigError,
     load_enabled_violations,
@@ -322,6 +326,20 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         contributing = [vtype] if vtype else []
 
     flag_only = legal_status == "flag_only"
+    try:
+        from core.plate_review import machine_result_for_violation
+
+        plate_machine = machine_result_for_violation(db, vid)
+    except Exception:  # noqa: BLE001 - the experiment must never break the case page
+        app.logger.exception("plate machine payload unavailable for case %s", vid)
+        plate_machine = {
+            "experimental": True,
+            "state": "unavailable",
+            "outcome_is_ambiguous": True,
+            "eligible_for_confirmation": False,
+            "candidates": [],
+            "notes": "Experimental local OCR payload unavailable.",
+        }
     return {
         "id": f"VIO-{row['id']:06d}",
         "db_id": row["id"],
@@ -355,10 +373,12 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
             db.is_case_confirmed(vid) and not flag_only and row.get("status") != "dismissed"
         ),
         "review_material_only": bool(flag_only or legal_status in ("unverified", "partially_verified")),
+        "plate_machine": plate_machine,
     }
 
 
 def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+    from core.review_decision_service import disposition_label
     from core.violation_policy import (
         legal_status_for,
         proposed_official_category_for,
@@ -368,6 +388,20 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
     vtype = row.get("violation_type") or ""
     status = legal_status_for(vtype)
     legal_status = status.value if status else None
+    try:
+        from core.plate_review import machine_result_for_review
+
+        plate_machine = machine_result_for_review(row.get("id"))
+    except Exception:  # noqa: BLE001 - the experiment must never break the queue
+        app.logger.exception("plate machine payload unavailable for review %s", row.get("id"))
+        plate_machine = {
+            "experimental": True,
+            "state": "unavailable",
+            "outcome_is_ambiguous": True,
+            "eligible_for_confirmation": False,
+            "candidates": [],
+            "notes": "Experimental local OCR payload unavailable.",
+        }
     return {
         "id": row["id"],
         "display_id": f"RQ-{row['id']:05d}",
@@ -395,6 +429,15 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "episode_start_sec": row.get("episode_start_sec"),
         "episode_end_sec": row.get("episode_end_sec"),
         "timestamp_ocr_available": False,
+        "human_decision": row.get("human_decision"),
+        "disposition_label": (
+            disposition_label(row["human_decision"]) if row.get("human_decision") else None
+        ),
+        "decision_original_violation_type": row.get("decision_original_violation_type"),
+        "selected_canonical_rule": row.get("selected_canonical_rule"),
+        "decision_reason": row.get("decision_reason"),
+        "decided_at": row.get("decided_at"),
+        "plate_machine": plate_machine,
     }
 
 
@@ -472,6 +515,7 @@ def _detail_badge_count() -> int:
 def inject_globals():
     user = auth.current_user()
     role = user["role"] if user else None
+    review_queue_count = db.count_review_pending() if user else 0
     nav_items = [
         {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
         {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video", "badge": "live"},
@@ -479,6 +523,14 @@ def inject_globals():
         {"endpoint": "analytics", "label": "Analytics", "icon": "bi-bar-chart-line"},
     ]
     if role in ("admin", "enforcer"):
+        # Pending rows in the ordinary review_queue only (never detail candidates).
+        nav_items.insert(3, {
+            "endpoint": "review_queue",
+            "label": "Review Queue",
+            "icon": "bi-inbox",
+            "badge_count": review_queue_count,
+            "badge_label": "pending review item" if review_queue_count == 1 else "pending review items",
+        })
         nav_items.append({"endpoint": "reports", "label": "Reports", "icon": "bi-file-earmark-text"})
         nav_items.append({
             "endpoint": "motorcycle_detail_review",
@@ -494,7 +546,7 @@ def inject_globals():
         "current_year": datetime.now().year,
         "nav_items": nav_items,
         "current_user": user,
-        "review_queue_count": db.count_review_pending() if user else 0,
+        "review_queue_count": review_queue_count,
         "max_upload_mb": config.MAX_UPLOAD_MB,
     }
 
@@ -587,6 +639,7 @@ def live_monitor():
         enabled_violations=list(load_enabled_violations()),
         max_upload_mb=config.MAX_UPLOAD_MB,
         user_role=(auth.current_user() or {}).get("role", "viewer"),
+        vehicle_crossing_classes=list(FROZEN_VEHICLE_DETECTOR_CLASSES),
     )
 
 
@@ -655,6 +708,92 @@ def api_review_evidence(record_id: int, kind: str):
     return _evidence_media_response(row.get(path_key))
 
 
+def _plate_crop_response(attempt_id: str, name: str):
+    """Serve one private machine crop by manifest-owned reference only.
+
+    There is no path input: the caller passes the attempt id and the crop name
+    recorded by the server, and the store re-checks containment. Missing or
+    deleted evidence is an explicit 404, never a 500 and never a fallback to
+    another file.
+    """
+    from core import plate_manifest as plate_store
+
+    path = plate_store.crop_path(attempt_id, name)
+    if path is None:
+        return jsonify({"success": False, "error": "Plate evidence not found."}), 404
+    root = plate_store.plate_root().resolve()
+    return safe_media_response(
+        path,
+        roots=[root],
+        request=request,
+        download_name=path.name,
+        as_attachment=False,
+    )
+
+
+@app.route("/api/review-queue/<int:record_id>/plate-crop/<attempt_id>/<name>")
+@auth.role_required("enforcer")
+def api_review_plate_crop(record_id: int, attempt_id: str, name: str):
+    row = db.get_review_item(record_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    linked = {m.attempt_id for m in _linked_plate_attempts_for_review(record_id)}
+    if attempt_id not in linked:
+        # Cross-record reference: refuse without revealing whether the attempt
+        # exists for some other record.
+        return jsonify({"success": False, "error": "Plate evidence not found."}), 404
+    return _plate_crop_response(attempt_id, name)
+
+
+@app.route("/api/cases/<int:violation_id>/plate-crop/<attempt_id>/<name>")
+@auth.role_required("enforcer")
+def api_case_plate_crop(violation_id: int, attempt_id: str, name: str):
+    row = db.get_violation(violation_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    linked = {m.attempt_id for m in _linked_plate_attempts_for_violation(violation_id)}
+    if attempt_id not in linked:
+        return jsonify({"success": False, "error": "Plate evidence not found."}), 404
+    return _plate_crop_response(attempt_id, name)
+
+
+def _linked_plate_attempts_for_review(review_id: int | None):
+    from core.plate_manifest import attempts_for_review
+
+    if review_id is None:
+        return []
+    return attempts_for_review(int(review_id))
+
+
+def _linked_plate_attempts_for_violation(violation_id: int):
+    from core.plate_manifest import attempts_for_review
+    from core.plate_review import review_ids_for_violation
+
+    return attempts_for_review_ids(review_ids_for_violation(db, int(violation_id)))
+
+
+@app.route("/api/plate-ocr/status", methods=["GET"])
+@auth.login_required
+def api_plate_ocr_status():
+    """Experimental plate OCR feature status. Safe to call when disabled."""
+    try:
+        from core.plate_runtime import status_report
+
+        report = status_report()
+    except Exception:  # noqa: BLE001 - never fail the status call
+        app.logger.exception("plate OCR status unavailable")
+        report = {
+            "experimental": True,
+            "enabled": False,
+            "state": "unavailable",
+            "reason": "status_unavailable",
+        }
+    report["can_confirm_plate"] = bool(
+        auth.current_user() and auth.current_user().get("role") == "admin"
+    )
+    return jsonify({"success": True, "plate_ocr": report})
+
+
 @app.route("/analytics")
 @auth.login_required
 def analytics():
@@ -713,6 +852,10 @@ def review_queue():
         review_total=total,
         review_page=page,
         review_per_page=per_page,
+        canonical_violations=list(CANONICAL_VIOLATIONS),
+        recent_decisions=[
+            _decision_to_ui(item) for item in db.list_recent_review_decisions(8)
+        ],
     )
 
 
@@ -2197,14 +2340,29 @@ def api_upload_processing_analytics():
 @auth.login_required
 def api_review_queue():
     status = request.args.get("status", "pending")
+    decision = request.args.get("decision")
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
     videos = _video_name_map()
-    rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
+    if decision:
+        from core.review_decision_service import REVIEW_DECISIONS
+
+        if decision not in REVIEW_DECISIONS:
+            return jsonify({"success": False, "error": "Unknown review decision."}), 400
+        rows, total = db.list_review_queue_by_decision(
+            decision, page=page, per_page=per_page
+        )
+    else:
+        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
-        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
+        if decision:
+            rows, total = db.list_review_queue_by_decision(
+                decision, page=page, per_page=per_page
+            )
+        else:
+            rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
     return jsonify({
         "success": True,
         "items": [_review_to_ui(r, videos) for r in rows],
@@ -2219,15 +2377,34 @@ def api_review_queue():
 def api_confirm_review(review_id: int):
     user = auth.current_user()
     try:
-        from core.case_review_service import CaseReviewError, materialize_case_from_review
+        from core.case_review_service import CaseReviewError
+        from core.review_decision_service import (
+            DECISION_CONFIRM,
+            LEGACY_CONFIRM_KEY,
+            LEGACY_CONFIRM_REASON,
+            ReviewDecisionConflict,
+            ReviewDecisionError,
+            apply_review_decision,
+        )
 
-        # Actor always from session; service enforces can_confirm_case.
-        result = materialize_case_from_review(db, review_id, user["id"])
+        # Legacy confirm is confirm-proposed. The actor is the session user.
+        result = apply_review_decision(
+            db,
+            review_id,
+            user["id"],
+            decision=DECISION_CONFIRM,
+            reason=LEGACY_CONFIRM_REASON,
+            idempotency_key=LEGACY_CONFIRM_KEY,
+        )
         return jsonify({"success": True, **result})
     except TemporalEvidenceNotReady as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
+    except ReviewDecisionConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
     except PermissionError as exc:
         return jsonify({"success": False, "error": str(exc)}), 403
+    except ReviewDecisionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
     except (CaseReviewError, ValueError) as exc:
         return jsonify({"success": False, "error": str(exc)}), 404
 
@@ -2236,11 +2413,107 @@ def api_confirm_review(review_id: int):
 @auth.role_required("enforcer")
 def api_dismiss_review(review_id: int):
     user = auth.current_user()
-    if db.get_review_item(review_id) is None:
-        return jsonify({"success": False, "error": "Review item not found."}), 404
-    db.dismiss_review_item(review_id, reviewed_by=user["id"])
-    return jsonify({"success": True})
+    try:
+        from core.case_review_service import CaseReviewError
+        from core.review_decision_service import (
+            DECISION_NO_VIOLATION,
+            LEGACY_DISMISS_KEY,
+            LEGACY_DISMISS_REASON,
+            ReviewDecisionConflict,
+            ReviewDecisionError,
+            apply_review_decision,
+        )
 
+        # Legacy dismiss is no-violation. It does not invent a reviewer narrative.
+        result = apply_review_decision(
+            db,
+            review_id,
+            user["id"],
+            decision=DECISION_NO_VIOLATION,
+            reason=LEGACY_DISMISS_REASON,
+            idempotency_key=LEGACY_DISMISS_KEY,
+        )
+        return jsonify({"success": True, **result})
+    except ReviewDecisionConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ReviewDecisionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+
+
+def _decision_to_ui(row: dict[str, Any]) -> dict[str, Any]:
+    from core.review_decision_service import disposition_label
+
+    decision = row.get("decision") or ""
+    return {
+        "id": row.get("id"),
+        "review_id": row.get("review_id"),
+        "decision": decision,
+        "disposition_label": disposition_label(decision) if decision else "",
+        "original_violation_type": row.get("original_violation_type"),
+        "queue_violation_type": row.get("queue_violation_type"),
+        "selected_canonical_rule": row.get("selected_canonical_rule"),
+        "reason": row.get("reason"),
+        "reviewer_user_id": row.get("reviewer_user_id"),
+        "reviewer_username": row.get("reviewer_username"),
+        "decided_at": row.get("decided_at"),
+        "review_status": row.get("review_status"),
+    }
+
+
+@app.route("/api/review-queue/decisions", methods=["GET"])
+@auth.login_required
+def api_review_decisions():
+    limit = min(50, max(1, _int_query_arg("limit", 20)))
+    rows = db.list_recent_review_decisions(limit)
+    return jsonify({
+        "success": True,
+        "decisions": [_decision_to_ui(row) for row in rows],
+    })
+
+
+@app.route("/api/review-queue/<int:review_id>/decision", methods=["POST"])
+@auth.login_required
+def api_review_decision(review_id: int):
+    """Additive decision transport. Existing confirm and dismiss routes stay."""
+    from core.case_review_service import CaseReviewError
+    from core.review_decision_service import (
+        ReviewDecisionConflict,
+        ReviewDecisionError,
+        apply_review_decision,
+    )
+
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    if "reviewer_user_id" in payload or "reviewed_by" in payload:
+        return jsonify({
+            "success": False,
+            "error": "Reviewer identity is taken from the authenticated session.",
+        }), 400
+    try:
+        result = apply_review_decision(
+            db,
+            review_id,
+            user["id"],
+            decision=str(payload.get("decision") or ""),
+            reason=str(payload.get("reason") or ""),
+            selected_canonical_rule=payload.get("selected_canonical_rule"),
+            idempotency_key=payload.get("idempotency_key"),
+        )
+        return jsonify({"success": True, **result})
+    except TemporalEvidenceNotReady as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except ReviewDecisionConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ReviewDecisionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
 
 
 # ---------------------------------------------------------------------------
@@ -2439,7 +2712,6 @@ def motorcycle_detail_review():
         detail_outcome=outcome,
         detail_counts=db.count_motorcycle_detail_by_state(),
         detail_gate=_detail_scan_gate(),
-        review_queue_count=db.count_review_pending(),
     )
 
 
@@ -2586,13 +2858,39 @@ def api_get_case(violation_id: int):
 
 
 @app.route("/api/cases/<int:violation_id>/plate", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.role_required("admin")
 def api_verify_plate(violation_id: int):
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
     # Never trust client-supplied reviewer id or verification flag.
     try:
         from core.case_review_service import CaseReviewError, verify_plate_identity
+        from core.plate_review import PlateReviewError, manifest_provenance_for_verification, resolve_candidate
+
+        # A machine candidate id is a lookup key only. OCR text, crop reference,
+        # and provenance come from the server-owned manifest for THIS case, so a
+        # spoofed candidate id or a cross-case reference cannot contribute text.
+        candidate_id = payload.get("candidate_id")
+        machine_provenance = None
+        # Machine metadata is accepted only after resolving candidate_id below;
+        # client supplied OCR/provenance fields are never authority.
+        ocr_raw = None
+        ocr_confidence = None
+        evidence_crop_ref = None
+        candidate_reference = None
+        if candidate_id:
+            resolved = resolve_candidate(
+                db,
+                violation_id,
+                str(candidate_id),
+                review_id=payload.get("review_id"),
+            )
+            ocr_raw = resolved.get("ocr_raw")
+            ocr_confidence = resolved.get("ocr_scalar_score")
+            crop_ref = resolved.get("plate_crop_ref") or {}
+            evidence_crop_ref = crop_ref.get("stored_path") or evidence_crop_ref
+            candidate_reference = f"{resolved.get('attempt_id')}:{resolved.get('candidate_id')}"
+            machine_provenance = manifest_provenance_for_verification(resolved)
 
         result = verify_plate_identity(
             db,
@@ -2600,15 +2898,18 @@ def api_verify_plate(violation_id: int):
             user["id"],
             plate_status=str(payload.get("plate_status") or ""),
             accepted_plate_text=payload.get("accepted_plate_text"),
-            candidate_ocr_raw=payload.get("candidate_ocr_raw"),
-            candidate_reference=payload.get("candidate_reference"),
-            evidence_crop_ref=payload.get("evidence_crop_ref"),
-            ocr_confidence=payload.get("ocr_confidence"),
+            candidate_ocr_raw=ocr_raw,
+            candidate_reference=candidate_reference,
+            evidence_crop_ref=evidence_crop_ref,
+            ocr_confidence=ocr_confidence,
             review_id=payload.get("review_id"),
+            machine_provenance=machine_provenance,
         )
         return jsonify({"success": True, **result})
     except PermissionError as exc:
         return jsonify({"success": False, "error": str(exc)}), 403
+    except PlateReviewError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
     except (CaseReviewError, ValueError) as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
 

@@ -106,21 +106,21 @@ class TestPlateService:
         assert out["outcome"] == PlateProcessingOutcome.CANDIDATE_FOUND.value
         assert out["candidates"][0]["ocr_raw"] == "ABC123"
 
-    def test_verify_plate_authorized(self, test_db, enforcer, violation_id):
+    def test_verify_plate_authorized(self, test_db, admin, violation_id):
+        # Plate confirmation is an active-admin action while the experimental
+        # plate demo is in scope. See TestPlateAdminOnlyBoundary for the
+        # enforcer/viewer/grant denial cases.
         result = verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text="ABC123",
-            candidate_ocr_raw="ABC123",
-            candidate_reference="cand-1",
-            evidence_crop_ref="/tmp/plate.jpg",
         )
         assert result["accepted_plate_text"] == "ABC123"
         row = test_db.get_plate_verification(violation_id)
         assert row["plate_status"] == HUMAN_PLATE_STATUS_VERIFIED_READABLE
-        assert row["verified_by"] == enforcer
+        assert row["verified_by"] == admin
         actions = test_db.get_case_actions(violation_id)
         assert any(a["action_type"] == "plate_verified" for a in actions)
 
@@ -135,6 +135,24 @@ class TestPlateService:
         assert result["verified_by"] == admin
         assert test_db.get_plate_verification(violation_id)["accepted_plate_text"] == "ABC123"
 
+    def test_unresolved_client_machine_metadata_is_rejected(self, test_db, admin, violation_id):
+        with pytest.raises(CaseReviewError):
+            verify_plate_identity(
+                test_db,
+                violation_id,
+                admin,
+                plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
+                accepted_plate_text="ABC123",
+                candidate_ocr_raw="SPOOFED",
+                candidate_reference="not-a-server-reference",
+            )
+        assert test_db.get_plate_verification(violation_id) is None
+        assert test_db.get_violation(violation_id)["plate_status"] == "not_attempted"
+        assert not any(
+            action["action_type"] == "plate_verified"
+            for action in test_db.get_case_actions(violation_id)
+        )
+
     def test_inactive_enforcer_rejected(
         self, test_db, inactive_enforcer, violation_id
     ):
@@ -148,12 +166,12 @@ class TestPlateService:
             )
 
     def test_unclear_and_absent_retain_record_without_identity(
-        self, test_db, enforcer, violation_id
+        self, test_db, admin, violation_id
     ):
         verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_UNCLEAR,
             accepted_plate_text="SHOULD_CLEAR",
         )
@@ -164,7 +182,7 @@ class TestPlateService:
         verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_NOT_VISIBLE,
         )
         row = test_db.get_plate_verification(violation_id)
@@ -173,23 +191,23 @@ class TestPlateService:
         viol = test_db.get_violation(violation_id)
         assert viol["evidence_path"] == "/tmp/e.jpg"
 
-    def test_partial_plate_rejected(self, test_db, enforcer, violation_id):
+    def test_partial_plate_rejected(self, test_db, admin, violation_id):
         with pytest.raises(ValueError):
             verify_plate_identity(
                 test_db,
                 violation_id,
-                enforcer,
+                admin,
                 plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
                 accepted_plate_text="AB*123",
             )
 
-    def test_dismissed_case_blocked(self, test_db, enforcer, violation_id):
+    def test_dismissed_case_blocked(self, test_db, admin, violation_id):
         test_db.update_violation_status(violation_id, "dismissed")
         with pytest.raises(ValueError):
             verify_plate_identity(
                 test_db,
                 violation_id,
-                enforcer,
+                admin,
                 plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
                 accepted_plate_text="ABC123",
             )
@@ -458,12 +476,12 @@ class TestOriginalEventTimeCandidate:
 
 class TestPlateAtomicity:
     def test_audit_failure_rolls_back_plate_and_legacy(
-        self, test_db, enforcer, violation_id, monkeypatch
+        self, test_db, admin, violation_id, monkeypatch
     ):
         verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text="OLD111",
         )
@@ -479,7 +497,7 @@ class TestPlateAtomicity:
             verify_plate_identity(
                 test_db,
                 violation_id,
-                enforcer,
+                admin,
                 plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
                 accepted_plate_text="NEW222",
             )
@@ -490,12 +508,12 @@ class TestPlateAtomicity:
         assert viol["plate_status"] == "recognized"
 
     def test_legacy_failure_rolls_back_verification(
-        self, test_db, enforcer, violation_id, monkeypatch
+        self, test_db, admin, violation_id, monkeypatch
     ):
         verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text="KEEPME",
         )
@@ -511,7 +529,7 @@ class TestPlateAtomicity:
             verify_plate_identity(
                 test_db,
                 violation_id,
-                enforcer,
+                admin,
                 plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
                 accepted_plate_text="SHOULDNOT",
             )
@@ -519,7 +537,7 @@ class TestPlateAtomicity:
         assert pv["accepted_plate_text"] == "KEEPME"
 
     def test_verification_failure_leaves_unchanged(
-        self, test_db, enforcer, violation_id, monkeypatch
+        self, test_db, admin, violation_id, monkeypatch
     ):
         real_apply = test_db.apply_plate_verification
 
@@ -533,7 +551,7 @@ class TestPlateAtomicity:
             verify_plate_identity(
                 test_db,
                 violation_id,
-                enforcer,
+                admin,
                 plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
                 accepted_plate_text="NOWRITE",
             )
@@ -542,19 +560,19 @@ class TestPlateAtomicity:
         assert viol["plate_status"] == "not_attempted"
 
     def test_verified_to_unclear_clears_current_identity(
-        self, test_db, enforcer, violation_id
+        self, test_db, admin, violation_id
     ):
         verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_VERIFIED_READABLE,
             accepted_plate_text="ABC123",
         )
         result = verify_plate_identity(
             test_db,
             violation_id,
-            enforcer,
+            admin,
             plate_status=HUMAN_PLATE_STATUS_UNCLEAR,
         )
         assert result["accepted_plate_text"] is None

@@ -95,6 +95,9 @@
                                 <button class="btn btn-outline-secondary btn-dismiss" title="Dismiss"
                                         aria-label="Dismiss detection {{ item.display_id }}"
                                         data-loading-label="Dismissing…"><i class="bi bi-x-lg"></i></button>
+                                <button class="btn btn-outline-primary btn-decide" title="Record decision"
+                                        aria-label="Record decision for {{ item.display_id }}"
+                                        data-loading-label="Saving decision…">Decide</button>
                             </div>
                         </td>
                     </tr>
@@ -109,6 +112,92 @@
     </div>
 </div>
 
+<div class="card card-panel mt-4">
+    <div class="card-header"><h5 class="card-title mb-0">Recent human decisions</h5></div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-sm mb-0 align-middle" id="recentDecisions">
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Reviewer</th>
+                        <th>Original suggestion</th>
+                        <th>Disposition</th>
+                        <th>Selected rule</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for decision in recent_decisions %}
+                    <tr>
+                        <td class="small">{{ decision.decided_at }}</td>
+                        <td class="small">{{ decision.reviewer_username or decision.reviewer_user_id }}</td>
+                        <td class="small">{{ decision.original_violation_type }}</td>
+                        <td>
+                            <span class="badge {% if decision.decision == 'insufficient_evidence' %}bg-warning text-dark{% elif decision.decision == 'no_violation' %}bg-secondary{% elif decision.decision == 'correct_canonical' %}bg-info text-dark{% else %}bg-success{% endif %}">
+                                {{ decision.disposition_label }}
+                            </span>
+                        </td>
+                        <td class="small">{{ decision.selected_canonical_rule or "—" }}</td>
+                        <td class="small">{{ decision.reason }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6" class="text-muted small p-3">No human review decisions yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="decisionModal" tabindex="-1" aria-labelledby="decisionModalTitle">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="decisionModalTitle">Record review decision</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <form id="decisionForm">
+                <div class="modal-body text-start">
+                    <p class="small text-muted mb-2" id="decisionOriginal"></p>
+                    <fieldset>
+                        <legend class="form-label">Decision</legend>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="reviewDecision" id="decisionConfirm" value="confirm_proposed" checked>
+                            <label class="form-check-label" for="decisionConfirm">Confirm proposed violation</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="reviewDecision" id="decisionCorrect" value="correct_canonical">
+                            <label class="form-check-label" for="decisionCorrect">Correct to another existing canonical violation</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="reviewDecision" id="decisionNone" value="no_violation">
+                            <label class="form-check-label" for="decisionNone">No violation</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="reviewDecision" id="decisionInsufficient" value="insufficient_evidence">
+                            <label class="form-check-label" for="decisionInsufficient">Insufficient evidence</label>
+                        </div>
+                    </fieldset>
+                    <label class="form-label mt-3" for="decisionRule">Corrected canonical rule</label>
+                    <select class="form-select" id="decisionRule" disabled>
+                        {% for rule in canonical_violations %}
+                        <option value="{{ rule }}">{{ rule }}</option>
+                        {% endfor %}
+                    </select>
+                    <label class="form-label mt-3" for="decisionReason">Reason</label>
+                    <textarea class="form-control" id="decisionReason" rows="3" required maxlength="2000"></textarea>
+                    <p class="small text-muted mt-2 mb-0">Insufficient evidence closes the item. It does not confirm a violation and it is not a no-violation finding. The original system suggestion stays on the queue item.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="decisionSubmit">Save decision</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <div class="modal fade" id="evidenceModal" tabindex="-1">
     <div class="modal-dialog modal-xl modal-dialog-centered">
         <div class="modal-content">
@@ -117,6 +206,33 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body text-center" id="evidenceModalBody"></div>
+            <!--
+              Experimental local plate OCR panel.
+
+              Rendered entirely from the additive `plate_machine` block on the
+              selected review row. It is present in every build; when the
+              feature is disabled it reports "Disabled". Confirmation controls
+              are rendered only for an active System Administrator and are
+              additionally enforced on the server.
+            -->
+            <div class="card card-panel text-start mt-3" id="plateOcrPanel" hidden aria-labelledby="plateOcrHeading">
+                <div class="card-body">
+                    <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                        <div>
+                            <h6 class="card-title mb-1" id="plateOcrHeading">
+                                <i class="bi bi-upc-scan me-2"></i>Experimental local OCR
+                            </h6>
+                            <p class="small text-muted mb-0">
+                                Experimental local OCR &mdash; human admin review required.
+                                Machine text is a candidate only. It is not a verified plate,
+                                not an offender identity, and never a violation decision.
+                            </p>
+                        </div>
+                        <span class="badge text-bg-secondary" id="plateOcrStateBadge">Disabled</span>
+                    </div>
+                    <div id="plateOcrBody" class="mt-3"></div>
+                </div>
+            </div>
         </div>
     </div>
 </div>

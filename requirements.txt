@@ -11,3 +11,13 @@ lap>=0.4.0
 scipy>=1.11.0
 pytest>=7.0.0
 pytest-cov>=4.0.0
+
+# Experimental local plate detection/OCR (optional, disabled by default).
+#
+# onnxruntime pulls in no computer-vision package, so it can be installed into
+# the application environment without introducing a competing cv2 distribution.
+# Do NOT add opencv-python-headless here: this project already depends on
+# opencv-python, and two cv2 distributions in one interpreter is a known
+# conflict. The headless variant belongs only in the isolated plate
+# environment described in docs/plate_ocr/README.md.
+onnxruntime==1.30.0; extra == "plate-ocr"

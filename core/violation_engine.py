@@ -49,7 +49,11 @@ from core.detection_config import (
     vehicle_category,
 )
 from core.geometry_profile import GeometryProfile, build_geometry_profile
-from core.model_capability import assess_rule_capability, classes_satisfy_rule
+from core.model_capability import (
+    POSITIVE_UNCOVERED_HEAD_OBSERVATION_APPROVED,
+    assess_rule_capability,
+    classes_satisfy_rule,
+)
 from core.rule_confidence import legacy_confidence_mapping, score_from_persistence, score_violation
 from core.rule_types import (
     MembershipState,
@@ -165,6 +169,7 @@ class RuleEngineState:
     persistence: dict[tuple[str, int], _PersistenceTracker] = field(default_factory=dict)
     fired: dict[tuple[str, int], _FiredEpisode] = field(default_factory=dict)
     track_last_seen: dict[int, float] = field(default_factory=dict)
+    track_identity_epochs: dict[int, int] = field(default_factory=dict)
     contextual: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     associations: dict[tuple[str, int], Any] = field(default_factory=dict)
     membership_hysteresis: MembershipHysteresis = field(default_factory=MembershipHysteresis)
@@ -176,6 +181,18 @@ class RuleEngineState:
     # (violation_type, track_id, cleared_at_sec) produced when a fired episode re-arms
     recently_cleared: list[tuple[str, int, float]] = field(default_factory=list)
 
+    def _drop_expired_cargo_buffers(self, expired: list[int]) -> None:
+        if not expired:
+            return
+        expired_ids = set(expired)
+        buffers = self.contextual.get("_cargo_buffers")
+        if not isinstance(buffers, dict):
+            return
+        for key in list(buffers.keys()):
+            tid = key[0] if isinstance(key, tuple) and key else None
+            if isinstance(tid, int) and tid in expired_ids:
+                buffers.pop(key, None)
+
     def now(self, fallback: float) -> float:
         if self.clock is not None:
             return float(self.clock())
@@ -184,6 +201,18 @@ class RuleEngineState:
     def observe_tracks(self, tracked: list[dict[str, Any]], timestamp_sec: float) -> None:
         for det in tracked:
             tid = int(det["track_id"])
+            raw_epoch = det.get("track_identity_epoch")
+            if raw_epoch is not None:
+                epoch = int(raw_epoch)
+                previous = self.track_identity_epochs.get(tid)
+                if previous is not None and previous != epoch:
+                    # ByteTrack reused an ID (or the tracker found a new physical
+                    # identity). The prior rule episode must not suppress or
+                    # supply evidence to the new vehicle.
+                    last_seen = self.track_last_seen.get(tid, timestamp_sec)
+                    self._purge_track(tid, cleared_at=last_seen)
+                    self._drop_expired_cargo_buffers([tid])
+                self.track_identity_epochs[tid] = epoch
             self.track_last_seen[tid] = float(det.get("timestamp_sec", timestamp_sec))
 
     def tracker_for(self, rule_key: str, track_id: int) -> _PersistenceTracker:
@@ -231,6 +260,7 @@ class RuleEngineState:
         ]
         for tid in expired:
             self._purge_track(tid, cleared_at=now)
+        self._drop_expired_cargo_buffers(expired)
         # Also purge keys whose track is unknown / never observed recently.
         for key in list(self.persistence.keys()):
             tid = key[1]
@@ -245,6 +275,11 @@ class RuleEngineState:
                 self.fired.pop(key, None)
                 self.recently_cleared.append((vtype, tid, float(now)))
         for key in list(self.contextual.keys()):
+            # Cargo association buffers live under a non-track key so a frame
+            # prune does not wipe multi-frame evidence. Expired track ids are
+            # removed by ``_drop_expired_cargo_buffers``.
+            if not (isinstance(key, tuple) and len(key) >= 2 and isinstance(key[1], int)):
+                continue
             tid = key[1]
             last = self.track_last_seen.get(tid)
             if last is None or now - last > self.track_expiry_sec:
@@ -270,9 +305,12 @@ class RuleEngineState:
             if cleared_at is not None:
                 self.recently_cleared.append((vtype, tid, float(cleared_at)))
         self.track_last_seen.pop(track_id, None)
+        self.track_identity_epochs.pop(track_id, None)
         for store in (self.persistence, self.contextual, self.associations):
             for key in [k for k in store if k[1] == track_id]:
                 store.pop(key, None)
+        for key in [k for k in self.membership_hysteresis.history if k[1] == track_id]:
+            self.membership_hysteresis.history.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -391,22 +429,86 @@ def _helmet_labels(tracked: list[dict[str, Any]]) -> tuple[list[dict], list[dict
     return acceptable, nut, legacy
 
 
+_NO_HELMET_BLOCKED_DIAGNOSTIC = (
+    "No Helmet: automatic candidate generation is blocked pending an "
+    "owner/adviser decision. A missing helmet detection is UNKNOWN, not an "
+    "uncovered head. The motorcycle detail model is review-only and cannot "
+    "create or confirm this violation."
+)
+
+
+def _rider_visibility_unknown(rider: dict[str, Any]) -> bool:
+    """Clipped, occluded, tiny, blurred, or edge-cut riders are not head evidence."""
+    if rider.get("class_label") != YOLO_CLASS_RIDER:
+        return True
+    if rider.get("occluded") or rider.get("clipped") or rider.get("blurred"):
+        return True
+    if rider.get("frame_boundary_clip"):
+        return True
+    if rider.get("head_visible") is False:
+        return True
+    conf = float(rider.get("confidence") or 0.0)
+    area = float(rider.get("bbox_w") or 0.0) * float(rider.get("bbox_h") or 0.0)
+    if conf < 0.45 or area < 400.0:
+        return True
+    x = float(rider.get("bbox_x") or 0.0)
+    y = float(rider.get("bbox_y") or 0.0)
+    w = float(rider.get("bbox_w") or 0.0)
+    h = float(rider.get("bbox_h") or 0.0)
+    frame_w = rider.get("frame_w")
+    frame_h = rider.get("frame_h")
+    if frame_w is not None and (x <= 1.0 or x + w >= float(frame_w) - 1.0):
+        return True
+    if frame_h is not None and (y <= 1.0 or y + h >= float(frame_h) - 1.0):
+        return True
+    return False
+
+
+def attributed_motorcycle_riders(
+    motorcycles: list[dict[str, Any]],
+    riders: list[dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Map a motorcycle track to riders with one clear box overlap.
+
+    ``person`` is never a rider. A padding-only match is poorly associated.
+    A rider whose box overlaps two motorcycles is competing and is omitted.
+    """
+    chosen: dict[int, list[dict[str, Any]]] = {}
+    for rider in riders:
+        if rider.get("class_label") != YOLO_CLASS_RIDER:
+            continue
+        matched: list[int] = []
+        for mc in motorcycles:
+            if not _point_in_padded_bbox(
+                _bbox_center(rider), mc, RIDER_ASSOCIATION_PADDING
+            ):
+                continue
+            if not _boxes_overlap(mc, rider):
+                continue
+            matched.append(int(mc["track_id"]))
+        if len(matched) == 1:
+            chosen.setdefault(matched[0], []).append(rider)
+    return chosen
+
+
 def _rider_helmet_state(
     rider: dict[str, Any],
     acceptable: list[dict[str, Any]],
     nut_shell: list[dict[str, Any]],
 ) -> str:
-    """Return NO_HELMET | NUT_SHELL | ACCEPTABLE_SHAPE | UNKNOWN."""
+    """Return NUT_SHELL | ACCEPTABLE_SHAPE | UNKNOWN.
+
+    Absence of an overlapping helmet box is UNKNOWN for every rider size and
+    confidence. This path has no approved positive uncovered-head observation,
+    so it never returns a No Helmet state.
+    """
+    if _rider_visibility_unknown(rider):
+        return "UNKNOWN"
     if any(_boxes_overlap(rider, h) for h in nut_shell):
         return "NUT_SHELL"
     if any(_boxes_overlap(rider, h) for h in acceptable):
         return "ACCEPTABLE_SHAPE"
-    # Small / edge / low-confidence rider → UNKNOWN rather than NO_HELMET.
-    conf = float(rider.get("confidence", 0))
-    area = float(rider.get("bbox_w", 0)) * float(rider.get("bbox_h", 0))
-    if conf < 0.45 or area < 400:
-        return "UNKNOWN"
-    return "NO_HELMET"
+    return "UNKNOWN"
 
 
 def _is_stationary(
@@ -419,6 +521,36 @@ def _is_stationary(
         return False
     threshold = geometry.stationary_px_per_sec() if geometry is not None else stationary_px
     return float(speed) <= threshold
+
+
+def _has_nearby_stationary_traffic(
+    target: dict[str, Any],
+    vehicles: list[dict[str, Any]],
+    stationary_px: float,
+    geometry: GeometryProfile | None,
+) -> bool:
+    """Whether another stopped vehicle is close enough to suggest a queue.
+
+    This is a conservative review-candidate suppressor, not a legal finding.
+    Distances scale with the larger vehicle box to accommodate perspective.
+    """
+    tx = float(target["bbox_x"]) + float(target["bbox_w"]) / 2
+    ty = float(target["bbox_y"]) + float(target["bbox_h"]) / 2
+    tw = max(1.0, float(target["bbox_w"]))
+    th = max(1.0, float(target["bbox_h"]))
+    target_id = int(target["track_id"])
+    for other in vehicles:
+        if int(other.get("track_id", -1)) == target_id:
+            continue
+        if not _is_stationary(other, stationary_px, geometry):
+            continue
+        ox = float(other["bbox_x"]) + float(other["bbox_w"]) / 2
+        oy = float(other["bbox_y"]) + float(other["bbox_h"]) / 2
+        scale_w = max(tw, float(other["bbox_w"]))
+        scale_h = max(th, float(other["bbox_h"]))
+        if abs(tx - ox) <= 2.5 * scale_w and abs(ty - oy) <= 2.5 * scale_h:
+            return True
+    return False
 
 
 def _parse_clock(value: str) -> dtime:
@@ -510,10 +642,11 @@ def check_no_helmet(
     *,
     model_classes: tuple[str, ...] | None = None,
 ) -> list[ViolationEvent]:
-    """No Helmet — requires rider association + helmet taxonomy classes.
+    """No Helmet — rider association only; a missing helmet box is UNKNOWN.
 
-    Absence of a helmet detection alone is not proof when visibility or model
-    capability is insufficient (UNKNOWN / fail-closed).
+    The main detector roster has no approved positive uncovered-head source.
+    Motorcycle-detail ``no_helmet`` boxes are ignored here and cannot create
+    or confirm a violation. Manual review of the canonical rule remains.
     """
     if not _rule_allowed(state, VIOLATION_NO_HELMET):
         return []
@@ -525,52 +658,31 @@ def check_no_helmet(
     if not _rider_capability_ok(state, VIOLATION_NO_HELMET, model_classes):
         return []
 
-    motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
-    riders_pool = _rider_detections(tracked)
-    acceptable, nut, _ = _helmet_labels(tracked)
-
-    events: list[ViolationEvent] = []
-    for mc in motorcycles:
-        track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, riders_pool)
-        ts = float(mc.get("timestamp_sec", 0))
-        if not riders:
+    # Detail-model ``no_helmet`` labels are not read. There is no other
+    # approved uncovered-head observation to promote into a candidate.
+    if not POSITIVE_UNCOVERED_HEAD_OBSERVATION_APPROVED:
+        if _NO_HELMET_BLOCKED_DIAGNOSTIC not in state.diagnostics:
+            state.diagnostics.append(_NO_HELMET_BLOCKED_DIAGNOSTIC)
+        motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
+        riders_pool = _rider_detections(tracked)
+        acceptable, nut, _ = _helmet_labels(tracked)
+        attributed = attributed_motorcycle_riders(motorcycles, riders_pool)
+        for mc in motorcycles:
+            track_id = int(mc["track_id"])
+            ts = float(mc.get("timestamp_sec", 0))
+            riders = attributed.get(track_id, [])
+            # Missing, uncertain, competing, and detail-only observations stay
+            # false conditions. They are not No Helmet evidence.
+            _ = [_rider_helmet_state(r, acceptable, nut) for r in riders]
             state.persistence.pop(("no_helmet", track_id), None)
             state.note_condition(VIOLATION_NO_HELMET, track_id, False, ts)
-            continue
+        return []
 
-        states = [_rider_helmet_state(r, acceptable, nut) for r in riders]
-        if any(s == "UNKNOWN" for s in states) and not any(s == "NO_HELMET" for s in states):
-            # Visibility insufficient — do not treat as NO_HELMET.
-            state.persistence.pop(("no_helmet", track_id), None)
-            continue
-
-        unhelmeted = [
-            (r, s) for r, s in zip(riders, states) if s == "NO_HELMET"
-        ]
-        condition = len(unhelmeted) > 0
-        tracker = state.tracker_for("no_helmet", track_id)
-        if tracker.update(condition, ts):
-            rider_ids = ", ".join(str(int(r["track_id"])) for r, _ in unhelmeted)
-            score = score_from_persistence(
-                detection_confidence=float(mc.get("confidence", 0)),
-                elapsed_sec=tracker.elapsed(ts),
-                required_sec=VIOLATION_PERSISTENCE_SEC,
-                association_quality=min(1.0, len(riders) / 2.0),
-                geometry_stability=0.8,
-            )
-            _emit(
-                state,
-                events,
-                VIOLATION_NO_HELMET,
-                mc,
-                frame_number,
-                f"Motorcycle track #{track_id}: rider(s) #{rider_ids} classified "
-                f"NO_HELMET for >={VIOLATION_PERSISTENCE_SEC}s.",
-                score,
-            )
-        state.note_condition(VIOLATION_NO_HELMET, track_id, condition, ts)
-    return events
+    state.diagnostics.append(
+        "No Helmet: the positive uncovered-head flag is set, but no approved "
+        "observation is connected to this rule. Fail closed."
+    )
+    return []
 
 
 def check_substandard_helmet(
@@ -1675,6 +1787,52 @@ def check_restricted_lane(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def scene_capability_flags(
+    zones: dict[str, Any] | None,
+    rule_scene: Any,
+    params: dict[str, Any] | None = None,
+    *,
+    recording_time_known: bool | None = None,
+    now_time: dtime | None = None,
+) -> dict[str, bool]:
+    """Scene prerequisites actually required before each evaluator runs.
+
+    Illegal Terminal is runnable only with a ``loading_unloading`` zone.
+    Activity regions do not satisfy that prerequisite. Illegal Parking stays
+    on ``no_parking`` alone.
+    """
+    zones = zones or {}
+    merged = params or {}
+    lanes = tuple(getattr(rule_scene, "lanes", ()) or ())
+    markings = tuple(getattr(rule_scene, "markings", ()) or ())
+    signs = tuple(getattr(rule_scene, "signs", ()) or ())
+    lane_flows = tuple(getattr(rule_scene, "lane_flows", ()) or ())
+    return {
+        "zone:no_parking": bool(zones.get("no_parking")),
+        "zone:active_lane": bool(zones.get("active_lane") or lanes),
+        "zone:active_lane_or_crossing": bool(
+            zones.get("active_lane") or lanes or zones.get("pedestrian_crossing")
+        ),
+        "zone:truck_ban_zone": bool(zones.get("truck_ban_zone")),
+        "zone:loading_unloading": bool(zones.get("loading_unloading")),
+        "recording_datetime": bool(
+            recording_time_known
+            if recording_time_known is not None
+            else now_time is not None
+        ),
+        "lane_flow_degrees": "lane_flow_degrees" in merged or bool(lane_flows),
+        "marking_geometry": bool(
+            merged.get("marking_geometry")
+            or zones.get("restricted_lane")
+            or markings
+        ),
+        "supported_sign_annotations": bool(merged.get("supported_signs") or signs),
+        # For-hire identity is decided per detection. The flag records that the
+        # evaluator owns that TriState; it does not prove boarding or alighting.
+        "puv_context": True,
+    }
+
+
 def evaluate_detection_rules(
     tracked: list[dict[str, Any]],
     state: RuleEngineState,
@@ -1740,37 +1898,16 @@ def evaluate_detection_rules(
         merged["_rule_scene"] = rule_scene
         merged["_track_history"] = history
 
-    # Capability gate snapshot (once per state unless refreshed by caller).
-    if model_classes is not None and not state.capability:
-        context_flags = {
-            "zone:no_parking": bool(zones.get("no_parking")),
-            "zone:active_lane": bool(zones.get("active_lane") or rule_scene.lanes),
-            "zone:active_lane_or_crossing": bool(
-                zones.get("active_lane")
-                or rule_scene.lanes
-                or zones.get("pedestrian_crossing")
-            ),
-            "zone:truck_ban_zone": bool(zones.get("truck_ban_zone")),
-            "zone:loading_unloading_or_terminal": bool(
-                zones.get("loading_unloading") or rule_scene.activity_regions
-            ),
-            "recording_datetime": bool(
-                recording_time_known
-                if recording_time_known is not None
-                else now_time is not None
-            ),
-            "lane_flow_degrees": "lane_flow_degrees" in merged
-            or bool(rule_scene.lane_flows),
-            "marking_geometry": bool(
-                merged.get("marking_geometry")
-                or zones.get("restricted_lane")
-                or rule_scene.markings
-            ),
-            "supported_sign_annotations": bool(
-                merged.get("supported_signs") or rule_scene.signs
-            ),
-            "puv_context": True,  # evaluated per-detection as TriState
-        }
+    # Refresh from the scene actually required by the evaluators. A class-only
+    # pre-seed must not keep reporting a zone-gated rule as runnable.
+    if model_classes is not None:
+        context_flags = scene_capability_flags(
+            zones,
+            rule_scene,
+            merged,
+            recording_time_known=recording_time_known,
+            now_time=now_time,
+        )
         for name in CANONICAL_VIOLATIONS:
             if name in enabled_set:
                 state.capability[name] = assess_rule_capability(
@@ -1938,9 +2075,10 @@ def build_processing_diagnostics(
     enabled_violations: tuple[str, ...],
     geometry: GeometryProfile | None,
     state: RuleEngineState | None = None,
+    context_flags: dict[str, bool] | None = None,
 ) -> ProcessingDiagnostics:
     caps = [
-        assess_rule_capability(name, model_classes)
+        assess_rule_capability(name, model_classes, context_flags=context_flags)
         for name in enabled_violations
         if name in CANONICAL_VIOLATIONS
     ]

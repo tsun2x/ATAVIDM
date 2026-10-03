@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from typing import Any
 
 import cv2
@@ -96,9 +97,35 @@ class LiveStreamWorker(threading.Thread):
 
         model_classes = extract_model_class_names(detector)
         gpu_slot = gpu_inference_slot()
+        started = time.monotonic()
+
+        # Experimental local plate OCR (disabled by default). The collector
+        # samples at most two frames per second for at most two seconds after a
+        # review observation exists, and all detector/OCR calls run on a
+        # background worker: never on the live frame path and never inside the
+        # vehicle GPU reservation above.
+        plate_collector = None
+        plate_runtime = None
+        live_session_id = f"{uuid.uuid4().hex}_{self.camera['id']}"
+        try:
+            from core.plate_runtime import get_runtime
+
+            plate_runtime = get_runtime()
+            if plate_runtime is not None:
+                plate_collector = plate_runtime.new_collector(
+                    source="camera",
+                    run_key=f"camera_{self.camera['id']}",
+                    live_session_id=live_session_id,
+                )
+        except Exception:  # noqa: BLE001 - the experiment must never break a stream
+            logger.exception("plate OCR collector unavailable; continuing without plate OCR")
+            plate_collector = None
 
         cap = cv2.VideoCapture(self.camera["rtsp_url"])
         if not cap.isOpened():
+            if plate_collector is not None:
+                plate_collector.flush("stream_start_failed")
+            cap.release()
             self.status = "error"
             self.error = f"Cannot open stream: {self.camera['rtsp_url']}"
             return
@@ -110,7 +137,6 @@ class LiveStreamWorker(threading.Thread):
         conf_threshold = float(params["confidence_threshold"])
         frame_number = -1
         skipped_frames = 0
-        started = time.monotonic()
 
         try:
             while not self._stop_event.is_set():
@@ -118,9 +144,24 @@ class LiveStreamWorker(threading.Thread):
                 if not ok:
                     self.status = "reconnecting"
                     cap.release()
+                    if plate_collector is not None:
+                        plate_collector.flush("stream_reconnected")
                     time.sleep(2)
                     cap = cv2.VideoCapture(self.camera["rtsp_url"])
                     if cap.isOpened():
+                        # New session identity isolates all post-reconnect
+                        # observations from pending crops in the old session.
+                        live_session_id = f"{uuid.uuid4().hex}_{self.camera['id']}"
+                        if plate_runtime is not None:
+                            try:
+                                plate_collector = plate_runtime.new_collector(
+                                    source="camera",
+                                    run_key=f"camera_{self.camera['id']}",
+                                    live_session_id=live_session_id,
+                                )
+                            except Exception:  # noqa: BLE001 - OCR cannot stop live tracking
+                                logger.exception("plate collector unavailable after camera reconnect")
+                                plate_collector = None
                         self.status = "live"
                     continue
 
@@ -170,7 +211,7 @@ class LiveStreamWorker(threading.Thread):
                             source_key=f"camera_{self.camera['id']}",
                             frame_number=event.frame_number,
                         )
-                    db.insert_review_queue(
+                    review_id = db.insert_review_queue(
                         video_id=None,
                         track_id=event.track_id,
                         violation_type=event.violation_type,
@@ -186,7 +227,20 @@ class LiveStreamWorker(threading.Thread):
                         vehicle_class=event.vehicle_class,
                         timestamp_sec=event.timestamp_sec,
                     )
+                    if plate_collector is not None and det is not None:
+                        plate_collector.register(
+                            review_id=int(review_id),
+                            track_id=event.track_id,
+                            identity_epoch=det.get("track_identity_epoch"),
+                            violation_type=event.violation_type,
+                            frame_number=event.frame_number,
+                            timestamp_sec=event.timestamp_sec,
+                        )
+                if plate_collector is not None:
+                    plate_collector.observe(frame, frame_number, timestamp_sec, tracked)
         finally:
+            if plate_collector is not None:
+                plate_collector.flush("stream_stopped")
             cap.release()
             if skipped_frames:
                 logger.info(

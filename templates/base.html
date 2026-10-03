@@ -15,7 +15,7 @@
 
     {% block extra_css %}{% endblock %}
 </head>
-<body>
+<body{% if current_user %} data-tavidm-role="{{ current_user.role }}" data-tavidm-user="{{ current_user.username }}"{% endif %}>
     <div class="app-wrapper">
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-brand">
@@ -31,13 +31,16 @@
             <nav class="sidebar-nav">
                 <ul class="nav flex-column">
                     {% for item in nav_items %}
+                    {% set is_current = request.endpoint == item.endpoint %}
                     <li class="nav-item">
-                        <a class="nav-link {% if request.endpoint == item.endpoint %}active{% endif %}"
-                           href="{{ url_for(item.endpoint) }}">
-                            <i class="bi {{ item.icon }}"></i>
+                        <a class="nav-link {% if is_current %}active{% endif %}"
+                           href="{{ url_for(item.endpoint) }}"{% if is_current %} aria-current="page"{% endif %}{% if item.badge_count and item.badge_label %} aria-label="{{ item.label }}, {{ item.badge_count }} {{ item.badge_label }}"{% endif %}>
+                            <i class="bi {{ item.icon }}" aria-hidden="true"></i>
                             <span>{{ item.label }}</span>
                             {% if item.badge == 'live' %}
                             <span class="nav-badge nav-badge-live">LIVE</span>
+                            {% elif item.badge_count and item.badge_label %}
+                            <span class="nav-badge nav-badge-count" aria-hidden="true">{{ item.badge_count }}</span>
                             {% elif item.badge_count %}
                             <span class="nav-badge nav-badge-count">{{ item.badge_count }}</span>
                             {% endif %}

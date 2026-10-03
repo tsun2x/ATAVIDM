@@ -3,6 +3,28 @@ name = "tavidm"
 version = "0.1.0"
 description = "Traffic Violation Detection and Monitoring System"
 requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0.0",
+    "ultralytics>=8.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "fpdf2>=2.7.0",
+    "openpyxl>=3.1.0",
+    "bcrypt>=4.0.0",
+    "python-dotenv>=1.0.0",
+    "lap>=0.4.0",
+    "scipy>=1.11.0",
+]
+
+# Experimental local plate detection/OCR. Never installed by default; the
+# feature is disabled unless an explicit config enables it, and the defense
+# demo additionally requires a passing recorded evaluation. Note there is
+# deliberately no opencv-python-headless here: one cv2 distribution per
+# interpreter only.
+[project.optional-dependencies]
+plate-ocr = ["onnxruntime==1.30.0"]
+test = ["pytest>=7.0.0", "pytest-cov>=4.0.0"]
 
 [build-system]
 requires = ["hatchling"]

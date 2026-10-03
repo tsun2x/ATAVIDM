@@ -462,44 +462,41 @@ class TestTruckBanApplicability:
 class TestNoHelmet:
     """Tests for No Helmet violation."""
 
-    def test_no_helmet_fires_without_helmet(self, rule_params):
-        """No Helmet should fire when rider detected without helmet."""
-        from core.violation_engine import RuleEngineState, check_no_helmet
-        
+    def test_missing_helmet_box_does_not_fire(self, rule_params):
+        """A missing helmet box is UNKNOWN and creates no No Helmet candidate."""
+        from core.violation_engine import RuleEngineState, _rider_helmet_state, check_no_helmet
+
         state = RuleEngineState()
-        
         mc = {
             "class_label": "motorcycle",
             "track_id": 1,
             "bbox_x": 100, "bbox_y": 100, "bbox_w": 50, "bbox_h": 25,
             "confidence": 0.95, "speed_px_per_sec": 0.0, "direction_degrees": 0,
         }
-        
-        # Rider positioned to be associated with motorcycle
-        person = {
+        rider = {
             "class_label": "rider",
             "track_id": 2,
             "bbox_x": 110, "bbox_y": 90, "bbox_w": 20, "bbox_h": 40,
             "confidence": 0.9, "speed_px_per_sec": 0.0,
         }
-        
-        # No helmets in detections!
+        assert _rider_helmet_state(rider, [], []) == "UNKNOWN"
+
         events = []
         for frame in range(0, 10):
             ts = frame * 0.3
             mc["timestamp_sec"] = ts
-            person["timestamp_sec"] = ts
-            evt = check_no_helmet(
-                [mc, person],
-                state,
-                frame,
-                rule_params,
-                model_classes=("motorcycle", "rider", "helmet_acceptable", "helmet_nut_shell"),
+            rider["timestamp_sec"] = ts
+            events.extend(
+                check_no_helmet(
+                    [mc, rider],
+                    state,
+                    frame,
+                    rule_params,
+                    model_classes=("motorcycle", "rider", "helmet_acceptable", "helmet_nut_shell"),
+                )
             )
-            events.extend(evt)
-        
-        assert any(e.violation_type == VIOLATION_NO_HELMET for e in events), \
-            f"Expected No Helmet event, got {events}"
+        assert events == []
+        assert any("blocked" in note.lower() for note in state.diagnostics)
 
 
 class TestMotorcycleOverloading:

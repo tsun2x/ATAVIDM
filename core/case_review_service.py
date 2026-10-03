@@ -7,8 +7,12 @@ never from client-supplied reviewer flags.
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+
+from collections.abc import Mapping
 
 from core.case_identity import (
     ObservationRef,
@@ -37,6 +41,8 @@ from core.plate_processing import (
 )
 
 
+_NO_CASE_DECISIONS = frozenset({"no_violation", "insufficient_evidence"})
+
 VERIFIED_PLATE_STATUSES = frozenset({HUMAN_PLATE_STATUS_VERIFIED_READABLE})
 NON_IDENTITY_PLATE_STATUSES = frozenset(
     {
@@ -51,10 +57,121 @@ class CaseReviewError(ValueError):
     """Domain error for case review operations."""
 
 
+class ReviewDecisionStateConflict(CaseReviewError):
+    """Another request already closed the review. Nothing was written."""
+
+    def __init__(self, message: str, existing: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.existing = existing
+
+
+def _review_write_transaction(adapter: Any):
+    tx = getattr(adapter, "review_write_transaction", None)
+    if tx is None:
+        raise CaseReviewError(
+            "Adapter lacks review_write_transaction; serialized decision writes required"
+        )
+    return tx()
+
+
+def _stored_review_decision(adapter: Any, review_id: int) -> dict[str, Any] | None:
+    getter = getattr(adapter, "get_review_decision", None)
+    if getter is None:
+        return None
+    return getter(int(review_id))
+
+
+def _effective_violation_type(
+    row: dict[str, Any],
+    decision: dict[str, Any] | None,
+) -> str | None:
+    """Canonical rule used for grouping.
+
+    A saved correction or confirmation wins over the original queue suggestion.
+    No-violation and insufficient-evidence decisions return None so the
+    observation cannot re-enter fusion or materialization. Rows with no
+    decision keep the stored suggestion.
+    """
+    from core.detection_config import canonicalize_violation
+
+    if decision is not None and str(decision.get("decision") or "") in _NO_CASE_DECISIONS:
+        return None
+    if decision is not None and decision.get("selected_canonical_rule"):
+        selected = canonicalize_violation(str(decision["selected_canonical_rule"]))
+        if selected:
+            return selected
+    suggested = canonicalize_violation(row.get("violation_type") or "")
+    return suggested or str(row.get("violation_type") or "")
+
+
+def _observation_from_queue_row(
+    adapter: Any,
+    row: dict[str, Any],
+) -> ObservationRef | None:
+    """Rebuild one observation from the queue row and its saved decision."""
+    effective = _effective_violation_type(row, _stored_review_decision(adapter, int(row["id"])))
+    if effective is None:
+        return None
+    observed = observation_from_review_row(row)
+    if observed.violation_type == effective:
+        return observed
+    return replace(observed, violation_type=effective)
+
+
+def _observation_for_materialization(
+    adapter: Any,
+    row: dict[str, Any],
+    canonical_override: str | None,
+) -> ObservationRef:
+    """Use the saved human rule when one exists. Do not rewrite the queue row.
+
+    ``canonical_override`` applies only while the review has no decision yet.
+    A later recovery or sibling load cannot replace that saved rule with the
+    original suggestion.
+    """
+    decision = _stored_review_decision(adapter, int(row["id"]))
+    if decision is not None and str(decision.get("decision") or "") in _NO_CASE_DECISIONS:
+        raise CaseReviewError(
+            f"Review item {row['id']} is closed without a case and cannot be materialized"
+        )
+    if decision is not None and decision.get("selected_canonical_rule"):
+        effective = _effective_violation_type(row, decision)
+        observed = observation_from_review_row(row)
+        if effective and observed.violation_type != effective:
+            return replace(observed, violation_type=effective)
+        return observed
+    observed = observation_from_review_row(row)
+    if not canonical_override:
+        return observed
+    return replace(observed, violation_type=canonical_override)
+
+
+def _decision_payload_with_policy(
+    decision_insert: dict[str, Any] | None,
+    group,
+    policy_version_id: int,
+) -> dict[str, Any] | None:
+    """Attach the group policy snapshot computed before case materialization."""
+    if not decision_insert:
+        return None
+    payload = dict(decision_insert)
+    payload["policy_refs"] = {
+        "policy_version_id": int(policy_version_id),
+        "snapshots": policy_snapshots_for_group(group),
+        "contributing_rules": list(group.contributing_rules),
+        "primary_canonical_rule": group.primary_canonical_rule,
+        "computed_before_materialization": True,
+    }
+    return payload
+
+
 def materialize_case_from_review(
     adapter: Any,
     review_id: int,
     reviewed_by: int,
+    *,
+    canonical_override: str | None = None,
+    decision_insert: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Confirm a review item into a stable logical case.
 
@@ -70,47 +187,106 @@ def materialize_case_from_review(
     Authorization: active account with case-review capability
     (``can_confirm_case``) — Traffic Enforcer, System Administrator, or
     explicit grant. Legal-policy approval is a separate capability.
+
+    Concurrency: decision state is read only while the adapter's review write
+    lock is held. The first locked transaction re-reads the review, its saved
+    decision, and the sibling group, then commits the case or attachment, the
+    human decision, and every group member's link together. When
+    ``decision_insert`` is given and any decision already exists, it raises
+    ``ReviewDecisionStateConflict`` before writing, so the caller can tell a
+    matching retry from a conflict. The second locked transaction rebuilds the
+    group from current state and finishes evidence and policy snapshots. A
+    failure there leaves the first transaction in place for recovery.
     """
     if not adapter.can_confirm_case(reviewed_by):
         raise PermissionError(
             f"User {reviewed_by} lacks confirm_case / case-review authority"
         )
 
+    with _review_write_transaction(adapter):
+        reused = _materialize_initial_locked(
+            adapter,
+            int(review_id),
+            int(reviewed_by),
+            canonical_override=canonical_override,
+            decision_insert=decision_insert,
+        )
+    with _review_write_transaction(adapter):
+        return _recover_or_return_materialization(
+            adapter,
+            int(review_id),
+            int(reviewed_by),
+            canonical_override=canonical_override,
+            reused=reused,
+        )
+
+
+def _materialize_initial_locked(
+    adapter: Any,
+    review_id: int,
+    reviewed_by: int,
+    *,
+    canonical_override: str | None,
+    decision_insert: dict[str, Any] | None,
+) -> bool:
+    """Atomic first stage. Returns True when an existing case was used.
+
+    Runs inside the review write lock, so every read below is authoritative
+    until the transaction ends.
+    """
     row = adapter.get_review_item(review_id)
     if row is None:
         raise CaseReviewError(f"Review item {review_id} not found")
 
-    if row.get("status") != "pending":
-        return _recover_or_return_materialization(
-            adapter, review_id, reviewed_by, row
+    stored_decision = _stored_review_decision(adapter, review_id)
+    if decision_insert is not None and stored_decision is not None:
+        raise ReviewDecisionStateConflict(
+            f"Review item {review_id} already has a human decision",
+            existing=stored_decision,
+        )
+    if stored_decision is not None and str(stored_decision.get("decision") or "") in _NO_CASE_DECISIONS:
+        raise CaseReviewError(
+            f"Review item {review_id} is closed without a case and cannot be materialized"
         )
 
-    primary = observation_from_review_row(row)
+    if row.get("status") != "pending":
+        if decision_insert is not None:
+            raise ReviewDecisionStateConflict(
+                f"Review item {review_id} is not pending (status: {row.get('status')})"
+            )
+        return True
+
+    primary = _observation_for_materialization(adapter, row, canonical_override)
     siblings = _load_sibling_observations(adapter, primary)
     group = build_case_group(primary, siblings)
     policy_version_id = _resolve_policy_version_id(adapter)
+    decision_payload = _decision_payload_with_policy(
+        decision_insert, group, policy_version_id
+    )
 
     existing_vid = find_existing_fused_case_violation_id(adapter, group)
     if existing_vid is not None:
         viol = adapter.get_violation(int(existing_vid))
         if viol is not None and viol.get("status") == "dismissed":
             existing_vid = None
-        else:
-            _complete_materialization(
-                adapter,
-                group,
+    if existing_vid is not None:
+        reuse_version = _resolve_original_policy_version(adapter, int(existing_vid))
+        decision_payload = _decision_payload_with_policy(
+            decision_insert, group, reuse_version
+        )
+        if decision_payload is not None:
+            adapter.attach_review_decision_to_existing_case(
+                int(review_id),
                 int(existing_vid),
-                reviewed_by,
-                policy_version_id=_resolve_original_policy_version(
-                    adapter, int(existing_vid)
-                ),
+                int(reviewed_by),
+                policy_version_id=reuse_version,
+                contributing_rules=group.contributing_rules,
+                review_ids=group.review_ids,
+                decision_insert=decision_payload,
             )
-            return _materialization_result(
-                adapter, int(existing_vid), group, reused=True
-            )
+        _claim_group_members(adapter, group, int(existing_vid), reviewed_by)
+        return True
 
-    # Initial case + review confirmation/link + selected policy intent must
-    # commit atomically. Evidence/snapshots remain recoverable staged writes.
     primary_for_insert = _choose_primary_observation(group)
     create_initial = getattr(adapter, "create_case_with_materialization_intent", None)
     if create_initial is None:
@@ -123,6 +299,10 @@ def materialize_case_from_review(
         if primary_for_insert.review_id != review_id
         else []
     )
+    stored_primary = adapter.get_review_item(primary_for_insert.review_id) or {}
+    insert_override = None
+    if primary_for_insert.violation_type != stored_primary.get("violation_type"):
+        insert_override = primary_for_insert.violation_type
     violation_id = create_initial(
         primary_for_insert.review_id,
         reviewed_by,
@@ -130,42 +310,69 @@ def materialize_case_from_review(
         contributing_rules=group.contributing_rules,
         review_ids=group.review_ids,
         additional_link_review_ids=extra_links,
+        violation_type_override=insert_override,
+        decision_insert=decision_payload,
     )
-
     if group.is_fused_parking_obstruction:
         adapter.update_violation_canonical_type(
             violation_id, group.primary_canonical_rule
         )
-        for obs in group.observations:
-            if obs.review_id in (primary_for_insert.review_id, review_id):
-                continue
-            if adapter.get_review_item(obs.review_id) is None:
-                continue
-            status = (adapter.get_review_item(obs.review_id) or {}).get("status")
-            if status == "pending":
-                adapter.mark_review_confirmed_linked(
-                    obs.review_id, violation_id, reviewed_by
-                )
+    _claim_group_members(adapter, group, int(violation_id), reviewed_by)
+    return False
 
-    _complete_materialization(
-        adapter,
-        group,
-        int(violation_id),
-        reviewed_by,
-        policy_version_id=policy_version_id,
+
+def _claim_group_members(
+    adapter: Any,
+    group,
+    violation_id: int,
+    reviewed_by: int,
+) -> None:
+    """Confirm and link every group member in the first-stage transaction.
+
+    A member closed without a case must never be linked. Under the write lock
+    the group excludes such rows, so reaching one means the group is stale.
+    """
+    for obs in group.observations:
+        row = adapter.get_review_item(obs.review_id)
+        if row is None:
+            continue
+        _assert_member_can_join(adapter, row)
+        if row.get("status") == "pending":
+            adapter.mark_review_confirmed_linked(obs.review_id, violation_id, reviewed_by)
+        else:
+            adapter.link_review_to_case(obs.review_id, violation_id)
+
+
+def _assert_member_can_join(adapter: Any, row: dict[str, Any]) -> None:
+    decision = _stored_review_decision(adapter, int(row["id"]))
+    closed_without_case = (
+        decision is not None
+        and str(decision.get("decision") or "") in _NO_CASE_DECISIONS
     )
-    return _materialization_result(
-        adapter, int(violation_id), group, reused=False
-    )
+    if closed_without_case or row.get("status") == "dismissed":
+        raise ReviewDecisionStateConflict(
+            f"Review item {row['id']} was closed without a case; the case group is stale",
+            existing=decision,
+        )
 
 
 def _recover_or_return_materialization(
     adapter: Any,
     review_id: int,
     reviewed_by: int,
-    row: dict[str, Any],
+    row: dict[str, Any] | None = None,
+    *,
+    canonical_override: str | None = None,
+    reused: bool = True,
 ) -> dict[str, Any]:
-    """Finish incomplete materialization or return a verified-complete result."""
+    """Finish incomplete materialization or return a verified-complete result.
+
+    Callers hold the review write lock. The review row and group are re-read
+    here so a stale snapshot from before the lock is never used.
+    """
+    row = adapter.get_review_item(review_id)
+    if row is None:
+        raise CaseReviewError(f"Review item {review_id} not found")
     existing = adapter.find_violation_linked_to_review(review_id)
     if existing is None and hasattr(adapter, "find_orphan_violation_for_review"):
         existing = adapter.find_orphan_violation_for_review(review_id)
@@ -183,7 +390,7 @@ def _recover_or_return_materialization(
             f"Review item {review_id} is not pending (status: {row.get('status')})"
         )
 
-    primary = observation_from_review_row(row)
+    primary = _observation_for_materialization(adapter, row, canonical_override)
     siblings = _load_sibling_observations(adapter, primary)
     # Include already-linked observations for this violation so fused recovery
     # knows every required contributing behavior.
@@ -206,7 +413,7 @@ def _recover_or_return_materialization(
         policy_version_id=policy_version_id,
     )
     return _materialization_result(
-        adapter, int(existing), group, reused=True
+        adapter, int(existing), group, reused=reused
     )
 
 
@@ -231,7 +438,10 @@ def _load_linked_observations_for_violation(
         row = adapter.get_review_item(int(rid))
         if row is None or str(row.get("status") or "") == "dismissed":
             continue
-        out.append(observation_from_review_row(row))
+        observed = _observation_from_queue_row(adapter, row)
+        if observed is None:
+            continue
+        out.append(observed)
     return out
 
 
@@ -384,6 +594,7 @@ def _complete_materialization(
         row = adapter.get_review_item(obs.review_id)
         if row is None:
             continue
+        _assert_member_can_join(adapter, row)
         if row.get("status") == "pending":
             adapter.mark_review_confirmed_linked(
                 obs.review_id, violation_id, reviewed_by
@@ -471,7 +682,10 @@ def _load_sibling_observations(adapter: Any, primary: ObservationRef) -> list[Ob
             viol = adapter.get_violation(int(linked))
             if viol is not None and viol.get("status") == "dismissed":
                 continue
-        out.append(observation_from_review_row(r))
+        observed = _observation_from_queue_row(adapter, r)
+        if observed is None:
+            continue
+        out.append(observed)
     return out
 
 
@@ -556,18 +770,34 @@ def verify_plate_identity(
     evidence_crop_ref: str | None = None,
     ocr_confidence: float | None = None,
     review_id: int | None = None,
+    machine_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Authorized human plate acceptance/correction.
 
     ``verified_readable`` requires fully readable accepted text. Unclear and
     not_visible retain the vehicle/evidence record without establishing identity.
 
+    Authority: **active System Administrator only**. This check lives in the
+    service, not only in the route, so a direct service call cannot bypass it.
+    An explicit ``verify_plate`` grant does not bypass it either. This is a
+    deliberate, narrow restriction for the experimental plate demo; it does not
+    change ``can_verify_plate``, ``ENFORCEMENT_ROLES``, case confirmation,
+    event-time review, review decisions, or any other enforcer permission.
+
+    Machine jobs must never call this function. Only an explicit human action
+    may write accepted identity or ``verified_readable``.
+
     Plate row, audit history, and legacy field sync are one atomic persistence
-    operation — any failure rolls all three back.
+    operation - any failure rolls all three back.
     """
-    if not adapter.can_verify_plate(actor_user_id):
+    confirm = getattr(adapter, "can_confirm_plate_identity", None)
+    if confirm is None:
+        raise CaseReviewError(
+            "Adapter lacks can_confirm_plate_identity; active-admin authority required"
+        )
+    if not confirm(actor_user_id):
         raise PermissionError(
-            f"User {actor_user_id} lacks verify_plate authority"
+            f"User {actor_user_id} lacks admin-only plate confirmation authority"
         )
     viol = adapter.get_violation(violation_id)
     if viol is None:
@@ -576,6 +806,29 @@ def verify_plate_identity(
         raise CaseReviewError(
             f"Violation {violation_id} is dismissed; cannot verify plate"
         )
+
+    if candidate_reference is None and any(
+        value is not None
+        for value in (candidate_ocr_raw, evidence_crop_ref, ocr_confidence, machine_provenance)
+    ):
+        raise CaseReviewError("Machine candidate metadata requires a server-resolved candidate reference")
+    if candidate_reference is not None:
+        try:
+            from core.plate_review import manifest_provenance_for_verification, resolve_candidate
+            from core import plate_manifest as plate_manifests
+
+            attempt_id, candidate_id = str(candidate_reference).split(":", 1)
+            linked = [item for item in plate_manifests.attempts_for_review(review_id) if item.attempt_id == attempt_id]
+            if len(linked) != 1:
+                raise ValueError("attempt is not linked to the review")
+            resolved = resolve_candidate(adapter, violation_id, candidate_id, review_id=review_id)
+            if resolved.get("attempt_id") != attempt_id:
+                raise ValueError("attempt identity mismatch")
+            candidate_ocr_raw = resolved.get("ocr_raw")
+            evidence_crop_ref = (resolved.get("plate_crop_ref") or {}).get("stored_path")
+            machine_provenance = manifest_provenance_for_verification(resolved)
+        except Exception as exc:
+            raise CaseReviewError("Machine candidate could not be validated for this case") from exc
 
     status = str(plate_status).strip()
     accepted = (accepted_plate_text or "").strip() or None
@@ -616,6 +869,7 @@ def verify_plate_identity(
 
     prior = adapter.get_plate_verification(violation_id)
     prior_snapshot = None
+    prior_machine_provenance: dict[str, Any] = {}
     if prior is not None:
         prior_snapshot = {
             "plate_status": prior.get("plate_status"),
@@ -625,6 +879,18 @@ def verify_plate_identity(
             "verified_at": prior.get("verified_at"),
             "evidence_crop_ref": (prior.get("processing_diagnostics_json") or ""),
         }
+        # Retain machine provenance recorded by an earlier confirmation. A
+        # correction that does not name a candidate must not erase it.
+        prior_machine_provenance = _machine_provenance_from_diagnostics(
+            prior.get("processing_diagnostics_json")
+        )
+
+    diagnostics: dict[str, Any] = {
+        "candidate_reference": candidate_reference,
+        "actor_user_id": actor_user_id,
+    }
+    diagnostics.update(prior_machine_provenance)
+    diagnostics.update(dict(machine_provenance or {}))
 
     apply = getattr(adapter, "apply_plate_verification", None)
     if apply is None:
@@ -642,10 +908,7 @@ def verify_plate_identity(
         verified_by=actor_user_id,
         verified_at=now,
         evidence_crop_ref=evidence_crop_ref,
-        processing_diagnostics={
-            "candidate_reference": candidate_reference,
-            "actor_user_id": actor_user_id,
-        },
+        processing_diagnostics=diagnostics,
         legacy_plate_text=legacy_text,
         legacy_plate_status=legacy_status,
         audit_detail={
@@ -664,6 +927,19 @@ def verify_plate_identity(
         "verified_by": actor_user_id,
         "verified_at": now,
     }
+
+
+def _machine_provenance_from_diagnostics(raw: Any) -> dict[str, Any]:
+    """Recover previously stored ``machine_*`` provenance from a diagnostics blob."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: value for key, value in data.items() if key.startswith("machine_")}
 
 
 # ---------------------------------------------------------------------------

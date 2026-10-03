@@ -212,7 +212,7 @@ class TestRiderOnlyGate6:
             )
         assert events == []
 
-    def test_rider_triggers_no_helmet_without_helmet(self):
+    def test_rider_without_helmet_box_creates_no_candidate(self):
         state = RuleEngineState()
         classes = ("motorcycle", "rider", "helmet_acceptable", "helmet_nut_shell")
         mc = _det(track_id=1, class_label="motorcycle", bbox_x=100, bbox_y=100, bbox_w=60, bbox_h=60)
@@ -232,7 +232,8 @@ class TestRiderOnlyGate6:
             events.extend(
                 check_no_helmet([mc, rider], state, 1, {}, model_classes=classes)
             )
-        assert any(e.violation_type == VIOLATION_NO_HELMET for e in events)
+        assert events == []
+        assert all(getattr(e, "outcome", "") != "confirmed" for e in events)
 
     def test_person_cannot_trigger_overloading_or_substandard(self):
         state = RuleEngineState()

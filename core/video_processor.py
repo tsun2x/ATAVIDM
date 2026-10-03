@@ -53,6 +53,7 @@ from core.violation_engine import (
     RuleEngineState,
     ViolationEvent,
     build_processing_diagnostics,
+    scene_capability_flags,
 )
 from core.violation_engine import evaluate_detection_rules
 from core.zone_config import parse_zones_json
@@ -262,8 +263,15 @@ def _persist_event(
     evidence_buf: TemporalEvidenceBuffer,
     *,
     processing_run_id: int | None = None,
+    plate_collector: Any | None = None,
 ) -> int:
-    """Save still/crop, insert review row, begin temporal episode linked to that row."""
+    """Save still/crop, insert review row, begin temporal episode linked to that row.
+
+    When the experimental plate runtime is enabled, a *machine* observation is
+    registered for the freshly created pending review row. This never creates or
+    confirms a violation, never writes a plate status, and never touches the GPU
+    reservation: the machine work happens later on a background worker.
+    """
     evidence_path = None
     vehicle_evidence_path = None
     if detection is not None:
@@ -309,6 +317,16 @@ def _persist_event(
         unavailable_factors_json=unavailable_json,
         processing_run_id=processing_run_id,
     )
+
+    if plate_collector is not None and detection is not None:
+        plate_collector.register(
+            review_id=review_id,
+            track_id=event.track_id,
+            identity_epoch=(detection.get("track_identity_epoch")),
+            violation_type=event.violation_type,
+            frame_number=event.frame_number,
+            timestamp_sec=event.timestamp_sec,
+        )
 
     episode = evidence_buf.begin_episode(
         violation_type=event.violation_type,
@@ -460,6 +478,13 @@ def process_video(
             enabled_violations=tuple(enabled_violations),
             geometry=geometry,
             state=rule_state,
+            context_flags=scene_capability_flags(
+                ctx["zones"],
+                ctx.get("scene"),
+                params,
+                recording_time_known=recording_time_known,
+                now_time=base_dt.time() if base_dt is not None else None,
+            ),
         )
         for note in baseline_capability_notes(model_classes):
             diagnostics.notes.append(note)
@@ -510,6 +535,23 @@ def process_video(
         last_ts = 0.0
         run_id_int = int(processing_run_id) if processing_run_id is not None else None
 
+        # Experimental local plate OCR: disabled by default. When explicitly
+        # enabled, the collector only observes frames this pipeline already
+        # processed and only uses each frame's own tracked vehicle box.
+        plate_collector = None
+        try:
+            from core.plate_runtime import get_runtime
+
+            plate_runtime = get_runtime()
+            if plate_runtime is not None:
+                plate_collector = plate_runtime.new_collector(
+                    source="video",
+                    run_key=f"run_{run_id_int}" if run_id_int is not None else f"video_{video_id}",
+                )
+        except Exception:  # noqa: BLE001 - the experiment must never break a run
+            logger.exception("plate OCR collector unavailable; continuing without plate OCR")
+            plate_collector = None
+
         # Motorcycle detail candidates (uploaded-video processing only). The
         # collector only scores frames this pipeline already processed and writes
         # bounded, run-scoped evidence; it never feeds the violation engine.
@@ -524,6 +566,8 @@ def process_video(
 
         while True:
             if cancel_requested is not None and cancel_requested():
+                if plate_collector is not None:
+                    plate_collector.flush("cancelled")
                 raise ProcessVideoCancelled("Processing cancelled by user.", progress_snapshot=_snap())
             ok, frame = cap.read()
             if not ok:
@@ -543,6 +587,12 @@ def process_video(
 
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
+            # End an old identity's review episode before a reused ByteTrack ID
+            # can emit a new event on this frame. evaluate_detection_rules also
+            # observes tracks; the second call is idempotent for the same epoch.
+            rule_state.observe_tracks(tracked, timestamp_sec)
+            for vtype, tid, cleared_at in rule_state.consume_cleared():
+                evidence_buf.end_episode(vtype, tid, cleared_at)
             crossing_counter.update(tracked)
             if detail_collector.enabled:
                 detail_collector.observe(
@@ -609,7 +659,10 @@ def process_video(
                     video_id,
                     evidence_buf,
                     processing_run_id=run_id_int,
+                    plate_collector=plate_collector,
                 )
+            if plate_collector is not None:
+                plate_collector.observe(frame, frame_number, timestamp_sec, tracked)
             events.extend(frame_events)
 
             annotated = annotate_frame(
@@ -649,6 +702,12 @@ def process_video(
 
         if detection_batch:
             db.bulk_insert_detections(detection_batch)
+
+        if plate_collector is not None:
+            # End of file (or an unreadable tail): every pending machine
+            # observation is closed with an explicit outcome. The pending review
+            # rows are unaffected.
+            plate_collector.flush("end_of_source")
 
         if progress_tracker:
             progress_tracker.set_stage("finalizing")
