@@ -46,6 +46,16 @@
             return '<span class="badge bg-success-subtle text-success" title="Verified / recognized plate">' +
                 escapeHtml(v.plate_text) + "</span>";
         }
+        const machine = v.plate_machine || {};
+        const candidates = Array.isArray(machine.candidates) ? machine.candidates : [];
+        if (machine.state === "candidate_found" && candidates.length) {
+            const primary = candidates.find(function (candidate) {
+                return candidate.candidate_id === machine.primary_candidate_id;
+            }) || candidates[0];
+            const candidateText = String(primary.ocr_raw || "").trim();
+            return '<span class="badge bg-warning-subtle text-warning" title="Unverified machine OCR candidate; an administrator must confirm it">Candidate' +
+                (candidateText ? ": " + escapeHtml(candidateText) : "") + "</span>";
+        }
         if (status === "candidate_awaiting_verification") {
             return '<span class="badge bg-info-subtle text-info" title="OCR candidate awaiting review">Candidate</span>';
         }
@@ -79,7 +89,7 @@
             date_from: date || "", date_to: date || "" });
     }
 
-    function loadPage(filters) {
+    function loadPage(filters, onLoaded) {
         const sequence = ++requestSequence;
         const params = new URLSearchParams({
             page: String(currentPage),
@@ -107,6 +117,7 @@
                 totalRecords = Number(payload.total) || 0;
                 currentPage = payload.page || currentPage;
                 render();
+                if (typeof onLoaded === "function") onLoaded();
             })
             .catch(function (error) {
                 if (sequence !== requestSequence) return;
@@ -184,8 +195,8 @@
             '<div class="detail-grid">' +
             detailField("Violation ID", escapeHtml(v.id)) +
             detailField("Canonical Type", '<span class="vtype-badge vtype-' + escapeHtml(v.type_slug) + '">' + escapeHtml(v.type) + "</span>") +
-            detailField("Official Category", official) +
-            detailField("Legal Status", legalBadge) +
+            detailField("Proposed / Verified Category", official) +
+            detailField("Legal Mapping Status", legalBadge) +
             detailField("Contributing Behaviors", escapeHtml((v.contributing_behaviors || []).join("; ") || v.type)) +
             detailField("Track ID", "#" + v.track_id) +
             detailField("Video Source", escapeHtml(v.video_name)) +
@@ -380,6 +391,14 @@
             .then(function (res) {
                 if (res.j.success) {
                     showToast("Saved", "Case update recorded.", "success");
+                    const selectedId = selectedViolation ? Number(selectedViolation.db_id) : null;
+                    loadPage(null, function () {
+                        if (selectedId === null) return;
+                        const refreshed = allViolations.find(function (item) {
+                            return Number(item.db_id) === selectedId;
+                        });
+                        if (refreshed) showDetail(refreshed);
+                    });
                 } else {
                     showToast("Error", res.j.error || "Action failed.", "danger");
                 }

@@ -13,10 +13,10 @@ Enablement contract
   no environment-only shortcut that could silently half-enable the feature.
 * The provider is validated against an explicit allowlist. Automatic provider
   selection and undocumented CPU fallback are rejected.
-* A recorded evaluation record (``evaluation_record``) is required before a
-  demo may run. Its ``model_hashes`` block must match the configured artifact
-  hashes, so changing a model or its configuration invalidates the recorded
-  gate.
+* ``evaluation_record`` is retained as provenance for evaluation tooling. A
+  passing evaluation is not required to start an isolated local thesis demo.
+  Configured model and config artifact hashes are still checked before OCR
+  runs.
 
 This module never reads ``os.environ`` for anything other than the single
 config-path variable, so the demo launcher can scope it to one child process

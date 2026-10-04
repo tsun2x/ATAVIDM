@@ -205,14 +205,8 @@ if (typeof document !== "undefined") {
             return (c.ocr_display_normalized || "") !== (candidate.ocr_display_normalized || "");
         }).length;
         const confirmControls = canConfirm
-            ? '<div class="mt-2 d-flex flex-wrap gap-2">' +
-              '<button type="button" class="btn btn-sm btn-outline-primary plate-confirm" data-candidate-id="' +
-              escapeHtml(candidate.candidate_id || "") + '" data-raw="' + escapeHtml(candidate.ocr_raw || "") +
-              '">Confirm this plate (admin)</button>' +
-              '<button type="button" class="btn btn-sm btn-outline-secondary plate-manual" data-candidate-id="' +
-              escapeHtml(candidate.candidate_id || "") + '">Enter different text (admin)</button>' +
-              "</div>"
-            : '<p class="small text-muted mb-0"><i class="bi bi-lock me-1"></i>Plate confirmation is restricted to an active System Administrator.</p>';
+            ? '<p class="small text-muted mb-0">To save this plate confirmation, first confirm this pending review into a case. Then open the case details and verify the candidate there.</p>'
+            : '<p class="small text-muted mb-0"><i class="bi bi-lock me-1"></i>Plate verification is administrator-only and is available from case details after this review becomes a case.</p>';
 
         return '<div class="border rounded p-2' + (isPrimary ? " border-warning" : "") + '">' +
             '<div class="d-flex flex-wrap justify-content-between gap-2">' +
@@ -284,34 +278,6 @@ if (typeof document !== "undefined") {
         }
 
         body.innerHTML = html;
-        body.querySelectorAll(".plate-confirm, .plate-manual").forEach(function (button) {
-            button.addEventListener("click", function () {
-                const candidateId = button.getAttribute("data-candidate-id") || "";
-                const raw = button.getAttribute("data-raw") || "";
-                const suggested = button.classList.contains("plate-manual") ? "" : raw;
-                const accepted = window.prompt(
-                    "Confirm the plate text exactly as it is visibly readable (administrator action).\n" +
-                    "Leave blank to mark the plate unclear instead. Partial text is rejected.",
-                    suggested
-                );
-                if (accepted === null) return;
-                submitPlateConfirmation(item, candidateId, accepted.trim());
-            });
-        });
-    }
-
-    // A pending review has no case yet, so plate confirmation is only offered on
-    // the case page. This helper keeps the flow honest instead of silently
-    // dropping the admin's action.
-    function submitPlateConfirmation(item, candidateId, acceptedText) {
-        const body = document.getElementById("plateOcrBody");
-        const notice = document.createElement("p");
-        notice.className = "small text-warning mb-0";
-        notice.textContent = "Plate confirmation is recorded on the case, after the review is confirmed into a case. Open the case detail to confirm this plate.";
-        if (body && !body.querySelector(".plate-defer-note")) {
-            notice.classList.add("plate-defer-note");
-            body.appendChild(notice);
-        }
     }
 
     function updateCount() {

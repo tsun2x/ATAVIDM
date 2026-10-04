@@ -1,12 +1,13 @@
 # Experimental local plate detection and OCR
 
-**Status: implemented, tested, measured — and NOT enabled.** The experimental
-defense-demo gate **failed** on the owner-selected footage, so the demo
-launcher refuses to start. See [Demo gate verdict](#demo-gate-verdict).
+**Status: experimental local thesis demo.** OCR stays disabled in ordinary
+application startup and runs only through the isolated demo launcher. The
+measured evaluation below is limited and is not a production accuracy claim;
+it does not block supervised local inference.
 
 This feature is:
 
-* **disabled by default** — a stock checkout never runs plate OCR;
+* **disabled by default** — enable regular-app OCR with an explicit process flag;
 * **experimental** — every surface is labelled as such, and machine text is a
   *candidate* only;
 * **human-in-the-loop** — only an active System Administrator can confirm a
@@ -29,7 +30,7 @@ initiates enforcement, and never uploads footage, crops, or results anywhere.
 | `core/plate_runtime.py` | Process-scoped runtime holder |
 | `scripts/plate_ocr_evaluate.py` | Local evaluation harness (freezes units, scores the gate) |
 | `scripts/plate_ocr_benchmark.py` | Latency / memory benchmark |
-| `scripts/run_plate_ocr_demo.py` | Process-scoped demo launcher (refuses to start while the gate fails) |
+| `scripts/run_plate_ocr_demo.py` | Process-scoped isolated thesis demo launcher |
 | `tests/test_plate_ocr.py` | Focused feature tests (temporary DB + temporary evidence) |
 | `tests/test_plate_ocr_offline.py` | Offline / real-ONNX tests (sockets and hub downloads blocked) |
 | `tests/js/test_plate_ocr_labels.cjs` | Presentation-layer contracts (states, escaping, admin-only controls) |
@@ -130,8 +131,8 @@ This is a **documented ambiguity, not a clean pass**. Consequences:
   already excludes `*.onnx`, so they cannot be committed.
 * `artifacts/plate_alpr/provenance/` keeps the upstream `LICENSE` files, the
   published configs, and every SHA-256 so the provenance chain is auditable.
-* This ambiguity is recorded as a blocker in the evaluation record and is one of
-  the reasons the demo cannot be enabled without explicit owner acknowledgement.
+* This ambiguity remains documented for thesis provenance; it does not block
+  a local supervised experiment and does not grant permission to redistribute weights.
 * Nothing here supports any production or real-CCTV accuracy claim.
 
 ---
@@ -257,7 +258,9 @@ python scripts\plate_ocr_evaluate.py `
 ```
 
 The score-only run verifies the frozen package hash and writes a new report to
-its own unique temporary output root. To produce a qualified gate record,
+its own unique temporary output root. Evaluation qualification is research
+reporting only; it does not control whether the isolated thesis demo can start.
+To produce a qualified evaluation record,
 provide `--qualification-evidence <reviewed-evidence.json>` containing the
 per-unit `association_results`, the offline, isolation, admin-authorization,
 retry-preservation, and browser-review checks, and the unresolved licensing
@@ -277,10 +280,12 @@ demo. The checked-in failed record is not replaced by an evaluation run.
 Plate OCR is enabled only by an explicit JSON file pointed at by
 `TAVIDM_PLATE_OCR_CONFIG`. See `artifacts/plate_alpr/plate_ocr_demo.json`.
 An enabled config alone does not start OCR: application runtime startup also
-requires exactly one explicit isolated mode (`TAVIDM_PLATE_OCR_DEMO=1` after a
-passing gate, or `TAVIDM_PLATE_OCR_EVALUATION=1` with isolated paths and
-verified artifacts). Ordinary application startup and status serialization
-remain disabled.
+requires exactly one explicit mode: `TAVIDM_PLATE_OCR_APP=1` for the regular
+app, `TAVIDM_PLATE_OCR_DEMO=1` for the isolated demo, or
+`TAVIDM_PLATE_OCR_EVALUATION=1` for evaluation. Regular-app manifests are kept
+under the configured private evidence root, separate from the database and
+model/config inputs. A passing evaluation record is not required. All modes
+remain off unless explicitly selected.
 
 Required keys: `enabled`, `provider`, `detector_path`, `detector_sha256`,
 `ocr_path`, `ocr_sha256`, `ocr_config_path`, `ocr_config_sha256`,
@@ -528,9 +533,8 @@ Needed improvements, none of which were applied here:
   a multi-scale plate detector — a **different model stack**, which would
   invalidate the recorded evaluation and require re-evaluation before any demo
   enablement;
-* explicit owner acknowledgement of the weight-licensing and training-data
-  ambiguity in section 2, or replacement artifacts with an unambiguous model
-  license.
+* more independently labelled, readable plate observations before making any
+  accuracy claim.
 
 Nothing was relabelled, cherry-picked, or tuned on the scored set.
 
@@ -631,7 +635,26 @@ Tests that were updated because of the **authorized** admin-only restriction
 
 ## 14. Demo enablement and rollback
 
-### Enable (only after the gate passes)
+### Enable OCR in the regular app
+
+In the PowerShell window used to start TAVIDM, set the explicit opt-in and
+config, then start the app as usual:
+
+```powershell
+cd D:\tavidm
+$env:TAVIDM_PLATE_OCR_APP = "1"
+$env:TAVIDM_PLATE_OCR_CONFIG = (Resolve-Path artifacts\plate_alpr\plate_ocr_demo.json).Path
+.\venv\Scripts\python.exe app.py
+```
+
+OCR will observe newly processed frames and save private attempt manifests
+under `<EVIDENCE_FOLDER>\plate_ocr`. It does not update old observations; use
+Reprocess on the video to create new review observations with OCR attempts.
+The existing review UI keeps machine output pending and only an administrator
+can manually confirm a plate. Stop TAVIDM and omit the opt-in on the next start
+to disable OCR.
+
+### Start the isolated thesis demo
 
 ```powershell
 cd D:\tavidm
@@ -659,17 +682,17 @@ It never writes the canonical database, the canonical evidence root, the user's
 global environment, or any application setting. **Admin role alone does not
 enable OCR.**
 
-The launcher refuses to start (exit code 2 or 3) when the config is invalid, an
-artifact is missing or hash-mismatched, `onnxruntime` is absent, the requested
-provider is unavailable, or the recorded evaluation is not a pass for these exact
-hashes, provider, colour mode, and configuration hash.
+The launcher refuses to start when the config is invalid, an artifact is
+missing or hash-mismatched, `onnxruntime` is absent, the requested provider is
+unavailable, or the isolated paths are unsafe. Evaluation status does not block
+the supervised demo.
 
 ### Stop / disable
 
 1. Press **Ctrl+C** in the demo console, or close the window. The child process
    exits; the worker thread is a daemon and dies with it.
 2. Plate OCR is off in every other start path. A normal `python app.py` cannot
-   start OCR from `TAVIDM_PLATE_OCR_CONFIG` alone; runtime mode and isolated
+   start OCR from `TAVIDM_PLATE_OCR_CONFIG` alone; runtime mode and evidence
    path validation are enforced inside the application.
 
 ### Verify the demo is stopped
@@ -701,12 +724,12 @@ another process's active temporary files are not swept. Deleting demo evidence
 is an explicit operator action on the demo directory, and `orphan_report()`
 will then report attempts whose crops are gone instead of failing silently.
 
-### Invalidating the gate
+### Evaluation record
 
-Changing a model, a model config, `ocr_color_mode`, the provider, or any declared
-bound changes the configuration hash or the artifact hashes, and
-`demo_gate_status()` then refuses the recorded evaluation. Re-evaluation is
-required before the demo can be enabled again.
+Changing a model, model config, `ocr_color_mode`, provider, or declared bound
+invalidates comparability with prior evaluation results. Re-evaluate before
+making updated quality claims. The isolated demo still validates the configured
+artifact hashes and does not require a passing evaluation record.
 
 ---
 

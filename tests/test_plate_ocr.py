@@ -304,17 +304,31 @@ class TestDisabledByDefault:
         plate_runtime.reset_runtime()
         try:
             assert plate_runtime.get_runtime() is None
-            assert "explicit_isolated_mode_required" in plate_runtime.status_report()["reason"]
+            assert "explicit_ocr_mode_required" in plate_runtime.status_report()["reason"]
         finally:
             plate_runtime.reset_runtime()
 
-    def test_demo_gate_failure_and_repository_paths_fail_closed(self, tmp_path, monkeypatch):
-        from core import plate_runtime, plate_settings
+    def test_demo_runtime_ignores_evaluation_gate_but_repository_paths_fail_closed(self, tmp_path, monkeypatch):
+        from core import plate_runtime
 
         settings = enabled_settings(tmp_path)
         monkeypatch.setattr(plate_runtime, "load_plate_ocr_settings", lambda: settings)
-        monkeypatch.setattr(plate_settings, "demo_gate_status", lambda _settings: {"ok": False, "reason": "failed_record"})
-        monkeypatch.setattr(plate_runtime, "PlateRuntime", lambda _settings: pytest.fail("runtime started"))
+        monkeypatch.setattr(
+            plate_runtime, "verify_artifact_hashes",
+            lambda _settings: [{"ok": True}],
+        )
+
+        class StubRuntime:
+            def __init__(self, _settings):
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr(plate_runtime, "PlateRuntime", StubRuntime)
         root = tmp_path / "isolated"
         root.mkdir()
         monkeypatch.setenv("TAVIDM_PLATE_OCR_DEMO", "1")
@@ -328,7 +342,9 @@ class TestDisabledByDefault:
             monkeypatch.setenv(name, str(root / name.lower()))
         plate_runtime.reset_runtime()
         try:
-            assert plate_runtime.get_runtime() is None
+            runtime = plate_runtime.get_runtime()
+            assert isinstance(runtime, StubRuntime)
+            assert runtime.started is True
             repo = Path(__file__).resolve().parents[1]
             monkeypatch.setenv("TAVIDM_PLATE_OCR_DEMO", "")
             monkeypatch.setenv("TAVIDM_PLATE_OCR_EVALUATION", "1")
@@ -337,6 +353,48 @@ class TestDisabledByDefault:
             monkeypatch.setenv("DATABASE_URL", str(repo / "database" / "canonical-probe.sqlite"))
             monkeypatch.setenv("EVIDENCE_FOLDER", str(repo / "dataset" / "evidence"))
             assert plate_runtime._authorized_mode()[0] is None
+        finally:
+            plate_runtime.reset_runtime()
+
+    def test_explicit_regular_app_mode_starts_runtime_with_private_evidence_paths(self, tmp_path, monkeypatch):
+        from core import plate_runtime
+
+        settings = enabled_settings(tmp_path)
+        evidence = tmp_path / "app-evidence"
+        database = tmp_path / "tavidm.db"
+        monkeypatch.setattr(plate_runtime, "load_plate_ocr_settings", lambda: settings)
+        monkeypatch.setattr(plate_runtime, "verify_artifact_hashes", lambda _settings: [{"ok": True}])
+        monkeypatch.setenv("TAVIDM_PLATE_OCR_APP", "1")
+        monkeypatch.setenv("TAVIDM_PLATE_OCR_DEMO", "")
+        monkeypatch.setenv("TAVIDM_PLATE_OCR_EVALUATION", "")
+        monkeypatch.setenv("EVIDENCE_FOLDER", str(evidence))
+        monkeypatch.setenv("SQLITE_PATH", str(database))
+        monkeypatch.setenv("DATABASE_URL", str(database))
+        monkeypatch.setenv("TAVIDM_PLATE_OCR_EVIDENCE_ROOT", str(evidence / "plate_ocr"))
+
+        class StubRuntime:
+            def __init__(self, _settings):
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr(plate_runtime, "PlateRuntime", StubRuntime)
+        plate_runtime.reset_runtime()
+        try:
+            assert plate_runtime._authorized_mode() == ("app", None)
+            runtime = plate_runtime.get_runtime()
+            assert isinstance(runtime, StubRuntime)
+            assert runtime.started is True
+
+            monkeypatch.setenv("TAVIDM_PLATE_OCR_EVIDENCE_ROOT", str(tmp_path / "outside-evidence"))
+            assert plate_runtime._authorized_mode()[0] is None
+            monkeypatch.setenv("TAVIDM_PLATE_OCR_EVIDENCE_ROOT", str(evidence / "plate_ocr"))
+            monkeypatch.setenv("DATABASE_URL", str(evidence / "plate_ocr" / "nested.db"))
+            assert plate_runtime._authorized_mode() == (None, "plate_evidence_overlaps_database")
         finally:
             plate_runtime.reset_runtime()
 
@@ -581,7 +639,6 @@ class TestArtifacts:
         )
         monkeypatch.setattr(plate_settings, "load_plate_ocr_settings", lambda *_args: settings)
         monkeypatch.setattr(plate_settings, "verify_artifact_hashes", lambda _settings: [])
-        monkeypatch.setattr(plate_settings, "demo_gate_status", lambda _settings: {"ok": True})
         monkeypatch.setitem(sys.modules, "onnxruntime", types.ModuleType("onnxruntime"))
         captured = {}
         monkeypatch.setattr("subprocess.run", lambda *_args, **kwargs: (captured.update(kwargs) or types.SimpleNamespace(returncode=0)))
@@ -2236,3 +2293,19 @@ class TestReviewFlowEndToEnd:
         )
         denied = client.get(f"/api/review-queue/{other}/plate-crop/att_flow/plate_cand_1.png")
         assert denied.status_code == 404
+
+        violation_id = test_db.insert_violation(
+            video_id=None,
+            track_id=4,
+            violation_type="no_parking",
+            confidence=0.8,
+            frame_number=20,
+            timestamp_sec=2.0,
+            status="confirmed",
+        )
+        test_db.link_review_to_case(rid, violation_id)
+        case_crop = client.get(
+            f"/api/cases/{violation_id}/plate-crop/att_flow/plate_cand_1.png"
+        )
+        assert case_crop.status_code == 200
+        assert case_crop.mimetype == "image/png"

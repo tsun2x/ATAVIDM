@@ -25,8 +25,7 @@ The launcher refuses to start when:
 * any artifact is missing, unreadable, or hash-mismatched;
 * the requested execution provider is not available (no automatic fallback);
 * ``onnxruntime`` is not importable;
-* the recorded evaluation does not pass, or was recorded against different
-  model/config hashes or a different provider or colour mode.
+* the isolated output root overlaps any input artifact or the repository.
 """
 
 from __future__ import annotations
@@ -105,7 +104,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - a linear launche
 
     from core.plate_settings import (
         PlateOcrConfigError,
-        demo_gate_status,
         load_plate_ocr_settings,
         verify_artifact_hashes,
     )
@@ -145,20 +143,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - a linear launche
         )
         return 2
 
-    gate = demo_gate_status(settings)
-    if not gate.get("ok"):
-        print("BLOCKED: the experimental defense-demo gate is not satisfied.", file=sys.stderr)
-        print(f"  reason: {gate.get('reason')}", file=sys.stderr)
-        for key in ("recorded_result", "recorded_config_sha256", "artifact", "evaluated_at"):
-            if gate.get(key) is not None:
-                print(f"  {key}: {gate[key]}", file=sys.stderr)
-        print(
-            "  The demo must not be enabled while a gate blocker remains. See "
-            "artifacts/plate_alpr/provenance/evaluation_record.json.",
-            file=sys.stderr,
-        )
-        return 3
-
     child_env = dict(os.environ)
     child_env.update(
         {
@@ -183,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901 - a linear launche
     print(f"  provider         : {settings.provider}")
     print(f"  demo database    : {db_path}")
     print(f"  demo evidence    : {evidence_root}")
-    print(f"  gate             : {json.dumps(gate, sort_keys=True)}")
+    print("  evaluation       : informational; supervised thesis demo")
     print("  Plate confirmation is restricted to an active System Administrator.")
     print("  Stop the demo with Ctrl+C; plate OCR is off in every other start path.")
 

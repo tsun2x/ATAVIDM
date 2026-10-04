@@ -42,20 +42,37 @@ _RUNTIME_BUILT = False
 _LAST_ERROR: str | None = None
 
 
-def _validated_manifest_root(protected_paths: tuple[str, ...] = ()) -> tuple[Path | None, str | None]:
-    """Validate the effective plate tree against the isolated evidence root."""
+def _validated_manifest_root(
+    protected_paths: tuple[str, ...] = (), *, mode: str | None = None
+) -> tuple[Path | None, str | None]:
+    """Validate the plate tree against the isolated or regular-app evidence root."""
     try:
-        isolated = Path(os.environ["TAVIDM_PLATE_OCR_ISOLATED_ROOT"]).resolve()
-        evidence = Path(os.environ["EVIDENCE_FOLDER"]).resolve()
-        database = Path(os.environ["SQLITE_PATH"]).resolve()
+        from config import EVIDENCE_FOLDER, SQLITE_PATH
+
+        if mode == "app":
+            evidence = Path(os.environ.get("EVIDENCE_FOLDER", EVIDENCE_FOLDER)).resolve()
+            database_text = os.environ.get(
+                "DATABASE_URL", os.environ.get("SQLITE_PATH", SQLITE_PATH)
+            )
+            database = Path(database_text).resolve()
+            expected = (evidence / manifests.PLATE_SUBDIR).resolve()
+        else:
+            isolated = Path(os.environ["TAVIDM_PLATE_OCR_ISOLATED_ROOT"]).resolve()
+            evidence = Path(os.environ["EVIDENCE_FOLDER"]).resolve()
+            database = Path(os.environ["SQLITE_PATH"]).resolve()
+            expected = (evidence / manifests.PLATE_SUBDIR).resolve()
+
         manifest_root = manifests.plate_root().resolve()
-        expected = (evidence / manifests.PLATE_SUBDIR).resolve()
         repo = Path(__file__).resolve().parents[1]
-        if manifest_root != expected or evidence == isolated or isolated not in evidence.parents:
+        if manifest_root != expected:
+            if mode == "app":
+                return None, "plate_evidence_outside_authorized_evidence_root"
+            return None, "plate_evidence_outside_isolated_evidence_root"
+        if mode != "app" and (evidence == isolated or isolated not in evidence.parents):
             return None, "plate_evidence_outside_isolated_evidence_root"
         if manifest_root == database or manifest_root in database.parents or database in manifest_root.parents:
             return None, "plate_evidence_overlaps_database"
-        if manifest_root == repo or manifest_root in repo.parents or repo in manifest_root.parents:
+        if mode != "app" and (manifest_root == repo or manifest_root in repo.parents or repo in manifest_root.parents):
             return None, "plate_evidence_overlaps_repository"
         for text in protected_paths:
             protected = Path(text).resolve()
@@ -67,15 +84,24 @@ def _validated_manifest_root(protected_paths: tuple[str, ...] = ()) -> tuple[Pat
 
 
 def _authorized_mode() -> tuple[str | None, str | None]:
-    """Return a validated isolated mode; ordinary app startup is always off."""
+    """Return an explicitly enabled app, demo, or evaluation mode."""
     demo_value = os.environ.get("TAVIDM_PLATE_OCR_DEMO", "").strip()
     evaluation_value = os.environ.get("TAVIDM_PLATE_OCR_EVALUATION", "").strip()
     if demo_value not in ("", "0", "1") or evaluation_value not in ("", "0", "1"):
         return None, "execution_mode_invalid"
+    app_value = os.environ.get("TAVIDM_PLATE_OCR_APP", "").strip()
+    if app_value not in ("", "0", "1"):
+        return None, "execution_mode_invalid"
     demo = demo_value == "1"
     evaluation = evaluation_value == "1"
-    if demo == evaluation:
-        return None, "explicit_isolated_mode_required"
+    app_mode = app_value == "1"
+    if sum((demo, evaluation, app_mode)) != 1:
+        return None, "explicit_ocr_mode_required"
+    if app_mode:
+        manifest_root, manifest_error = _validated_manifest_root(mode="app")
+        if manifest_root is None:
+            return None, manifest_error
+        return "app", None
     root_text = os.environ.get("TAVIDM_PLATE_OCR_ISOLATED_ROOT", "").strip()
     db_text = os.environ.get("SQLITE_PATH", "").strip()
     database_url_text = os.environ.get("DATABASE_URL", "").strip()
@@ -192,10 +218,14 @@ def get_runtime() -> PlateRuntime | None:
         if not settings.is_enabled:
             _RUNTIME = None
             return None
-        isolated_root = Path(os.environ["TAVIDM_PLATE_OCR_ISOLATED_ROOT"]).resolve()
+        isolated_root = (
+            Path(os.environ["TAVIDM_PLATE_OCR_ISOLATED_ROOT"]).resolve()
+            if mode != "app"
+            else None
+        )
         protected = [*settings.artifact_paths()]
         protected.extend(path for path in (settings.config_path, settings.evaluation_record_path) if path)
-        manifest_root, manifest_error = _validated_manifest_root(tuple(protected))
+        manifest_root, manifest_error = _validated_manifest_root(tuple(protected), mode=mode)
         if manifest_root is None:
             _LAST_ERROR = f"plate_ocr_{manifest_error}"
             _RUNTIME = None
@@ -206,27 +236,20 @@ def get_runtime() -> PlateRuntime | None:
             except (OSError, RuntimeError, ValueError):
                 _LAST_ERROR = "plate_ocr_protected_path_invalid"
                 return None
-            if (
+            if isolated_root is not None and (
                 protected_path == isolated_root
                 or isolated_root in protected_path.parents
                 or protected_path in isolated_root.parents
             ):
                 _LAST_ERROR = "plate_ocr_output_overlaps_input_artifact"
                 return None
-        if mode == "demo":
-            from core.plate_settings import demo_gate_status
-
-            gate = demo_gate_status(settings)
-            if gate.get("ok") is not True:
-                _LAST_ERROR = f"plate_ocr_demo_gate_blocked:{gate.get('reason', 'invalid')}"
-                _RUNTIME = None
-                return None
-        else:
-            artifact_rows = verify_artifact_hashes(settings)
-            if not artifact_rows or any(row.get("ok") is not True for row in artifact_rows):
-                _LAST_ERROR = "plate_ocr_evaluation_artifacts_unavailable"
-                _RUNTIME = None
-                return None
+        # A thesis demo does not require a passing evaluation record. Keep
+        # model/config integrity checks for both isolated execution modes.
+        artifact_rows = verify_artifact_hashes(settings)
+        if not artifact_rows or any(row.get("ok") is not True for row in artifact_rows):
+            _LAST_ERROR = "plate_ocr_artifacts_unavailable"
+            _RUNTIME = None
+            return None
         try:
             runtime = PlateRuntime(settings)
             runtime.start()

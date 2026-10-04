@@ -84,7 +84,8 @@ assert.strictEqual(reviewUi.plateMachineStateLabel("detected_unreadable"), "Plat
 assert.strictEqual(reviewUi.plateMachineStateLabel("association_uncertain"), "Association uncertain");
 assert.strictEqual(reviewUi.plateMachineStateLabel("totally_unknown"), "Unknown");
 
-// 4. Confirmation controls are admin-only AND require machine eligibility.
+// 4. Case-detail confirmation eligibility is admin-only AND requires a
+//    resolved machine candidate. Review Queue itself only explains the next step.
 const eligible = {
     eligible_for_confirmation: true,
     association_uncertain: false,

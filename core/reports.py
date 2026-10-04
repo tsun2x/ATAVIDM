@@ -24,8 +24,9 @@ from database import db
 _COLUMNS = (
     ("id", "ID", 12),
     ("violation_type", "Canonical Behavior", 48),
-    ("official_category", "Official Category", 52),
-    ("legal_status", "Legal Status", 28),
+    ("official_category", "Proposed / Verified Category", 52),
+    ("legal_status", "Legal Mapping Status", 32),
+    ("plate_display", "Plate (verification)", 68),
     ("case_outcome", "Case Outcome", 28),
     ("vehicle_class", "Vehicle Class", 30),
     ("confidence", "Confidence", 20),
@@ -89,7 +90,33 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
         enriched["case_outcome"] = "case_confirmed"
     else:
         enriched["case_outcome"] = "observation_only"
-    # Never truncate official wording in the enriched value itself.
+
+    # A report may include an OCR string for research visibility, but it must
+    # remain explicitly distinguished from a human-verified plate identity.
+    plate_status = str(row.get("plate_status") or "").strip()
+    plate_text = str(row.get("plate_text") or "").strip()
+    if plate_text and plate_status in {"recognized", "verified_readable"}:
+        enriched["plate_display"] = f"{plate_text} (verified)"
+    else:
+        enriched["plate_display"] = "N/A"
+        if vid is not None:
+            try:
+                from core.plate_review import machine_result_for_violation
+
+                machine = machine_result_for_violation(db, int(vid))
+                candidates = machine.get("candidates") or []
+                primary = next(
+                    (c for c in candidates if c.get("candidate_id") == machine.get("primary_candidate_id")),
+                    candidates[0] if candidates else None,
+                )
+                candidate_text = str((primary or {}).get("ocr_raw") or "").strip()
+                if candidate_text:
+                    suffix = "; association uncertain" if machine.get("association_uncertain") else ""
+                    enriched["plate_display"] = f"{candidate_text} (OCR candidate; unverified{suffix})"
+            except Exception:  # noqa: BLE001 - report still works if machine evidence is unavailable
+                enriched["plate_display"] = "N/A"
+
+    # Never truncate category wording in the enriched value itself.
     return enriched
 
 
@@ -172,9 +199,18 @@ def _generate_pdf(rows: list[dict[str, Any]], title: str, filters: dict[str, Any
 
     # Narrower landscape table; official category uses multi-cell rows to avoid
     # silent truncation of legal wording.
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(
+        0, 4,
+        "Legal mapping status describes whether the behavior-to-law classification "
+        "has been verified against authoritative sources; it is separate from case "
+        "review and plate verification. Plate values marked OCR candidate are "
+        "machine suggestions and are not verified identities.",
+    )
+    pdf.ln(2)
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_fill_color(230, 230, 230)
-    col_widths = [10, 40, 55, 24, 24, 28, 16, 32, 18]
+    col_widths = [9, 35, 48, 25, 38, 22, 24, 15, 28, 17]
     headers = [h for _k, h, _w in _COLUMNS]
     for header, width in zip(headers, col_widths):
         pdf.cell(width, 7, header, border=1, fill=True)
@@ -183,16 +219,17 @@ def _generate_pdf(rows: list[dict[str, Any]], title: str, filters: dict[str, Any
     pdf.set_font("Helvetica", "", 7)
     for row in rows:
         values = [_cell_value(row, key) for key, _h, _w in _COLUMNS]
-        # Compute row height from the longest wrapped official category.
+        # Compute row height for the wrapped category and plate-verification text.
         official = values[2]
-        lines = max(1, (len(official) // 40) + 1)
+        plate_display = values[4]
+        lines = max(1, (len(official) // 40) + 1, (len(plate_display) // 28) + 1)
         row_h = 5 * lines
         x_start = pdf.get_x()
         y_start = pdf.get_y()
         for idx, (value, width) in enumerate(zip(values, col_widths)):
             x = x_start + sum(col_widths[:idx])
             pdf.set_xy(x, y_start)
-            if idx == 2:
+            if idx in (2, 4):
                 pdf.multi_cell(width, 5, value, border=1)
             else:
                 pdf.cell(width, row_h, value[:60], border=1)
@@ -239,7 +276,10 @@ def _generate_excel(rows: list[dict[str, Any]], title: str, filters: dict[str, A
     summary.append(
         [
             "Note",
-            "Official category text is stored in full on the Violations sheet. "
+            "Official/proposed category wording is stored on the Violations sheet. "
+            "Legal Mapping Status concerns validation of behavior-to-law mappings; "
+            "it is separate from human case review and plate verification. Plate "
+            "values marked OCR candidate are unverified machine suggestions. "
             "Observation counts in case_policy_records may exceed grouped-case counts "
             "when parking/obstruction behaviors are fused. Currency values are not "
             "auto-applied from unverified schedules.",

@@ -766,7 +766,7 @@ def _linked_plate_attempts_for_review(review_id: int | None):
 
 
 def _linked_plate_attempts_for_violation(violation_id: int):
-    from core.plate_manifest import attempts_for_review
+    from core.plate_manifest import attempts_for_review_ids
     from core.plate_review import review_ids_for_violation
 
     return attempts_for_review_ids(review_ids_for_violation(db, int(violation_id)))
