@@ -878,10 +878,9 @@ CANONICAL_VIOLATIONS = (
     VIOLATION_SUBSTANDARD_HELMET,
 )
 
-# Core rules with working detection logic in the current engine
+# Rules with an executable, evidence-backed candidate path in the current engine.
 IMPLEMENTED_VIOLATIONS = (
     VIOLATION_OBSTRUCTION,
-    VIOLATION_NO_HELMET,
     VIOLATION_COUNTERFLOW,
     VIOLATION_TRUCK_BAN,
     VIOLATION_MOTORCYCLE_OVERLOADING,
@@ -891,6 +890,9 @@ IMPLEMENTED_VIOLATIONS = (
 # Do not label these "implemented" solely because a stub or fail-closed
 # evaluator is present.
 PARTIAL_VIOLATIONS = (
+    # Missing positive uncovered-head evidence; the rule is deliberately
+    # blocked and must not be represented as fully implemented.
+    VIOLATION_NO_HELMET,
     VIOLATION_ILLEGAL_PARKING,
     VIOLATION_ILLEGAL_TERMINAL,
     VIOLATION_PAVEMENT_MARKINGS,
@@ -921,8 +923,10 @@ TOGGLEABLE_VIOLATIONS = IMPLEMENTED_VIOLATIONS + PARTIAL_VIOLATIONS
 
 ENABLED_VIOLATIONS_SETTING_KEY = "enabled_violations"
 
-# Default runtime enablement preserves prior behavior (5 core rules)
-DEFAULT_ENABLED_VIOLATIONS = IMPLEMENTED_VIOLATIONS
+# Enable every canonical evaluator by default. Partial rules remain explicitly
+# review-only and capability-gated; this does not make their evidence a legal
+# confirmation. Persisted operator choices continue to take precedence.
+DEFAULT_ENABLED_VIOLATIONS = TOGGLEABLE_VIOLATIONS
 
 ALL_VIOLATION_TYPES = CANONICAL_VIOLATIONS + (
     LEGACY_FUSED_PARKING_TERMINAL,

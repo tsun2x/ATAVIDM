@@ -345,6 +345,50 @@ def resolve_candidate(
     raise PlateReviewError("candidate_id is not a machine candidate for this case")
 
 
+def resolve_review_candidate(review_id: int, candidate_id: str) -> dict[str, Any]:
+    """Resolve a candidate while its observation is still pending.
+
+    The review id must be present in the manifest itself and in the server
+    generated review index. Candidate metadata is always sourced from that
+    manifest; the caller's candidate id is only a lookup key.
+    """
+    text = str(candidate_id or "").strip()
+    if not text:
+        raise PlateReviewError("candidate_id is required")
+    for loaded in manifests.attempts_for_review(int(review_id)):
+        data = loaded.data or {}
+        if loaded.status != manifests.MANIFEST_STATUS_OK:
+            continue
+        if data.get("review_id") is None or int(data["review_id"]) != int(review_id):
+            continue
+        for candidate in data.get("candidates") or []:
+            if not isinstance(candidate, dict) or str(candidate.get("candidate_id")) != text:
+                continue
+            outcome = str(data.get("outcome") or "")
+            uncertain = data.get("association_uncertain") is True or outcome == PlateAttemptOutcome.ASSOCIATION_UNCERTAIN.value
+            if uncertain or outcome != PlateAttemptOutcome.CANDIDATE_FOUND.value:
+                raise PlateReviewError("machine candidate is not eligible for confirmation")
+            sample = _sample_for(data, str(candidate.get("sample_id") or ""))
+            crop_ref = candidate.get("plate_crop_ref")
+            if not sample or not isinstance(crop_ref, dict) or manifests.resolve_crop_ref(crop_ref.get("stored_path")) is None:
+                raise PlateReviewError("required machine evidence is unavailable")
+            resolved = {
+                "attempt_id": loaded.attempt_id,
+                "review_id": int(review_id),
+                "candidate_id": text,
+                "ocr_raw": candidate.get("ocr_raw"),
+                "ocr_scalar_score": candidate.get("ocr_scalar_score"),
+                "detection_confidence": candidate.get("detection_confidence"),
+                "plate_crop_ref": crop_ref,
+                "association_uncertain": uncertain,
+                "outcome": outcome,
+                "machine_provenance": data.get("machine_provenance"),
+                "sample": sample,
+            }
+            return resolved
+    raise PlateReviewError("candidate_id is not a machine candidate for this review")
+
+
 def manifest_provenance_for_verification(resolved: dict[str, Any]) -> dict[str, Any]:
     """Compact machine provenance stored alongside a human verification."""
     provenance = resolved.get("machine_provenance") or {}

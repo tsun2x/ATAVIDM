@@ -7,6 +7,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
+from core.trajectory_overlay import TrajectoryOverlay
+
 _BOX_COLOR = (246, 130, 59)  # BGR — detections
 _VIOLATION_COLOR = (40, 40, 220)  # BGR — rule-fired tracks
 _ZONE_COLOR = (57, 57, 230)
@@ -28,6 +30,7 @@ def annotate_frame(
     zones: Mapping[str, Sequence[Sequence[float]]] | None = None,
     violation_track_ids: Iterable[int] | None = None,
     scene: Any | None = None,
+    trajectory_overlay: TrajectoryOverlay | None = None,
 ) -> Any:
     """Draw zones, detection boxes/labels, and highlight violation candidates.
 
@@ -46,6 +49,8 @@ def annotate_frame(
                 cv2.line(annotated, pts[i], pts[(i + 1) % len(pts)], _ZONE_COLOR, 2)
     if scene is not None:
         _draw_scene_document(annotated, scene)
+    if trajectory_overlay is not None:
+        annotated = trajectory_overlay.annotate(annotated, detections)
 
     for det in detections:
         try:

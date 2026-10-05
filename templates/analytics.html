@@ -5,6 +5,7 @@
 {% block page_subtitle %}Violation trends, traffic conditions, and detection performance{% endblock %}
 
 {% block content %}
+<div class="analytics-page">
 <div class="row g-4 mb-4">
     <div class="col-sm-6 col-xl-3">
         <div class="kpi-card">
@@ -56,8 +57,11 @@
     </div>
     <div class="col-lg-4">
         <div class="card card-panel h-100">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-truck me-2"></i>By Vehicle Classification</h5></div>
-            <div class="card-body"><div class="chart-container"><canvas id="vehicleChart"></canvas></div></div>
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-truck me-2"></i>Violation records by vehicle class</h5>
+                <p class="small text-muted mb-0">Non-dismissed violation records — not a traffic count.</p>
+            </div>
+            <div class="card-body"><div class="chart-container"><canvas id="vehicleChart" aria-label="Non-dismissed violation records by vehicle class; not a traffic count" role="img"></canvas></div></div>
         </div>
     </div>
     <div class="col-lg-4">
@@ -68,7 +72,7 @@
     </div>
 </div>
 
-<div class="card card-panel">
+<div class="card card-panel mb-4">
     <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-table me-2"></i>Violation Type Breakdown</h5></div>
     <div class="card-body p-0">
         <div class="table-responsive">
@@ -133,13 +137,16 @@
             <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Detection records</div><div class="fs-5" id="upaDets">—</div></div></div>
             <div class="col-md-3"><div class="border rounded p-2"><div class="text-muted small">Violation candidates</div><div class="fs-5" id="upaCands">—</div></div></div>
         </div>
-        <div class="mt-3 small" id="upaClasses">Class counts: —</div>
+        <div class="mt-3 small analytics-class-counts" id="upaClasses">Class counts: —</div>
         <div class="mt-3">
-            <canvas id="upaTrendChart" height="120" aria-label="Upload and processing trends"></canvas>
+            <div class="chart-container analytics-trend-chart">
+                <canvas id="upaTrendChart" aria-label="Upload and processing trends" role="img"></canvas>
+            </div>
             <div class="small text-muted mt-2 d-none" id="upaTrendEmpty">No upload or processing activity in this period.</div>
         </div>
         <div class="mt-2 small text-muted" id="upaMeta"></div>
     </div>
+</div>
 </div>
 {% endblock %}
 
@@ -203,6 +210,7 @@
             },
             options: {
                 responsive: true,
+                maintainAspectRatio: false,
                 plugins: { legend: { position: "bottom" } },
                 scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
             },

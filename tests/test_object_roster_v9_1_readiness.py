@@ -742,18 +742,27 @@ class TestHelmetAndMirrorCapabilityGates:
             assert f"class:{missing}" in cap.missing_prerequisites
 
     def test_helmet_taxonomy_rules_fail_closed_without_helmet_nut_shell(self):
-        """No Helmet survives on the ``helmet_acceptable``-only alternate set, but
-        distinguishing nut-shell substandard helmets from outright absence needs
-        both helmet classes."""
+        """The acceptable-helmet alternate still satisfies the No Helmet class
+        gate. Automatic evaluation stays blocked without a positive uncovered-head
+        source. Distinguishing nut-shell helmets still needs that class."""
         names = tuple(n for n in EXPECTED_15 if n != "helmet_nut_shell")
-        assert assess_rule_capability(VIOLATION_NO_HELMET, names).automatic_evaluation is True
+        # The acceptable-helmet alternate still satisfies the class gate, but
+        # automatic No Helmet evaluation stays blocked without a positive
+        # uncovered-head source.
+        assert classes_satisfy_rule(VIOLATION_NO_HELMET, names) is True
+        blocked = assess_rule_capability(VIOLATION_NO_HELMET, names)
+        assert blocked.automatic_evaluation is False
+        assert "evidence:positive_uncovered_head_observation" in blocked.missing_prerequisites
         cap = assess_rule_capability(VIOLATION_SUBSTANDARD_HELMET, names)
         assert cap.automatic_evaluation is False
         assert "class:helmet_nut_shell" in cap.missing_prerequisites
 
     def test_helmet_rules_enabled_for_the_full_object_roster(self):
-        for rule in (VIOLATION_NO_HELMET, VIOLATION_SUBSTANDARD_HELMET,
-                     VIOLATION_MOTORCYCLE_OVERLOADING, VIOLATION_NO_SIDE_MIRROR):
+        no_helmet = assess_rule_capability(VIOLATION_NO_HELMET, EXPECTED_15)
+        assert no_helmet.automatic_evaluation is False
+        assert "evidence:positive_uncovered_head_observation" in no_helmet.missing_prerequisites
+        for rule in (VIOLATION_SUBSTANDARD_HELMET, VIOLATION_MOTORCYCLE_OVERLOADING,
+                     VIOLATION_NO_SIDE_MIRROR):
             cap = assess_rule_capability(rule, EXPECTED_15)
             assert cap.automatic_evaluation is True, rule
 

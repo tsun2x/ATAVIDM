@@ -126,6 +126,13 @@ function run() {
     assert.ok(saved.zones.some(function (z) { return z.type === "loading_unloading"; }));
     assert.ok(saved.flow_arrows[0].lane_ids.indexOf("lane-keep") >= 0);
     assert.strictEqual(saved.markings[0].prohibited_from, "both");
+    const incompleteLine = api.createSceneObjectEditor();
+    incompleteLine.create("markings", "single_solid", [[0, 0], [10, 0]]);
+    assert.strictEqual(
+        incompleteLine.toDocument({ completeOnly: true }).markings.length,
+        0,
+        "line markings without a prohibited side must not be saved as complete",
+    );
     const snapshotIds = {};
     ["zones", "lanes", "flow_arrows", "threshold_lines", "markings", "signs", "activity_regions"].forEach(function (key) {
         snapshotIds[key] = saved[key].map(function (o) { return o.id; });
@@ -153,6 +160,15 @@ function run() {
     });
     assert.strictEqual(canvasEditor.getSceneDocument().schema_version, 2);
     assert.strictEqual(canvasEditor.getSceneDocument().lanes[0].id, "lane-keep");
+    canvasEditor.setObjectKind("markings", "single_solid");
+    canvasEditor.prohibitedFrom = "left";
+    canvasEditor._ensureCreating([80, 100]);
+    canvasEditor._ensureCreating([180, 100]);
+    const createdSingleSolid = canvasEditor.getSceneDocument().markings.find(function (marking) {
+        return marking.type === "single_solid";
+    });
+    assert.ok(createdSingleSolid, "single solid should be saved from the canvas editor");
+    assert.strictEqual(createdSingleSolid.prohibited_from, "left");
     canvasEditor.setObjectKind("zones", "no_parking");
     canvasEditor._ensureCreating([5, 5]);
     canvasEditor._ensureCreating([25, 5]);

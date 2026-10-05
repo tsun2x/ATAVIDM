@@ -402,6 +402,17 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
             "candidates": [],
             "notes": "Experimental local OCR payload unavailable.",
         }
+    plate_choice = None
+    try:
+        event = db.get_review_plate_choice(int(row["id"]))
+        detail = json.loads(event.get("detail_json") or "{}") if event else {}
+        if detail.get("pending_review_plate_choice"):
+            plate_choice = {
+                "accepted_plate_text": detail.get("accepted_plate_text"),
+                "verified_by": event.get("actor_user_id"),
+            }
+    except Exception:  # noqa: BLE001 - optional plate review must not break the queue
+        app.logger.exception("pending plate choice unavailable for review %s", row.get("id"))
     return {
         "id": row["id"],
         "display_id": f"RQ-{row['id']:05d}",
@@ -438,6 +449,7 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "decision_reason": row.get("decision_reason"),
         "decided_at": row.get("decided_at"),
         "plate_machine": plate_machine,
+        "review_plate_choice": plate_choice,
     }
 
 
@@ -2514,6 +2526,33 @@ def api_review_decision(review_id: int):
         return jsonify({"success": False, "error": str(exc)}), 400
     except (CaseReviewError, ValueError) as exc:
         return jsonify({"success": False, "error": str(exc)}), 404
+
+
+@app.route("/api/review-queue/<int:review_id>/plate", methods=["POST"])
+@auth.role_required("admin")
+def api_verify_review_plate(review_id: int):
+    """Save an explicit admin plate verification before case materialization."""
+    user = auth.current_user()
+    payload = request.get_json(silent=True) or {}
+    if any(key in payload for key in ("reviewer_user_id", "verified_by", "ocr_raw", "machine_provenance")):
+        return jsonify({"success": False, "error": "Reviewer and machine evidence are server-derived."}), 400
+    if str(payload.get("plate_status") or "") != "verified_readable":
+        return jsonify({"success": False, "error": "Only a complete human-verified plate can be saved here."}), 400
+    try:
+        from core.case_review_service import CaseReviewError, stage_review_plate_choice
+
+        result = stage_review_plate_choice(
+            db,
+            review_id,
+            user["id"],
+            accepted_plate_text=payload.get("accepted_plate_text") or "",
+            candidate_id=payload.get("candidate_id"),
+        )
+        return jsonify({"success": True, **result})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
 
 
 # ---------------------------------------------------------------------------

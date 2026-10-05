@@ -1,6 +1,6 @@
 """Bounded temporal evidence for uploaded prerecorded CCTV.
 
-Evidence window: 6s before confirmation + full episode + 3s after end.
+Evidence window: 3s before confirmation + full episode + 3s after end.
 Pre-roll lives in a JPEG ring; open episodes spool JPEGs to a run-specific
 directory so long episodes stay RAM-bounded and abort cannot wipe other runs.
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import uuid
 from collections import deque
 from collections.abc import Iterator
@@ -21,7 +22,7 @@ import numpy as np
 
 from config import EVIDENCE_FOLDER
 
-EVIDENCE_PRE_SEC = 6.0
+EVIDENCE_PRE_SEC = 3.0
 EVIDENCE_POST_SEC = 3.0
 DEFAULT_JPEG_QUALITY = 70
 # Hard cap on the *pre-roll* ring only. Open episodes spool to disk.
@@ -30,6 +31,56 @@ DEFAULT_MAX_FRAMES = 450
 
 class TemporalEvidenceFinalizationError(RuntimeError):
     """Episode could not be written as durable temporal evidence."""
+
+
+def _browser_compatible_clip(source_path: Path) -> Path | None:
+    """Create an H.264 MP4 sidecar that browsers can play reliably.
+
+    OpenCV's ``mp4v`` writer creates valid MPEG-4 Part 2 files, but several
+    browsers cannot decode that codec in an HTML ``<video>`` element. Keep the
+    OpenCV original and write a separate H.264 derivative when ffmpeg is
+    available; callers can still retain the source clip if transcoding fails.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+
+    target = source_path.with_name("evidence_clip_browser.mp4")
+    temporary = source_path.with_name(f".evidence_clip_browser_{uuid.uuid4().hex}.tmp.mp4")
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "24",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(temporary),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+            return None
+        temporary.replace(target)
+        return target
+    except OSError:
+        return None
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _slug(value: str) -> str:
@@ -52,7 +103,7 @@ def clip_window_start(
     confirmed_at_sec: float,
     pre_sec: float,
 ) -> float:
-    """Inclusive clip start: 6s before confirmation, not 6s before episode start.
+    """Inclusive clip start: pre-roll before confirmation, not before episode start.
 
     If ``episode_start_sec`` is already ``confirmed - pre``, using
     ``episode_start - pre`` would double the pre-roll. Take the earlier of
@@ -408,9 +459,12 @@ class TemporalEvidenceBuffer:
                     "finalization did not produce an evidence clip"
                 )
 
+            browser_clip_path = _browser_compatible_clip(clip_path) if write_clip else None
+
             self._open_episodes.pop(key, None)
-            if clip_path.exists():
-                ep.clip_path = _project_relative(clip_path)
+            selected_clip_path = browser_clip_path or clip_path
+            if write_clip and selected_clip_path.exists():
+                ep.clip_path = _project_relative(selected_clip_path)
             ep.sequence_dir = _project_relative(out_dir)
             ep.finalized = True
             marker = out_dir / ".finalized"

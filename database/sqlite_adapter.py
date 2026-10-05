@@ -4378,6 +4378,20 @@ def get_case_actions(violation_id: int) -> list[dict[str, Any]]:
         return [_row_to_dict(row) for row in rows]
 
 
+def get_review_plate_choice(review_id: int) -> dict[str, Any] | None:
+    """Return the latest append-only admin plate choice recorded on a review."""
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM case_action_events
+            WHERE review_id = ? AND action_type = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (int(review_id), ACTION_PLATE_VERIFIED),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
 def user_has_permission(user_id: int, permission: str) -> bool:
     """Check if a user has an explicitly granted (non-revoked) permission."""
     with db_session() as conn:

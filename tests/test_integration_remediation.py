@@ -126,7 +126,14 @@ class TestModelCapabilityDetectorClassNames:
             (VIOLATION_NO_SIDE_MIRROR, VIOLATION_TRUCK_BAN, "No Helmet"),
             names,
         )
-        assert all(c.automatic_evaluation for c in caps)
+        by_name = {c.rule_name: c for c in caps}
+        assert by_name[VIOLATION_NO_SIDE_MIRROR].automatic_evaluation is True
+        assert by_name[VIOLATION_TRUCK_BAN].automatic_evaluation is True
+        assert by_name["No Helmet"].automatic_evaluation is False
+        assert any(
+            "positive_uncovered_head" in item
+            for item in by_name["No Helmet"].missing_prerequisites
+        )
 
     def test_no_helmet_not_enabled_when_person_substitutes_for_rider(self):
         det = _fake_detector_with_names(
@@ -630,7 +637,7 @@ class TestTemporalEvidenceProcessVideoLifecycle:
         assert item is not None
         assert item.get("evidence_sequence_dir") or item.get("evidence_clip_path")
         assert item.get("episode_end_sec") is not None
-        assert item.get("evidence_pre_sec") == 6.0
+        assert item.get("evidence_pre_sec") == 3.0
         assert item.get("evidence_post_sec") == 3.0
 
 

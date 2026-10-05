@@ -51,6 +51,9 @@ class CargoAssociationBuffer:
     frames: deque = field(default_factory=lambda: deque(maxlen=_BUFFER_MAX))
     started_at: float | None = None
     last_ts: float | None = None
+    # TrackState identity epoch. A reused or discontinuous ID must not keep
+    # the previous vehicle's frames. 0 means the caller did not supply one.
+    identity_epoch: int = 0
 
     def add(self, item: CargoEvidenceFrame) -> None:
         if self.started_at is None:
@@ -173,6 +176,22 @@ def anchor_in_region(anchor: tuple[float, float], region: dict[str, float]) -> b
     )
 
 
+def cargo_applicability_label(det: dict[str, Any]) -> str | None:
+    """Resolved per-track class when the tracker supplied one.
+
+    ``class_label`` remains the raw per-frame prediction. An unresolved
+    car/pickup identity is not cargo-applicable. Callers that never ran
+    track stabilization still use the per-frame label.
+    """
+    if "resolved_track_class" in det:
+        resolved = det.get("resolved_track_class")
+        if resolved is None or not str(resolved).strip():
+            return None
+        return str(resolved)
+    label = str(det.get("class_label") or "").strip()
+    return label or None
+
+
 def relative_position(
     anchor: tuple[float, float],
     vehicle_box: tuple[float, float, float, float],
@@ -200,9 +219,11 @@ def evaluate_cargo_passenger_candidates(
         )
         return []
 
-    vehicles = [
-        d for d in tracked if is_cargo_passenger_applicable(str(d.get("class_label", "")))
-    ]
+    vehicles = []
+    for det in tracked:
+        label = cargo_applicability_label(det)
+        if label and is_cargo_passenger_applicable(label):
+            vehicles.append(det)
     persons = [d for d in tracked if d.get("class_label") == YOLO_CLASS_PERSON]
     events: list[Any] = []
 
@@ -211,9 +232,19 @@ def evaluate_cargo_passenger_candidates(
     )
 
     active_keys: set[tuple[int, int]] = set()
+    epochs = {
+        int(det["track_id"]): int(det["track_identity_epoch"])
+        for det in tracked
+        if det.get("track_id") is not None and "track_identity_epoch" in det
+    }
+    for key, buf in list(buffers.items()):
+        epoch = epochs.get(key[0])
+        if epoch is not None and buf.identity_epoch != epoch:
+            buffers.pop(key, None)
 
     for veh in vehicles:
         track_id = int(veh["track_id"])
+        epoch = epochs.get(track_id)
         ts = float(veh.get("timestamp_sec", 0))
         vbox = (
             float(veh["bbox_x"]),
@@ -270,8 +301,15 @@ def evaluate_cargo_passenger_candidates(
 
             rel = relative_position(anchor, vbox)
             buf = buffers.get(key)
+            if buf is not None and epoch is not None and buf.identity_epoch != epoch:
+                buffers.pop(key, None)
+                buf = None
             if buf is None:
-                buf = CargoAssociationBuffer(vehicle_track_id=track_id, person_track_id=pid)
+                buf = CargoAssociationBuffer(
+                    vehicle_track_id=track_id,
+                    person_track_id=pid,
+                    identity_epoch=0 if epoch is None else epoch,
+                )
                 buffers[key] = buf
             elif buf.frames:
                 prev = buf.frames[-1]
@@ -316,15 +354,20 @@ def evaluate_cargo_passenger_candidates(
                 )
                 # Attach evidence metadata onto detection for persistence layer.
                 veh = dict(veh)
+                frame_label = str(veh.get("class_label") or "")
+                veh.setdefault("raw_class", frame_label)
                 veh["_cargo_evidence"] = evidence
                 veh["_cargo_person_track_id"] = pid
+                shown = cargo_applicability_label(veh) or frame_label or "vehicle"
+                if shown != frame_label and shown != "vehicle":
+                    veh["class_label"] = shown
                 emit_fn(
                     state,
                     events,
                     VIOLATION_CARGO_PASSENGERS,
                     veh,
                     frame_number,
-                    f"{veh.get('class_label', 'vehicle')} track #{track_id}: person "
+                    f"{shown} track #{track_id}: person "
                     f"#{pid} stable in movement-relative cargo region for "
                     f">={_PERSIST_SEC}s (manual review).",
                     score,

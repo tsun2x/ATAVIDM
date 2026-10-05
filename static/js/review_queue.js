@@ -130,6 +130,7 @@ if (typeof document !== "undefined") {
     };
 
     function showEvidence(item) {
+        window.__tavidmEvidenceItem = item;
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
         const sceneImg = item.evidence_url
@@ -204,9 +205,13 @@ if (typeof document !== "undefined") {
         const conflicting = (item.plate_machine.candidates || []).filter(function (c) {
             return (c.ocr_display_normalized || "") !== (candidate.ocr_display_normalized || "");
         }).length;
+        const plateInputId = "reviewPlate-" + String(item.id) + "-" + String(candidate.candidate_id || "candidate");
         const confirmControls = canConfirm
-            ? '<p class="small text-muted mb-0">To save this plate confirmation, first confirm this pending review into a case. Then open the case details and verify the candidate there.</p>'
-            : '<p class="small text-muted mb-0"><i class="bi bi-lock me-1"></i>Plate verification is administrator-only and is available from case details after this review becomes a case.</p>';
+            ? '<label class="form-label small mt-2 mb-1" for="' + escapeHtml(plateInputId) + '">Verify the full plate you can read</label>' +
+              '<div class="input-group input-group-sm"><input class="form-control review-plate-text" id="' + escapeHtml(plateInputId) + '" maxlength="32" value="' + escapeHtml((item.review_plate_choice && item.review_plate_choice.accepted_plate_text) || candidate.ocr_display_normalized || "") + '" aria-label="Human-verified plate text">' +
+              '<button type="button" class="btn btn-outline-primary btn-save-review-plate" data-candidate-id="' + escapeHtml(String(candidate.candidate_id || "")) + '">Verify plate (admin)</button></div>' +
+              '<p class="small text-muted mt-1 mb-0">This records your plate review only. Confirm the violation separately; the verified plate will then appear on the case and report.</p>'
+            : '<p class="small text-muted mb-0"><i class="bi bi-lock me-1"></i>Plate verification is administrator-only.</p>';
 
         return '<div class="border rounded p-2' + (isPrimary ? " border-warning" : "") + '">' +
             '<div class="d-flex flex-wrap justify-content-between gap-2">' +
@@ -244,6 +249,10 @@ if (typeof document !== "undefined") {
         badge.textContent = copy.label;
 
         let html = '<p class="small mb-2">' + escapeHtml(copy.text) + "</p>";
+        if (item.review_plate_choice && item.review_plate_choice.accepted_plate_text) {
+            html += '<p class="small mb-2"><span class="badge bg-success">Admin verified in Review Queue</span> ' +
+                '<strong>' + escapeHtml(item.review_plate_choice.accepted_plate_text) + '</strong> — will transfer to the case if confirmed.</p>';
+        }
 
         const humanStatus = item.plate_status || "not_attempted";
         if (humanStatus === "verified_readable" || (humanStatus === "recognized" && item.plate_text)) {
@@ -271,6 +280,13 @@ if (typeof document !== "undefined") {
             html += '<p class="small text-muted mb-0">No candidate text is available for this observation. This is an explicit machine outcome, not a statement that no plate exists.</p>';
         }
 
+        if (!candidates.length && isAdminViewer()) {
+            html += '<div class="border rounded p-2 mt-2"><label class="form-label small mb-1" for="reviewPlate-' + escapeHtml(String(item.id)) + '">Enter the complete plate you can read</label>' +
+                '<div class="input-group input-group-sm"><input class="form-control review-plate-text" id="reviewPlate-' + escapeHtml(String(item.id)) + '" maxlength="32" value="' + escapeHtml((item.review_plate_choice && item.review_plate_choice.accepted_plate_text) || "") + '" aria-label="Human-verified plate text">' +
+                '<button type="button" class="btn btn-outline-primary btn-save-review-plate" data-candidate-id="">Verify plate (admin)</button></div>' +
+                '<p class="small text-muted mt-1 mb-0">Your plate review is saved separately. Confirm the violation to attach it to the case and report.</p></div>';
+        }
+
         if (machine.artifact) {
             html += '<p class="small text-muted mb-0 mt-2">Detector ' + escapeHtml(String(machine.artifact.detector_sha256 || "").slice(0, 12)) +
                 " · OCR " + escapeHtml(String(machine.artifact.ocr_sha256 || "").slice(0, 12)) +
@@ -279,6 +295,41 @@ if (typeof document !== "undefined") {
 
         body.innerHTML = html;
     }
+
+    document.getElementById("plateOcrBody")?.addEventListener("click", function (event) {
+        const button = event.target.closest(".btn-save-review-plate");
+        if (!button) return;
+        const item = window.__tavidmEvidenceItem;
+        if (!item || !isAdminViewer()) return;
+        const input = button.closest(".border")?.querySelector(".review-plate-text");
+        const accepted = input?.value.trim() || "";
+        if (!accepted) {
+            showToast("Plate not saved", "Enter the complete plate text you can read.", "warning");
+            return;
+        }
+        button.disabled = true;
+        fetch("/api/review-queue/" + encodeURIComponent(item.id) + "/plate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                plate_status: "verified_readable",
+                accepted_plate_text: accepted,
+                candidate_id: button.dataset.candidateId || null,
+            }),
+        }).then(function (response) { return response.json(); }).then(function (payload) {
+            if (!payload.success) {
+                showToast("Plate not saved", payload.error || "Verification failed.", "danger");
+                return;
+            }
+            showToast("Plate verified", "The admin-verified plate will be attached to the case when you confirm this review.", "success");
+            item.review_plate_choice = { accepted_plate_text: accepted };
+            const confirmation = button.closest(".border")?.querySelector(".small.text-muted.mt-1");
+            if (confirmation) confirmation.textContent = "Admin-verified plate saved. It will be attached to the case and report if this review is confirmed.";
+            button.textContent = "Plate saved";
+        }).catch(function () {
+            showToast("Plate not saved", "Request failed. Please try again.", "danger");
+        }).finally(function () { button.disabled = false; });
+    });
 
     function updateCount() {
         if (!pendingCount || !tbody) return;

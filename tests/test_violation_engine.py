@@ -155,7 +155,7 @@ class TestViolationRegistry:
             assert v in CANONICAL_VIOLATIONS, f"{v} in IMPLEMENTED but not in CANONICAL"
 
     def test_implemented_count(self):
-        assert len(IMPLEMENTED_VIOLATIONS) == 5
+        assert len(IMPLEMENTED_VIOLATIONS) == 4
 
     def test_planned_violations_not_in_implemented(self):
         for stub in PLANNED_VIOLATIONS:
@@ -237,10 +237,10 @@ class TestIllegalParking:
 
         assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
 
-    def test_no_parking_dwell_is_suppressed_when_neighboring_traffic_is_queued(
+    def test_no_parking_dwell_is_not_suppressed_by_other_stopped_vehicles(
         self, rule_params, no_parking_zone
     ):
-        """A stopped target beside stopped traffic is a queue, not a parking cue."""
+        """Each long-stopped vehicle in the zone is reviewed independently."""
         from core.violation_engine import RuleEngineState, evaluate_detection_rules
 
         state = RuleEngineState()
@@ -267,7 +267,86 @@ class TestIllegalParking:
                 model_classes=("car",),
             ))
 
-        assert events == []
+        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
+
+    def test_parking_dwell_tolerates_detector_box_jitter(
+        self, rule_params
+    ):
+        """A slow stationary car should not lose its dwell to box jitter."""
+        from core.tracker import TrackHistory
+        from core.violation_engine import RuleEngineState, check_illegal_parking
+
+        state = RuleEngineState()
+        history = TrackHistory(track_id=31, class_label="car")
+        zone = [[50, 50], [300, 50], [300, 250], [50, 250]]
+        params = dict(rule_params)
+        params["parking_dwell_sec"] = 30.0
+        events = []
+
+        for frame in range(201):
+            timestamp = frame * 0.2
+            jitter = 15.0 if frame % 2 else -15.0
+            x = 120.0 + frame * 0.4 + jitter
+            vehicle = {
+                "class_label": "car", "track_id": 31,
+                "bbox_x": x, "bbox_y": 110.0, "bbox_w": 40.0, "bbox_h": 20.0,
+                "confidence": 0.95, "speed_px_per_sec": 0.0,
+                "timestamp_sec": timestamp,
+            }
+            history.add(timestamp, x + 20.0, 120.0)
+            params["_track_history"] = {31: history.snapshot()}
+            events.extend(check_illegal_parking(
+                [vehicle], zone, state, frame, params
+            ))
+
+        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
+
+    def test_parking_dwell_survives_brief_vehicle_class_flicker(
+        self, rule_params, no_parking_zone
+    ):
+        """Brief changes among vehicle labels must not reset parked-track dwell."""
+        from core.tracker import TrackState
+        from core.detection_config import VEHICLE_CLASSES
+        from core.violation_engine import RuleEngineState, evaluate_detection_rules
+
+        tracker = TrackState(stationary_px=rule_params["stationary_px"])
+        state = RuleEngineState()
+        params = dict(rule_params)
+        params["parking_dwell_sec"] = 5.0
+        events = []
+        identity_epochs = set()
+        flicker_labels = {
+            25 + index * 5: label
+            for index, label in enumerate(label for label in VEHICLE_CLASSES if label != "car")
+        }
+
+        for frame in range(101):
+            timestamp = frame * 0.2
+            raw = {
+                "class_label": flicker_labels.get(frame, "car"),
+                "track_id": 31,
+                "bbox_x": 120.0,
+                "bbox_y": 110.0,
+                "bbox_w": 40.0,
+                "bbox_h": 20.0,
+                "confidence": 0.95,
+                "timestamp_sec": timestamp,
+            }
+            tracked = tracker.update([raw], now=timestamp)
+            identity_epochs.add(tracked[0]["track_identity_epoch"])
+            events.extend(evaluate_detection_rules(
+                tracked,
+                state,
+                frame,
+                zones={"no_parking": no_parking_zone},
+                params=params,
+                enabled_violations=(VIOLATION_ILLEGAL_PARKING,),
+                now_sec=timestamp,
+                history=tracker.history_view(now=timestamp),
+            ))
+
+        assert len(identity_epochs) == 1
+        assert any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events)
 
 
 class TestIllegalTerminal:
@@ -622,3 +701,60 @@ def tracked_detections():
             "direction_degrees": 90,
         }
     ]
+
+
+def test_restricted_boundary_marking_does_not_suppress_restricted_lane_review():
+    from core.violation_engine import RuleEngineState, check_pavement_markings
+
+    state = RuleEngineState()
+    params = {"_enabled_violations": (VIOLATION_PAVEMENT_MARKINGS,)}
+    polygon = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    marking = {"id": "restricted-edge", "type": "restricted_lane_boundary", "points": polygon}
+    vehicle = {
+        "class_label": "motorcycle", "track_id": 31,
+        "bbox_x": 40, "bbox_y": 40, "bbox_w": 20, "bbox_h": 20,
+        "confidence": 0.9, "direction_degrees": 90,
+    }
+
+    results = []
+    for frame, timestamp in enumerate((0.0, 0.1)):
+        vehicle["timestamp_sec"] = timestamp
+        results.extend(check_pavement_markings(
+            [vehicle], state, frame, params,
+            restricted_lane=polygon,
+            marking_geometry=[marking],
+        ))
+
+    assert len(results) == 1
+    assert results[0].violation_type == VIOLATION_PAVEMENT_MARKINGS
+    assert results[0].outcome == "review"
+    assert "entered Restricted Lane" in results[0].reason_log
+
+
+def test_saved_line_crossing_creates_only_a_manual_review_candidate():
+    from types import SimpleNamespace
+    from core.violation_engine import RuleEngineState, check_pavement_markings
+
+    vehicle = {
+        "class_label": "car", "track_id": 32,
+        "bbox_x": 40, "bbox_y": 50, "bbox_w": 20, "bbox_h": 20,
+        "confidence": 0.9, "timestamp_sec": 1.0, "direction_degrees": 90,
+    }
+    history = {
+        32: SimpleNamespace(observations=(
+            SimpleNamespace(x=50, y=40), SimpleNamespace(x=50, y=60),
+        ))
+    }
+    result = check_pavement_markings(
+        [vehicle], RuleEngineState(), 10,
+        {"_track_history": history},
+        marking_geometry=[{
+            "id": "center-line", "type": "single_solid",
+            "points": [[0, 50], [100, 50]], "prohibited_from": "right",
+        }],
+    )
+
+    assert len(result) == 1
+    assert result[0].violation_type == VIOLATION_PAVEMENT_MARKINGS
+    assert result[0].outcome == "review"
+    assert "manual review" in result[0].reason_log

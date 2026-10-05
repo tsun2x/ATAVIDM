@@ -29,7 +29,7 @@ from core.detector import (
     resolve_weights_path,
 )
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
-from core.frame_annotate import annotate_frame
+from core.frame_annotate import TrajectoryOverlay, annotate_frame
 from core.geometry_profile import build_geometry_profile
 from core.motorcycle_detail import MotorcycleDetailCollector
 from core.model_capability import (
@@ -468,6 +468,14 @@ def process_video(
             ) from exc
 
         track_state = TrackState(stationary_px=geometry.stationary_px_per_sec())
+        trajectory_overlay = None
+        try:
+            trajectory_overlay = TrajectoryOverlay(trace_length=30)
+        except Exception:
+            # A visualization dependency must never block violation processing.
+            logger.exception(
+                "trajectory overlay unavailable; continuing without track trails"
+            )
         counting_lines = [line for line in ctx["scene"].threshold_lines if line.type == "counting_line"]
         crossing_counter = VehicleCrossingCounter(counting_lines)
         rule_state = RuleEngineState()
@@ -665,13 +673,31 @@ def process_video(
                 plate_collector.observe(frame, frame_number, timestamp_sec, tracked)
             events.extend(frame_events)
 
-            annotated = annotate_frame(
-                frame,
-                tracked,
-                zones=ctx["zones"],
-                violation_track_ids=viol_ids,
-                scene=ctx.get("scene_document"),
-            )
+            try:
+                annotated = annotate_frame(
+                    frame,
+                    tracked,
+                    zones=ctx["zones"],
+                    violation_track_ids=viol_ids,
+                    scene=ctx.get("scene_document"),
+                    trajectory_overlay=trajectory_overlay,
+                )
+            except Exception:
+                if trajectory_overlay is None:
+                    raise
+                # Keep the optional trace layer from interrupting an otherwise
+                # valid processing run if the renderer encounters bad input.
+                logger.exception(
+                    "trajectory overlay failed; retrying frame without track trails"
+                )
+                trajectory_overlay = None
+                annotated = annotate_frame(
+                    frame,
+                    tracked,
+                    zones=ctx["zones"],
+                    violation_track_ids=viol_ids,
+                    scene=ctx.get("scene_document"),
+                )
             if writer is not None:
                 writer.write(annotated)
 

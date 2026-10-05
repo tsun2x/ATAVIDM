@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 from core.detection_config import confidence_band
 from core.detector import Detector, DetectorError, enforce_object_class_contract
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
+from core.frame_annotate import TrajectoryOverlay, annotate_frame
 from core.gpu_inference_slot import PRIORITY_LIVE_FRAME, gpu_inference_slot
 from core.model_capability import extract_model_class_names
 from core.scene_annotation import load_scene_annotation
@@ -29,17 +30,21 @@ from core.violation_config import load_enabled_violations
 from core.violation_engine import RuleEngineState, evaluate_detection_rules
 from database import db
 
-_BOX_COLOR = (246, 130, 59)   # BGR
-_ZONE_COLOR = (57, 57, 230)
-
-
 class LiveStreamWorker(threading.Thread):
     def __init__(self, camera: dict[str, Any]) -> None:
         super().__init__(daemon=True, name=f"camera-{camera['id']}")
         self.camera = camera
-        scene = load_scene_annotation(camera.get("zones_json"))
-        self.rule_scene = scene.to_rule_context()
+        self.scene_document = load_scene_annotation(camera.get("zones_json"))
+        self.rule_scene = self.scene_document.to_rule_context()
         self.zones = dict(self.rule_scene.legacy_zones)
+        try:
+            self.trajectory_overlay = TrajectoryOverlay(trace_length=30)
+        except Exception:
+            logger.exception(
+                "camera %s trajectory overlay unavailable; continuing without track trails",
+                camera.get("id"),
+            )
+            self.trajectory_overlay = None
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
@@ -54,20 +59,22 @@ class LiveStreamWorker(threading.Thread):
             return self._latest_jpeg
 
     def _annotate(self, frame: Any, tracked: list[dict[str, Any]]) -> Any:
-        annotated = frame.copy()
-        for polygon in self.zones.values():
-            if len(polygon) >= 3:
-                pts = [(int(p[0]), int(p[1])) for p in polygon]
-                for i in range(len(pts)):
-                    cv2.line(annotated, pts[i], pts[(i + 1) % len(pts)], _ZONE_COLOR, 2)
-        for det in tracked:
-            x, y = int(det["bbox_x"]), int(det["bbox_y"])
-            w, h = int(det["bbox_w"]), int(det["bbox_h"])
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), _BOX_COLOR, 2)
-            label = f"{det['class_label']} #{det['track_id']} {det['confidence'] * 100:.0f}%"
-            cv2.putText(annotated, label, (x, max(y - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, _BOX_COLOR, 2)
-        return annotated
+        try:
+            return annotate_frame(
+                frame,
+                tracked,
+                scene=self.scene_document,
+                trajectory_overlay=self.trajectory_overlay,
+            )
+        except Exception:
+            if self.trajectory_overlay is None:
+                raise
+            logger.exception(
+                "camera %s trajectory overlay failed; retrying without track trails",
+                self.camera.get("id"),
+            )
+            self.trajectory_overlay = None
+            return annotate_frame(frame, tracked, scene=self.scene_document)
 
     def _publish(self, frame: Any) -> None:
         ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])

@@ -78,13 +78,23 @@ RULE_ALTERNATE_CLASS_SETS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
 }
 
+# The frozen main detector roster can observe a helmet. It cannot observe an
+# uncovered head. Motorcycle-detail ``no_helmet`` is a review-only label and
+# is not an approved source for this rule. Until an owner/adviser defines a
+# positive uncovered-head contract, automatic No Helmet evaluation stays off.
+POSITIVE_UNCOVERED_HEAD_OBSERVATION_APPROVED = False
+NO_HELMET_BLOCKED_PREREQUISITE = "evidence:positive_uncovered_head_observation"
+
+
 # Annotation / context prerequisites (not detector classes).
 RULE_REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
     VIOLATION_ILLEGAL_PARKING: ("zone:no_parking",),
     VIOLATION_OBSTRUCTION: ("zone:active_lane_or_crossing",),
     VIOLATION_COUNTERFLOW: ("zone:active_lane", "lane_flow_degrees"),
     VIOLATION_TRUCK_BAN: ("zone:truck_ban_zone", "recording_datetime"),
-    VIOLATION_ILLEGAL_TERMINAL: ("zone:loading_unloading_or_terminal", "puv_context"),
+    # The evaluator runs only when a loading_unloading zone is present.
+    # Activity regions do not satisfy this prerequisite.
+    VIOLATION_ILLEGAL_TERMINAL: ("zone:loading_unloading", "puv_context"),
     VIOLATION_PAVEMENT_MARKINGS: ("marking_geometry",),
     VIOLATION_DISREGARDING_SIGN: ("supported_sign_annotations",),
     # Mirror/cargo visibility is produced per-episode by observation helpers —
@@ -143,6 +153,12 @@ def assess_rule_capability(
         if req in flags and not flags[req]:
             missing.append(f"context:{req}")
 
+    if (
+        rule_name == VIOLATION_NO_HELMET
+        and not POSITIVE_UNCOVERED_HEAD_OBSERVATION_APPROVED
+    ):
+        missing.append(NO_HELMET_BLOCKED_PREREQUISITE)
+
     auto = len(missing) == 0
     notes = ""
     if not auto:
@@ -150,6 +166,14 @@ def assess_rule_capability(
             f"Automatic evaluation disabled for '{rule_name}'. "
             f"Missing: {', '.join(missing)}."
         )
+    if NO_HELMET_BLOCKED_PREREQUISITE in missing:
+        notes = (
+            f"{notes} A missing helmet detection is UNKNOWN, not an uncovered head. "
+            "Automatic No Helmet candidate generation is blocked pending an "
+            "owner/adviser decision on a positive uncovered-head source. "
+            "The motorcycle detail model remains review-only and cannot create "
+            "or confirm this violation."
+        ).strip()
     return RuleCapabilityStatus(
         rule_name=rule_name,
         automatic_evaluation=auto,

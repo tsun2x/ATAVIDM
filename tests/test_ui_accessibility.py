@@ -42,6 +42,7 @@ def test_review_queue_exposes_filter_and_action_state(client):
         frame_number=12,
         status="pending",
         vehicle_class="car",
+        evidence_clip_path="static/evidence/review-accessibility/evidence_clip.mp4",
     )
     html = client.get("/review-queue").get_data(as_text=True)
 
@@ -54,6 +55,11 @@ def test_review_queue_exposes_filter_and_action_state(client):
     assert 'aria-label="Dismiss detection' in html
     assert 'data-confirm-message=' in html
     assert 'data-loading-label="Confirming…"' in html
+    assert "/static/evidence/review-accessibility/evidence_clip.mp4" in html
+
+    review_js = open("static/js/review_queue.js", encoding="utf-8").read()
+    assert "evidence_clip_url" in review_js
+    assert "<video" in review_js and "controls" in review_js
 
 
 def test_icon_actions_and_dialog_closers_have_names(client):
@@ -108,3 +114,11 @@ def test_styles_define_reduced_motion_and_mobile_workspace_rules():
     assert ".main-content { min-width: 0; width: 100%; }" in css
     assert ".top-navbar" in css
     assert ".live-jobs-list" in css
+
+
+def test_temporal_evidence_uses_three_second_context_window():
+    """Keeps evidence clips bounded to the requested 3s before and after."""
+    from core.temporal_evidence import EVIDENCE_POST_SEC, EVIDENCE_PRE_SEC
+
+    assert EVIDENCE_PRE_SEC == 3.0
+    assert EVIDENCE_POST_SEC == 3.0

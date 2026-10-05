@@ -69,13 +69,24 @@
                         <div class="col-6 col-md-3">Elapsed: <span id="ppElapsed">—</span></div>
                         <div class="col-6 col-md-3">FPS: <span id="ppFps">—</span></div>
                         <div class="col-6 col-md-3">ETA: <span id="ppEta">—</span></div>
-                        <div class="col-6 col-md-3">Detection observations: <span id="ppDetections">—</span></div>
-                        <div class="col-6 col-md-3">Candidates: <span id="ppCandidates">—</span></div>
-                        <div class="col-12">Detection observations by class: <span id="ppClasses">—</span></div>
-                        <div class="col-12">Vehicles crossed: <span id="ppCrossings">Requires a counting line</span></div>
+                        <div class="col-6 col-md-3">Detection observations (frame-level detection records): <span id="ppDetections">—</span></div>
+                        <div class="col-6 col-md-3">Violation candidates (rule hits, not confirmed violations): <span id="ppCandidates">—</span></div>
+                        <div class="col-12">Detection observations by class (frame-level detection records, not vehicles): <span id="ppClasses">—</span></div>
+                        <div class="col-12">Vehicles crossed (line-crossing passages, this attempt): <span id="ppCrossings">Requires a counting line</span></div>
                     </div>
                     <div class="mt-2 d-none" id="ppCompletionSummary"></div>
                 </div>
+                <section class="px-3 py-2 border-top d-none" id="crossingSummaryPanel" aria-labelledby="crossingSummaryHeading">
+                    <h6 class="mb-1" id="crossingSummaryHeading">Vehicle line crossings by class</h6>
+                    <p class="small text-muted mb-2">
+                        Uploaded-video completed result only. Counts are line-crossing passages by the ten vehicle classes:
+                        each ByteTrack ID counts at most once per counting line after a valid crossing, so one vehicle crossing two
+                        lines counts twice and tracker fragmentation can add passages. These are not guaranteed to be unique physical
+                        vehicles, and they are not detection records, review items, or confirmed violations.
+                        Live camera streams do not produce this summary.
+                    </p>
+                    <div id="crossingSummaryBody" aria-live="polite"></div>
+                </section>
             </div>
             <div class="card-footer">
                 <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
@@ -444,8 +455,10 @@
     window.TAVIDM_ENABLED_VIOLATIONS = {{ enabled_violations | tojson }};
     window.TAVIDM_MAX_UPLOAD_MB = {{ max_upload_mb }};
     window.TAVIDM_USER_ROLE = {{ user_role | tojson }};
+    window.TAVIDM_VEHICLE_CROSSING_CLASSES = {{ vehicle_crossing_classes | tojson }};
 </script>
 <script src="{{ url_for('static', filename='js/violation_switch.js') }}"></script>
+<script src="{{ url_for('static', filename='js/crossing_summary.js') }}"></script>
 <script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>

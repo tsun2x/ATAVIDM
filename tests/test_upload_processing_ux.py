@@ -536,12 +536,16 @@ class TestProcessVideoIntegration:
         (tmp_path / "ev").mkdir()
 
         class FakeDetector:
+            calls = 0
+
             def load(self):
                 return None
 
             def track_frame(self, frame, conf=0.5, timestamp_sec=0.0):
+                x = 10 + self.calls * 30
+                self.calls += 1
                 return [{
-                    "bbox_x": 20, "bbox_y": 20, "bbox_w": 40, "bbox_h": 30,
+                    "bbox_x": x, "bbox_y": 20, "bbox_w": 20, "bbox_h": 20,
                     "class_label": "car", "confidence": 0.9, "track_id": 1,
                     "timestamp_sec": timestamp_sec,
                 }]
@@ -573,8 +577,20 @@ class TestProcessVideoIntegration:
         cap = cv2.VideoCapture(str(out))
         assert cap.isOpened()
         ok, frame = cap.read()
+        ok_trail, trail_frame = cap.read()
         cap.release()
-        assert ok and frame is not None
+        assert ok and frame is not None and ok_trail and trail_frame is not None
+        source_cap = cv2.VideoCapture(str(_path))
+        source_cap.set(cv2.CAP_PROP_POS_FRAMES, 2)
+        source_ok, source_frame = source_cap.read()
+        source_cap.release()
+        assert source_ok and source_frame is not None
+        # The second processed frame should contain a trail between the prior
+        # and current bottom-center points, outside the current detection box.
+        assert np.max(np.abs(
+            trail_frame[40, 35].astype(np.int16)
+            - source_frame[40, 35].astype(np.int16)
+        )) > 40
         assert result.detection_records > 0
         snap = tracker.snapshot()
         assert snap["progress_percent"] >= 100 or snap["frames_processed"] > 0

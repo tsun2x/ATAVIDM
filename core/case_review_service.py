@@ -212,13 +212,15 @@ def materialize_case_from_review(
             decision_insert=decision_insert,
         )
     with _review_write_transaction(adapter):
-        return _recover_or_return_materialization(
+        result = _recover_or_return_materialization(
             adapter,
             int(review_id),
             int(reviewed_by),
             canonical_override=canonical_override,
             reused=reused,
         )
+    transfer_review_plate_choice(adapter, int(review_id), result["violation_id"])
+    return result
 
 
 def _materialize_initial_locked(
@@ -927,6 +929,108 @@ def verify_plate_identity(
         "verified_by": actor_user_id,
         "verified_at": now,
     }
+
+
+def stage_review_plate_choice(
+    adapter: Any,
+    review_id: int,
+    actor_user_id: int,
+    *,
+    accepted_plate_text: str,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
+    """Record an explicit admin plate decision against a still-pending review.
+
+    The append-only case-action audit can reference a review before a case
+    exists. Case confirmation later transfers this choice to the normal
+    plate_verifications record and report fields.
+    """
+    confirm = getattr(adapter, "can_confirm_plate_identity", None)
+    if confirm is None or not confirm(actor_user_id):
+        raise PermissionError("Active System Administrator plate authority required")
+    accepted = str(accepted_plate_text or "").strip()
+    if not accepted or len(accepted) > 32 or any(ch in accepted for ch in ("*", "?", "_", "…")):
+        raise CaseReviewError("Enter the complete, visibly readable plate text")
+
+    resolved = None
+    candidate_reference = None
+    provenance: dict[str, Any] = {}
+    if candidate_id:
+        try:
+            from core.plate_review import manifest_provenance_for_verification, resolve_review_candidate
+
+            resolved = resolve_review_candidate(int(review_id), str(candidate_id))
+            candidate_reference = f"{resolved['attempt_id']}:{resolved['candidate_id']}"
+            provenance = manifest_provenance_for_verification(resolved)
+        except Exception as exc:
+            raise CaseReviewError("Machine candidate could not be validated for this review") from exc
+
+    detail = {
+        "pending_review_plate_choice": True,
+        "plate_status": HUMAN_PLATE_STATUS_VERIFIED_READABLE,
+        "accepted_plate_text": accepted,
+        "candidate_reference": candidate_reference,
+        "candidate_ocr_raw": resolved.get("ocr_raw") if resolved else None,
+        "ocr_confidence": resolved.get("ocr_scalar_score") if resolved else None,
+        "evidence_crop_ref": ((resolved or {}).get("plate_crop_ref") or {}).get("stored_path"),
+        "machine_provenance": provenance,
+    }
+    with _review_write_transaction(adapter):
+        row = adapter.get_review_item(int(review_id))
+        if row is None:
+            raise CaseReviewError(f"Review item {review_id} not found")
+        if row.get("status") != "pending":
+            raise CaseReviewError("Plate choice can only be saved while the review is pending")
+        adapter.record_case_action(
+            None,
+            getattr(adapter, "ACTION_PLATE_VERIFIED", "plate_verified"),
+            detail=detail,
+            actor_user_id=int(actor_user_id),
+            review_id=int(review_id),
+        )
+    return {"review_id": int(review_id), "plate_status": detail["plate_status"], "accepted_plate_text": accepted}
+
+
+def transfer_review_plate_choice(adapter: Any, review_id: int, violation_id: int) -> None:
+    """Carry a staged admin plate choice into the materialized case, idempotently."""
+    getter = getattr(adapter, "get_review_plate_choice", None)
+    if getter is None:
+        return
+    event = getter(int(review_id))
+    if not event:
+        return
+    try:
+        detail = json.loads(event.get("detail_json") or "{}")
+    except (TypeError, ValueError):
+        return
+    if not detail.get("pending_review_plate_choice"):
+        return
+    existing = adapter.get_plate_verification(int(violation_id))
+    if (
+        existing
+        and existing.get("review_id") == int(review_id)
+        and existing.get("accepted_plate_text") == detail.get("accepted_plate_text")
+        and existing.get("verified_by") == event.get("actor_user_id")
+    ):
+        return
+    if existing and existing.get("plate_status") == HUMAN_PLATE_STATUS_VERIFIED_READABLE:
+        # A fused observation must never silently replace an already
+        # administrator-verified case identity with a later observation.
+        return
+    candidate_reference = detail.get("candidate_reference")
+    verify_plate_identity(
+        adapter,
+        int(violation_id),
+        int(event["actor_user_id"]),
+        plate_status=str(detail.get("plate_status") or ""),
+        accepted_plate_text=detail.get("accepted_plate_text"),
+        candidate_ocr_raw=detail.get("candidate_ocr_raw"),
+        candidate_reference=candidate_reference,
+        evidence_crop_ref=detail.get("evidence_crop_ref"),
+        ocr_confidence=detail.get("ocr_confidence"),
+        review_id=int(review_id),
+        machine_provenance=detail.get("machine_provenance") or None,
+    )
 
 
 def _machine_provenance_from_diagnostics(raw: Any) -> dict[str, Any]:

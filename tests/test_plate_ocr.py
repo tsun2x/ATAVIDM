@@ -2140,11 +2140,11 @@ class TestReviewFlowEndToEnd:
     as escaped data, and that the confirmation affordance is admin-only.
     """
 
-    def _seed(self, plate_root_env, test_db, admin):
+    def _seed(self, plate_root_env, test_db, admin, video_id=None):
         rid = test_db.insert_review_queue(
-            video_id=None,
+            video_id=video_id,
             track_id=4,
-            violation_type="no_parking",
+            violation_type="Illegal Parking",
             confidence=0.8,
             frame_number=20,
             evidence_path="/tmp/e.jpg",
@@ -2168,7 +2168,7 @@ class TestReviewFlowEndToEnd:
                     "live_session_id": None,
                     "track_id": 4,
                     "track_identity_epoch": 1,
-                    "violation_type": "no_parking",
+                    "violation_type": "Illegal Parking",
                 },
                 "trigger": {"frame_number": 20, "timestamp_sec": 2.0},
                 "candidates": [
@@ -2276,6 +2276,99 @@ class TestReviewFlowEndToEnd:
         payload = client.get("/api/review-queue").get_json()
         item = next(i for i in payload["items"] if i["id"] == rid)
         assert item["plate_machine"]["eligible_for_confirmation"] is True
+
+    def test_admin_verifies_plate_in_review_and_case_confirmation_carries_it_forward(
+        self, plate_root_env, plate_admin_env, client, test_db
+    ):
+        """Regression: pending review must persist an admin plate choice for its later case/report."""
+        video_id = test_db.insert_video("review-plate.mp4", "/tmp/review-plate.mp4", status="ready")
+        rid, _ = self._seed(plate_root_env, test_db, None, video_id=video_id)
+        client.post("/login", data={"username": "admin", "password": plate_admin_env})
+
+        staged = client.post(
+            f"/api/review-queue/{rid}/plate",
+            json={
+                "candidate_id": "cand_1",
+                "plate_status": "verified_readable",
+                "accepted_plate_text": "ABC123",
+            },
+        )
+        assert staged.status_code == 200, staged.get_json()
+        assert test_db.get_review_item(rid)["status"] == "pending"
+        queue_item = next(
+            item for item in client.get("/api/review-queue").get_json()["items"]
+            if item["id"] == rid
+        )
+        assert queue_item["review_plate_choice"]["accepted_plate_text"] == "ABC123"
+
+        confirmed = client.post(
+            f"/api/review-queue/{rid}/decision",
+            json={
+                "decision": "confirm_proposed",
+                "reason": "Reviewed evidence",
+                "idempotency_key": "review-with-plate",
+            },
+        )
+        assert confirmed.status_code == 200, confirmed.get_json()
+        violation_id = confirmed.get_json()["violation_id"]
+        verification = test_db.get_plate_verification(violation_id)
+        assert verification["accepted_plate_text"] == "ABC123"
+        assert verification["plate_status"] == "verified_readable"
+        assert verification["review_id"] == rid
+        assert test_db.get_violation(violation_id)["plate_text"] == "ABC123"
+
+        # An idempotent case-confirm retry must not duplicate plate audits.
+        retry = client.post(
+            f"/api/review-queue/{rid}/decision",
+            json={
+                "decision": "confirm_proposed",
+                "reason": "Reviewed evidence",
+                "idempotency_key": "review-with-plate",
+            },
+        )
+        assert retry.status_code == 200
+        actions = test_db.get_case_actions(violation_id)
+        assert sum(action["action_type"] == "plate_verified" for action in actions) == 1
+
+    def test_enforcer_cannot_stage_plate_verification(self, plate_root_env, plate_admin_env, client, test_db):
+        import bcrypt
+        from database import db
+
+        rid, _ = self._seed(plate_root_env, test_db, None)
+        db.create_user(
+            "review_plate_enf",
+            bcrypt.hashpw(b"enforcer123", bcrypt.gensalt()).decode("utf-8"),
+            role="enforcer",
+        )
+        client.post("/login", data={"username": "review_plate_enf", "password": "enforcer123"})
+        response = client.post(
+            f"/api/review-queue/{rid}/plate",
+            json={"plate_status": "verified_readable", "accepted_plate_text": "ABC123"},
+        )
+        assert response.status_code == 403
+        assert test_db.get_review_item(rid)["status"] == "pending"
+        assert test_db.get_review_plate_choice(rid) is None
+
+    def test_admin_can_enter_plate_in_review_without_machine_candidate(
+        self, plate_root_env, plate_admin_env, client, test_db
+    ):
+        video_id = test_db.insert_video("manual-review-plate.mp4", "/tmp/manual-review-plate.mp4", status="ready")
+        rid, _ = self._seed(plate_root_env, test_db, None, video_id=video_id)
+        client.post("/login", data={"username": "admin", "password": plate_admin_env})
+        staged = client.post(
+            f"/api/review-queue/{rid}/plate",
+            json={"plate_status": "verified_readable", "accepted_plate_text": "MANUAL7"},
+        )
+        assert staged.status_code == 200, staged.get_json()
+        confirmed = client.post(
+            f"/api/review-queue/{rid}/decision",
+            json={"decision": "confirm_proposed", "reason": "Reviewed", "idempotency_key": "manual-plate"},
+        )
+        assert confirmed.status_code == 200, confirmed.get_json()
+        violation_id = confirmed.get_json()["violation_id"]
+        verification = test_db.get_plate_verification(violation_id)
+        assert verification["accepted_plate_text"] == "MANUAL7"
+        assert verification["processing_diagnostics_json"]
 
     def test_plate_crop_endpoint_is_record_scoped(self, plate_root_env, plate_admin_env, client, test_db):
         rid, _ = self._seed(plate_root_env, test_db, None)

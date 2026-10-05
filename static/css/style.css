@@ -116,7 +116,7 @@ body {
 
 .main-content {
     flex: 1; margin-left: var(--sidebar-width);
-    display: flex; flex-direction: column; min-height: 100vh;
+    display: flex; flex-direction: column; min-height: 100vh; min-width: 0;
 }
 
 .top-navbar {
@@ -256,6 +256,20 @@ body {
 
 .chart-container { position: relative; height: 280px; }
 .chart-container-pie { height: 320px; }
+
+/* Keep responsive Analytics charts from setting the page's minimum width. */
+.analytics-page,
+.analytics-page .row > *,
+.analytics-page .card-panel,
+.analytics-page .card-body,
+.analytics-page .chart-container { min-width: 0; }
+.analytics-page .chart-container { width: 100%; }
+.analytics-page canvas { max-width: 100%; }
+.analytics-page .kpi-card > div:last-child { min-width: 0; overflow-wrap: anywhere; }
+.analytics-page .kpi-icon { flex-shrink: 0; }
+.analytics-page .card-title,
+.analytics-class-counts { overflow-wrap: anywhere; }
+.analytics-trend-chart { height: 300px; }
 
 .table { font-size: 0.875rem; }
 .table thead th {

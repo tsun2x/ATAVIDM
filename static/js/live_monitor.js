@@ -25,12 +25,27 @@
     const btnProcessSelected = document.getElementById("btnProcessSelected");
     const btnCancelProcessing = document.getElementById("btnCancelProcessing");
 
+    const CrossingSummary = window.TavidmCrossingSummary;
+    const crossingPanel = document.getElementById("crossingSummaryPanel");
+    const crossingBody = document.getElementById("crossingSummaryBody");
+    const vehicleCrossingClasses = window.TAVIDM_VEHICLE_CROSSING_CLASSES || CrossingSummary.DEFAULT_VEHICLE_CLASSES;
+    // Responses for a video that is no longer selected are discarded.
+    const selectionGuard = CrossingSummary.createSelectionGuard();
+    // Completed-result breakdowns seen this page session, keyed by video id.
+    const completedCrossings = {};
+
     let activeCamera = null;
     let activeVideo = null;
     let statusPoll = null;
     let mediaMode = "reference";
     let watchingLive = false;
     let pendingDeleteVideo = null;
+
+    function esc(value) {
+        return String(value == null ? "" : value)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
 
     function hideAllMedia() {
         feedImage?.classList.add("d-none");
@@ -46,6 +61,8 @@
             el.classList.remove("active");
         });
         if (statusPoll) { clearInterval(statusPoll); statusPoll = null; }
+        selectionGuard.clear();
+        hideCrossingSummary();
         activeCamera = null;
         activeVideo = null;
         watchingLive = false;
@@ -228,6 +245,7 @@
     function selectVideo(video, btn) {
         clearActive();
         activeVideo = video;
+        selectionGuard.next(video.db_id);
         btn.classList.add("active");
         activeSourceName.textContent = video.filename;
         sourceMeta.textContent = (video.condition || "peak").charAt(0).toUpperCase() + (video.condition || "peak").slice(1) +
@@ -243,7 +261,70 @@
             btnCancelProcessing?.classList.remove("d-none");
             processProgressPanel?.classList.remove("d-none");
             pollProcessing(video.db_id);
+        } else {
+            loadCompletedSummary(video.db_id);
         }
+    }
+
+    function hideCrossingSummary() {
+        if (crossingBody) crossingBody.textContent = "";
+        crossingPanel?.classList.add("d-none");
+    }
+
+    function renderCrossingSummary(videoId, payload, extra) {
+        if (!crossingPanel || !crossingBody) return;
+        const options = extra || {};
+        const key = String(videoId);
+        const model = CrossingSummary.buildModel(payload, {
+            vehicleClasses: vehicleCrossingClasses,
+            cached: completedCrossings[key],
+            history: options.history || null,
+            historyFailed: !!options.historyFailed,
+        });
+        if (model.result && (model.kind === "current" || model.kind === "earlier")) {
+            completedCrossings[key] = model.result;
+        }
+        if (model.kind === "none") {
+            hideCrossingSummary();
+            return;
+        }
+        CrossingSummary.render(crossingBody, model, document);
+        crossingPanel.classList.remove("d-none");
+    }
+
+    // Process-status stays the live-progress path. When its run is not the
+    // current completed result, the earlier crossings come from video history.
+    // The loader drops a history response when a newer status snapshot for this
+    // page has already been applied, including a newer snapshot for the same video.
+    const crossingLoader = CrossingSummary.createCrossingLoader({
+        guard: selectionGuard,
+        cache: completedCrossings,
+        fetchHistory: function (videoId) {
+            return fetch("/api/videos/" + videoId + "/history")
+                .then(function (r) {
+                    if (!r.ok) throw new Error("history failed");
+                    return r.json();
+                });
+        },
+        render: function (videoId, payload, extra) {
+            renderCrossingSummary(videoId, payload, extra);
+        },
+    });
+
+    function showCrossingForStatus(videoId, token, payload) {
+        crossingLoader.showStatus(videoId, token, payload);
+    }
+
+    function loadCompletedSummary(videoId) {
+        const token = selectionGuard.current();
+        fetch("/api/videos/" + videoId + "/process-status")
+            .then(function (r) { return r.json(); })
+            .then(function (payload) {
+                showCrossingForStatus(videoId, token, payload);
+            })
+            .catch(function () {
+                if (selectionGuard.isCurrent(token, videoId)) hideCrossingSummary();
+            });
     }
 
     videoList?.addEventListener("click", function (e) {
@@ -290,11 +371,11 @@
             ? Object.keys(classes).map(function (k) { return k + ": " + classes[k]; }).join(", ")
             : "—";
         document.getElementById("ppClasses").textContent = classText;
-        const crossings = payload.crossing_counts || {};
+        const crossings = CrossingSummary.readCounts(payload.crossing_counts, vehicleCrossingClasses);
         document.getElementById("ppCrossings").textContent = payload.vehicles_crossed == null
             ? "Requires a configured counting line"
-            : payload.vehicles_crossed + (Object.keys(crossings).length
-                ? " (" + Object.keys(crossings).map(function (k) { return k + ": " + crossings[k]; }).join(", ") + ")"
+            : payload.vehicles_crossed + (crossings.rows.length
+                ? " (" + crossings.rows.map(function (row) { return row.label + ": " + row.count; }).join(", ") + ")"
                 : "");
         if (payload.queue_position != null && payload.queue_position > 0) {
             document.getElementById("ppStage").textContent = "queued (position " + payload.queue_position + ")";
@@ -306,23 +387,23 @@
         if (!box) return;
         const classes = payload.class_counts || {};
         const classLines = Object.keys(classes).map(function (k) {
-            return "<li>" + k + ": " + classes[k] + " detection records</li>";
+            return "<li>" + esc(k) + ": " + esc(classes[k]) + " frame-level detection records</li>";
         }).join("");
         box.classList.remove("d-none");
         box.innerHTML =
             "<div class='small'>" +
-            "<div><strong>Model:</strong> " + (payload.model_identifier || "YOLOv8m") + "</div>" +
-            "<div><strong>Duration:</strong> " + formatSec(payload.elapsed_sec) +
-            " · Source: " + formatSec(payload.source_duration_sec) + "</div>" +
-            "<div><strong>Detection observations:</strong> " + (payload.detection_records || 0) +
-            (payload.unique_tracks != null ? " · ByteTrack IDs observed (diagnostic): " + payload.unique_tracks : "") + "</div>" +
-            "<div><strong>Vehicles crossed:</strong> " + (payload.vehicles_crossed == null ? "Requires a counting line" : payload.vehicles_crossed) + "</div>" +
-            "<div><strong>Violation candidates:</strong> " + (payload.violation_candidates || 0) +
+            "<div><strong>Model:</strong> " + esc(payload.model_identifier || "YOLOv8m") + "</div>" +
+            "<div><strong>Duration:</strong> " + esc(formatSec(payload.elapsed_sec)) +
+            " · Source: " + esc(formatSec(payload.source_duration_sec)) + "</div>" +
+            "<div><strong>Frame-level detection records:</strong> " + esc(payload.detection_records || 0) +
+            (payload.unique_tracks != null ? " · ByteTrack IDs observed (diagnostic): " + esc(payload.unique_tracks) : "") + "</div>" +
+            "<div><strong>Vehicle line crossings:</strong> see “Vehicle line crossings by class” below.</div>" +
+            "<div><strong>Violation candidates (rule hits, not confirmed violations):</strong> " + esc(payload.violation_candidates || 0) +
             ' · <a href="/review-queue">Open Review Queue</a></div>' +
-            (classLines ? "<ul class='mb-1'>" + classLines + "</ul>" : "") +
+            (classLines ? "<div class='mt-1'>Frame-level detection records by class (not vehicle counts):</div><ul class='mb-1'>" + classLines + "</ul>" : "") +
             (payload.annotated_video_url
                 ? '<div class="mt-1"><button type="button" class="btn btn-sm btn-outline-secondary me-1" id="btnPreviewAnnotatedDone">Preview Annotated</button>' +
-                  '<a class="btn btn-sm btn-outline-danger" href="' + payload.annotated_video_url + '?download=1">Download Annotated</a></div>'
+                  '<a class="btn btn-sm btn-outline-danger" href="' + esc(payload.annotated_video_url) + '?download=1">Download Annotated</a></div>'
                 : "") +
             "</div>";
         document.getElementById("btnPreviewAnnotatedDone")?.addEventListener("click", function () {
@@ -336,18 +417,22 @@
     }
 
     function pollProcessing(videoId) {
+        const token = selectionGuard.current();
+        if (!selectionGuard.isCurrent(token, videoId)) return;
         if (statusPoll) clearInterval(statusPoll);
         const tick = function () {
             fetch("/api/videos/" + videoId + "/process-status")
                 .then(function (r) { return r.json(); })
                 .then(function (payload) {
+                    if (!selectionGuard.isCurrent(token, videoId)) return;
                     if (!payload.success) return;
                     updateProgressUI(payload);
+                    showCrossingForStatus(videoId, token, payload);
                     if (watchingLive && mediaMode === "live_preview" && feedImage && !feedImage.src.includes("process-preview")) {
                         showImage("/api/videos/" + videoId + "/process-preview?t=" + Date.now());
                     }
-                    if (payload.stage !== "cancelled" && payload.job_state !== "cancelled" &&
-                        (payload.job_state === "done" || payload.stage === "completed" || payload.video_status === "processed")) {
+                    // An earlier completed result never marks this attempt complete.
+                    if (CrossingSummary.attemptCompleted(payload)) {
                         clearInterval(statusPoll);
                         statusPoll = null;
                         feedStatus.textContent = "Processing complete.";

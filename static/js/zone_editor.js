@@ -287,7 +287,10 @@
             var lane = this._selectedOrFirstLane();
             if (lane) fields.lane_ids = [lane.id];
         }
-        if (this.objectKind === "markings" && this.objectType === "double_solid") {
+        if (
+            this.objectKind === "markings" &&
+            ["double_solid", "single_solid", "solid_broken"].indexOf(this.objectType) >= 0
+        ) {
             fields.prohibited_from = this.prohibitedFrom || "both";
         }
         return this.scene.create(this.objectKind, this.objectType, [coords], fields);
@@ -656,7 +659,11 @@
                     var min = MIN_POINTS[key] || 2;
                     if (!obj.points || obj.points.length < min) return false;
                     if (key === "flow_arrows" && (!obj.lane_ids || !obj.lane_ids.length)) return false;
-                    if (key === "markings" && obj.type === "double_solid" && !obj.prohibited_from) return false;
+                    if (
+                        key === "markings" &&
+                        ["double_solid", "single_solid", "solid_broken"].indexOf(obj.type) >= 0 &&
+                        !obj.prohibited_from
+                    ) return false;
                     return true;
                 });
             }

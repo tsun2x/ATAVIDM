@@ -6,8 +6,10 @@ into violation confidence. Track/rule state expires with the tracker policy.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
+from statistics import median
 from typing import Any, Callable
 
 from core.detection_config import (
@@ -62,7 +64,7 @@ from core.rule_types import (
     TriState,
     ViolationScore,
 )
-from core.tracker import TRACK_EXPIRY_SEC, angle_difference
+from core.tracker import MOTION_WINDOW_SEC, TRACK_EXPIRY_SEC, angle_difference
 from core.zone_membership import (
     POLICY_LANE,
     POLICY_STATIONARY,
@@ -87,6 +89,9 @@ TERMINAL_STRICT_CLASSES = (
 )
 DEFAULT_RESTRICTED_LANE_CLASSES = (YOLO_CLASS_MOTORCYCLE, "bicycle")
 REARM_CLEAR_SEC = 2.0
+PARKING_MOTION_SMOOTH_SEC = 4.0
+PARKING_MOTION_COMPARE_SEC = 5.0
+PARKING_STATIONARY_JITTER_MULTIPLIER = 1.75
 
 
 @dataclass
@@ -523,6 +528,69 @@ def _is_stationary(
     return float(speed) <= threshold
 
 
+def _is_stationary_for_parking(
+    det: dict[str, Any],
+    params: dict[str, Any],
+    geometry: GeometryProfile | None,
+) -> bool:
+    """Use robust multi-second centroid motion for parking dwell only.
+
+    Raw detector boxes jitter enough to reset the ordinary two-second tracker
+    speed estimate on parked vehicles. A trailing median smooths box jitter;
+    displacement is then compared across five seconds. The widened tolerance
+    is only for review candidates and does not change other rule motion tests.
+    """
+    history = params.get("_track_history")
+    snapshot = history.get(int(det["track_id"])) if history is not None else None
+    observations = tuple(getattr(snapshot, "observations", ()) or ())
+    if not observations:
+        return _is_stationary(det, float(params["stationary_px"]), geometry)
+
+    now = float(det.get("timestamp_sec", observations[-1].timestamp_sec))
+    needed_history = PARKING_MOTION_SMOOTH_SEC + PARKING_MOTION_COMPARE_SEC
+    if now - float(observations[0].timestamp_sec) < needed_history:
+        return False
+
+    def smoothed_center(end_time: float) -> tuple[float, float] | None:
+        window = [
+            obs for obs in observations
+            if end_time - PARKING_MOTION_SMOOTH_SEC
+            <= float(obs.timestamp_sec) <= end_time
+        ]
+        if not window:
+            return None
+        return (
+            median(float(point.x) for point in window),
+            median(float(point.y) for point in window),
+        )
+
+    current_time = float(observations[-1].timestamp_sec)
+    target_time = current_time - PARKING_MOTION_COMPARE_SEC
+    older_observation = min(
+        observations[:-1],
+        key=lambda point: abs(float(point.timestamp_sec) - target_time),
+    )
+    older_time = float(older_observation.timestamp_sec)
+    current_center = smoothed_center(current_time)
+    older_center = smoothed_center(older_time)
+    if current_center is None or older_center is None:
+        return False
+    elapsed = current_time - older_time
+    if elapsed < PARKING_MOTION_COMPARE_SEC * 0.8:
+        return False
+
+    speed = (
+        (current_center[0] - older_center[0]) ** 2
+        + (current_center[1] - older_center[1]) ** 2
+    ) ** 0.5 / elapsed
+    base_threshold = (
+        geometry.stationary_px_per_sec()
+        if geometry is not None
+        else float(params["stationary_px"])
+    )
+    return speed <= base_threshold * PARKING_STATIONARY_JITTER_MULTIPLIER
+
+
 def _has_nearby_stationary_traffic(
     target: dict[str, Any],
     vehicles: list[dict[str, Any]],
@@ -739,7 +807,8 @@ def check_substandard_helmet(
                 mc,
                 frame_number,
                 f"Motorcycle track #{track_id}: nut-shell/substandard helmet form "
-                f"persisted >={VIOLATION_PERSISTENCE_SEC}s.",
+                f"persisted >={VIOLATION_PERSISTENCE_SEC}s; visual category only, "
+                "not proof of helmet-standard certification.",
                 score,
                 outcome="review",
             )
@@ -978,6 +1047,7 @@ def _check_zone_dwell(
     class_filter: tuple[str, ...] | None = None,
     geometry: GeometryProfile | None = None,
     require_extra: Callable[[dict[str, Any]], TriState] | None = None,
+    stationary_check: Callable[[dict[str, Any]], bool] | None = None,
     outcome: str = "candidate",
 ) -> list[ViolationEvent]:
     events: list[ViolationEvent] = []
@@ -988,7 +1058,11 @@ def _check_zone_dwell(
         track_id = int(det["track_id"])
         ts = float(det.get("timestamp_sec", 0))
         inside = _in_zone(det, polygon, state, rule_key, policy=POLICY_STATIONARY)
-        stationary = _is_stationary(det, stationary_px, geometry)
+        stationary = (
+            stationary_check(det)
+            if stationary_check is not None
+            else _is_stationary(det, stationary_px, geometry)
+        )
         extra = TriState.TRUE
         if require_extra is not None:
             extra = require_extra(det)
@@ -1038,26 +1112,16 @@ def check_illegal_parking(
     *,
     all_vehicles: list[dict[str, Any]] | None = None,
 ) -> list[ViolationEvent]:
-    """Illegal Parking — distinct from Illegal Terminal.
+    """Possible Illegal Parking: sustained stop inside the configured zone.
 
-    The dwell must begin in the no-parking zone. Nearby stopped traffic resets
-    the dwell as a queue-like hard negative. This remains a review candidate:
-    video context cannot establish every legal exception.
+    A vehicle may already be in the zone when the video begins; its observed
+    in-zone stationary dwell starts at its first usable observation. Other
+    stopped vehicles do not suppress this vehicle's candidate. All output
+    remains a review candidate; video alone cannot establish every statutory
+    exception.
     """
     if not _rule_allowed(state, VIOLATION_ILLEGAL_PARKING):
         return []
-    # Stopping briefly must not prove Illegal Parking — use parking_dwell only.
-    surrounding = all_vehicles if all_vehicles is not None else vehicles
-
-    def not_in_queue(det: dict[str, Any]) -> TriState:
-        if _has_nearby_stationary_traffic(
-            det,
-            surrounding,
-            float(params["stationary_px"]),
-            geometry,
-        ):
-            return TriState.FALSE
-        return TriState.TRUE
 
     return _check_zone_dwell(
         vehicles,
@@ -1069,11 +1133,11 @@ def check_illegal_parking(
         violation_type=VIOLATION_ILLEGAL_PARKING,
         dwell_sec=float(params.get("parking_dwell_sec", 30.0)),
         reason_template=(
-            "Vehicle track #{track_id} stationary in No Parking Zone for "
-            ">={dwell}s without nearby stopped traffic (possible Illegal Parking; review)."
+            "Vehicle track #{track_id} remained stopped in the configured No Parking "
+            "Zone for >={dwell}s (possible Illegal Parking; manual review required)."
         ),
         geometry=geometry,
-        require_extra=not_in_queue,
+        stationary_check=lambda det: _is_stationary_for_parking(det, params, geometry),
         outcome="review",
     )
 
@@ -1496,8 +1560,14 @@ def check_pavement_markings(
 
     # Preferred path: configured marking segments with prohibited_from.
     markings = marking_geometry or params.get("marking_geometry") or []
+    line_markings = [
+        marking for marking in markings
+        if str(marking.get("type") or "") in (
+            "double_solid", "marking_double_solid", "single_solid", "solid_broken"
+        )
+    ]
     history = params.get("_track_history")
-    if markings:
+    if line_markings:
         from core.trajectory import crossed_oriented_line
 
         for det in vehicles:
@@ -1505,14 +1575,12 @@ def check_pavement_markings(
             ts = float(det.get("timestamp_sec", 0))
             heading = det.get("direction_degrees")
             crossed = False
-            for marking in markings:
+            for marking in line_markings:
                 mtype = str(marking.get("type") or "")
-                # Review-only types until separately approved.
-                if mtype in (
-                    "single_solid",
-                    "solid_broken",
-                    "generic_marking",
-                ):
+                # A line crossing is only a review observation. For markings
+                # whose legal effect depends on which side is crossed, require
+                # that direction to be explicitly saved by the operator.
+                if mtype in ("generic_marking", "restricted_lane_boundary"):
                     continue
                 geom = (
                     marking.get("polygon")
@@ -1528,6 +1596,12 @@ def check_pavement_markings(
                 if mtype in ("double_solid", "marking_double_solid"):
                     prohibited = prohibited or "both"
                 if prohibited not in ("left", "right", "both"):
+                    if mtype in ("single_solid", "solid_broken"):
+                        state.diagnostics.append(
+                            f"Pavement marking {marking.get('id', '<unknown>')} "
+                            "needs an explicit prohibited_from side before it can "
+                            "raise a review candidate."
+                        )
                     continue
                 prev = curr = None
                 if history is not None:
@@ -1546,7 +1620,10 @@ def check_pavement_markings(
                     crossed = True
                     break
             tracker = state.tracker_for("pavement_markings", track_id)
-            if tracker.update(crossed and heading is not None, ts):
+            # Crossing is an instantaneous trajectory event, not a condition
+            # that remains true for 1.5 seconds. Emit a review candidate on the
+            # observed crossing, then rely on episode deduplication.
+            if tracker.update(crossed and heading is not None, ts, threshold_sec=0.0):
                 score = score_from_persistence(
                     detection_confidence=float(det.get("confidence", 0)),
                     elapsed_sec=tracker.elapsed(ts),
@@ -1566,7 +1643,6 @@ def check_pavement_markings(
                     outcome="review",
                 )
             state.note_condition(VIOLATION_PAVEMENT_MARKINGS, track_id, crossed, ts)
-        return events
 
     # Restricted-lane: outside-to-inside transition with hysteresis.
     if restricted_lane and len(restricted_lane) >= 3:
@@ -1590,7 +1666,7 @@ def check_pavement_markings(
             transition = hyst.update(currently)
             entered = transition == "entered"
             tracker = state.tracker_for("restricted_lane", track_id)
-            if tracker.update(entered or currently, ts) and entered:
+            if tracker.update(entered, ts, threshold_sec=0.0) and entered:
                 score = score_from_persistence(
                     detection_confidence=float(det.get("confidence", 0)),
                     elapsed_sec=tracker.elapsed(ts),
@@ -1609,12 +1685,290 @@ def check_pavement_markings(
                     outcome="review",
                 )
             state.note_condition(VIOLATION_PAVEMENT_MARKINGS, track_id, entered, ts)
-    else:
+    elif not line_markings:
         state.diagnostics.append(
-            "Failure to Follow Road/Pavement Markings: no marking geometry or "
+            "Failure to Follow Road/Pavement Markings: no usable line marking or "
             "restricted_lane zone configured; automatic confirmation disabled."
         )
     return events
+
+
+def _check_prohibited_turn_sign(
+    sign: Any,
+    thresholds: list[Any],
+    lane_flows: list[Any],
+    vehicles: list[dict[str, Any]],
+    state: RuleEngineState,
+    frame_number: int,
+    history: Any,
+    min_direction_px: float,
+    events: list[ViolationEvent],
+) -> None:
+    """Flag a prohibited turn only with an annotated approach and line crossing.
+
+    This is a pending-review signal, not a legal conclusion. The scene must
+    explicitly associate one flow arrow and one threshold with the sign's lane.
+    """
+    from core.trajectory import segments_intersect
+
+    sign_id = str(sign.id)
+    lane_ids = set(sign.lane_ids)
+    if not lane_ids:
+        state.diagnostics.append(
+            f"Disregarding Traffic Sign: turn sign {sign_id} needs an associated approach lane."
+        )
+        return
+
+    flows = [flow for flow in lane_flows if flow.lane_id in lane_ids]
+    lines = [
+        line for line in thresholds
+        if line.type in ("threshold", "no_entry_threshold")
+        and lane_ids.intersection(line.lane_ids)
+        and len(line.points) >= 2
+    ]
+    if len(flows) != 1 or len(lines) != 1:
+        state.diagnostics.append(
+            f"Disregarding Traffic Sign: turn sign {sign_id} needs exactly one matching "
+            "approach flow arrow and threshold line; evaluation skipped."
+        )
+        return
+
+    flow = flows[0]
+    flow_x, flow_y = (float(flow.vector[0]), float(flow.vector[1]))
+    line = lines[0]
+    line_a = (float(line.points[0][0]), float(line.points[0][1]))
+    line_b = (float(line.points[-1][0]), float(line.points[-1][1]))
+    history_by_id = getattr(history, "tracks", {}) if history is not None else {}
+    min_motion = max(float(min_direction_px), 1.0)
+    minimum_alignment = math.cos(math.radians(35.0))
+    sign_types = {
+        "no_left_turn": ("No Left Turn", "left"),
+        "no_right_turn": ("No Right Turn", "right"),
+        "no_u_turn": ("No U-turn", "u_turn"),
+    }
+    display_name, prohibited_turn = sign_types[str(sign.type).lower()]
+
+    for det in vehicles:
+        track_id = int(det["track_id"])
+        snapshot = history_by_id.get(track_id)
+        observations = tuple(getattr(snapshot, "observations", ()) or ())
+        if len(observations) < 3:
+            continue
+        try:
+            bottom_offset = max(float(det.get("bbox_h", 0.0)), 0.0) / 2.0
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(bottom_offset):
+            continue
+
+        def road_point(observation: Any) -> tuple[float, float]:
+            return float(observation.x), float(observation.y) + bottom_offset
+
+        # Use the most recent crossing made while traveling along this lane's
+        # configured flow. This avoids treating a reverse crossing as approach.
+        crossing_index = None
+        for index in range(1, len(observations)):
+            before, after = observations[index - 1], observations[index]
+            if (
+                float(observations[-1].timestamp_sec) - float(after.timestamp_sec)
+                > MOTION_WINDOW_SEC
+            ):
+                continue
+            before_point = road_point(before)
+            after_point = road_point(after)
+            motion_x = after_point[0] - before_point[0]
+            motion_y = after_point[1] - before_point[1]
+            motion_length = math.hypot(motion_x, motion_y)
+            if motion_length < max(1.0, min_motion * 0.1):
+                continue
+            alignment = (motion_x * flow_x + motion_y * flow_y) / motion_length
+            if alignment < minimum_alignment:
+                continue
+            if segments_intersect(
+                (before_point, after_point),
+                (line_a, line_b),
+            ):
+                crossing_index = index
+
+        if crossing_index is None:
+            continue
+
+        crossing = observations[crossing_index]
+        endpoint = observations[-1]
+        crossing_point = road_point(crossing)
+        endpoint_point = road_point(endpoint)
+        out_x = endpoint_point[0] - crossing_point[0]
+        out_y = endpoint_point[1] - crossing_point[1]
+        if math.hypot(out_x, out_y) < min_motion:
+            continue
+
+        incoming_heading = math.degrees(math.atan2(flow_y, flow_x)) % 360.0
+        outgoing_heading = math.degrees(math.atan2(out_y, out_x)) % 360.0
+        signed_turn = (outgoing_heading - incoming_heading + 180.0) % 360.0 - 180.0
+        turn_abs = abs(signed_turn)
+        is_prohibited = (
+            turn_abs >= 135.0
+            if prohibited_turn == "u_turn"
+            else (
+                45.0 <= turn_abs < 135.0
+                and ((signed_turn < 0) if prohibited_turn == "left" else (signed_turn > 0))
+            )
+        )
+        if not is_prohibited:
+            continue
+
+        score = score_from_persistence(
+            detection_confidence=float(det.get("confidence", 0)),
+            elapsed_sec=0.0,
+            required_sec=VIOLATION_PERSISTENCE_SEC,
+            contextual_availability=0.75,
+        )
+        _emit(
+            state,
+            events,
+            VIOLATION_DISREGARDING_SIGN,
+            det,
+            frame_number,
+            f"Vehicle track #{track_id} crossed the configured approach threshold "
+            f"and its observed path is consistent with a prohibited {prohibited_turn.replace('_', '-')} "
+            f"movement under {display_name} sign {sign_id} (manual review required).",
+            score,
+            outcome="review",
+        )
+
+
+def _check_no_overtaking_sign(
+    sign: Any,
+    lanes: list[Any],
+    lane_flows: list[Any],
+    vehicles: list[dict[str, Any]],
+    state: RuleEngineState,
+    frame_number: int,
+    history: Any,
+    min_direction_px: float,
+    events: list[ViolationEvent],
+) -> None:
+    """Flag a tracked longitudinal pass inside explicitly signed lane geometry."""
+    from core.trajectory import point_in_polygon
+
+    sign_id = str(sign.id)
+    lane_ids = set(sign.lane_ids)
+    if not lane_ids:
+        state.diagnostics.append(
+            f"Disregarding Traffic Sign: No Overtaking sign {sign_id} needs an associated lane."
+        )
+        return
+
+    history_by_id = getattr(history, "tracks", {}) if history is not None else {}
+    detection_by_id = {int(det["track_id"]): det for det in vehicles}
+    min_motion = max(float(min_direction_px), 1.0)
+    min_gap = max(5.0, min_motion * 0.25)
+    max_match_gap = 0.35
+
+    for lane_id in sorted(lane_ids):
+        lane_matches = [
+            lane for lane in lanes
+            if str(lane.id) == lane_id and len(lane.points) >= 3
+        ]
+        flow_matches = [flow for flow in lane_flows if flow.lane_id == lane_id]
+        if len(lane_matches) != 1 or len(flow_matches) != 1:
+            state.diagnostics.append(
+                f"Disregarding Traffic Sign: No Overtaking sign {sign_id} needs one "
+                f"configured lane polygon and flow arrow for lane {lane_id}; evaluation skipped."
+            )
+            continue
+
+        lane = lane_matches[0]
+        flow_x, flow_y = float(flow_matches[0].vector[0]), float(flow_matches[0].vector[1])
+        polygon = [[float(point[0]), float(point[1])] for point in lane.points]
+        paths: dict[int, list[tuple[float, tuple[float, float]]]] = {}
+        current_time = max(
+            (float(det.get("timestamp_sec", 0.0)) for det in vehicles),
+            default=0.0,
+        )
+        for track_id, det in detection_by_id.items():
+            snapshot = history_by_id.get(track_id)
+            observations = tuple(getattr(snapshot, "observations", ()) or ())
+            if not observations:
+                continue
+            try:
+                bottom_offset = max(float(det.get("bbox_h", 0.0)), 0.0) / 2.0
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(bottom_offset):
+                continue
+            path = []
+            for observation in observations:
+                timestamp = float(observation.timestamp_sec)
+                if current_time - timestamp > MOTION_WINDOW_SEC:
+                    continue
+                point = (float(observation.x), float(observation.y) + bottom_offset)
+                if point_in_polygon(point, polygon):
+                    path.append((timestamp, point))
+            if len(path) >= 2:
+                paths[track_id] = path
+
+        track_ids = sorted(paths)
+        for overtaking_id in track_ids:
+            overtaking_path = paths[overtaking_id]
+            for overtaken_id in track_ids:
+                if overtaking_id == overtaken_id:
+                    continue
+                overtaken_path = paths[overtaken_id]
+                samples: list[tuple[float, float]] = []
+                for timestamp, point_a in overtaking_path:
+                    nearest = min(
+                        overtaken_path,
+                        key=lambda item: abs(item[0] - timestamp),
+                    )
+                    if abs(nearest[0] - timestamp) > max_match_gap:
+                        continue
+                    relative_forward = (
+                        (point_a[0] - nearest[1][0]) * flow_x
+                        + (point_a[1] - nearest[1][1]) * flow_y
+                    )
+                    samples.append((timestamp, relative_forward))
+                if len(samples) < 2:
+                    continue
+
+                first_a, last_a = overtaking_path[0][1], overtaking_path[-1][1]
+                first_b, last_b = overtaken_path[0][1], overtaken_path[-1][1]
+                travel_a = (last_a[0] - first_a[0]) * flow_x + (last_a[1] - first_a[1]) * flow_y
+                travel_b = (last_b[0] - first_b[0]) * flow_x + (last_b[1] - first_b[1]) * flow_y
+                if travel_a < min_motion or travel_b < min_motion:
+                    continue
+
+                samples.sort(key=lambda item: item[0])
+                has_passed = any(
+                    earlier_gap <= -min_gap
+                    and any(
+                        later_gap >= min_gap
+                        for _, later_gap in samples[index + 1 :]
+                    )
+                    for index, (_, earlier_gap) in enumerate(samples)
+                )
+                if not has_passed:
+                    continue
+
+                det = detection_by_id[overtaking_id]
+                score = score_from_persistence(
+                    detection_confidence=float(det.get("confidence", 0)),
+                    elapsed_sec=0.0,
+                    required_sec=VIOLATION_PERSISTENCE_SEC,
+                    contextual_availability=0.75,
+                )
+                _emit(
+                    state,
+                    events,
+                    VIOLATION_DISREGARDING_SIGN,
+                    det,
+                    frame_number,
+                    f"Vehicle track #{overtaking_id} passed tracked vehicle "
+                    f"#{overtaken_id} inside configured No Overtaking lane {lane_id} "
+                    f"({sign_id}); admin review required.",
+                    score,
+                    outcome="review",
+                )
 
 
 def check_disregarding_traffic_sign(
@@ -1643,9 +1997,13 @@ def check_disregarding_traffic_sign(
     history = params.get("_track_history")
     signs = []
     thresholds = []
+    lane_flows = []
+    lanes = []
     if isinstance(rule_scene, RuleSceneContext) and rule_scene.signs:
         signs = list(rule_scene.signs)
         thresholds = list(rule_scene.threshold_lines)
+        lane_flows = list(rule_scene.lane_flows)
+        lanes = list(rule_scene.lanes)
     else:
         signs = params.get("supported_signs") or []
 
@@ -1670,6 +2028,32 @@ def check_disregarding_traffic_sign(
             sign_lane_ids = list(sign.get("lane_ids") or [])
             sign_id = str(sign.get("id") or stype)
 
+        if stype in ("no_left_turn", "no_right_turn", "no_u_turn") and hasattr(sign, "type"):
+            _check_prohibited_turn_sign(
+                sign,
+                thresholds,
+                lane_flows,
+                vehicles,
+                state,
+                frame_number,
+                history,
+                min_dir,
+                events,
+            )
+            continue
+        if stype == "no_overtaking" and hasattr(sign, "type"):
+            _check_no_overtaking_sign(
+                sign,
+                lanes,
+                lane_flows,
+                vehicles,
+                state,
+                frame_number,
+                history,
+                min_dir,
+                events,
+            )
+            continue
         if stype in ("stop", "speed_limit", "sign_stop", "sign_speed_limit"):
             continue
         # Only no-entry is executable; others stay unsupported.
@@ -1744,7 +2128,8 @@ def check_disregarding_traffic_sign(
                 prev, curr, line_a, line_b, prohibited_from="both"
             )
             tracker = state.tracker_for(f"sign_no_entry_{sign_id}", track_id)
-            if tracker.update(conflict, ts):
+            # A threshold crossing is an instantaneous maneuver event.
+            if tracker.update(conflict, ts, threshold_sec=0.0):
                 score = score_from_persistence(
                     detection_confidence=float(det.get("confidence", 0)),
                     elapsed_sec=tracker.elapsed(ts),
