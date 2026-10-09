@@ -7,6 +7,7 @@ annotated frame available as JPEG for the Live Monitor MJPEG feed.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -17,7 +18,11 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-from core.detection_config import confidence_band
+from core.detection_config import (
+    VIOLATION_NO_SIDE_MIRROR,
+    VIOLATION_TRUCK_BAN,
+    confidence_band,
+)
 from core.detector import Detector, DetectorError, enforce_object_class_contract
 from core.evidence import save_evidence_snapshot, save_vehicle_crop
 from core.frame_annotate import TrajectoryOverlay, annotate_frame
@@ -27,8 +32,44 @@ from core.scene_annotation import load_scene_annotation
 from core.tracker import TrackState
 from core.video_processor import load_rule_parameters
 from core.violation_config import load_enabled_violations
-from core.violation_engine import RuleEngineState, evaluate_detection_rules
+from core.violation_engine import RuleDiagnostics, RuleEngineState, evaluate_detection_rules
 from database import db
+
+
+def live_capability_diagnostics(capabilities: dict[str, Any]) -> list[str]:
+    """Visible fail-closed prerequisites for live-only time/evidence gates."""
+    notes = []
+    for rule in (VIOLATION_TRUCK_BAN, VIOLATION_NO_SIDE_MIRROR):
+        capability = capabilities.get(rule)
+        if capability is not None and not capability.automatic_evaluation and capability.notes:
+            notes.append(capability.notes)
+    return notes
+
+
+def live_review_evidence_fields(event: Any) -> dict[str, Any]:
+    """Keep live review confidence fields aligned with uploaded-video events."""
+    return {
+        "detection_confidence": event.detection_confidence,
+        "violation_confidence": event.violation_confidence,
+        "evidence_sufficiency": event.evidence_sufficiency,
+        "contributing_factors_json": json.dumps(event.contributing_factors),
+        "unavailable_factors_json": json.dumps(list(event.unavailable_factors)),
+    }
+
+
+def _consume_live_diagnostics(
+    target: list[str], seen: set[str], state: RuleEngineState, revision: int
+) -> int:
+    new_notes, revision = state.diagnostics.since(revision)
+    for note in live_capability_diagnostics(state.capability) + new_notes:
+        if note in seen:
+            continue
+        seen.add(note)
+        target.append(note)
+        if len(target) > RuleDiagnostics.MAX_ITEMS:
+            seen.discard(target.pop(0))
+    return revision
+
 
 class LiveStreamWorker(threading.Thread):
     def __init__(self, camera: dict[str, Any]) -> None:
@@ -50,6 +91,8 @@ class LiveStreamWorker(threading.Thread):
         self._latest_jpeg: bytes | None = None
         self.status = "starting"
         self.error: str | None = None
+        self.diagnostics: list[str] = []
+        self._diagnostic_seen: set[str] = set()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -140,6 +183,7 @@ class LiveStreamWorker(threading.Thread):
         self.status = "live"
         track_state = TrackState(stationary_px=float(params["stationary_px"]))
         rule_state = RuleEngineState()
+        rule_diagnostic_revision = 0
         frame_skip = max(int(params["frame_skip"]), 1)
         conf_threshold = float(params["confidence_threshold"])
         frame_number = -1
@@ -202,6 +246,10 @@ class LiveStreamWorker(threading.Thread):
                     model_classes=model_classes,
                     history=track_state.history_view(now=timestamp_sec),
                 )
+                rule_diagnostic_revision = _consume_live_diagnostics(
+                    self.diagnostics, self._diagnostic_seen, rule_state,
+                    rule_diagnostic_revision,
+                )
                 by_track = {int(d["track_id"]): d for d in tracked}
                 for event in events:
                     det = by_track.get(event.track_id)
@@ -212,6 +260,8 @@ class LiveStreamWorker(threading.Thread):
                             frame, det, event.violation_type,
                             source_key=f"camera_{self.camera['id']}",
                             frame_number=event.frame_number,
+                            violation_confidence=event.violation_confidence,
+                            detection_confidence=event.detection_confidence,
                         )
                         vehicle_evidence_path = save_vehicle_crop(
                             frame, det,
@@ -223,6 +273,7 @@ class LiveStreamWorker(threading.Thread):
                         track_id=event.track_id,
                         violation_type=event.violation_type,
                         confidence=event.confidence,
+                        **live_review_evidence_fields(event),
                         frame_number=event.frame_number,
                         evidence_path=evidence_path,
                         vehicle_evidence_path=vehicle_evidence_path,
@@ -291,11 +342,17 @@ class StreamManager:
     def status(self, camera_id: int) -> dict[str, Any]:
         worker = self.get(camera_id)
         if worker is None:
-            return {"running": False, "status": "stopped", "error": None}
+            return {
+                "running": False,
+                "status": "stopped",
+                "error": None,
+                "diagnostics": [],
+            }
         return {
             "running": worker.is_alive(),
             "status": worker.status,
             "error": worker.error,
+            "diagnostics": list(worker.diagnostics),
         }
 
 

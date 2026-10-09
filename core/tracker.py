@@ -22,6 +22,10 @@ from core.detection_config import VEHICLE_CLASSES
 TRACK_EXPIRY_SEC = 5.0
 # Sliding window (seconds) used for speed/direction estimation.
 MOTION_WINDOW_SEC = 2.0
+# Longest current rule consumer needs nine seconds (four-second smoothing plus
+# a five-second parking comparison). Retain a small time margin independent
+# of processed frame rate; histories are also cleared on normal track expiry.
+TRACK_HISTORY_RETENTION_SEC = 10.0
 # Brief changes between recognized vehicle labels do not by themselves create
 # a new physical track: the detector can alternate labels while ByteTrack
 # keeps the same spatially continuous identity. Non-vehicle class changes still
@@ -94,7 +98,7 @@ class TrackHistoryView:
 class TrackHistory:
     track_id: int
     class_label: str
-    points: deque = field(default_factory=lambda: deque(maxlen=300))  # (ts, cx, cy)
+    points: deque = field(default_factory=deque)  # (ts, cx, cy), bounded by time in add()
     stationary_since: float | None = None
     last_seen: float = 0.0
     # Latest per-frame label stays on class_label. resolved_track_class is the
@@ -105,7 +109,15 @@ class TrackHistory:
     support_since: float | None = None
 
     def add(self, timestamp_sec: float, cx: float, cy: float) -> None:
-        self.points.append((timestamp_sec, cx, cy))
+        point = (timestamp_sec, cx, cy)
+        if self.points and timestamp_sec == self.points[-1][0]:
+            # A repeated media timestamp must not grow history without bound.
+            self.points[-1] = point
+        else:
+            self.points.append(point)
+        cutoff = timestamp_sec - TRACK_HISTORY_RETENTION_SEC
+        while self.points and self.points[0][0] < cutoff:
+            self.points.popleft()
         self.last_seen = timestamp_sec
 
     def _window(self, window_sec: float = MOTION_WINDOW_SEC) -> list[tuple[float, float, float]]:

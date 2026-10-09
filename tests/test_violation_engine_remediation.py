@@ -32,7 +32,7 @@ from core.model_capability import (
 )
 from core.rule_confidence import score_violation
 from core.temporal_evidence import TemporalEvidenceBuffer
-from core.tracker import TRACK_EXPIRY_SEC
+from core.tracker import TRACK_EXPIRY_SEC, TrackState
 from core.violation_config import load_enabled_violations, save_enabled_violations
 from core.violation_engine import RuleEngineState, evaluate_detection_rules
 from core.zone_membership import (
@@ -386,6 +386,16 @@ class TestTruckBanRecordingTime:
         assert cap.automatic_evaluation is False
         assert any("recording_datetime" in p for p in cap.missing_prerequisites)
 
+    def test_side_mirror_capability_requires_mounting_visibility_producer(self):
+        cap = assess_rule_capability(
+            VIOLATION_NO_SIDE_MIRROR,
+            ("side_mirror",),
+        )
+
+        assert cap.automatic_evaluation is False
+        assert "context:mirror_mounting_visibility" in cap.missing_prerequisites
+        assert "both mirror mounting areas" in cap.notes
+
 
 class TestIllegalParkingTerminalSeparate:
     def test_stop_alone_does_not_prove_terminal(self):
@@ -424,6 +434,57 @@ class TestIllegalParkingTerminalSeparate:
         for e in ev:
             assert e.violation_type == VIOLATION_ILLEGAL_PARKING
             assert "/" not in e.violation_type or "Nut-Shell" in e.violation_type
+
+
+def test_parking_candidate_has_equivalent_history_at_15_30_and_60_hz():
+    zone = [[0, 0], [300, 0], [300, 300], [0, 300]]
+
+    def stationary_candidate(frequency):
+        tracker = TrackState(stationary_px=8.0)
+        state = RuleEngineState()
+        events = []
+        frame_count = int(40.2 * frequency) + 1
+        for index in range(frame_count):
+            timestamp = index / frequency
+            tracked = tracker.update(
+                [_vehicle(timestamp_sec=timestamp, bbox_x=100.0)], now=timestamp
+            )
+            events.extend(evaluate_detection_rules(
+                tracked, state, index,
+                zones={"no_parking": zone},
+                params={"parking_dwell_sec": 0.5, "stationary_px": 8.0},
+                enabled_violations=(VIOLATION_ILLEGAL_PARKING,),
+                model_classes=("car",), now_sec=timestamp,
+                history=tracker.history_view(now=timestamp),
+            ))
+        return events
+
+    results = [stationary_candidate(rate) for rate in (15, 30, 60)]
+
+    assert all(any(e.violation_type == VIOLATION_ILLEGAL_PARKING for e in events) for events in results)
+
+
+def test_parking_motion_over_five_seconds_does_not_emit_candidate_at_60_hz():
+    zone = [[0, 0], [1200, 0], [1200, 300], [0, 300]]
+    tracker = TrackState(stationary_px=8.0)
+    state = RuleEngineState()
+    events = []
+    for index in range(int(40.2 * 60) + 1):
+        timestamp = index / 60
+        tracked = tracker.update(
+            [_vehicle(timestamp_sec=timestamp, bbox_x=100.0 + 20.0 * timestamp)],
+            now=timestamp,
+        )
+        events.extend(evaluate_detection_rules(
+            tracked, state, index,
+            zones={"no_parking": zone},
+            params={"parking_dwell_sec": 0.5, "stationary_px": 8.0},
+            enabled_violations=(VIOLATION_ILLEGAL_PARKING,),
+            model_classes=("car",), now_sec=timestamp,
+            history=tracker.history_view(now=timestamp),
+        ))
+
+    assert events == []
 
 
 class TestEnabledEmptyList:

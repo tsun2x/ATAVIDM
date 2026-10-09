@@ -1,8 +1,11 @@
+import pytest
+
 from core.scene_annotation import (
     IdentifiedSceneObject,
     LaneFlow,
     RuleSceneContext,
     SceneAnnotation,
+    load_scene_annotation,
     project_rule_scene_context,
 )
 from core.tracker import CentroidObservation, TrackHistorySnapshot, TrackHistoryView
@@ -187,6 +190,301 @@ def test_turn_candidate_runs_through_the_video_rule_entrypoint():
     assert len(events) == 1
     assert events[0].outcome == "review"
     assert "No Left Turn" in events[0].reason_log
+
+
+def test_no_entry_uses_saved_prohibited_side_on_threshold_through_main_entrypoint():
+    """A saved side must control the entry direction; current metadata-only lookup misses it."""
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[IdentifiedSceneObject(
+            id="entry-line", type="no_entry_threshold",
+            points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+            prohibited_from="left",
+        )],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    points = [(100, 160), (100, 80)]
+    event = {
+        "class_label": "car", "track_id": 7,
+        "bbox_x": 85, "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    candidates = evaluate_detection_rules(
+        [event], RuleEngineState(), frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history(points),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].outcome == "review"
+    assert candidates[0].violation_type == "Disregarding Traffic Sign"
+
+
+def test_no_entry_saved_right_side_and_allowed_reverse_direction():
+    def run(points, side):
+        scene = SceneAnnotation(
+            schema_version=2,
+            source_kind="v2",
+            threshold_lines=[IdentifiedSceneObject(
+                id="entry-line", type="no_entry_threshold",
+                points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+                prohibited_from=side,
+            )],
+            signs=[IdentifiedSceneObject(
+                id="no-entry", type="no_entry",
+                points=((10, 10), (30, 10), (30, 30), (10, 30)),
+                lane_ids=("lane-1",),
+            )],
+        )
+        x, y = points[-1]
+        detection = {
+            "class_label": "car", "track_id": 7,
+            "bbox_x": x - 15, "bbox_y": y - 15,
+            "bbox_w": 30, "bbox_h": 30,
+            "confidence": 0.9, "timestamp_sec": 1.0,
+        }
+        return evaluate_detection_rules(
+            [detection], RuleEngineState(), frame_number=2,
+            params={"min_direction_px": 20},
+            enabled_violations=("Disregarding Traffic Sign",),
+            now_sec=1.0, scene=project_rule_scene_context(scene),
+            history=_history(points),
+        )
+
+    # From above to below enters from the right side of the oriented line.
+    assert len(run([(100, 40), (100, 120)], "right")) == 1
+    # The same geometric crossing from the opposite side is allowed.
+    assert run([(100, 120), (100, 40)], "right") == []
+
+
+def test_no_entry_preserves_explicit_prohibited_vector_behavior():
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[IdentifiedSceneObject(
+            id="entry-line", type="no_entry_threshold",
+            points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+            metadata={"prohibited_vector": (0, -1)},
+        )],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    detection = {
+        "class_label": "car", "track_id": 7, "bbox_x": 85,
+        "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    events = evaluate_detection_rules(
+        [detection], RuleEngineState(), frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history([(100, 160), (100, 80)]),
+    )
+
+    assert len(events) == 1
+    assert events[0].outcome == "review"
+
+
+def test_no_entry_without_lane_associated_direction_fails_closed_with_diagnostic():
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[IdentifiedSceneObject(
+            id="entry-line", type="no_entry_threshold",
+            points=((20, 100), (180, 100)), lane_ids=("lane-2",),
+        )],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    state = RuleEngineState()
+    detection = {
+        "class_label": "car", "track_id": 7, "bbox_x": 85,
+        "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    candidates = evaluate_detection_rules(
+        [detection], state, frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history([(100, 160), (100, 80)]),
+    )
+
+    assert candidates == []
+    assert any("no-entry sign" in note and "decision threshold" in note for note in state.diagnostics)
+
+
+def test_counting_line_does_not_make_no_entry_threshold_ambiguous():
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[
+            IdentifiedSceneObject(
+                id="entry-line", type="no_entry_threshold",
+                points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+                prohibited_from="left",
+            ),
+            IdentifiedSceneObject(
+                id="count-line", type="counting_line",
+                points=((20, 80), (180, 80)), lane_ids=("lane-1",),
+            ),
+        ],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    detection = {
+        "class_label": "car", "track_id": 7,
+        "bbox_x": 85, "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    candidates = evaluate_detection_rules(
+        [detection], RuleEngineState(), frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history([(100, 160), (100, 80)]),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].outcome == "review"
+
+
+def test_counting_line_alone_does_not_create_no_entry_candidate():
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[IdentifiedSceneObject(
+            id="count-line", type="counting_line",
+            points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+        )],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    state = RuleEngineState()
+    detection = {
+        "class_label": "car", "track_id": 7,
+        "bbox_x": 85, "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    candidates = evaluate_detection_rules(
+        [detection], state, frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history([(100, 160), (100, 80)]),
+    )
+
+    assert candidates == []
+    assert any("decision threshold" in note for note in state.diagnostics)
+
+
+@pytest.mark.parametrize("bad_vector", [
+    {"x": 0, "y": -1},  # objects are not a supported serialized vector shape
+    3,
+    [0],
+    ["north", 1],
+    [float("inf"), 0],
+    [0, 0],
+])
+def test_malformed_saved_no_entry_vector_fails_closed_at_scene_rule_boundary(bad_vector):
+    document = {
+        "schema_version": 2,
+        "threshold_lines": [{
+            "id": "entry-line", "type": "no_entry_threshold",
+            "points": [[20, 100], [180, 100]], "lane_ids": ["lane-1"],
+            "prohibited_vector": bad_vector,
+        }],
+        "lanes": [{
+            "id": "lane-1", "type": "active_lane",
+            "points": [[40, 40], [160, 40], [160, 200], [40, 200]],
+        }],
+        "signs": [{
+            "id": "no-entry", "type": "no_entry",
+            "points": [[10, 10], [30, 10], [30, 30], [10, 30]],
+            "lane_ids": ["lane-1"],
+        }],
+        "flow_arrows": [{
+            "id": "flow", "type": "lane_flow",
+            "points": [[100, 180], [100, 100]], "lane_ids": ["lane-1"],
+        }],
+    }
+    scene = load_scene_annotation(document)
+    state = RuleEngineState()
+    detection = {
+        "class_label": "car", "track_id": 7,
+        "bbox_x": 85, "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    candidates = evaluate_detection_rules(
+        [detection], state, frame_number=2,
+        params={"min_direction_px": 20},
+        enabled_violations=("Disregarding Traffic Sign",),
+        now_sec=1.0, scene=project_rule_scene_context(scene),
+        history=_history([(100, 160), (100, 80)]),
+    )
+
+    assert candidates == []
+    assert any("unambiguous prohibited direction" in note for note in state.diagnostics)
+
+
+def test_repeated_rule_evaluations_retain_one_missing_threshold_diagnostic():
+    scene = SceneAnnotation(
+        schema_version=2,
+        source_kind="v2",
+        threshold_lines=[IdentifiedSceneObject(
+            id="count-line", type="counting_line",
+            points=((20, 100), (180, 100)), lane_ids=("lane-1",),
+        )],
+        signs=[IdentifiedSceneObject(
+            id="no-entry", type="no_entry",
+            points=((10, 10), (30, 10), (30, 30), (10, 30)),
+            lane_ids=("lane-1",),
+        )],
+    )
+    state = RuleEngineState()
+    detection = {
+        "class_label": "car", "track_id": 7,
+        "bbox_x": 85, "bbox_y": 65, "bbox_w": 30, "bbox_h": 30,
+        "confidence": 0.9, "timestamp_sec": 1.0,
+    }
+
+    for frame in range(1000):
+        evaluate_detection_rules(
+            [detection], state, frame_number=frame,
+            params={"min_direction_px": 20},
+            enabled_violations=("Disregarding Traffic Sign",),
+            now_sec=1.0, scene=project_rule_scene_context(scene),
+            history=_history([(100, 160), (100, 80)]),
+        )
+
+    assert len(state.diagnostics) == 1
+    assert "counting line only" in state.diagnostics[0]
 
 
 def _evaluate_no_overtaking(first_path, second_path):

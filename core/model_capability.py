@@ -97,8 +97,8 @@ RULE_REQUIRED_CONTEXT: dict[str, tuple[str, ...]] = {
     VIOLATION_ILLEGAL_TERMINAL: ("zone:loading_unloading", "puv_context"),
     VIOLATION_PAVEMENT_MARKINGS: ("marking_geometry",),
     VIOLATION_DISREGARDING_SIGN: ("supported_sign_annotations",),
-    # Mirror/cargo visibility is produced per-episode by observation helpers —
-    # not unconditional context flags.
+    # Production currently lacks a mirror mounting-visibility producer.
+    VIOLATION_NO_SIDE_MIRROR: ("mirror_mounting_visibility",),
 }
 
 
@@ -149,8 +149,11 @@ def assess_rule_capability(
 
     flags = context_flags or {}
     for req in RULE_REQUIRED_CONTEXT.get(rule_name, ()):
-        # Only fail when the flag is explicitly False; absent means unchecked.
-        if req in flags and not flags[req]:
+        # Mounting visibility is a required positive evidence source: absent
+        # metadata means the producer is unavailable, not "unchecked".
+        if req == "mirror_mounting_visibility" and req not in flags:
+            missing.append(f"context:{req}")
+        elif req in flags and not flags[req]:
             missing.append(f"context:{req}")
 
     if (
@@ -173,6 +176,12 @@ def assess_rule_capability(
             "owner/adviser decision on a positive uncovered-head source. "
             "The motorcycle detail model remains review-only and cannot create "
             "or confirm this violation."
+        ).strip()
+    if "context:mirror_mounting_visibility" in missing:
+        notes = (
+            f"{notes} No Side Mirror remains review-only: production does not "
+            "produce visibility evidence for both mirror mounting areas. "
+            "Missing detections remain UNKNOWN."
         ).strip()
     return RuleCapabilityStatus(
         rule_name=rule_name,

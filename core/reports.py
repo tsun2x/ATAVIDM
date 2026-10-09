@@ -57,21 +57,22 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
     vid = row.get("id")
     policy_rows = db.get_case_policy_records(vid) if vid is not None else []
     if policy_rows:
-        verified = next(
-            (
-                p.get("official_category")
-                for p in policy_rows
-                if p.get("legal_status") == "verified" and p.get("official_category")
-            ),
-            None,
+        policy_pairs = []
+        for policy in policy_rows:
+            behavior = str(policy.get("canonical_rule") or "Behavior")
+            category = str(policy.get("official_category") or "No official category")
+            status = str(policy.get("legal_status") or "unknown")
+            pair = (behavior, category, status)
+            if pair not in policy_pairs:
+                policy_pairs.append(pair)
+        enriched["official_category"] = "; ".join(
+            f"{behavior}: {category} [{status}]"
+            for behavior, category, status in policy_pairs
         )
-        proposed = next(
-            (p.get("official_category") for p in policy_rows if p.get("official_category")),
-            None,
+        enriched["legal_status"] = "; ".join(
+            f"{behavior}: {status}"
+            for behavior, _category, status in policy_pairs
         )
-        legal = next((p.get("legal_status") for p in policy_rows if p.get("legal_status")), None)
-        enriched["official_category"] = verified or proposed or ""
-        enriched["legal_status"] = legal or ""
         enriched["observation_count"] = len(policy_rows)
     else:
         vtype = row.get("violation_type") or ""
@@ -197,8 +198,8 @@ def _generate_pdf(rows: list[dict[str, Any]], title: str, filters: dict[str, Any
         pdf.cell(0, 5, f"  {outcome}: {count}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
-    # Narrower landscape table; official category uses multi-cell rows to avoid
-    # silent truncation of legal wording.
+    # Narrower landscape table; policy associations and plate labels use
+    # multi-cell rows so fused records do not lose legal/evidence wording.
     pdf.set_font("Helvetica", "", 8)
     pdf.multi_cell(
         0, 4,
@@ -208,32 +209,87 @@ def _generate_pdf(rows: list[dict[str, Any]], title: str, filters: dict[str, Any
         "machine suggestions and are not verified identities.",
     )
     pdf.ln(2)
-    pdf.set_font("Helvetica", "B", 8)
-    pdf.set_fill_color(230, 230, 230)
     col_widths = [9, 35, 48, 25, 38, 22, 24, 15, 28, 17]
     headers = [h for _k, h, _w in _COLUMNS]
-    for header, width in zip(headers, col_widths):
-        pdf.cell(width, 7, header, border=1, fill=True)
-    pdf.ln()
+
+    def draw_table_header() -> None:
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(230, 230, 230)
+        for header, width in zip(headers, col_widths):
+            pdf.cell(width, 7, header, border=1, fill=True)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 7)
+
+    def wrap_cell_text(value: str, cell_width: float) -> list[str]:
+        """Wrap on words, splitting only tokens wider than the cell."""
+        inner_width = cell_width - 2 - 2 * pdf.c_margin
+        output: list[str] = []
+        for paragraph in value.split("\n"):
+            line = ""
+            for word in paragraph.split(" "):
+                candidate = f"{line} {word}" if line else word
+                if pdf.get_string_width(candidate) <= inner_width:
+                    line = candidate
+                    continue
+                if line:
+                    output.append(line)
+                    line = ""
+                if pdf.get_string_width(word) <= inner_width:
+                    line = word
+                    continue
+                piece = ""
+                for char in word:
+                    if piece and pdf.get_string_width(piece + char) > inner_width:
+                        output.append(piece)
+                        piece = char
+                    else:
+                        piece += char
+                line = piece
+            output.append(line)
+        return output or [""]
+
+    draw_table_header()
 
     pdf.set_font("Helvetica", "", 7)
+    pdf.set_auto_page_break(auto=False)
     for row in rows:
         values = [_cell_value(row, key) for key, _h, _w in _COLUMNS]
-        # Compute row height for the wrapped category and plate-verification text.
-        official = values[2]
-        plate_display = values[4]
-        lines = max(1, (len(official) // 40) + 1, (len(plate_display) // 28) + 1)
-        row_h = 5 * lines
-        x_start = pdf.get_x()
-        y_start = pdf.get_y()
-        for idx, (value, width) in enumerate(zip(values, col_widths)):
-            x = x_start + sum(col_widths[:idx])
-            pdf.set_xy(x, y_start)
-            if idx in (2, 4):
-                pdf.multi_cell(width, 5, value, border=1)
-            else:
-                pdf.cell(width, row_h, value[:60], border=1)
-        pdf.set_xy(x_start, y_start + row_h)
+        wrapped = [wrap_cell_text(value, width) for value, width in zip(values, col_widths)]
+        total_lines = max(len(lines) for lines in wrapped)
+        y = pdf.get_y()
+        line_capacity = max(1, int((pdf.h - pdf.b_margin - y) // 5))
+        if total_lines > line_capacity:
+            pdf.add_page()
+            draw_table_header()
+            y = pdf.get_y()
+            line_capacity = max(1, int((pdf.h - pdf.b_margin - y) // 5))
+
+        offset = 0
+        while offset < total_lines:
+            y = pdf.get_y()
+            capacity = max(1, int((pdf.h - pdf.b_margin - y) // 5))
+            chunk_lines = min(capacity, total_lines - offset)
+            if chunk_lines <= 0:
+                pdf.add_page()
+                draw_table_header()
+                continue
+            row_h = chunk_lines * 5
+            x = pdf.l_margin
+            for idx, (lines, width) in enumerate(zip(wrapped, col_widths)):
+                pdf.rect(x, y, width, row_h)
+                chunk = lines[offset:offset + chunk_lines]
+                if offset and idx == 0:
+                    chunk = [values[0]] + chunk[1:]
+                for line_index, text_line in enumerate(chunk):
+                    pdf.set_xy(x + 1, y + line_index * 5)
+                    pdf.cell(width - 2, 5, text_line)
+                x += width
+            pdf.set_xy(pdf.l_margin, y + row_h)
+            offset += chunk_lines
+            if offset < total_lines:
+                pdf.add_page()
+                draw_table_header()
+    pdf.set_auto_page_break(auto=True, margin=12)
 
     pdf.output(str(out_path))
 

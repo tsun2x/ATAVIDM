@@ -512,6 +512,7 @@ def process_video(
             rule_state.capability[rule_cap.rule_name] = rule_cap
 
         diagnostics_json = json.dumps(diagnostics.as_dict())
+        reported_rule_diagnostic_revision = rule_state.diagnostics.revision
         if progress_tracker:
             progress_tracker.add_diagnostics(list(diagnostics.notes))
 
@@ -657,6 +658,14 @@ def process_video(
                 scene=ctx.get("scene"),
                 history=track_state.history_view(now=timestamp_sec),
             )
+            new_rule_diagnostics, reported_rule_diagnostic_revision = (
+                rule_state.diagnostics.since(reported_rule_diagnostic_revision)
+            )
+            if new_rule_diagnostics:
+                diagnostics.notes.extend(new_rule_diagnostics)
+                diagnostics_json = json.dumps(diagnostics.as_dict())
+                if progress_tracker:
+                    progress_tracker.add_diagnostics(new_rule_diagnostics)
             by_track = {int(d["track_id"]): d for d in tracked}
             viol_ids = {int(e.track_id) for e in frame_events if e.track_id is not None}
             for event in frame_events:

@@ -7,6 +7,7 @@ into violation confidence. Track/rule state expires with the tracker policy.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from statistics import median
@@ -167,6 +168,42 @@ class _FiredEpisode:
     condition_false_since: float | None = None
 
 
+class RuleDiagnostics(list[str]):
+    """Bounded, unique rule notes with a sequence for incremental consumers."""
+
+    MAX_ITEMS = 512
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._recent: deque[tuple[int, str]] = deque()
+        self._seen: set[str] = set()
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def append(self, note: str) -> None:
+        note = str(note)
+        if not note or note in self._seen:
+            return
+        self._revision += 1
+        self._seen.add(note)
+        self._recent.append((self._revision, note))
+        super().append(note)
+        if len(self._recent) > self.MAX_ITEMS:
+            _old_revision, old_note = self._recent.popleft()
+            self._seen.discard(old_note)
+            del self[0]
+
+    def extend(self, notes: Any) -> None:
+        for note in notes:
+            self.append(note)
+
+    def since(self, revision: int) -> tuple[list[str], int]:
+        return [note for seq, note in self._recent if seq > revision], self._revision
+
+
 @dataclass
 class RuleEngineState:
     """Mutable per-run rule state with track-aligned expiry."""
@@ -178,7 +215,7 @@ class RuleEngineState:
     contextual: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     associations: dict[tuple[str, int], Any] = field(default_factory=dict)
     membership_hysteresis: MembershipHysteresis = field(default_factory=MembershipHysteresis)
-    diagnostics: list[str] = field(default_factory=list)
+    diagnostics: RuleDiagnostics = field(default_factory=RuleDiagnostics)
     capability: dict[str, RuleCapabilityStatus] = field(default_factory=dict)
     track_expiry_sec: float = TRACK_EXPIRY_SEC
     rearm_clear_sec: float = REARM_CLEAR_SEC
@@ -2064,41 +2101,68 @@ def check_disregarding_traffic_sign(
             )
             continue
 
-        # Resolve threshold: matching threshold_line or points on the sign.
+        # A no-entry sign needs an associated decision threshold and a saved
+        # direction. Never infer a legal counting line from the sign artwork.
         line_a = line_b = None
         prohibited_vec = None
-        for th in thresholds:
-            if sign_lane_ids and th.lane_ids and not set(sign_lane_ids) & set(th.lane_ids):
-                continue
-            if len(th.points) >= 2:
-                line_a = th.points[0]
-                line_b = th.points[-1]
-                # Prohibited direction: A→B normal into the restricted side, or
-                # metadata vector when provided.
-                meta = th.metadata if hasattr(th, "metadata") else {}
-                if meta.get("prohibited_vector"):
-                    pv = meta["prohibited_vector"]
-                    prohibited_vec = (float(pv[0]), float(pv[1]))
-                else:
-                    # Default: crossing from A-left toward A-right is not assumed;
-                    # use segment direction as prohibited motion projection axis.
-                    prohibited_vec = (line_b[0] - line_a[0], line_b[1] - line_a[1])
-                    # Prefer perpendicular into "entry" if annotated.
-                    if meta.get("prohibited_from") == "left":
-                        prohibited_vec = (
-                            -(line_b[1] - line_a[1]),
-                            (line_b[0] - line_a[0]),
-                        )
-                    elif meta.get("prohibited_from") == "right":
-                        prohibited_vec = (
-                            (line_b[1] - line_a[1]),
-                            -(line_b[0] - line_a[0]),
-                        )
-                break
-        if line_a is None and hasattr(sign, "points") and len(sign.points) >= 2:
-            line_a, line_b = sign.points[0], sign.points[-1]
-            prohibited_vec = (line_b[0] - line_a[0], line_b[1] - line_a[1])
-        if line_a is None or line_b is None or prohibited_vec is None:
+        prohibited_from = None
+        associated_thresholds = [
+            th for th in thresholds
+            if str(getattr(th, "type", "")).lower()
+            in ("threshold", "no_entry_threshold")
+            if len(th.points) >= 2
+            and sign_lane_ids
+            and th.lane_ids
+            and set(sign_lane_ids) & set(th.lane_ids)
+        ]
+        if len(associated_thresholds) != 1:
+            reason = "no" if not associated_thresholds else "ambiguous"
+            counting_line_only = not associated_thresholds and any(
+                str(getattr(th, "type", "")).lower() == "counting_line"
+                and len(th.points) >= 2
+                and sign_lane_ids
+                and th.lane_ids
+                and set(sign_lane_ids) & set(th.lane_ids)
+                for th in thresholds
+            )
+            state.diagnostics.append(
+                f"Disregarding Traffic Sign: {'counting line only; save a' if counting_line_only else reason + ' lane-associated'} decision "
+                f"threshold for no-entry sign {sign_id}; candidate generation is disabled."
+            )
+            continue
+        th = associated_thresholds[0]
+        line_a, line_b = th.points[0], th.points[-1]
+        meta = th.metadata if hasattr(th, "metadata") else {}
+        saved_side = getattr(th, "prohibited_from", None) or meta.get("prohibited_from")
+        if saved_side in ("left", "right", "both"):
+            prohibited_from = saved_side
+        elif "prohibited_vector" in meta:
+            prohibited_vec = _validated_direction_vector(meta.get("prohibited_vector"))
+        else:
+            # Lane flow gives the allowed direction. A no-entry crossing must
+            # move against it, and the flow must belong to the associated lane.
+            associated_lanes = set(sign_lane_ids) & set(th.lane_ids)
+            matched_flows = [
+                flow for flow in lane_flows
+                if flow.lane_id in associated_lanes
+            ]
+            vectors = set()
+            invalid_flow = False
+            for flow in matched_flows:
+                vector = _validated_direction_vector(flow.vector)
+                if vector is None:
+                    invalid_flow = True
+                    continue
+                vectors.add((round(vector[0], 6), round(vector[1], 6)))
+            if not invalid_flow and len(vectors) == 1:
+                allowed = next(iter(vectors))
+                prohibited_vec = (-allowed[0], -allowed[1])
+        if prohibited_from is None and prohibited_vec is None:
+            state.diagnostics.append(
+                f"Disregarding Traffic Sign: no-entry sign {sign_id} has no "
+                "unambiguous prohibited direction; save prohibited_from or an "
+                "associated lane flow/vector before candidate generation."
+            )
             continue
 
         for det in vehicles:
@@ -2120,12 +2184,13 @@ def check_disregarding_traffic_sign(
                 continue
             if is_parallel_motion(motion, line_a, line_b):
                 continue
-            if not motion_projects_into_direction(
+            if prohibited_vec is not None and not motion_projects_into_direction(
                 motion, prohibited_vec, min_projection=min_dir * 0.5
             ):
                 continue
             conflict = crossed_oriented_line(
-                prev, curr, line_a, line_b, prohibited_from="both"
+                prev, curr, line_a, line_b,
+                prohibited_from=prohibited_from or "both",
             )
             tracker = state.tracker_for(f"sign_no_entry_{sign_id}", track_id)
             # A threshold crossing is an instantaneous maneuver event.
@@ -2149,6 +2214,21 @@ def check_disregarding_traffic_sign(
                 )
             state.note_condition(VIOLATION_DISREGARDING_SIGN, track_id, conflict, ts)
     return events
+
+
+def _validated_direction_vector(value: Any) -> tuple[float, float] | None:
+    """Return a finite non-zero 2D vector, rejecting ambiguous saved shapes."""
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    try:
+        vector = (float(value[0]), float(value[1]))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(component) for component in vector):
+        return None
+    if math.hypot(*vector) <= 0:
+        return None
+    return vector
 
 
 # Legacy alias kept for older imports/tests.
@@ -2205,6 +2285,9 @@ def scene_capability_flags(
             if recording_time_known is not None
             else now_time is not None
         ),
+        # There is no production producer for tri-state mirror mounting-area
+        # visibility yet; detector class availability cannot satisfy this.
+        "mirror_mounting_visibility": False,
         "lane_flow_degrees": "lane_flow_degrees" in merged or bool(lane_flows),
         "marking_geometry": bool(
             merged.get("marking_geometry")

@@ -150,7 +150,10 @@
                 .then(function (payload) {
                     if (!activeCamera || activeCamera.id !== camera.id) return;
                     feedStatus.textContent = "Stream: " + payload.status +
-                        (payload.error ? " — " + payload.error : "");
+                        (payload.error ? " — " + payload.error : "") +
+                        ((payload.diagnostics || []).length
+                            ? " — " + payload.diagnostics.join("; ")
+                            : "");
                 });
         }, 5000);
     }
