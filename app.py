@@ -483,6 +483,74 @@ def _user_to_ui(row: dict) -> dict:
     }
 
 
+_LEGAL_PERMISSION_LABELS = {
+    "confirm_case": "Confirm enforcement case",
+    "attest_print": "Attest that a notice was printed",
+    "propose_policy": "Propose legal policy",
+    "approve_policy": "Approve legal policy",
+    "verify_plate": "Verify a license plate",
+    "confirm_event_time": "Confirm event time",
+}
+
+
+def _user_access_to_ui(row: dict) -> dict:
+    """Admin-only access details, kept separate from general user serialization."""
+    role = row.get("role") or "viewer"
+    active = bool(row.get("is_active", 1))
+    enforcement_role = role in ("admin", "enforcer")
+    role_defaults = {
+        "confirm_case": enforcement_role,
+        "attest_print": enforcement_role,
+        "propose_policy": role == "admin",
+        "approve_policy": False,
+        "verify_plate": enforcement_role,
+        "confirm_event_time": enforcement_role,
+        "confirm_plate_identity": role == "admin",
+    }
+    effective = {
+        "confirm_case": active and db.can_confirm_case(row["id"]),
+        "attest_print": active and db.can_attest_print(row["id"]),
+        "propose_policy": active and db.can_propose_policy(row["id"]),
+        "approve_policy": active and db.can_approve_policy(row["id"]),
+        "verify_plate": active and db.can_verify_plate(row["id"]),
+        "confirm_event_time": active and db.can_confirm_event_time(row["id"]),
+        "confirm_plate_identity": active and db.can_confirm_plate_identity(row["id"]),
+    }
+    grants = db.list_active_policy_permission_assignments(row["id"])
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "role": role,
+        "role_label": auth.ROLE_LABELS.get(role, role),
+        "is_active": active,
+        "role_defaults": role_defaults,
+        "effective_permissions": effective,
+        "explicit_policy_grants": [
+            {
+                **grant,
+                "label": _LEGAL_PERMISSION_LABELS.get(
+                    grant["permission"], grant["permission"]
+                ),
+            }
+            for grant in grants
+        ],
+    }
+
+
+def _case_actions_for_user(user: dict) -> dict[str, bool]:
+    """Return the persisted action capabilities used by the case detail UI."""
+    user_id = int(user["id"])
+    return {
+        "confirm_case": db.can_confirm_case(user_id),
+        "attest_print": db.can_attest_print(user_id),
+        "confirm_event_time": db.can_confirm_event_time(user_id),
+        # Preparation/preview remains an Admin/Enforcer role action.
+        "prepare_notice": user.get("role") in ("admin", "enforcer"),
+        # Identity confirmation is intentionally stricter than verify_plate grants.
+        "confirm_plate_identity": db.can_confirm_plate_identity(user_id),
+    }
+
+
 def _camera_to_ui(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -691,9 +759,11 @@ def api_list_violations():
         page = last_page
         rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort)
     videos = _video_name_map()
+    actor = auth.current_user()
     return jsonify({
         "success": True,
         "items": [_violation_to_ui(row, videos) for row in rows],
+        "case_actions": _case_actions_for_user(actor),
         "total": total,
         "page": page,
         "per_page": per_page,
@@ -2349,7 +2419,7 @@ def api_upload_processing_analytics():
 # ---------------------------------------------------------------------------
 
 @app.route("/api/review-queue", methods=["GET"])
-@auth.login_required
+@auth.role_required("enforcer")
 def api_review_queue():
     status = request.args.get("status", "pending")
     decision = request.args.get("decision")
@@ -2477,7 +2547,7 @@ def _decision_to_ui(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.route("/api/review-queue/decisions", methods=["GET"])
-@auth.login_required
+@auth.role_required("enforcer")
 def api_review_decisions():
     limit = min(50, max(1, _int_query_arg("limit", 20)))
     rows = db.list_recent_review_decisions(limit)
@@ -2755,7 +2825,7 @@ def motorcycle_detail_review():
 
 
 @app.route("/api/motorcycle-detail-review", methods=["GET"])
-@auth.login_required
+@auth.role_required("enforcer")
 def api_motorcycle_detail_list():
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
@@ -2875,6 +2945,7 @@ def api_get_case(violation_id: int):
     if row is None:
         return jsonify({"success": False, "error": "Case not found."}), 404
     ui = _violation_to_ui(row, videos)
+    ui["case_actions"] = _case_actions_for_user(auth.current_user())
     ui["policy_records"] = db.get_case_policy_records(violation_id)
     ui["plate_verification"] = db.get_plate_verification(violation_id)
     ui["actions"] = db.get_case_actions(violation_id)
@@ -2954,7 +3025,7 @@ def api_verify_plate(violation_id: int):
 
 
 @app.route("/api/cases/<int:violation_id>/event-time", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.login_required
 def api_confirm_event_time(violation_id: int):
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
@@ -2978,7 +3049,7 @@ def api_confirm_event_time(violation_id: int):
 
 
 @app.route("/api/cases/<int:violation_id>/confirm-case", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.login_required
 def api_confirm_case(violation_id: int):
     user = auth.current_user()
     try:
@@ -2991,7 +3062,7 @@ def api_confirm_case(violation_id: int):
 
 
 @app.route("/api/cases/<int:violation_id>/notice-printed", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.login_required
 def api_notice_printed(violation_id: int):
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
@@ -3009,7 +3080,7 @@ def api_notice_printed(violation_id: int):
 
 
 @app.route("/api/cases/notice-printed/batch", methods=["POST"])
-@auth.role_required("enforcer")
+@auth.login_required
 def api_notice_printed_batch():
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
@@ -3060,7 +3131,7 @@ def api_list_policy_versions():
 
 
 @app.route("/api/policy/versions", methods=["POST"])
-@auth.role_required("admin")
+@auth.login_required
 def api_propose_policy_version():
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
@@ -3280,6 +3351,43 @@ def api_update_user(user_id: int):
         is_active=payload.get("is_active"),
     )
     return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
+
+
+@app.route("/api/users/<int:user_id>/access", methods=["GET"])
+@auth.role_required("admin")
+def api_user_access(user_id: int):
+    user = db.get_user(user_id)
+    if user is None:
+        return jsonify({"success": False, "error": "User not found."}), 404
+    return jsonify({"success": True, "access": _user_access_to_ui(user)})
+
+
+@app.route("/api/users/<int:user_id>/access", methods=["PUT"])
+@auth.role_required("admin")
+def api_update_user_access(user_id: int):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"grants", "revokes"}:
+        return jsonify({"success": False, "error": "Expected only grants and revokes."}), 400
+    grants = payload.get("grants", [])
+    revokes = payload.get("revokes", [])
+    if not isinstance(grants, list) or not isinstance(revokes, list) or not (grants or revokes):
+        return jsonify({"success": False, "error": "Provide a non-empty grants or revokes list."}), 400
+    actor = auth.current_user()
+    try:
+        db.update_user_policy_permissions(
+            user_id,
+            actor["id"],
+            grants=grants,
+            revokes=revokes,
+        )
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    user = db.get_user(user_id)
+    if user is None:
+        return jsonify({"success": False, "error": "User not found."}), 404
+    return jsonify({"success": True, "access": _user_access_to_ui(user)})
 
 
 # ---------------------------------------------------------------------------

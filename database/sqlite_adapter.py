@@ -4133,6 +4133,16 @@ PERM_PROPOSE_POLICY = "propose_policy"
 PERM_APPROVE_POLICY = "approve_policy"
 PERM_VERIFY_PLATE = "verify_plate"
 PERM_CONFIRM_EVENT_TIME = "confirm_event_time"
+POLICY_PERMISSION_NAMES = frozenset(
+    {
+        PERM_CONFIRM_CASE,
+        PERM_ATTEST_PRINT,
+        PERM_PROPOSE_POLICY,
+        PERM_APPROVE_POLICY,
+        PERM_VERIFY_PLATE,
+        PERM_CONFIRM_EVENT_TIME,
+    }
+)
 
 # Roles that may perform case-review actions by role: confirm/materialize,
 # plate verification, event-time confirmation, and notice-print attestation.
@@ -4417,19 +4427,26 @@ def assign_policy_permission(
 ) -> int:
     """Grant an explicit policy permission to a user.
 
-    Requires the granter to have the corresponding granting authority.
+    Requires an active administrator and rejects self-grants. Administration
+    of the six existing legal capabilities is the sole supported grant scope.
     """
+    if not isinstance(permission, str) or permission not in POLICY_PERMISSION_NAMES:
+        raise ValueError("Unknown policy permission")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         if not _table_exists(conn, "policy_permission_assignments"):
             raise ValueError("policy_permission_assignments table does not exist")
-        # Validate both users exist.
-        for uid in (user_id, granted_by):
-            user_row = conn.execute(
-                "SELECT id FROM users WHERE id = ?", (uid,)
-            ).fetchone()
-            if user_row is None:
-                raise ValueError(f"User {uid} does not exist")
+        target = conn.execute("SELECT id FROM users WHERE id = ?", (int(user_id),)).fetchone()
+        if target is None:
+            raise ValueError(f"User {user_id} does not exist")
+        actor = conn.execute(
+            "SELECT id, role, is_active FROM users WHERE id = ?", (int(granted_by),)
+        ).fetchone()
+        if actor is None or actor["role"] != "admin" or not bool(actor["is_active"]):
+            raise PermissionError("An active System Administrator must grant permissions")
+        if int(user_id) == int(granted_by):
+            raise PermissionError("Administrators cannot grant a legal permission to themselves")
         cursor = conn.execute(
             """
             INSERT INTO policy_permission_assignments
@@ -4441,20 +4458,95 @@ def assign_policy_permission(
         return int(cursor.lastrowid)
 
 
-def revoke_policy_permission(user_id: int, permission: str) -> None:
+def revoke_policy_permission(user_id: int, permission: str, revoked_by: int) -> None:
     """Revoke a previously granted permission (soft delete)."""
+    if not isinstance(permission, str) or permission not in POLICY_PERMISSION_NAMES:
+        raise ValueError("Unknown policy permission")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         if not _table_exists(conn, "policy_permission_assignments"):
             raise ValueError("policy_permission_assignments table does not exist")
+        actor = conn.execute(
+            "SELECT id, role, is_active FROM users WHERE id = ?", (int(revoked_by),)
+        ).fetchone()
+        if actor is None or actor["role"] != "admin" or not bool(actor["is_active"]):
+            raise PermissionError("An active System Administrator must revoke permissions")
         conn.execute(
             """
             UPDATE policy_permission_assignments
             SET revoked_at = ?
             WHERE user_id = ? AND permission = ? AND revoked_at IS NULL
             """,
-            (now, user_id, permission),
+            (now, int(user_id), permission),
         )
+
+
+def update_user_policy_permissions(
+    user_id: int,
+    actor_user_id: int,
+    *,
+    grants: list[dict[str, str]],
+    revokes: list[str],
+) -> None:
+    """Atomically apply explicit legal-policy grants and revocations."""
+    if not isinstance(grants, list) or not isinstance(revokes, list):
+        raise ValueError("grants and revokes must be lists")
+    if any(not isinstance(item, dict) for item in grants):
+        raise ValueError("Each grant must be an object")
+    grant_names = [item.get("permission") for item in grants]
+    revoke_names = list(revokes)
+    all_names = grant_names + revoke_names
+    if any(not isinstance(name, str) or name not in POLICY_PERMISSION_NAMES for name in all_names):
+        raise ValueError("Unknown policy permission")
+    if len(set(grant_names)) != len(grant_names) or len(set(revoke_names)) != len(revoke_names):
+        raise ValueError("Duplicate permission changes are not allowed")
+    if set(grant_names) & set(revoke_names):
+        raise ValueError("A permission cannot be granted and revoked in the same request")
+    if any(
+        not isinstance(item, dict)
+        or set(item) - {"permission", "reason"}
+        or not isinstance(item.get("reason", ""), str)
+        or len(item.get("reason", "")) > 500
+        for item in grants
+    ):
+        raise ValueError("Each grant must contain a permission and an optional reason of at most 500 characters")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _table_exists(conn, "policy_permission_assignments"):
+            raise ValueError("policy_permission_assignments table does not exist")
+        actor = conn.execute(
+            "SELECT id, role, is_active FROM users WHERE id = ?", (int(actor_user_id),)
+        ).fetchone()
+        if actor is None or actor["role"] != "admin" or not bool(actor["is_active"]):
+            raise PermissionError("An active System Administrator must manage permissions")
+        if int(actor_user_id) == int(user_id) and grants:
+            raise PermissionError("Administrators cannot grant legal permissions to themselves")
+        target = conn.execute("SELECT id FROM users WHERE id = ?", (int(user_id),)).fetchone()
+        if target is None:
+            raise ValueError(f"User {user_id} does not exist")
+        for item in grants:
+            permission = item["permission"]
+            existing = conn.execute(
+                """SELECT 1 FROM policy_permission_assignments
+                   WHERE user_id = ? AND permission = ? AND revoked_at IS NULL""",
+                (int(user_id), permission),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO policy_permission_assignments
+                       (user_id, permission, granted_by, granted_at, reason)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (int(user_id), permission, int(actor_user_id), now, item.get("reason") or None),
+                )
+        for permission in revoke_names:
+            conn.execute(
+                """UPDATE policy_permission_assignments SET revoked_at = ?
+                   WHERE user_id = ? AND permission = ? AND revoked_at IS NULL""",
+                (now, int(user_id), permission),
+            )
 
 
 def get_user_permissions(user_id: int) -> list[str]:
@@ -4470,6 +4562,25 @@ def get_user_permissions(user_id: int) -> list[str]:
             (user_id,),
         ).fetchall()
         return [row["permission"] for row in rows]
+
+
+def list_active_policy_permission_assignments(user_id: int) -> list[dict[str, Any]]:
+    """List active, audited legal-policy capabilities for the admin access view."""
+    with db_session() as conn:
+        if not _table_exists(conn, "policy_permission_assignments"):
+            return []
+        rows = conn.execute(
+            """
+            SELECT a.permission, a.granted_at, a.reason,
+                   granter.username AS granted_by_username
+            FROM policy_permission_assignments AS a
+            LEFT JOIN users AS granter ON granter.id = a.granted_by
+            WHERE a.user_id = ? AND a.revoked_at IS NULL
+            ORDER BY a.permission, a.granted_at, a.id
+            """,
+            (int(user_id),),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
 
 def _user_account_is_active(user: dict[str, Any]) -> bool:

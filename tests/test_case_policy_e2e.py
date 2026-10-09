@@ -24,6 +24,11 @@ from core.recurrence_policy import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_bootstrap_password(monkeypatch):
+    monkeypatch.setenv("TAVIDM_BOOTSTRAP_ADMIN_PASSWORD", "case-policy-test-only-2026")
+
+
 @pytest.fixture
 def test_db_path():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -327,7 +332,10 @@ def test_flask_case_apis_isolated(client, enforcer_client):
     assert printed.get_json()["notice_printed"] is True
 
     # Active System Administrator may perform case-review actions.
-    client.post("/login", data={"username": "admin", "password": "admin123"})
+    client.post(
+        "/login",
+        data={"username": "admin", "password": "case-policy-test-only-2026"},
+    )
     video2 = db.insert_video("adminok.mp4", "/tmp/adminok.mp4", status="ready")
     rid2 = db.insert_review_queue(
         video_id=video2,

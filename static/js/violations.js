@@ -12,6 +12,7 @@
     let selectedViolation = null;
     let requestSequence = 0;
     let filterTimer = null;
+    let currentCaseActions = {};
 
     const searchInput = document.getElementById("searchInput");
     const filterType = document.getElementById("filterType");
@@ -114,6 +115,7 @@
                 if (sequence !== requestSequence) return;
                 if (!payload.success) throw new Error(payload.error || "Could not load violations.");
                 allViolations = payload.items || [];
+                currentCaseActions = payload.case_actions || {};
                 totalRecords = Number(payload.total) || 0;
                 currentPage = payload.page || currentPage;
                 render();
@@ -191,6 +193,38 @@
             : (v.proposed_official_category
                 ? escapeHtml(v.proposed_official_category) + ' <span class="badge bg-secondary">proposed</span>'
                 : "—");
+        const caseActionButtons = [];
+        if (currentCaseActions.confirm_plate_identity) caseActionButtons.push(plateActionButton(v));
+        if (currentCaseActions.confirm_event_time) {
+            caseActionButtons.push(
+                '<button type="button" class="btn btn-sm btn-outline-primary" id="btnConfirmEventTime">' +
+                "Confirm Event Time</button>"
+            );
+        }
+        if (currentCaseActions.confirm_case) {
+            caseActionButtons.push(
+                '<button type="button" class="btn btn-sm btn-success" id="btnConfirmCase">' +
+                "Confirm Case</button>"
+            );
+        }
+        if (currentCaseActions.prepare_notice) {
+            caseActionButtons.push(
+                '<button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintable">' +
+                "Printable Record</button>"
+            );
+        }
+        if (currentCaseActions.attest_print) {
+            caseActionButtons.push(
+                '<button type="button" class="btn btn-sm btn-warning" id="btnAttestPrint">' +
+                "Attest Notice Printed</button>"
+            );
+        }
+        const caseActionBar = caseActionButtons.length
+            ? '<hr><div class="d-flex flex-wrap gap-2" id="caseActionBar">' +
+                caseActionButtons.join("") +
+                '</div><p class="small text-muted mt-2 mb-0">Preview/PDF/download do not establish Notice Printed. ' +
+                "Flag-only and unverified mappings remain review material.</p>"
+            : '<p class="small text-muted mt-3 mb-0">This account has view-only access to these case actions.</p>';
         body.innerHTML =
             '<div class="detail-grid">' +
             detailField("Violation ID", escapeHtml(v.id)) +
@@ -213,14 +247,7 @@
             detailField("Reason Log", escapeHtml(v.reason_log || ""), true) +
             "</div>" +
             plateMachineSection(v) +
-            '<hr><div class="d-flex flex-wrap gap-2" id="caseActionBar">' +
-            plateActionButton(v) +
-            '<button type="button" class="btn btn-sm btn-outline-primary" id="btnConfirmEventTime">Confirm Event Time</button>' +
-            '<button type="button" class="btn btn-sm btn-success" id="btnConfirmCase">Confirm Case</button>' +
-            '<button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintable">Printable Record</button>' +
-            '<button type="button" class="btn btn-sm btn-warning" id="btnAttestPrint">Attest Notice Printed</button>' +
-            "</div>" +
-            '<p class="small text-muted mt-2 mb-0">Preview/PDF/download do not establish Notice Printed. Flag-only and unverified mappings remain review material.</p>';
+            caseActionBar;
         detailModal.show();
         wireCaseActions(v);
     }

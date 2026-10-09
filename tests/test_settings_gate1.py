@@ -20,10 +20,18 @@ from core.violation_config import save_enabled_violations
 from database import db
 
 
+@pytest.fixture(autouse=True)
+def isolated_bootstrap_password(monkeypatch):
+    monkeypatch.setenv("TAVIDM_BOOTSTRAP_ADMIN_PASSWORD", "settings-gate-test-only-2026")
+
+
 @pytest.fixture
 def admin_client(client):
     """Logged-in admin client against the isolated temporary database."""
-    client.post("/login", data={"username": "admin", "password": "admin123"})
+    client.post(
+        "/login",
+        data={"username": "admin", "password": "settings-gate-test-only-2026"},
+    )
     return client
 
 

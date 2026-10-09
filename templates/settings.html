@@ -221,7 +221,7 @@
     <div class="col-lg-6">
         <div class="card card-panel">
             <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="card-title mb-0"><i class="bi bi-people me-2"></i>User Management</h5>
+                <h5 class="card-title mb-0"><i class="bi bi-people me-2"></i>Individual Account Access</h5>
                 <button class="btn btn-sm btn-danger" id="btnAddUser"><i class="bi bi-person-plus me-1"></i> Add User</button>
             </div>
             <div class="card-body p-0">
@@ -251,12 +251,44 @@
                                     {% endif %}
                                 </td>
                                 <td class="small">{{ user.created_at }}</td>
-                                <td><button class="btn btn-sm btn-outline-secondary btn-edit-user" aria-label="Edit user {{ user.username }}"><i class="bi bi-pencil"></i></button></td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-primary btn-user-access" aria-label="View access for {{ user.username }}">Access</button>
+                                        <button class="btn btn-outline-secondary btn-edit-user" aria-label="Edit user {{ user.username }}"><i class="bi bi-pencil"></i></button>
+                                    </div>
+                                </td>
                             </tr>
                             {% endfor %}
                         </tbody>
                     </table>
                 </div>
+            </div>
+        </div>
+
+        <div class="card card-panel mt-4">
+            <div class="card-header">
+                <h5 class="card-title mb-0"><i class="bi bi-shield-lock me-2"></i>Role Access Defaults</h5>
+            </div>
+            <div class="card-body">
+                <p class="small text-muted">Role defaults apply to active accounts. Some legal actions also require a separately recorded policy permission.</p>
+                <div class="table-responsive">
+                    <table class="table table-sm table-bordered align-middle mb-0">
+                        <thead><tr><th>Area</th><th>System Administrator</th><th>Traffic Enforcement Officer</th><th>Guest Viewer</th></tr></thead>
+                        <tbody>
+                            <tr><th>Dashboards, analytics, live monitoring, violations and standard evidence</th><td>View</td><td>View</td><td>View</td></tr>
+                            <tr><th>Review queue, queue evidence and review decisions</th><td>Manage</td><td>Manage</td><td>—</td></tr>
+                            <tr><th>Motorcycle detail review and evidence</th><td>Manage</td><td>Manage</td><td>—</td></tr>
+                            <tr><th>Reports</th><td>Manage</td><td>Manage</td><td>—</td></tr>
+                            <tr><th>Prepare and preview notices</th><td>Allowed</td><td>Allowed</td><td>—</td></tr>
+                            <tr><th>Attest that a notice was printed</th><td>Role default or explicit grant</td><td>Role default or explicit grant</td><td>Explicit grant</td></tr>
+                            <tr><th>Zone templates and annotations</th><td>Manage</td><td>Manage</td><td>View</td></tr>
+                            <tr><th>Camera setup and configuration</th><td>Manage</td><td>View and stop streams</td><td>View</td></tr>
+                            <tr><th>System settings and user accounts</th><td>Manage</td><td>—</td><td>—</td></tr>
+                            <tr><th>Approve legal policy</th><td>Explicit grant required</td><td>Explicit grant required</td><td>Explicit grant required</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <p class="small text-muted mt-3 mb-0">The current database supports only the listed legal-policy grants. It does not store general per-user grants or denials.</p>
             </div>
         </div>
 
@@ -395,6 +427,21 @@
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-danger" id="btnSaveUser"><i class="bi bi-check-lg me-1"></i> Save User</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Account access details and explicit legal-policy grants -->
+<div class="modal fade" id="userAccessModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="userAccessTitle">Account Access</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="userAccessBody" aria-live="polite">
+                <p class="text-muted mb-0">Select an account to view its role defaults and explicit legal-policy grants.</p>
             </div>
         </div>
     </div>

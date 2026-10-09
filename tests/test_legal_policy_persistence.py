@@ -532,7 +532,9 @@ class TestPermissions:
         test_db.assign_policy_permission(
             enforcer_user, "confirm_case", granted_by=admin_user
         )
-        test_db.revoke_policy_permission(enforcer_user, "confirm_case")
+        test_db.revoke_policy_permission(
+            enforcer_user, "confirm_case", revoked_by=admin_user
+        )
         assert test_db.user_has_permission(enforcer_user, "confirm_case") is False
 
     def test_get_user_permissions(self, test_db, admin_user, enforcer_user):

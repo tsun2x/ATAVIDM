@@ -234,7 +234,11 @@ $env:TAVIDM_BOOTSTRAP_ADMIN_PASSWORD = 'replace-this-with-your-own-unique-passwo
 $env:FLASK_SECRET_KEY = (& python -c "import secrets; print(secrets.token_hex(32))").Trim()
 ```
 
-### B. Sign in
+### B. Change or reset an account password
+
+An active System Administrator can set a user's password in **Settings → Individual Account Access → Edit**. Leave the password field blank to keep the current password. Changing a password invalidates that user's existing sessions on their next request. The bootstrap variable is for first-run creation or replacing the insecure legacy `admin123` account; it does not reset an already-secured account. TAVIDM has no self-service password reset or recovery flow if every administrator account is inaccessible.
+
+### C. Sign in
 
 Open **http://localhost:5000** — you are redirected to the login page.
 
@@ -246,7 +250,7 @@ The in-memory video processing queue is shared by threads in one app process.
 Run one worker process; multiple WSGI worker processes would each have a separate
 queue and could process videos concurrently.
 
-### C. Explore the UI
+### D. Explore the UI
 
 | URL | Page |
 |-----|------|
