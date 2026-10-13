@@ -11,7 +11,12 @@ import pytest
 import app as app_module
 from core.detection_config import VIOLATION_ILLEGAL_PARKING
 from core.upload_analytics import build_upload_processing_analytics
-from core.video_lifecycle import VideoLifecycleError, delete_video_permanently
+from core.video_lifecycle import (
+    VideoLifecycleError,
+    delete_video_permanently,
+    invalidate_processing_results_for_annotation_change,
+    remove_processing_results,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -302,6 +307,114 @@ class TestAttemptVsCompletedResult:
 
 
 class TestAtomicDeleteWithAudit:
+    @pytest.mark.parametrize(
+        "owner_scope", ["same_video", "other_video", "missing_annotated"]
+    )
+    def test_remove_results_preserves_raw_sidecar_referenced_by_confirmed_review(
+        self, owner_scope, test_db, tmp_path, monkeypatch
+    ):
+        """A confirmed review owns its raw scene sibling even if another row is removable."""
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "raw-protected.mp4")
+        scene_dir = tmp_path / "ev" / f"video_{vid}" / "run_33"
+        scene_dir.mkdir(parents=True)
+        annotated = scene_dir / "counterflow_f000010_t007.jpg"
+        raw = scene_dir / f"raw_{annotated.name}"
+        if owner_scope != "missing_annotated":
+            annotated.write_bytes(b"annotated-evidence")
+        raw.write_bytes(b"raw-evidence")
+        owner_video_id = vid
+        if owner_scope == "other_video":
+            owner_video_id, _ = _seed_video_with_source(test_db, tmp_path, "raw-owner.mp4")
+        test_db.insert_review_queue(
+            video_id=owner_video_id, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=10, evidence_path=str(annotated), status="confirmed",
+        )
+        test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=.8,
+            frame_number=11, evidence_path=str(annotated), status="pending",
+        )
+
+        remove_processing_results(vid, is_busy=lambda _v: False)
+
+        if owner_scope != "missing_annotated":
+            assert annotated.read_bytes() == b"annotated-evidence"
+        assert raw.read_bytes() == b"raw-evidence"
+
+    def test_reference_read_failure_after_quarantine_restores_all_files(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        """A DB reference-query error must not strand a prior quarantine move."""
+        from core import video_lifecycle as vl
+
+        _ready_paths(tmp_path, monkeypatch)
+        vid, source = _seed_video_with_source(test_db, tmp_path, "reference-failure.mp4")
+        run = test_db.create_processing_run(vid, "[]")
+        art = tmp_path / "ann" / f"run_{run}"
+        art.mkdir(parents=True)
+        annotated_video = art / "annotated.webm"
+        annotated_video.write_bytes(b"preserve-me")
+        scene = tmp_path / "ev" / f"video_{vid}_run_41" / "scene.jpg"
+        scene.parent.mkdir(parents=True)
+        scene.write_bytes(b"scene")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=10, evidence_path=str(scene), status="pending",
+        )
+
+        quarantine_moves = {"count": 0}
+        real_quarantine = vl._quarantine_path
+
+        def track_successful_move(path, token):
+            result = real_quarantine(path, token)
+            quarantine_moves["count"] += 1
+            return result
+
+        def fail_reference_read(_path, _video_id):
+            if quarantine_moves["count"] > 0:
+                raise sqlite3.OperationalError("injected reference query failure")
+            return False
+
+        monkeypatch.setattr(vl, "_quarantine_path", track_successful_move)
+        monkeypatch.setattr(vl, "_evidence_referenced_elsewhere", fail_reference_read)
+        with pytest.raises(VideoLifecycleError, match="reference"):
+            delete_video_permanently(
+                vid, is_busy=lambda _v: False, expected_filename="reference-failure.mp4"
+            )
+
+        assert quarantine_moves["count"] == 1
+        assert test_db.get_video(vid) is not None
+        assert source.is_file()
+        assert annotated_video.is_file() and annotated_video.read_bytes() == b"preserve-me"
+        assert scene.is_file()
+        qroot = tmp_path / "ann" / "_quarantine"
+        assert not qroot.exists() or list(qroot.iterdir()) == []
+
+    @pytest.mark.parametrize("cleanup", [remove_processing_results, invalidate_processing_results_for_annotation_change])
+    def test_recursive_detail_cleanup_keeps_shared_sequence_child(
+        self, cleanup, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "recursive-cleanup.mp4")
+        other, _other_path = _seed_video_with_source(test_db, tmp_path, "recursive-shared.mp4")
+        run_id = test_db.create_processing_run(vid, "[]")
+        detail_dir = tmp_path / "ev" / "detail" / f"run_{run_id}"
+        shared_sequence = detail_dir / "shared-sequence"
+        shared_sequence.mkdir(parents=True)
+        shared_child = shared_sequence / "frame.jpg"
+        removable_child = detail_dir / "stale-crop.jpg"
+        shared_child.write_bytes(b"shared")
+        removable_child.write_bytes(b"stale")
+        test_db.insert_review_queue(
+            video_id=other, track_id=9, violation_type="Counterflow", confidence=.8,
+            frame_number=3, evidence_sequence_dir=str(shared_sequence), status="pending",
+        )
+
+        cleanup(vid, is_busy=lambda _v: False)
+
+        assert shared_child.is_file()
+        assert not removable_child.exists()
+
     def test_audit_failure_restores_everything(self, test_db, tmp_path, monkeypatch):
         from core import video_lifecycle as vl
 
@@ -472,6 +585,199 @@ class TestAtomicDeleteWithAudit:
         assert detail["filename"] == "okdel.mp4"
         qroot = tmp_path / "ann" / "_quarantine"
         assert not qroot.exists() or list(qroot.glob("*")) == []
+
+    def test_permanent_delete_quarantines_raw_scene_sidecar_with_snapshot(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "raw-delete.mp4")
+        directory = tmp_path / "ev" / f"video_{vid}_run_41"
+        directory.mkdir(parents=True)
+        annotated = directory / "counterflow_f000010_t007.jpg"
+        raw = directory / f"raw_{annotated.name}"
+        annotated.write_bytes(b"annotated")
+        raw.write_bytes(b"raw")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=10, evidence_path=str(annotated), status="pending",
+        )
+
+        result = delete_video_permanently(
+            vid, is_busy=lambda _v: False, expected_filename="raw-delete.mp4"
+        )
+
+        assert result["success"] is True
+        assert not annotated.exists()
+        assert not raw.exists()
+
+
+    def test_remove_results_deletes_paired_scene_files_but_keeps_another_source(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "remove-raw.mp4")
+        other, _other_path = _seed_video_with_source(test_db, tmp_path, "other.mp4")
+        event_dir = tmp_path / "ev" / f"video_{vid}_run_17"
+        event_dir.mkdir(parents=True)
+        annotated = event_dir / "illegal_parking_f000020_t003.jpg"
+        raw = event_dir / f"raw_{annotated.name}"
+        annotated.write_bytes(b"annotated")
+        raw.write_bytes(b"raw")
+        other_dir = tmp_path / "ev" / f"video_{other}_run_18"
+        other_dir.mkdir(parents=True)
+        other_file = other_dir / "keep.jpg"
+        other_file.write_bytes(b"other")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=3, violation_type="Illegal Parking", confidence=.7,
+            frame_number=20, evidence_path=str(annotated), status="pending",
+        )
+        test_db.insert_review_queue(
+            video_id=other, track_id=4, violation_type="Illegal Parking", confidence=.7,
+            frame_number=20, evidence_path=str(other_file), status="pending",
+        )
+
+        remove_processing_results(vid, is_busy=lambda _v: False)
+
+        assert not annotated.exists()
+        assert not raw.exists()
+        assert other_file.is_file()
+
+    def test_remove_results_also_deletes_dismissed_artifacts(self, test_db, tmp_path, monkeypatch):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "dismissed-artifact.mp4")
+        event_dir = tmp_path / "ev" / f"video_{vid}_run_27"
+        event_dir.mkdir(parents=True)
+        scene = event_dir / "scene.jpg"
+        raw = event_dir / "raw_scene.jpg"
+        scene.write_bytes(b"annotated")
+        raw.write_bytes(b"raw")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=10, evidence_path=str(scene), status="dismissed",
+        )
+
+        remove_processing_results(vid, is_busy=lambda _v: False)
+
+        assert test_db.list_review_items_for_video(vid, status="dismissed") == []
+        assert not scene.exists()
+        assert not raw.exists()
+
+    def test_annotation_invalidation_preserves_sidecar_shared_with_confirmed_case(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "shared-raw.mp4")
+        directory = tmp_path / "ev" / f"video_{vid}_run_19"
+        directory.mkdir(parents=True)
+        annotated = directory / "obstruction_f000030_t005.jpg"
+        raw = directory / f"raw_{annotated.name}"
+        annotated.write_bytes(b"annotated")
+        raw.write_bytes(b"raw")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=5, violation_type="Obstruction", confidence=.7,
+            frame_number=30, evidence_path=str(annotated), status="pending",
+        )
+        test_db.insert_violation(
+            video_id=vid, track_id=5, violation_type="Obstruction", confidence=.7,
+            frame_number=30, timestamp_sec=3.0, evidence_path=str(annotated), status="confirmed",
+        )
+
+        invalidate_processing_results_for_annotation_change(vid, is_busy=lambda _v: False)
+
+        assert annotated.is_file()
+        assert raw.is_file()
+
+    def test_annotation_invalidation_preserves_retained_sequence_parent_of_pending_file(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "retained-sequence.mp4")
+        sequence = tmp_path / "ev" / f"video_{vid}_run_21" / "sequence"
+        sequence.mkdir(parents=True)
+        retained_frame = sequence / "frame-1.jpg"
+        pending_frame = sequence / "frame-2.jpg"
+        retained_frame.write_bytes(b"confirmed")
+        pending_frame.write_bytes(b"pending")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=1, evidence_sequence_dir=str(sequence), status="confirmed",
+        )
+        test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=.8,
+            frame_number=2, evidence_path=str(pending_frame), status="pending",
+        )
+
+        invalidate_processing_results_for_annotation_change(vid, is_busy=lambda _v: False)
+
+        assert retained_frame.is_file()
+        assert pending_frame.is_file()
+
+    def test_remove_results_preserves_retained_sequence_parent_of_pending_file(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "remove-retained-sequence.mp4")
+        sequence = tmp_path / "ev" / f"video_{vid}_run_23" / "sequence"
+        sequence.mkdir(parents=True)
+        retained_frame = sequence / "frame-1.jpg"
+        pending_frame = sequence / "frame-2.jpg"
+        retained_frame.write_bytes(b"confirmed")
+        pending_frame.write_bytes(b"pending")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=.8,
+            frame_number=1, evidence_sequence_dir=str(sequence), status="confirmed",
+        )
+        test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=.8,
+            frame_number=2, evidence_path=str(pending_frame), status="pending",
+        )
+
+        remove_processing_results(vid, is_busy=lambda _v: False)
+
+        assert retained_frame.is_file()
+        assert pending_frame.is_file()
+
+    def test_annotation_invalidation_preserves_cross_video_shared_parent_of_file(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "shared-child.mp4")
+        other, _other_path = _seed_video_with_source(test_db, tmp_path, "shared-parent.mp4")
+        shared_dir = tmp_path / "ev" / "shared-sequence"
+        shared_dir.mkdir(parents=True)
+        child = shared_dir / "frame.jpg"
+        child.write_bytes(b"shared")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=.8,
+            frame_number=2, evidence_path=str(child), status="pending",
+        )
+        test_db.insert_review_queue(
+            video_id=other, track_id=9, violation_type="Counterflow", confidence=.8,
+            frame_number=3, evidence_sequence_dir=str(shared_dir), status="pending",
+        )
+
+        invalidate_processing_results_for_annotation_change(vid, is_busy=lambda _v: False)
+
+        assert child.is_file()
+
+    def test_remove_results_cleans_raw_sidecar_when_annotated_file_is_missing(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        _ready_paths(tmp_path, monkeypatch)
+        vid, _path = _seed_video_with_source(test_db, tmp_path, "missing-annotated.mp4")
+        directory = tmp_path / "ev" / f"video_{vid}_run_22"
+        directory.mkdir(parents=True)
+        annotated = directory / "scene.jpg"
+        raw = directory / "raw_scene.jpg"
+        raw.write_bytes(b"raw")
+        test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=.8,
+            frame_number=2, evidence_path=str(annotated), status="pending",
+        )
+
+        remove_processing_results(vid, is_busy=lambda _v: False)
+
+        assert not raw.exists()
 
     def test_purge_failure_after_commit_reports_cleanup_warning(
         self, test_db, tmp_path, monkeypatch

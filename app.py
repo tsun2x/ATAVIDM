@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import sqlite3
 import threading
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
@@ -77,6 +78,7 @@ from core.video_lifecycle import (
 )
 from core.video_processor import ProcessVideoCancelled, ProcessVideoError, ProcessVideoResult, process_video
 from database.sqlite_adapter import TemporalEvidenceNotReady
+from database.review_revision import motorcycle_detail_review_revision
 from core.recording_time import RecordingTimeError, normalize_recorded_at
 from core.zone_config import (
     dumps_zones,
@@ -243,6 +245,48 @@ def _record_evidence_url(record_id: int, kind: str, *, review: bool = False) -> 
     return url_for(endpoint, record_id=record_id, kind=kind)
 
 
+def _raw_scene_url(record_id: int, stored_path: str | None, *, review: bool = False) -> str | None:
+    if not stored_path:
+        return None
+    from core.evidence import raw_scene_sidecar_path
+
+    path = _private_file_path(stored_path, [config.EVIDENCE_FOLDER])
+    if path is None or raw_scene_sidecar_path(path) is None:
+        return None
+    endpoint = "api_review_evidence" if review else "api_violation_evidence"
+    return url_for(endpoint, record_id=record_id, kind="raw-scene")
+
+
+def _preferred_scene_url(record_id: int, sequence_dir: str | None, *, review: bool = False) -> str | None:
+    if not sequence_dir:
+        return None
+    directory = _private_file_path(sequence_dir, [config.EVIDENCE_FOLDER])
+    if directory is None or not directory.is_dir():
+        return None
+    image = _private_file_path(str(directory / "preferred_scene.jpg"), [config.EVIDENCE_FOLDER])
+    if image is None or not image.is_file():
+        return None
+    endpoint = "api_review_evidence" if review else "api_violation_evidence"
+    return url_for(endpoint, record_id=record_id, kind="preferred-scene")
+
+
+def _preferred_scene_reason(sequence_dir: str | None) -> str | None:
+    if not sequence_dir:
+        return None
+    directory = _private_file_path(sequence_dir, [config.EVIDENCE_FOLDER])
+    if directory is None:
+        return None
+    metadata = _private_file_path(str(directory / "preferred_scene.json"), [config.EVIDENCE_FOLDER])
+    if metadata is None or not metadata.is_file():
+        return None
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    reason = payload.get("selection_reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
 def _private_file_path(stored_path: str | None, roots: list[str | Path]) -> Path | None:
     if not stored_path:
         return None
@@ -363,11 +407,24 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "track_id": row.get("track_id"),
         "timestamp": detected,
         "timestamp_iso": detected.replace(" ", "T"),
-        "confidence": row.get("confidence") or 0,
+        "confidence": (
+            row.get("violation_confidence")
+            if row.get("violation_confidence") is not None
+            else row.get("confidence")
+        ),
+        "violation_confidence": (
+            row.get("violation_confidence")
+            if row.get("violation_confidence") is not None
+            else row.get("confidence")
+        ),
+        "detection_confidence": row.get("detection_confidence"),
         "status": row.get("status"),
         "condition": (video or {}).get("condition") or "—",
         "vehicle_class": row.get("vehicle_class") or "—",
         "evidence_url": _record_evidence_url(vid, "scene") if row.get("evidence_path") else None,
+        "raw_evidence_url": _raw_scene_url(vid, row.get("evidence_path")),
+        "preferred_evidence_url": _preferred_scene_url(vid, row.get("evidence_sequence_dir")),
+        "preferred_evidence_reason": _preferred_scene_reason(row.get("evidence_sequence_dir")),
         "vehicle_evidence_url": _record_evidence_url(vid, "vehicle") if row.get("vehicle_evidence_path") else None,
         "evidence_clip_url": _record_evidence_url(vid, "clip") if row.get("evidence_clip_path") else None,
         "annotated_evidence_clip_url": (
@@ -438,10 +495,23 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "track_id": row.get("track_id"),
         "violation_type": row.get("violation_type"),
         "type_slug": _vtype_slug(row.get("violation_type") or ""),
-        "confidence": row.get("confidence") or 0,
+        "confidence": (
+            row.get("violation_confidence")
+            if row.get("violation_confidence") is not None
+            else row.get("confidence")
+        ),
+        "violation_confidence": (
+            row.get("violation_confidence")
+            if row.get("violation_confidence") is not None
+            else row.get("confidence")
+        ),
+        "detection_confidence": row.get("detection_confidence"),
         "frame_number": row.get("frame_number"),
         "vehicle_class": row.get("vehicle_class") or "—",
         "evidence_url": _record_evidence_url(row["id"], "scene", review=True) if row.get("evidence_path") else None,
+        "raw_evidence_url": _raw_scene_url(row["id"], row.get("evidence_path"), review=True),
+        "preferred_evidence_url": _preferred_scene_url(row["id"], row.get("evidence_sequence_dir"), review=True),
+        "preferred_evidence_reason": _preferred_scene_reason(row.get("evidence_sequence_dir")),
         "vehicle_evidence_url": _record_evidence_url(row["id"], "vehicle", review=True) if row.get("vehicle_evidence_path") else None,
         "evidence_clip_url": _record_evidence_url(row["id"], "clip", review=True) if row.get("evidence_clip_path") else None,
         "annotated_evidence_clip_url": (
@@ -497,6 +567,10 @@ def _user_to_ui(row: dict) -> dict:
         "id": row["id"],
         "username": row["username"],
         "name": row.get("full_name") or row["username"],
+        "full_name_raw": row.get("full_name") or "",
+        # Raw persisted value is needed for exact account-edit reconciliation;
+        # ``name`` is intentionally display-fallback text.
+        "full_name_raw": row.get("full_name") or "",
         "role": row["role"],
         "role_label": auth.ROLE_LABELS.get(row["role"], row["role"]),
         "is_active": bool(row.get("is_active", 1)),
@@ -812,9 +886,100 @@ def api_list_violations():
     })
 
 
+@app.route("/api/violations/vehicle-groups", methods=["GET"])
+@auth.login_required
+def api_list_vehicle_groups():
+    """Opt-in vehicle view. Filter matching events first, then group and paginate."""
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 8)))
+    sort = request.args.get("sort", "newest")
+    if sort not in {"newest", "oldest", "confidence_desc", "confidence_asc", "type"}:
+        sort = "newest"
+    filters = {
+        key: request.args.get(key)
+        for key in ("search", "violation_type", "video_name", "date_from", "date_to", "status")
+        if request.args.get(key)
+    }
+    video_id = request.args.get("video_id", "")
+    if video_id.isdigit():
+        filters["video_id"] = int(video_id)
+
+    # A complete bounded result is necessary to keep groups stable across pages.
+    # Refuse oversized result sets instead of silently splitting a group.
+    group_event_limit = 100
+    rows, event_total = db.list_violations(
+        filters=filters, page=1, per_page=group_event_limit + 1, sort=sort
+    )
+    if event_total > group_event_limit:
+        return jsonify({
+            "success": False,
+            "error": "Vehicle grouping is limited to 100 matching events. Narrow the filters or switch to Individual events.",
+            "event_total": event_total,
+        }), 413
+
+    from core.vehicle_grouping import group_vehicle_events
+
+    provenance = db.list_vehicle_grouping_provenance(
+        [int(row["id"]) for row in rows if type(row.get("id")) is int]
+    )
+    groups = group_vehicle_events(
+        rows,
+        evidence_root=Path(config.EVIDENCE_FOLDER),
+        provenance_by_case=provenance,
+    )
+    group_total = len(groups)
+    verified_vehicle_total = sum(bool(group["vehicle_identity_verified"]) for group in groups)
+    unassociated_event_total = sum(
+        int(group["event_count"]) for group in groups if not group["vehicle_identity_verified"]
+    )
+    last_page = max(1, (group_total + per_page - 1) // per_page)
+    page = min(page, last_page)
+    start = (page - 1) * per_page
+    videos = _video_name_map()
+    actor = auth.current_user()
+    return jsonify({
+        "success": True,
+        "groups": [
+            {
+                **{key: value for key, value in group.items() if key != "events"},
+                "events": [_violation_to_ui(event, videos) for event in group["events"]],
+            }
+            for group in groups[start:start + per_page]
+        ],
+        "case_actions": _case_actions_for_user(actor),
+        "total": group_total,
+        "group_total": group_total,
+        "verified_vehicle_total": verified_vehicle_total,
+        "unassociated_event_total": unassociated_event_total,
+        "event_total": event_total,
+        "page": page,
+        "per_page": per_page,
+    })
+
+
 @app.route("/api/violations/<int:record_id>/evidence/<kind>")
 @auth.login_required
 def api_violation_evidence(record_id: int, kind: str):
+    if kind == "preferred-scene":
+        row = db.get_violation(record_id)
+        if row is None:
+            return jsonify({"success": False, "error": "Evidence not found."}), 404
+        directory = _private_file_path(row.get("evidence_sequence_dir"), [config.EVIDENCE_FOLDER])
+        path = _private_file_path(str(directory / "preferred_scene.jpg"), [config.EVIDENCE_FOLDER]) if directory else None
+        if path is None or not path.is_file():
+            return jsonify({"success": False, "error": "Preferred event frame is unavailable."}), 404
+        return _evidence_media_response(str(path))
+    if kind == "raw-scene":
+        row = db.get_violation(record_id)
+        if row is None:
+            return jsonify({"success": False, "error": "Evidence not found."}), 404
+        from core.evidence import raw_scene_sidecar_path
+
+        path = _private_file_path(row.get("evidence_path"), [config.EVIDENCE_FOLDER])
+        raw_path = raw_scene_sidecar_path(path) if path else None
+        if raw_path is None:
+            return jsonify({"success": False, "error": "Raw scene evidence is unavailable."}), 404
+        return _evidence_media_response(str(raw_path))
     if kind == "annotated-clip":
         row = db.get_violation(record_id)
         path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
@@ -831,6 +996,26 @@ def api_violation_evidence(record_id: int, kind: str):
 @app.route("/api/review-queue/<int:record_id>/evidence/<kind>")
 @auth.role_required("enforcer")
 def api_review_evidence(record_id: int, kind: str):
+    if kind == "preferred-scene":
+        row = db.get_review_item(record_id)
+        if row is None:
+            return jsonify({"success": False, "error": "Evidence not found."}), 404
+        directory = _private_file_path(row.get("evidence_sequence_dir"), [config.EVIDENCE_FOLDER])
+        path = _private_file_path(str(directory / "preferred_scene.jpg"), [config.EVIDENCE_FOLDER]) if directory else None
+        if path is None or not path.is_file():
+            return jsonify({"success": False, "error": "Preferred event frame is unavailable."}), 404
+        return _evidence_media_response(str(path))
+    if kind == "raw-scene":
+        row = db.get_review_item(record_id)
+        if row is None:
+            return jsonify({"success": False, "error": "Evidence not found."}), 404
+        from core.evidence import raw_scene_sidecar_path
+
+        path = _private_file_path(row.get("evidence_path"), [config.EVIDENCE_FOLDER])
+        raw_path = raw_scene_sidecar_path(path) if path else None
+        if raw_path is None:
+            return jsonify({"success": False, "error": "Raw scene evidence is unavailable."}), 404
+        return _evidence_media_response(str(raw_path))
     if kind == "annotated-clip":
         row = db.get_review_item(record_id)
         path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
@@ -2837,6 +3022,8 @@ def _motorcycle_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> di
         "scan_error": row.get("scan_error"),
         "reviewer_notes": row.get("reviewer_notes"),
         "reviewed_at": row.get("reviewed_at"),
+        "reviewer_name": row.get("reviewer_full_name") or row.get("reviewer_username"),
+        "review_revision": motorcycle_detail_review_revision(row),
         "queued_at": row.get("created_at"),
         # Explicit contract: this queue has no case-confirm action.
         "can_confirm": False,
@@ -2932,6 +3119,8 @@ def api_motorcycle_detail_outcome(candidate_id: int):
     payload = request.get_json(silent=True) or {}
     outcome = str(payload.get("outcome") or "").strip().lower()
     notes = payload.get("notes")
+    expected_outcome = payload.get("expected_outcome")
+    expected_revision = payload.get("expected_revision")
     if outcome not in ("reviewed", "dismissed", "uncertain"):
         return jsonify(
             {
@@ -2939,18 +3128,45 @@ def api_motorcycle_detail_outcome(candidate_id: int):
                 "error": "Outcome must be reviewed, dismissed, or uncertain.",
             }
         ), 400
+    if expected_outcome is not None and expected_outcome not in ("pending", "reviewed", "dismissed", "uncertain"):
+        return jsonify({"success": False, "error": "Invalid expected outcome."}), 400
+    if expected_revision is not None and (
+        not isinstance(expected_revision, str)
+        or len(expected_revision) != 64
+        or any(char not in "0123456789abcdef" for char in expected_revision)
+    ):
+        return jsonify({"success": False, "error": "Invalid review revision."}), 400
     if db.get_motorcycle_detail_candidate(candidate_id) is None:
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     try:
-        db.record_motorcycle_detail_review(
+        saved_snapshot = db.record_motorcycle_detail_review(
             candidate_id=candidate_id,
             outcome=outcome,
             reviewed_by=auth.current_user()["id"],
             notes=notes if isinstance(notes, str) else None,
+            expected_outcome=expected_outcome,
+            expected_revision=expected_revision,
+            return_snapshot=True,
         )
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
-    return jsonify({"success": True, "id": candidate_id, "outcome": outcome})
+    if saved_snapshot is False:
+        return jsonify({
+            "success": False,
+            "error": "This observation was updated by another reviewer. Reload it before making another change.",
+        }), 409
+    # Keep every response field on the snapshot returned before the write lock
+    # was released; a later review may already have superseded it.
+    updated = saved_snapshot if isinstance(saved_snapshot, dict) else {}
+    return jsonify({
+        "success": True,
+        "id": candidate_id,
+        "outcome": updated.get("human_outcome", outcome),
+        "reviewed_at": updated.get("reviewed_at"),
+        "reviewer_name": updated.get("reviewer_full_name") or updated.get("reviewer_username"),
+        "reviewer_notes": updated.get("reviewer_notes"),
+        "review_revision": motorcycle_detail_review_revision(updated),
+    })
 
 
 @app.route("/api/motorcycle-detail-review/scan-now", methods=["POST"])
@@ -3269,6 +3485,8 @@ def api_generate_report():
             title=(payload.get("title") or "").strip() or None,
             generated_by=user["id"],
         )
+    except reports_core.ReportLogoError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
     return jsonify({"success": True, "report": _report_to_ui(row)})
@@ -3372,18 +3590,27 @@ def api_create_user():
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     role = payload.get("role") or "enforcer"
+    is_active = payload.get("is_active", True)
     if not username or not password:
         return jsonify({"success": False, "error": "Username and password are required."}), 400
+    if not isinstance(is_active, bool):
+        return jsonify({"success": False, "error": "is_active must be true or false."}), 400
     if role not in auth.ROLES:
         return jsonify({"success": False, "error": f"Role must be one of: {', '.join(auth.ROLES)}."}), 400
     if db.get_user_by_username(username):
         return jsonify({"success": False, "error": "Username already exists."}), 400
-    user_id = db.create_user(
-        username,
-        auth.hash_password(password),
-        role=role,
-        full_name=(payload.get("full_name") or "").strip() or None,
-    )
+    try:
+        user_id = db.create_user(
+            username,
+            auth.hash_password(password),
+            role=role,
+            full_name=(payload.get("full_name") or "").strip() or None,
+            is_active=is_active,
+        )
+    except sqlite3.IntegrityError:
+        # The preflight lookup improves the common message, while the unique
+        # constraint remains authoritative for simultaneous account requests.
+        return jsonify({"success": False, "error": "Username already exists."}), 400
     return jsonify({"success": True, "user": _user_to_ui(db.get_user(user_id))})
 
 

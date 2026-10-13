@@ -317,6 +317,28 @@ class TestHumanOutcomes:
                 candidate_id=9999, outcome="reviewed", reviewed_by=None
             )
 
+    def test_expected_outcome_prevents_stale_review_overwrite_and_allows_replay(
+        self, test_db, video_row
+    ):
+        candidate_id = _seed_candidate(test_db, video_id=video_row)
+        first_reviewer = test_db.create_user("reviewer_one", "hash", role="enforcer")
+        second_reviewer = test_db.create_user("reviewer_two", "hash", role="enforcer")
+        assert test_db.record_motorcycle_detail_review(
+            candidate_id=candidate_id, outcome="reviewed", reviewed_by=first_reviewer,
+            expected_outcome="pending",
+        ) is True
+        assert test_db.record_motorcycle_detail_review(
+            candidate_id=candidate_id, outcome="uncertain", reviewed_by=second_reviewer,
+            expected_outcome="pending",
+        ) is False
+        assert test_db.record_motorcycle_detail_review(
+            candidate_id=candidate_id, outcome="reviewed", reviewed_by=second_reviewer,
+            expected_outcome="pending",
+        ) is True
+        row = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert row["human_outcome"] == "reviewed"
+        assert row["reviewed_by"] == first_reviewer
+
     def test_scan_never_creates_violations_or_review_rows(self, test_db, video_row):
         candidate_id = _seed_candidate(test_db, video_id=video_row)
         test_db.claim_motorcycle_detail_scans(10)

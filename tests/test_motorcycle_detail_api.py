@@ -247,6 +247,128 @@ class TestOutcomeEndpoint:
         assert response.status_code == 200
         assert response.get_json()["outcome"] == outcome
 
+    def test_stale_second_reviewer_receives_conflict(self, detail_enforcer, seeded, test_db):
+        _video_id, candidate_id = seeded
+        path = f"/api/motorcycle-detail-review/{candidate_id}/outcome"
+        first = detail_enforcer.post(path, json={
+            "outcome": "reviewed", "expected_outcome": "pending"
+        })
+        assert first.status_code == 200
+        assert first.get_json()["reviewed_at"]
+        assert first.get_json()["reviewer_name"]
+        stale = detail_enforcer.post(path, json={
+            "outcome": "uncertain", "expected_outcome": "pending"
+        })
+        assert stale.status_code == 409
+        assert test_db.get_motorcycle_detail_candidate(candidate_id)["human_outcome"] == "reviewed"
+
+    def test_full_revision_blocks_same_outcome_review_overwrites_and_aba(
+        self, detail_enforcer, seeded, test_db
+    ):
+        _video_id, candidate_id = seeded
+        second_reviewer = _create_user("detail_reviewer_two", "enforcer-pass-2", "enforcer")
+        path = f"/api/motorcycle-detail-review/{candidate_id}/outcome"
+        listed = detail_enforcer.get("/api/motorcycle-detail-review?outcome=pending").get_json()
+        initial = next(item for item in listed["items"] if item["id"] == candidate_id)
+        rev0 = initial["review_revision"]
+        assert len(rev0) == 64
+
+        first = detail_enforcer.post(path, json={
+            "outcome": "uncertain", "notes": "first reviewer notes", "expected_revision": rev0,
+        })
+        assert first.status_code == 200
+        saved = test_db.get_motorcycle_detail_candidate(candidate_id)
+        rev1 = first.get_json()["review_revision"]
+        assert rev1 != rev0
+        saved_by = saved["reviewed_by"]
+        saved_at = saved["reviewed_at"]
+
+        # A byte-for-byte retry after a lost response is stale: reload is the
+        # defined reconciliation path and persisted attribution is unchanged.
+        replay = detail_enforcer.post(path, json={
+            "outcome": "uncertain", "notes": "first reviewer notes", "expected_revision": rev0,
+        })
+        assert replay.status_code == 409
+        # Same outcome is not enough to let a second reviewer replace notes.
+        same_outcome = second_reviewer.post(path, json={
+            "outcome": "uncertain", "notes": "second reviewer notes", "expected_revision": rev0,
+        })
+        assert same_outcome.status_code == 409
+        saved_after_conflicts = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert saved_after_conflicts["reviewed_by"] == saved_by
+        assert saved_after_conflicts["reviewed_at"] == saved_at
+        assert saved_after_conflicts["reviewer_notes"] == "first reviewer notes"
+
+        # Current revision may change outcome; old token cannot perform ABA.
+        changed = second_reviewer.post(path, json={
+            "outcome": "reviewed", "notes": "second reviewer notes", "expected_revision": rev1,
+        })
+        assert changed.status_code == 200
+        aba = detail_enforcer.post(path, json={
+            "outcome": "uncertain", "notes": "first reviewer notes", "expected_revision": rev0,
+        })
+        assert aba.status_code == 409
+        current = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert current["human_outcome"] == "reviewed"
+        assert current["reviewed_by"] != saved_by
+        assert current["reviewer_notes"] == "second reviewer notes"
+
+    def test_success_response_uses_snapshot_written_by_its_transaction(
+        self, detail_enforcer, seeded, test_db, monkeypatch
+    ):
+        """A later reviewer must not leak metadata into the first response."""
+        from database import db
+        from database.review_revision import motorcycle_detail_review_revision
+
+        _video_id, candidate_id = seeded
+        path = f"/api/motorcycle-detail-review/{candidate_id}/outcome"
+        initial = detail_enforcer.get("/api/motorcycle-detail-review?outcome=pending").get_json()
+        row = next(item for item in initial["items"] if item["id"] == candidate_id)
+        revision_a = row["review_revision"]
+        reviewer_b = test_db.create_user("snapshot_reviewer_b", "hash", role="enforcer")
+        real_record = db.record_motorcycle_detail_review
+        injected = {"done": False}
+
+        def save_then_interleave(**kwargs):
+            saved = real_record(**kwargs)
+            if not injected["done"] and kwargs.get("candidate_id") == candidate_id and saved is not False:
+                injected["done"] = True
+                first = test_db.get_motorcycle_detail_candidate(candidate_id)
+                real_record(
+                    candidate_id=candidate_id,
+                    outcome="uncertain",
+                    reviewed_by=reviewer_b,
+                    notes="second reviewer saved between response construction steps",
+                    expected_revision=motorcycle_detail_review_revision(first),
+                )
+            return saved
+
+        monkeypatch.setattr(db, "record_motorcycle_detail_review", save_then_interleave)
+        response = detail_enforcer.post(path, json={
+            "outcome": "reviewed",
+            "notes": "first reviewer snapshot",
+            "expected_revision": revision_a,
+        })
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["outcome"] == "reviewed"
+        assert payload["reviewer_notes"] == "first reviewer snapshot"
+        assert payload["reviewer_name"] == "detail_enforcer"
+        assert payload["review_revision"] != motorcycle_detail_review_revision(
+            test_db.get_motorcycle_detail_candidate(candidate_id)
+        )
+
+        stale_followup = detail_enforcer.post(path, json={
+            "outcome": "dismissed",
+            "notes": "must reload before another save",
+            "expected_revision": payload["review_revision"],
+        })
+        assert stale_followup.status_code == 409
+        current = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert current["human_outcome"] == "uncertain"
+        assert current["reviewed_by"] == reviewer_b
+        assert current["reviewer_notes"] == "second reviewer saved between response construction steps"
+
     def test_confirm_outcome_is_refused(self, detail_enforcer, seeded, test_db):
         _, candidate_id = seeded
         response = detail_enforcer.post(

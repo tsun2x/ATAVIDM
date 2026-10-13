@@ -28,7 +28,7 @@
     <div class="col-sm-6 col-xl-3">
         <div class="kpi-card">
             <div class="kpi-icon bg-success-subtle text-success"><i class="bi bi-bullseye"></i></div>
-            <div><span class="kpi-label">Avg. Detection Confidence</span><span class="kpi-value">{{ analytics.kpi.avg_confidence }}%</span></div>
+            <div><span class="kpi-label">Avg. Rule Evidence Score</span><span class="kpi-value">{% if analytics.kpi.avg_confidence is none %}Unavailable{% else %}{{ analytics.kpi.avg_confidence }}%{% endif %}</span></div>
         </div>
     </div>
 </div>
@@ -66,7 +66,7 @@
     </div>
     <div class="col-lg-4">
         <div class="card card-panel h-100">
-            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-bullseye me-2"></i>Detection Confidence</h5></div>
+            <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-bullseye me-2"></i>Rule Evidence Score Bands</h5><p class="small text-muted mb-0">Evidence-strength guidance, not a probability of guilt.</p></div>
             <div class="card-body"><div class="chart-container"><canvas id="confidenceChart"></canvas></div></div>
         </div>
     </div>

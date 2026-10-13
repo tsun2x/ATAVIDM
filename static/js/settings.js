@@ -363,7 +363,9 @@
         refreshUserAccess(userId, generation);
     });
 
+    let userSavePending = false;
     document.getElementById("btnSaveUser")?.addEventListener("click", function () {
+        if (userSavePending) return;
         const id = document.getElementById("editUserId").value;
         const body = {
             username: document.getElementById("editUserUsername").value.trim(),
@@ -376,22 +378,96 @@
             showToast("Missing Fields", "Username and password are required for new users.", "warning");
             return;
         }
+        const saveButton = document.getElementById("btnSaveUser");
+        const usersBody = document.getElementById("usersTableBody");
+        const initiallyExisting = Array.from(usersBody?.querySelectorAll("tr[data-user]") || []).some(function (row) {
+            try { return JSON.parse(row.dataset.user).username === body.username; } catch (_error) { return false; }
+        });
+        userSavePending = true;
+        if (saveButton) saveButton.disabled = true;
+
+        function showRejected(message) {
+            try { showToast("Error", message || "Save failed.", "danger"); } catch (_uiError) { /* Keep the editor state. */ }
+        }
+
+        function reconcileUncertainWrite() {
+            return fetch("/api/users").then(function (response) {
+                return response.json().then(function (payload) {
+                    if (!response.ok || !payload.success || !Array.isArray(payload.users)) {
+                        throw new Error("Could not verify the saved account.");
+                    }
+                    const found = payload.users.find(function (user) {
+                        return id ? String(user.id) === String(id) : user.username === body.username;
+                    });
+                    const matches = !!found && found.role === body.role &&
+                        found.is_active === body.is_active && found.full_name_raw === body.full_name;
+                    if (id && matches && !body.password) {
+                        try {
+                            showToast("Account Saved", "The server list confirms the requested account fields.", "success");
+                            userModal?.hide();
+                            window.location.reload();
+                        } catch (_uiError) {
+                            showRejected("The server confirmed the account update, but the page could not refresh.");
+                        }
+                    } else if (!id && found && !initiallyExisting && matches) {
+                        showToast("Save Outcome Unclear", "A matching account appeared after submission, but the list cannot verify this request or its password. Do not retry yet; check the account before proceeding.", "warning");
+                    } else if (!id && initiallyExisting) {
+                        showToast("Save Outcome Unclear", "This username existed before submission, so the list cannot confirm a new account was created. Your entries are still available.", "warning");
+                    } else {
+                        showToast("Save Outcome Unclear", "The server list did not confirm every requested field. Do not retry yet; check the account first. Your entries are still available.", "warning");
+                    }
+                });
+            }).catch(function () {
+                showToast("Save Outcome Unclear", "The request may have reached the server, but the account list could not be checked. Do not retry yet; refresh the list before trying again. Your entries are still available.", "warning");
+            });
+        }
+
         fetch(id ? "/api/users/" + id : "/api/users", {
             method: id ? "PUT" : "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
         })
-            .then(function (r) { return r.json(); })
-            .then(function (payload) {
-                if (payload.success) {
-                    showToast("User Saved", payload.user.username, "success");
-                    userModal?.hide();
-                    window.location.reload();
-                } else {
-                    showToast("Error", payload.error || "Save failed.", "danger");
-                }
+            .then(function (response) {
+                return response.json().then(function (payload) {
+                    return { response: response, payload: payload };
+                }, function () { return { response: response, payload: null }; });
             })
-            .catch(function () { showToast("Error", "Save failed. Please try again.", "danger"); });
+            .then(function (result) {
+                const response = result.response;
+                const payload = result.payload;
+                if (response.redirected && /\/login(?:\/|[?#]|$)/.test(response.url || "")) {
+                    showRejected("Your session expired or is not authorized to manage accounts. Your entries are still available.");
+                    return;
+                }
+                if (response.status >= 400 && response.status < 500) {
+                    showRejected(payload?.error || (response.status === 401 || response.status === 403
+                        ? "You are not authorized to save accounts. Your entries are still available."
+                        : "The server rejected this account change. Your entries are still available."));
+                    return;
+                }
+                if (response.ok && payload && payload.success === false) {
+                    showRejected(payload.error || "The server rejected this account change. Your entries are still available.");
+                    return;
+                }
+                if (response.ok && payload?.success && payload.user) {
+                    try {
+                        showToast("User Saved", payload.user.username, "success");
+                        userModal?.hide();
+                        window.location.reload();
+                    } catch (_uiError) {
+                        showRejected("The server confirmed the account change, but the page could not refresh.");
+                    }
+                    return;
+                }
+                return reconcileUncertainWrite();
+            })
+            .catch(function () {
+                return reconcileUncertainWrite();
+            })
+            .finally(function () {
+                userSavePending = false;
+                if (saveButton) saveButton.disabled = false;
+            });
     });
 
     // --- Camera management ---------------------------------------------------

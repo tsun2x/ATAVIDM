@@ -1,6 +1,7 @@
 from core import reports
 import re
 import zlib
+from pathlib import Path
 
 
 def _stub_report_database(monkeypatch):
@@ -67,6 +68,23 @@ def test_report_marks_uncertain_candidate_association(monkeypatch):
     )
 
     assert row["plate_display"] == "JAD7419 (OCR candidate; unverified; association uncertain)"
+
+
+def test_report_separates_detector_and_rule_scores_and_keeps_zero(monkeypatch):
+    _stub_report_database(monkeypatch)
+    row = reports._enrich_report_row({
+        "id": 12,
+        "violation_type": "Counterflow",
+        "confidence": 0.0,
+        "violation_confidence": 0.0,
+        "detection_confidence": 0.0,
+    })
+    columns = dict((key, header) for key, header, _width in reports._COLUMNS)
+    assert columns["detection_confidence"] == "Detector Model Score"
+    assert columns["violation_confidence"] == "Rule Evidence Score"
+    assert reports._cell_value(row, "detection_confidence") == "0%"
+    assert reports._cell_value(row, "violation_confidence") == "0%"
+    assert reports._cell_value({"violation_confidence": None, "confidence": None}, "violation_confidence") == "-"
 
 
 def test_report_keeps_category_and_legal_status_paired_per_contributing_behavior(monkeypatch):
@@ -201,3 +219,143 @@ def test_pdf_export_handles_empty_report(tmp_path):
 
     assert output.is_file()
     assert output.read_bytes().startswith(b"%PDF")
+
+
+def test_pdf_and_excel_embed_the_login_brand_mark(tmp_path):
+    from openpyxl import load_workbook
+
+    row = {"id": 1, "violation_type": "Illegal Parking", "status": "confirmed"}
+    pdf_path = tmp_path / "branded-report.pdf"
+    xlsx_path = tmp_path / "branded-report.xlsx"
+
+    reports._generate_pdf([row], "test", {}, pdf_path)
+    reports._generate_excel([row], "test", {}, xlsx_path)
+
+    pdf_bytes = pdf_path.read_bytes()
+    workbook = load_workbook(xlsx_path)
+    assert b"/Subtype /Image" in pdf_bytes
+    assert len(workbook["Violations"]._images) == 1
+    assert workbook["Violations"]["B1"].value.startswith("TAVIDM Traffic Violation Report")
+    sheet = workbook["Violations"]
+    image = sheet._images[0]
+    assert image.width > 0 and image.height > 0
+    assert image.width / image.height == 1
+    assert sheet.page_setup.orientation == "landscape"
+    assert sheet.page_setup.fitToWidth == 1
+    assert sheet.page_setup.fitToHeight == 0
+    assert sheet.print_title_rows == "$1:$5"
+    assert sheet.print_area == "'Violations'!$A$1:$K$6"
+
+
+def test_report_logo_missing_fails_before_output_or_report_record(tmp_path, monkeypatch):
+    output_dir = tmp_path / "reports"
+    monkeypatch.setattr(reports, "REPORTS_FOLDER", output_dir)
+    monkeypatch.setattr(reports, "_REPORT_LOGO", tmp_path / "missing.png")
+    monkeypatch.setattr(reports, "_fetch_rows", lambda _filters: [])
+    inserted = []
+    monkeypatch.setattr(reports.db, "insert_report", lambda **kwargs: inserted.append(kwargs))
+
+    import pytest
+
+    with pytest.raises(reports.ReportLogoError, match="approved TAVIDM report logo"):
+        reports.generate_report("pdf")
+
+    assert not output_dir.exists()
+    assert inserted == []
+
+
+def test_report_render_failure_removes_partial_output_without_inserting_record(tmp_path, monkeypatch):
+    output_dir = tmp_path / "reports"
+    monkeypatch.setattr(reports, "REPORTS_FOLDER", output_dir)
+    monkeypatch.setattr(reports, "_fetch_rows", lambda _filters: [])
+    inserted = []
+    monkeypatch.setattr(reports.db, "insert_report", lambda **kwargs: inserted.append(kwargs))
+
+    def write_then_fail(_rows, _title, _filters, out_path):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"partial")
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(reports, "_generate_pdf", write_then_fail)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        reports.generate_report("pdf")
+
+    assert list(output_dir.glob("*")) == []
+    assert inserted == []
+
+
+def test_report_lookup_failure_keeps_the_inserted_record_file_pair(tmp_path, monkeypatch):
+    output_dir = tmp_path / "reports"
+    monkeypatch.setattr(reports, "REPORTS_FOLDER", output_dir)
+    monkeypatch.setattr(reports, "_fetch_rows", lambda _filters: [])
+    inserted = []
+
+    def insert_report(**kwargs):
+        inserted.append(kwargs)
+        return 44
+
+    monkeypatch.setattr(reports.db, "insert_report", insert_report)
+    monkeypatch.setattr(
+        reports.db, "get_report", lambda _report_id: (_ for _ in ()).throw(RuntimeError("lookup failed"))
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="lookup failed"):
+        reports.generate_report("pdf")
+
+    assert len(inserted) == 1
+    assert (Path(inserted[0]["file_path"])).is_file()
+
+
+def test_corrupt_report_logo_fails_as_controlled_error_without_partial_file(tmp_path, monkeypatch):
+    corrupt = tmp_path / "corrupt.png"
+    corrupt.write_bytes(b"not an image")
+    monkeypatch.setattr(reports, "_REPORT_LOGO", corrupt)
+    output = tmp_path / "report.pdf"
+
+    import pytest
+
+    with pytest.raises(reports.ReportLogoError, match="approved TAVIDM report logo"):
+        reports._generate_pdf([], "empty", {}, output)
+
+    assert not output.exists()
+
+
+def test_report_api_returns_actionable_service_error_for_missing_brand(enforcer_client, monkeypatch):
+    import app as flask_app
+
+    def fail_for_logo(**_kwargs):
+        raise reports.ReportLogoError(
+            "The approved TAVIDM report logo is missing or unreadable. Restore "
+            "static/images/tavidm-report-logo.png, then retry."
+        )
+
+    monkeypatch.setattr(flask_app.reports_core, "generate_report", fail_for_logo)
+
+    response = enforcer_client.post("/api/reports", json={"format": "pdf"})
+
+    assert response.status_code == 503
+    assert "static/images/tavidm-report-logo.png" in response.get_json()["error"]
+
+
+def test_pdf_header_labels_wrap_inside_landscape_column_geometry():
+    from fpdf import FPDF
+
+    pdf = FPDF(orientation="L")
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 7.5)
+    widths = [9, 33, 45, 24, 35, 20, 22, 14, 14, 27, 17]
+    headers = [header for _key, header, _width in reports._COLUMNS]
+    assert sum(widths) <= pdf.w - pdf.l_margin - pdf.r_margin
+    wrapped = [
+        reports._wrap_pdf_cell_text(pdf, header, width + 2)
+        for header, width in zip(headers, widths)
+    ]
+    for lines, width in zip(wrapped, widths):
+        usable = width - 2 * pdf.c_margin
+        assert all(pdf.get_string_width(line) <= usable for line in lines)
+    header_height = max(8.0, max(len(lines) for lines in wrapped) * 4.0 + 2.0)
+    assert header_height >= max(len(lines) for lines in wrapped) * 4.0

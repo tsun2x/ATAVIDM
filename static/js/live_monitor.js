@@ -1087,13 +1087,20 @@
                     return;
                 }
                 alertFeed.innerHTML = items.map(function (item) {
-                    const level = item.confidence >= 0.95 ? "critical" : "warning";
+                    const score = item.violation_confidence !== undefined
+                        ? item.violation_confidence : item.confidence;
+                    const level = score >= 0.95 ? "critical" : "warning";
+                    const ruleText = score === null || score === undefined || !Number.isFinite(Number(score))
+                        ? "Unavailable" : Math.round(Number(score) * 100) + "%";
+                    const detectorText = item.detection_confidence === null || item.detection_confidence === undefined || !Number.isFinite(Number(item.detection_confidence))
+                        ? "Unavailable" : Math.round(Number(item.detection_confidence) * 100) + "%";
                     return (
                         '<div class="alert-feed-item alert-' + level + '">' +
                         '<div class="alert-icon"><i class="bi ' + alertIcon(item.violation_type) + '"></i></div>' +
                         '<div class="alert-content"><strong>' + item.violation_type + "</strong>" +
                         "<span>Track #" + item.track_id + " · " + item.video_name + "</span>" +
-                        "<small>Frame " + item.frame_number + " · " + Math.round(item.confidence * 100) + "% confidence</small></div>" +
+                        "<small>Frame " + item.frame_number + " · rule evidence score " + ruleText +
+                        " · detector model score " + detectorText + "</small></div>" +
                         "</div>"
                     );
                 }).join("");

@@ -60,9 +60,9 @@
         <div class="stat-card stat-primary">
             <div class="stat-icon"><i class="bi bi-percent"></i></div>
             <div class="stat-body">
-                <span class="stat-label">Avg. Confidence</span>
-                <span class="stat-value">{{ stats.avg_confidence }}%</span>
-                <span class="stat-trend text-muted"><i class="bi bi-bullseye"></i> Detection score</span>
+                <span class="stat-label">Avg. Rule Evidence Score</span>
+                <span class="stat-value">{% if stats.avg_confidence is none %}Unavailable{% else %}{{ stats.avg_confidence }}%{% endif %}</span>
+                <span class="stat-trend text-muted"><i class="bi bi-bullseye"></i> Not a probability of guilt</span>
             </div>
         </div>
     </div>
@@ -114,7 +114,7 @@
                                 <th>Type</th>
                                 <th>Video Source</th>
                                 <th>Time</th>
-                                <th>Confidence</th>
+                                <th>Rule Evidence Score</th>
                                 <th>Status</th>
                             </tr>
                         </thead>
@@ -127,8 +127,7 @@
                                 <td>{{ v.timestamp }}</td>
                                 <td>
                                     <div class="confidence-bar-wrap">
-                                        <div class="confidence-bar" style="width: {{ (v.confidence * 100)|int }}%;"></div>
-                                        <span>{{ (v.confidence * 100)|int }}%</span>
+                                        {% if v.confidence is not none %}<div class="confidence-bar" style="width: {{ (v.confidence * 100)|int }}%;"></div><span>{{ (v.confidence * 100)|int }}%</span>{% else %}<span>Unavailable</span>{% endif %}
                                     </div>
                                 </td>
                                 <td><span class="badge status-badge status-{{ v.status }}">{{ v.status }}</span></td>

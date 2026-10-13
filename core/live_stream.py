@@ -75,6 +75,7 @@ class LiveStreamWorker(threading.Thread):
     def __init__(self, camera: dict[str, Any]) -> None:
         super().__init__(daemon=True, name=f"camera-{camera['id']}")
         self.camera = camera
+        self.evidence_source_key = f"camera_{camera['id']}_run_{uuid.uuid4().hex[:12]}"
         self.scene_document = load_scene_annotation(camera.get("zones_json"))
         self.rule_scene = self.scene_document.to_rule_context()
         self.zones = dict(self.rule_scene.legacy_zones)
@@ -258,14 +259,14 @@ class LiveStreamWorker(threading.Thread):
                     if det is not None:
                         evidence_path = save_evidence_snapshot(
                             frame, det, event.violation_type,
-                            source_key=f"camera_{self.camera['id']}",
+                            source_key=self.evidence_source_key,
                             frame_number=event.frame_number,
                             violation_confidence=event.violation_confidence,
                             detection_confidence=event.detection_confidence,
                         )
                         vehicle_evidence_path = save_vehicle_crop(
                             frame, det,
-                            source_key=f"camera_{self.camera['id']}",
+                            source_key=self.evidence_source_key,
                             frame_number=event.frame_number,
                         )
                     review_id = db.insert_review_queue(

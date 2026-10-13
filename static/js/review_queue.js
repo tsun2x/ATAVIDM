@@ -59,7 +59,10 @@ function escapePlateText(value) {
 }
 
 function matchesReviewFilter(item, filterName) {
-    const confidence = Number(item && item.confidence);
+    const score = item && item.violation_confidence !== undefined
+        ? item.violation_confidence : (item && item.confidence);
+    if (score === null || score === undefined || !Number.isFinite(Number(score))) return filterName === "all";
+    const confidence = Number(score);
     if (filterName === "low") return confidence < 0.80;
     if (filterName === "careful") return confidence >= 0.80 && confidence < 0.95;
     return true;
@@ -134,8 +137,16 @@ if (typeof document !== "undefined") {
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
         const sceneImg = item.evidence_url
-            ? '<img src="' + escapeHtml(item.evidence_url) + '" alt="Evidence" class="evidence-preview img-fluid rounded">'
+            ? '<img src="' + escapeHtml(item.evidence_url) + '" alt="Annotated scene evidence" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
+        const rawSceneImg = item.raw_evidence_url
+            ? '<img src="' + escapeHtml(item.raw_evidence_url) + '" alt="Raw scene evidence" class="evidence-preview img-fluid rounded">'
+            : '<div class="text-muted py-5">Raw scene unavailable for this older or incomplete evidence record.</div>';
+        const preferredScene = item.preferred_evidence_url
+            ? '<section class="mt-3"><h6>Suggested clearer event frame</h6><img src="' +
+                escapeHtml(item.preferred_evidence_url) + '" alt="Suggested event frame" class="evidence-preview img-fluid rounded">' +
+                '<p class="small text-muted mt-1">' + escapeHtml(item.preferred_evidence_reason || "Selected from this event’s bounded temporal window.") +
+                ' The trigger snapshot and event clip remain the primary evidence record.</p></section>' : "";
         const vehicleImg = item.vehicle_evidence_url
             ? '<img src="' + escapeHtml(item.vehicle_evidence_url) + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4"><i class="bi bi-car-front fs-1 d-block mb-2"></i>No vehicle crop captured.</div>';
@@ -157,17 +168,23 @@ if (typeof document !== "undefined") {
             : (plateStatus === "unreadable" ? "Plate: unreadable" : "Plate: no human-verified plate");
         body.innerHTML =
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
-            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">Scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">Annotated scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqRawScene" type="button" role="tab">Raw scene</button></li>' +
             '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqVehicle" type="button" role="tab">Vehicle</button></li>' +
             clipTab +
             "</ul>" +
             '<div class="tab-content">' +
-            '<div class="tab-pane fade show active" id="rqScene" role="tabpanel">' + sceneImg + "</div>" +
+            '<div class="tab-pane fade show active" id="rqScene" role="tabpanel"><div class="row g-3 align-items-start"><div class="col-lg-8">' + sceneImg +
+            '</div><div class="col-lg-4"><h6>Enlarged vehicle/object crop</h6>' + vehicleImg +
+            '<p class="small text-muted mt-2">Original crop pixels are shown at a larger screen size; no missing detail is reconstructed.</p>' + preferredScene + '</div></div></div>' +
+            '<div class="tab-pane fade" id="rqRawScene" role="tabpanel">' + rawSceneImg + '<p class="small text-muted mt-2">Browser zoom does not recover missing image detail.</p></div>' +
             '<div class="tab-pane fade" id="rqVehicle" role="tabpanel">' + vehicleImg + "</div>" +
             '<div class="tab-pane fade" id="rqClip" role="tabpanel">' + clipPane + "</div>" +
             "</div>" +
             "<p class=\"mt-3 text-muted\">" + escapeHtml(item.display_id) + " · " + escapeHtml(item.violation_type) + " · Track #" + escapeHtml(item.track_id) + "</p>" +
             "<p class=\"small text-muted\">" + escapeHtml(item.reason_log) + "</p>" +
+            "<p class=\"small text-muted\">Rule evidence score: " + escapeHtml(fmtConfidence(item.violation_confidence !== undefined ? item.violation_confidence : item.confidence)) +
+            " (not a probability of guilt) · Detector model score: " + escapeHtml(fmtConfidence(item.detection_confidence)) + "</p>" +
             "<p class=\"small text-muted\">" + escapeHtml(plateLine) + "</p>" +
             "<p class=\"small\">Legal status: <strong>" + escapeHtml(item.legal_status || "—") + "</strong>" +
             (item.flag_only ? " · <span class=\"badge bg-warning text-dark\">flag_only review material</span>" : "") + "</p>" +
@@ -219,7 +236,7 @@ if (typeof document !== "undefined") {
     }
 
     function fmtConfidence(value) {
-        if (value === null || value === undefined) return "—";
+        if (value === null || value === undefined) return "Unavailable";
         const n = Number(value) * 100;
         return Number.isFinite(n) ? n.toFixed(1) + "%" : "—";
     }

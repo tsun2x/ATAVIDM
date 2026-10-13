@@ -8,6 +8,7 @@ directory so long episodes stay RAM-bounded and abort cannot wipe other runs.
 from __future__ import annotations
 
 import re
+import json
 import shutil
 import subprocess
 import uuid
@@ -29,9 +30,92 @@ DEFAULT_JPEG_QUALITY = 70
 # Hard cap on the *pre-roll* ring only. Open episodes spool to disk.
 DEFAULT_MAX_FRAMES = 450
 
+_SUSTAINED_RULE_KEYS = {
+    "Illegal Parking": ("illegal_parking_park",),
+    "Illegal Terminal": ("illegal_terminal",),
+    "Obstruction": ("obstruction", "blocking_pedestrian"),
+    "Counterflow": ("counterflow",),
+    "Truck-Ban Violation": ("truck_ban",),
+    "No Side Mirror": ("no_side_mirror",),
+    "Motorcycle Overloading": ("overloading",),
+    "Substandard / Nut-Shell Helmet": ("substandard_helmet",),
+}
+
+
+def active_sustained_event_keys(rule_state: Any, timestamp_sec: float) -> set[tuple[str, int]]:
+    """Return emitted events whose duration-based rule condition is true now.
+
+    Instantaneous transition rules are intentionally absent: their trigger
+    frame remains primary and later detections cannot compete for preference.
+    """
+    active: set[tuple[str, int]] = set()
+    now = float(timestamp_sec)
+    for violation_type, track_id in rule_state.fired:
+        for rule_key in _SUSTAINED_RULE_KEYS.get(violation_type, ()):
+            tracker = rule_state.persistence.get((rule_key, track_id))
+            if tracker is not None and tracker.last_true_at is not None and abs(
+                float(tracker.last_true_at) - now
+            ) <= 1e-6:
+                active.add((str(violation_type), int(track_id)))
+                break
+    return active
+
 
 class TemporalEvidenceFinalizationError(RuntimeError):
     """Episode could not be written as durable temporal evidence."""
+
+
+def select_preferred_evidence_frame(
+    candidates: list[dict[str, Any]],
+    *,
+    track_id: int,
+    episode_start_sec: float,
+    episode_end_sec: float,
+    confirmed_at_sec: float,
+    identity_epoch: int | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Select a same-track frame inside the established event window."""
+    eligible: list[tuple[float, float, int, dict[str, Any]]] = []
+    for candidate in candidates:
+        try:
+            if int(candidate.get("track_id")) != int(track_id):
+                continue
+            if identity_epoch is not None and _safe_track_id(
+                candidate.get("track_identity_epoch")
+            ) != int(identity_epoch):
+                continue
+            timestamp = float(candidate["timestamp_sec"])
+            if not float(episode_start_sec) <= timestamp <= float(episode_end_sec):
+                continue
+            sharpness = max(0.0, float(candidate.get("sharpness", 0.0)))
+            area = max(0.0, float(candidate.get("area_fraction", 0.0)))
+            reliability = max(0.0, min(1.0, float(candidate.get("detection_confidence", 0.0))))
+            visible = 1.0 if candidate.get("fully_visible") is True else 0.0
+            sharpness_score = sharpness / (sharpness + 100.0)
+            area_score = min(area / 0.20, 1.0)
+            proximity = max(0.0, 1.0 - abs(timestamp - float(confirmed_at_sec)) / max(
+                float(episode_end_sec) - float(episode_start_sec), 0.001
+            ))
+            score = (
+                0.35 * sharpness_score + 0.20 * area_score + 0.20 * visible
+                + 0.15 * reliability + 0.10 * proximity
+            )
+            frame_number = int(candidate["frame_number"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not np.isfinite(score):
+            continue
+        eligible.append((score, abs(timestamp - float(confirmed_at_sec)), frame_number, candidate))
+    if not eligible:
+        return None, "Preferred frame unavailable: no matching track frame inside the established event window."
+    eligible.sort(key=lambda item: (-item[0], item[1], item[2]))
+    score, _distance, _number, selected = eligible[0]
+    reason = (
+        f"Selected within the established event window; sharpness, crop area, "
+        f"full-frame visibility, detector reliability, and event-time proximity "
+        f"contributed to the display score ({score:.3f})."
+    )
+    return selected, reason
 
 
 def _browser_compatible_clip(
@@ -91,6 +175,30 @@ def _slug(value: str) -> str:
     return cleaned or "evidence"
 
 
+def _safe_track_id(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _event_identity_manifest(source_key: str, run_id: str, ep: "EvidenceEpisode") -> dict[str, Any]:
+    """Build only identity fields that have explicit producer provenance."""
+    video_match = re.fullmatch(r"video_(\d+)", str(source_key))
+    video_id = int(video_match.group(1)) if video_match else None
+    run_match = re.fullmatch(r"\d+", str(run_id))
+    processing_run_id = int(run_match.group(0)) if run_match else None
+    return {
+        "version": 1,
+        "video_id": video_id,
+        "processing_run_id": processing_run_id,
+        "review_id": ep.review_id,
+        "track_id": int(ep.track_id),
+        "violation_type": str(ep.violation_type),
+        "track_identity_epoch": ep.track_identity_epoch,
+    }
+
+
 def _safe_join(base: Path, *parts: str) -> Path:
     """Resolve a path under ``base``; reject traversal."""
     candidate = base.joinpath(*parts).resolve()
@@ -128,6 +236,7 @@ class BufferedFrame:
     overlay_zones: dict[str, Any] | None = field(default=None, repr=False)
     overlay_scene: Any | None = field(default=None, repr=False)
     overlay_violation_ids: tuple[int, ...] = field(default=(), repr=False)
+    preferred_event_keys: tuple[tuple[str, int], ...] = field(default=(), repr=False)
 
 
 @dataclass
@@ -150,6 +259,7 @@ class EvidenceEpisode:
     spilled_ids: set[int] = field(default_factory=set, repr=False)
     spool_dir: str | None = None
     run_id: str = "direct"
+    track_identity_epoch: int | None = None
 
 
 @dataclass
@@ -227,6 +337,7 @@ class TemporalEvidenceBuffer:
                     overlay_zones=bf.overlay_zones,
                     overlay_scene=bf.overlay_scene,
                     overlay_violation_ids=bf.overlay_violation_ids,
+                    preferred_event_keys=bf.preferred_event_keys,
                 )
             )
             ep.spilled_ids.add(bf.frame_number)
@@ -241,6 +352,7 @@ class TemporalEvidenceBuffer:
                     overlay_zones=bf.overlay_zones,
                     overlay_scene=bf.overlay_scene,
                     overlay_violation_ids=bf.overlay_violation_ids,
+                    preferred_event_keys=bf.preferred_event_keys,
                 )
             )
             ep.spilled_ids.add(bf.frame_number)
@@ -280,16 +392,17 @@ class TemporalEvidenceBuffer:
         zones: dict[str, Any],
         scene: Any | None,
         violation_track_ids: set[int],
+        preferred_event_keys: set[tuple[str, int]] | None = None,
     ) -> None:
         """Attach overlays to the ring/spool copies of one processed frame."""
         frame_number = int(frame_number)
         for frame in self._frames:
             if frame.frame_number == frame_number:
-                self._set_overlay(frame, detections, zones, scene, violation_track_ids)
+                self._set_overlay(frame, detections, zones, scene, violation_track_ids, preferred_event_keys)
         for episode in self._open_episodes.values():
             for frame in episode.spill:
                 if frame.frame_number == frame_number:
-                    self._set_overlay(frame, detections, zones, scene, violation_track_ids)
+                    self._set_overlay(frame, detections, zones, scene, violation_track_ids, preferred_event_keys)
 
     @staticmethod
     def _set_overlay(
@@ -298,11 +411,13 @@ class TemporalEvidenceBuffer:
         zones: dict[str, Any],
         scene: Any | None,
         violation_track_ids: set[int],
+        preferred_event_keys: set[tuple[str, int]] | None = None,
     ) -> None:
         frame.overlay_detections = detections
         frame.overlay_zones = zones
         frame.overlay_scene = scene
         frame.overlay_violation_ids = tuple(violation_track_ids)
+        frame.preferred_event_keys = tuple(preferred_event_keys or ())
 
     def _maybe_spill(self, ep: EvidenceEpisode, bf: BufferedFrame) -> None:
         window_start = self._window_start(ep)
@@ -325,6 +440,7 @@ class TemporalEvidenceBuffer:
         still_path: str | None = None,
         vehicle_crop_path: str | None = None,
         review_id: int | None = None,
+        track_identity_epoch: int | None = None,
     ) -> EvidenceEpisode:
         key = (violation_type, int(track_id))
         prior = self._open_episodes.pop(key, None)
@@ -355,6 +471,9 @@ class TemporalEvidenceBuffer:
             vehicle_crop_path=vehicle_crop_path,
             review_id=review_id,
             run_id=str(self.run_id),
+            track_identity_epoch=(
+                int(track_identity_epoch) if track_identity_epoch is not None else None
+            ),
         )
         window_start = self._window_start(ep)
         for bf in self._frames:
@@ -434,6 +553,7 @@ class TemporalEvidenceBuffer:
                 overlay_zones=ref.overlay_zones,
                 overlay_scene=ref.overlay_scene,
                 overlay_violation_ids=ref.overlay_violation_ids,
+                preferred_event_keys=ref.preferred_event_keys,
             )
 
     def finalize_episode(
@@ -468,6 +588,9 @@ class TemporalEvidenceBuffer:
         annotated_writer = None
         annotated_failed = False
         written = 0
+        preferred_candidate: dict[str, Any] | None = None
+        preferred_frame: np.ndarray | None = None
+        preferred_reason: str | None = None
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             clip_path = out_dir / "evidence_clip.mp4"
@@ -479,13 +602,60 @@ class TemporalEvidenceBuffer:
                 path = out_dir / f"frame_{i:04d}_n{bf.frame_number:06d}.jpg"
                 path.write_bytes(jpeg)
                 written += 1
-                if not write_clip:
-                    bf.jpeg = b""
-                    continue
                 img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 jpeg = b""
                 bf.jpeg = b""
                 if img is None:
+                    continue
+                if (
+                    ep.track_identity_epoch is not None
+                    and float(ep.episode_start_sec) <= bf.timestamp_sec <= float(ep.episode_end_sec)
+                    and (ep.violation_type, int(ep.track_id)) in set(bf.preferred_event_keys or ())
+                ):
+                    detection = next((
+                        det for det in (bf.overlay_detections or ())
+                        if _safe_track_id(det.get("track_id")) == int(ep.track_id)
+                    ), None)
+                    if detection is not None:
+                        try:
+                            x = float(detection["bbox_x"])
+                            y = float(detection["bbox_y"])
+                            bw = float(detection["bbox_w"])
+                            bh = float(detection["bbox_h"])
+                            x1, y1 = max(0, int(x)), max(0, int(y))
+                            x2, y2 = min(img.shape[1], int(x + bw)), min(img.shape[0], int(y + bh))
+                            if bw > 0 and bh > 0 and x2 > x1 and y2 > y1:
+                                crop = img[y1:y2, x1:x2]
+                                sharpness = float(cv2.Laplacian(
+                                    cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F
+                                ).var())
+                                candidate = {
+                                    "frame_number": int(bf.frame_number),
+                                    "timestamp_sec": float(bf.timestamp_sec),
+                                    "track_id": int(ep.track_id),
+                                    "track_identity_epoch": _safe_track_id(
+                                        detection.get("track_identity_epoch")
+                                    ),
+                                    "sharpness": sharpness,
+                                    "area_fraction": (bw * bh) / float(img.shape[0] * img.shape[1]),
+                                    "fully_visible": x >= 0 and y >= 0 and x + bw <= img.shape[1] and y + bh <= img.shape[0],
+                                    "detection_confidence": float(detection.get("confidence") or 0.0),
+                                }
+                                selected, reason = select_preferred_evidence_frame(
+                                    [candidate] + ([preferred_candidate] if preferred_candidate else []),
+                                    track_id=ep.track_id,
+                                    episode_start_sec=ep.episode_start_sec,
+                                    episode_end_sec=ep.episode_end_sec,
+                                    confirmed_at_sec=ep.confirmed_at_sec,
+                                    identity_epoch=ep.track_identity_epoch,
+                                )
+                                if selected is candidate:
+                                    preferred_candidate = candidate
+                                    preferred_frame = img.copy()
+                                    preferred_reason = reason
+                        except (KeyError, TypeError, ValueError, cv2.error):
+                            pass
+                if not write_clip:
                     continue
                 if writer is None:
                     h, w = img.shape[:2]
@@ -548,6 +718,25 @@ class TemporalEvidenceBuffer:
                     "finalization wrote no evidence frames "
                     "(spool files missing or unreadable)"
                 )
+            if preferred_candidate is not None and preferred_frame is not None:
+                preferred_path = out_dir / "preferred_scene.jpg"
+                try:
+                    if cv2.imwrite(str(preferred_path), preferred_frame) and preferred_path.is_file():
+                        (out_dir / "preferred_scene.json").write_text(
+                            json.dumps({
+                                "frame_number": preferred_candidate["frame_number"],
+                                "timestamp_sec": preferred_candidate["timestamp_sec"],
+                                "track_identity_epoch": preferred_candidate["track_identity_epoch"],
+                                "selection_reason": preferred_reason,
+                                "score_components": {
+                                    key: preferred_candidate[key]
+                                    for key in ("sharpness", "area_fraction", "fully_visible", "detection_confidence")
+                                },
+                            }, indent=2),
+                            encoding="utf-8",
+                        )
+                except (OSError, cv2.error):
+                    preferred_path.unlink(missing_ok=True)
             if write_clip and not clip_path.exists():
                 raise TemporalEvidenceFinalizationError(
                     "finalization did not produce an evidence clip"
@@ -573,6 +762,10 @@ class TemporalEvidenceBuffer:
                 )
             ep.sequence_dir = _project_relative(out_dir)
             ep.finalized = True
+            (out_dir / "event_identity.json").write_text(
+                json.dumps(_event_identity_manifest(self.source_key, str(self.run_id), ep), sort_keys=True),
+                encoding="utf-8",
+            )
             marker = out_dir / ".finalized"
             marker.write_text("ok", encoding="utf-8")
             self._finalized.append(ep)

@@ -20,6 +20,7 @@ class DatabaseAdapter(Protocol):
         password_hash: str,
         role: str = "enforcer",
         full_name: str | None = None,
+        is_active: bool = True,
     ) -> int: ...
     def get_user(self, user_id: int) -> dict[str, Any] | None: ...
     def get_user_by_username(self, username: str) -> dict[str, Any] | None: ...
@@ -151,6 +152,9 @@ class DatabaseAdapter(Protocol):
         per_page: int = 8,
         sort: str = "newest",
     ) -> tuple[list[dict[str, Any]], int]: ...
+    def list_vehicle_grouping_provenance(
+        self, case_ids: list[int] | tuple[int, ...]
+    ) -> dict[int, list[dict[str, Any]]]: ...
     def update_violation_status(
         self,
         violation_id: int,
@@ -251,7 +255,10 @@ class DatabaseAdapter(Protocol):
         outcome: str,
         reviewed_by: int | None,
         notes: str | None = None,
-    ) -> None: ...
+        expected_outcome: str | None = None,
+        expected_revision: str | None = None,
+        return_snapshot: bool = False,
+    ) -> bool | dict[str, Any] | None: ...
     def list_motorcycle_detail_run_keys_for_video(self, video_id: int) -> list[str]: ...
     def purge_motorcycle_detail_candidates_for_video(self, video_id: int) -> int: ...
 

@@ -62,12 +62,17 @@
             <span class="badge bg-danger ms-2" id="resultCount">{{ violations|length }}</span>
         </h5>
         <div class="d-flex align-items-center gap-2">
+            <label class="form-label mb-0 small text-muted" for="vehicleGrouping">Display</label>
+            <select class="form-select form-select-sm" id="vehicleGrouping" style="width:auto;">
+                <option value="individual" selected>Individual events</option>
+                <option value="vehicle">Vehicle groups (expandable)</option>
+            </select>
             <label class="form-label mb-0 small text-muted" for="sortSelect">Sort</label>
             <select class="form-select form-select-sm" id="sortSelect" style="width:auto;">
                 <option value="newest">Newest</option>
                 <option value="oldest">Oldest</option>
-                <option value="confidence_desc">Confidence ↓</option>
-                <option value="confidence_asc">Confidence ↑</option>
+                <option value="confidence_desc">Rule score ↓</option>
+                <option value="confidence_asc">Rule score ↑</option>
                 <option value="type">By Type</option>
             </select>
             <label class="form-label mb-0 small text-muted" for="pageSize">Show</label>
@@ -84,10 +89,10 @@
                 <thead>
                     <tr>
                         <th class="sortable" data-sort="id">ID</th>
-                        <th class="sortable" data-sort="type">Type</th>
+                        <th class="sortable" data-sort="type">Violation Type</th>
                         <th class="sortable" data-sort="video">Video</th>
                         <th class="sortable" data-sort="timestamp">Date / Time</th>
-                        <th class="sortable" data-sort="confidence">Confidence</th>
+                        <th class="sortable" data-sort="confidence" title="Rule evidence score; not a probability of guilt">Rule Evidence Score</th>
                         <th class="sortable" data-sort="status">Status</th>
                         <th>Vehicle</th>
                         <th>Plate</th>

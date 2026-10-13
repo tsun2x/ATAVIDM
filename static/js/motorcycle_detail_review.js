@@ -51,6 +51,20 @@ function formatClassMap(classes) {
     return "";
 }
 
+function detailOutcomeRequestBody(item, outcome) {
+    return {
+        outcome: outcome,
+        notes: item.reviewer_notes || null,
+        expected_revision: item.review_revision || null,
+        // Retained for older servers/clients that implement outcome-only CAS.
+        expected_outcome: item.human_outcome || "pending",
+    };
+}
+
+function isStaleDetailReviewResponse(status) {
+    return Number(status) === 409;
+}
+
 function describeModel(scan, item) {
     const identity = (scan && scan.model) || (item && item.scan_model) || "";
     if (!identity) return "—";
@@ -212,7 +226,9 @@ if (typeof module !== "undefined" && module.exports) {
         describeAttribution: describeAttribution,
         formatClassMap: formatClassMap,
         frameDetections: frameDetections,
-        uncertaintyList: uncertaintyList
+        uncertaintyList: uncertaintyList,
+        detailOutcomeRequestBody: detailOutcomeRequestBody,
+        isStaleDetailReviewResponse: isStaleDetailReviewResponse
     };
 }
 
@@ -274,13 +290,36 @@ if (typeof module !== "undefined" && module.exports) {
         fetch("/api/motorcycle-detail-review/" + item.id + "/outcome", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ outcome: outcome, notes: item.reviewer_notes || null })
+            body: JSON.stringify(detailOutcomeRequestBody(item, outcome))
         })
-            .then(function (r) { return r.json(); })
-            .then(function (payload) {
+            .then(function (r) { return r.json().then(function (payload) {
+                return { payload: payload, status: r.status };
+            }); })
+            .then(function (result) {
+                const payload = result.payload;
+                if (isStaleDetailReviewResponse(result.status)) {
+                    setRowBusy(row, false);
+                    showToast("Review Updated Elsewhere", "Reloading the latest reviewer state before another decision.", "warning");
+                    window.location.reload();
+                    return;
+                }
                 if (payload.success) {
                     const badge = row.querySelector("[data-outcome-badge]");
                     if (badge) badge.textContent = payload.outcome;
+                    item.human_outcome = payload.outcome;
+                    if (payload.reviewer_name) item.reviewer_name = payload.reviewer_name;
+                    if (payload.reviewed_at) item.reviewed_at = payload.reviewed_at;
+                    if (payload.reviewer_notes !== undefined) item.reviewer_notes = payload.reviewer_notes;
+                    if (payload.review_revision) item.review_revision = payload.review_revision;
+                    row.dataset.item = JSON.stringify(item);
+                    const reviewMeta = row.querySelector("[data-review-meta]");
+                    if (reviewMeta) {
+                        const parts = [];
+                        if (payload.reviewer_name) parts.push(payload.reviewer_name);
+                        if (payload.reviewed_at) parts.push(payload.reviewed_at);
+                        reviewMeta.textContent = parts.join(" · ") +
+                            (payload.reviewer_notes ? " — " + payload.reviewer_notes : "");
+                    }
                     setRowBusy(row, false);
                     showToast("Saved", "Detail candidate marked " + payload.outcome + ".", "info");
                     if (payload.outcome === "dismissed" || payload.outcome === "reviewed") {

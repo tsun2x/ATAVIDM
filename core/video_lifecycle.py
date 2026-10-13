@@ -77,6 +77,143 @@ def _safe_unlink(path: Path | None, roots: list[Path]) -> None:
         logger.exception("Failed to delete %s", resolved)
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _safe_unlink_preserving(path: Path | None, roots: list[Path], protected: set[Path]) -> None:
+    """Remove a tree without deleting a referenced path inside or around it."""
+    resolved = _safe_resolve(path, roots, allow_directory=True)
+    if resolved is None:
+        return
+    if any(_paths_overlap(resolved, kept) for kept in protected):
+        if resolved.is_dir() and not any(kept == resolved or kept in resolved.parents for kept in protected):
+            try:
+                for child in resolved.iterdir():
+                    _safe_unlink_preserving(child, roots, protected)
+                if not any(kept == resolved or resolved in kept.parents for kept in protected):
+                    resolved.rmdir()
+            except OSError:
+                logger.exception("Failed to selectively delete %s", resolved)
+        return
+    _safe_unlink(resolved, roots)
+
+
+def _external_evidence_paths(video_id: int, roots: list[Path]) -> set[Path]:
+    """Take one bounded reference snapshot for a lifecycle operation."""
+    from database import sqlite_adapter
+
+    columns = (
+        "evidence_path", "vehicle_evidence_path", "plate_evidence_path",
+        "evidence_clip_path", "evidence_sequence_dir",
+    )
+    paths: set[Path] = set()
+    with sqlite_adapter.db_session() as conn:
+        for table in ("review_queue", "violations"):
+            rows = conn.execute(
+                f"SELECT {', '.join(columns)} FROM {table} WHERE video_id != ?",
+                (int(video_id),),
+            ).fetchall()
+            for row in rows:
+                for column, value in zip(columns, row):
+                    if value:
+                        candidate = _safe_resolve(Path(value), roots, allow_directory=True)
+                        if candidate is not None:
+                            paths.add(candidate)
+                        if column == "evidence_path":
+                            raw = _raw_scene_sidecar(Path(value), roots)
+                            if raw is not None:
+                                paths.add(raw)
+    return paths
+
+
+def _evidence_referenced_elsewhere(
+    path: Path, video_id: int, shared_paths: set[Path] | None = None
+) -> bool:
+    """Keep a media path if another video's DB record still points to it."""
+    resolved_path = path.resolve()
+    references = shared_paths if shared_paths is not None else _external_evidence_paths(
+        video_id, _roots()["evidence"]
+    )
+    return any(_paths_overlap(resolved_path, candidate) for candidate in references)
+
+
+def _retained_evidence_paths(video_id: int, roots: list[Path]) -> set[Path]:
+    """Paths still referenced by confirmed records that lifecycle edits retain."""
+    retained: set[Path] = set()
+    for item in db.list_review_items_for_video(video_id, status=None):
+        if item.get("status") != "confirmed":
+            continue
+        retained.update(_stored_media_references(item, roots))
+    for item in db.list_violation_rows_for_video(video_id):
+        if item.get("status") != "confirmed":
+            continue
+        retained.update(_stored_media_references(item, roots))
+    return retained
+
+
+def _raw_scene_sidecar(path: Path, roots: list[Path]) -> Path | None:
+    annotated = _safe_resolve(path, roots)
+    if annotated is not None:
+        return _safe_resolve(annotated.with_name("raw_" + annotated.name), roots)
+    # Legacy DB rows can outlive the annotated sidecar while the raw sibling
+    # remains. Resolve the derived name under the configured root before use.
+    candidate = Path(path)
+    return _safe_resolve(candidate.with_name("raw_" + candidate.name), roots)
+
+
+def _stored_media_references(item: dict[str, Any], roots: list[Path]) -> set[Path]:
+    """Expand a retained row's stored media paths to every owned scene file."""
+    references: set[Path] = set()
+    for key in (
+        "evidence_path", "vehicle_evidence_path", "plate_evidence_path",
+        "evidence_clip_path", "evidence_sequence_dir",
+    ):
+        value = item.get(key)
+        if not value:
+            continue
+        resolved = _safe_resolve(Path(value), roots, allow_directory=True)
+        if resolved is not None:
+            references.add(resolved)
+        if key == "evidence_path":
+            raw = _raw_scene_sidecar(Path(value), roots)
+            if raw is not None:
+                references.add(raw)
+    return references
+
+
+def _remove_evidence_reference(
+    path: Path | None,
+    roots: list[Path],
+    *,
+    video_id: int,
+    retained: set[Path] | None = None,
+    paired_raw: bool = False,
+    shared_paths: set[Path] | None = None,
+) -> None:
+    resolved = _safe_resolve(path, roots)
+    if resolved is None:
+        if paired_raw:
+            raw = _raw_scene_sidecar(Path(path), roots)
+            protected = retained or set()
+            if raw is not None and not any(_paths_overlap(raw, item) for item in protected) and not _evidence_referenced_elsewhere(
+                raw, video_id, shared_paths
+            ):
+                _safe_unlink(raw, roots)
+        return
+    protected = retained or set()
+    if any(_paths_overlap(resolved, item) for item in protected) or _evidence_referenced_elsewhere(
+        resolved, video_id, shared_paths
+    ):
+        return
+    raw = _raw_scene_sidecar(resolved, roots) if paired_raw else None
+    _safe_unlink(resolved, roots)
+    if raw is not None and not any(_paths_overlap(raw, item) for item in protected) and not _evidence_referenced_elsewhere(
+        raw, video_id, shared_paths
+    ):
+        _safe_unlink(raw, roots)
+
+
 def _quarantine_path(resolved: Path, token: str) -> Path:
     """Move a resolved path into quarantine (same-volume rename preferred)."""
     qroot = _quarantine_root()
@@ -90,14 +227,24 @@ def _quarantine_path(resolved: Path, token: str) -> Path:
     return dest
 
 
-def _restore_quarantined(quarantined: list[tuple[Path, Path]]) -> None:
+def _restore_quarantined(quarantined: list[tuple[Path, Path]]) -> list[str]:
+    failures: list[str] = []
     for original, qp in reversed(quarantined):
         try:
-            if qp.exists() and not original.exists():
-                original.parent.mkdir(parents=True, exist_ok=True)
-                qp.rename(original)
-        except OSError:
-            logger.exception("Failed to restore %s", original)
+            if not qp.exists():
+                if not original.exists():
+                    failures.append(f"{original} is missing from both original and quarantine paths")
+                continue
+            if original.exists():
+                failures.append(f"{original} already exists; quarantined copy remains at {qp}")
+                continue
+            original.parent.mkdir(parents=True, exist_ok=True)
+            # Use the same cross-volume-capable primitive used for quarantine.
+            shutil.move(str(qp), str(original))
+        except OSError as exc:
+            logger.exception("Failed to restore %s from %s", original, qp)
+            failures.append(f"{original}: {exc}; recovery copy is at {qp}")
+    return failures
 
 
 def _collect_evidence_paths(video_id: int) -> list[Path]:
@@ -112,7 +259,12 @@ def _collect_evidence_paths(video_id: int) -> list[Path]:
         ):
             val = item.get(key)
             if val:
-                paths.append(Path(val))
+                path = Path(val)
+                paths.append(path)
+                if key == "evidence_path":
+                    raw = _raw_scene_sidecar(path, _roots()["evidence"])
+                    if raw is not None:
+                        paths.append(raw)
     for item in db.list_violation_rows_for_video(video_id):
         for key in (
             "evidence_path",
@@ -123,7 +275,12 @@ def _collect_evidence_paths(video_id: int) -> list[Path]:
         ):
             val = item.get(key)
             if val:
-                paths.append(Path(val))
+                path = Path(val)
+                paths.append(path)
+                if key == "evidence_path":
+                    raw = _raw_scene_sidecar(path, _roots()["evidence"])
+                    if raw is not None:
+                        paths.append(raw)
     return paths
 
 
@@ -205,8 +362,14 @@ def remove_processing_results(
     evidence_roots = roots["evidence"]
     annotated_roots = roots["annotated"]
 
-    pending = db.list_review_items_for_video(video_id, status="pending")
-    for item in pending:
+    removable_reviews = [
+        item
+        for item in db.list_review_items_for_video(video_id, status=None)
+        if item.get("status") in {"pending", "dismissed"}
+    ]
+    retained = _retained_evidence_paths(video_id, evidence_roots)
+    shared_paths = _external_evidence_paths(video_id, evidence_roots)
+    for item in removable_reviews:
         for key in (
             "evidence_path",
             "vehicle_evidence_path",
@@ -216,19 +379,26 @@ def remove_processing_results(
         ):
             val = item.get(key)
             if val:
-                _safe_unlink(Path(val), evidence_roots)
+                _remove_evidence_reference(
+                    Path(val), evidence_roots, video_id=video_id,
+                    retained=retained, paired_raw=key == "evidence_path",
+                    shared_paths=shared_paths,
+                )
 
     detail_dirs = _detail_evidence_dirs(video_id)
     db.delete_unconfirmed_results_for_video(video_id)
+    protected_evidence = retained | shared_paths
     for detail_dir in detail_dirs:
-        _safe_unlink(detail_dir, evidence_roots)
+        _safe_unlink_preserving(detail_dir, evidence_roots, protected_evidence)
 
     for run in db.list_processing_runs(video_id):
         _safe_unlink(run_artifact_dir(run["id"]), annotated_roots)
         db.clear_processing_run_artifact(run["id"])
 
     import config as _cfg
-    _safe_unlink(Path(_cfg.EVIDENCE_FOLDER) / f"video_{video_id}", evidence_roots)
+    _safe_unlink_preserving(
+        Path(_cfg.EVIDENCE_FOLDER) / f"video_{video_id}", evidence_roots, protected_evidence
+    )
 
     db.update_video(video_id, processed=0, status="ready")
     db.insert_video_history_event(
@@ -263,6 +433,8 @@ def invalidate_processing_results_for_annotation_change(
 
     evidence_roots = _roots()["evidence"]
     annotated_roots = _roots()["annotated"]
+    retained = _retained_evidence_paths(video_id, evidence_roots)
+    shared_paths = _external_evidence_paths(video_id, evidence_roots)
     for item in db.list_review_items_for_video(video_id, status=None):
         if item.get("status") == "confirmed":
             continue
@@ -275,15 +447,20 @@ def invalidate_processing_results_for_annotation_change(
         ):
             value = item.get(key)
             if value:
-                _safe_unlink(Path(value), evidence_roots)
+                _remove_evidence_reference(
+                    Path(value), evidence_roots, video_id=video_id,
+                    retained=retained, paired_raw=key == "evidence_path",
+                    shared_paths=shared_paths,
+                )
 
     detail_dirs = _detail_evidence_dirs(video_id)
     db.delete_unconfirmed_results_for_video(video_id)
     for run in db.list_processing_runs(video_id):
         _safe_unlink(run_artifact_dir(run["id"]), annotated_roots)
         db.clear_processing_run_artifact(run["id"])
+    protected_evidence = retained | shared_paths
     for detail_dir in detail_dirs:
-        _safe_unlink(detail_dir, evidence_roots)
+        _safe_unlink_preserving(detail_dir, evidence_roots, protected_evidence)
 
     db.update_video(video_id, processed=0, status="ready")
     db.insert_video_history_event(
@@ -369,72 +546,98 @@ def delete_video_permanently(
     token = f"v{video_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     quarantined: list[tuple[Path, Path]] = []  # (original, quarantine)
 
+    # Resolve and validate every deletion target and preflight ownership before
+    # the first move. Keep the per-target ownership recheck below to avoid
+    # deleting a path that another video's record references during preflight.
+    prepared: list[tuple[Path, list[Path], bool]] = []
+    prepared_paths: list[Path] = []
+    shared_evidence_snapshot = _external_evidence_paths(video_id, evidence_roots)
     try:
         for path, allowed in candidates:
             resolved = _safe_resolve(path, allowed, allow_directory=True)
             if resolved is None:
                 continue
-            # Cross-check against the union of media roots.
+            if any(parent == resolved or parent in resolved.parents for parent in prepared_paths):
+                continue
             try:
                 resolve_under_roots(resolved, media_roots, must_exist=True, allow_directory=True)
-            except MediaPathError:
+            except MediaPathError as exc:
                 raise VideoLifecycleError(
-                    "Refusing to delete a path outside approved media roots.",
-                    status_code=400,
-                )
-            try:
-                qpath = _quarantine_path(resolved, token)
-            except OSError as exc:
-                # Restore anything already moved, then abort — DB untouched.
-                _restore_quarantined(quarantined)
-                raise VideoLifecycleError(
-                    f"Filesystem quarantine failed: {exc}",
-                    status_code=500,
+                    "Refusing to delete a path outside approved media roots.", status_code=400
                 ) from exc
-            quarantined.append((resolved, qpath))
-
-        try:
-            db.delete_video_cascade_with_audit(
-                video_id,
-                event_type="video_deleted",
-                detail={
-                    "video_id": video_id,
-                    "filename": video.get("filename"),
-                    "actor_user_id": actor_user_id,
-                    "confirmed_violations_deleted": confirmed,
-                    "confirmed_dependents_override": bool(
-                        confirmed and allow_confirmed_dependents
-                    ),
-                },
+            is_evidence = any(
+                resolved == root or root in resolved.parents for root in evidence_roots
             )
-        except Exception as exc:
-            # Restore every quarantined file so DB + FS stay consistent.
-            _restore_quarantined(quarantined)
-            raise VideoLifecycleError(
-                f"Database deletion failed; files restored: {exc}",
-                status_code=500,
-            ) from exc
-
-        # DB committed — purge quarantine. Failure here is cleanup-only.
-        cleanup_warnings: list[str] = []
-        for _original, qp in quarantined:
-            try:
-                if qp.is_file():
-                    qp.unlink()
-                elif qp.is_dir():
-                    shutil.rmtree(qp)
-            except OSError as exc:
-                logger.exception("Failed to purge quarantine artifact %s", qp)
-                cleanup_warnings.append(f"{qp.name}: {exc}")
-
+            if is_evidence and any(
+                _paths_overlap(resolved, reference) for reference in shared_evidence_snapshot
+            ):
+                continue
+            prepared.append((resolved, allowed, is_evidence))
+            prepared_paths.append(resolved)
     except VideoLifecycleError:
         raise
-    except OSError as exc:
-        _restore_quarantined(quarantined)
+    except Exception as exc:
         raise VideoLifecycleError(
-            f"Filesystem operation failed: {exc}",
+            f"Could not verify deletion ownership; no files were moved: {exc}",
             status_code=500,
         ) from exc
+
+    try:
+        for resolved, _allowed, is_evidence in prepared:
+            # A previously moved parent directory owns any nested candidate.
+            if not resolved.exists():
+                continue
+            if is_evidence and _evidence_referenced_elsewhere(resolved, video_id):
+                continue
+            qpath = _quarantine_path(resolved, token)
+            quarantined.append((resolved, qpath))
+        db.delete_video_cascade_with_audit(
+            video_id,
+            event_type="video_deleted",
+            detail={
+                "video_id": video_id,
+                "filename": video.get("filename"),
+                "actor_user_id": actor_user_id,
+                "confirmed_violations_deleted": confirmed,
+                "confirmed_dependents_override": bool(
+                    confirmed and allow_confirmed_dependents
+                ),
+            },
+        )
+    except Exception as exc:
+        # Any failure before the cascade call returns is pre-commit from this
+        # service's contract. Restore moved files and report incomplete recovery.
+        restore_failures = _restore_quarantined(quarantined)
+        if restore_failures:
+            logger.error(
+                "Video %s deletion did not commit; restore failures: %s",
+                video_id,
+                "; ".join(restore_failures),
+            )
+            recovery = (
+                f"{len(restore_failures)} file(s) could not be restored; recovery "
+                f"token {token} remains under annotated/_quarantine/"
+            )
+        else:
+            recovery = "all quarantined files were restored"
+        status_code = exc.status_code if isinstance(exc, VideoLifecycleError) else 500
+        raise VideoLifecycleError(
+            f"Video deletion was not committed; {recovery}. {exc}",
+            status_code=status_code,
+        ) from exc
+
+    # The cascade/audit transaction returned successfully: later purge failures
+    # are cleanup warnings and must never be described as a rollback.
+    cleanup_warnings: list[str] = []
+    for _original, qp in quarantined:
+        try:
+            if qp.is_file():
+                qp.unlink()
+            elif qp.is_dir():
+                shutil.rmtree(qp)
+        except OSError as exc:
+            logger.exception("Failed to purge quarantine artifact %s", qp)
+            cleanup_warnings.append(f"{qp.name}: {exc}")
 
     result: dict[str, Any] = {
         "success": True,

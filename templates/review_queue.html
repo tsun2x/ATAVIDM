@@ -9,12 +9,13 @@
     <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
         <div>
             <span class="badge bg-warning-subtle text-warning me-2" id="pendingCount" data-total="{{ review_total }}">{{ review_total }} Pending</span>
-            <span class="text-muted small">≥95% auto-queued · 80–94% careful review · &lt;80% logged for monitoring</span>
+            <span class="text-muted small">Rule evidence score: evidence-strength guidance, not a probability of guilt. Detector confidence is a separate model score.</span>
+            <a class="small ms-2" href="{{ url_for('motorcycle_detail_review') }}">Review detail observations</a>
         </div>
         <div class="btn-group btn-group-sm" role="group" aria-label="Filter review queue">
             <button class="btn btn-outline-secondary active" id="filterAll" data-review-filter="all" aria-pressed="true">All</button>
-            <button class="btn btn-outline-secondary" id="filterLowConf" data-review-filter="low" aria-pressed="false">Low Confidence</button>
-            <button class="btn btn-outline-secondary" id="filterCareful" data-review-filter="careful" aria-pressed="false">Careful Review</button>
+            <button class="btn btn-outline-secondary" id="filterLowConf" data-review-filter="low" aria-pressed="false">Low Rule Score</button>
+            <button class="btn btn-outline-secondary" id="filterCareful" data-review-filter="careful" aria-pressed="false">Careful Rule Review</button>
         </div>
     </div>
     <div class="card-footer py-2">
@@ -49,7 +50,7 @@
                         <th>Source</th>
                         <th>Track</th>
                         <th>Vehicle Class</th>
-                        <th>Confidence</th>
+                        <th title="Rule evidence score; not a probability of guilt">Rule Evidence Score</th>
                         <th>Evidence</th>
                         <th>Queued At</th>
                         <th>Actions</th>
@@ -75,8 +76,8 @@
                         <td>#{{ item.track_id }}</td>
                         <td class="small">{{ item.vehicle_class }}</td>
                         <td>
-                            <span class="confidence-badge confidence-{% if item.confidence >= 0.95 %}high{% elif item.confidence >= 0.80 %}medium{% else %}low{% endif %}">
-                                {{ (item.confidence * 100)|int }}%
+                            <span class="confidence-badge confidence-{% if item.confidence is not none and item.confidence >= 0.95 %}high{% elif item.confidence is not none and item.confidence >= 0.80 %}medium{% else %}low{% endif %}" title="Rule engine evidence score; not a probability of guilt">
+                                {% if item.confidence is none %}Unavailable{% else %}{{ (item.confidence * 100)|int }}%{% endif %}
                             </span>
                         </td>
                         <td>

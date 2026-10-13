@@ -8,6 +8,18 @@ global.bootstrap = { Modal: function Modal() {} };
 
 const detailUi = require("../../static/js/motorcycle_detail_review.js");
 
+assert.deepStrictEqual(
+    detailUi.detailOutcomeRequestBody({
+        human_outcome: "uncertain", reviewer_notes: "check again", review_revision: "a".repeat(64)
+    }, "uncertain"),
+    {
+        outcome: "uncertain", notes: "check again", expected_revision: "a".repeat(64),
+        expected_outcome: "uncertain"
+    }
+);
+assert.strictEqual(detailUi.isStaleDetailReviewResponse(409), true);
+assert.strictEqual(detailUi.isStaleDetailReviewResponse(200), false);
+
 // Production defect: a missed mirror detection is UNKNOWN, never proof of
 // absence. The reviewer-facing copy must never imply a proven violation.
 assert.strictEqual(

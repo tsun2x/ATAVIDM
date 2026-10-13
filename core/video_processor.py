@@ -44,6 +44,7 @@ from core.temporal_evidence import (
     EVIDENCE_PRE_SEC,
     EvidenceEpisode,
     TemporalEvidenceBuffer,
+    active_sustained_event_keys,
     evidence_timing_dict,
 )
 from core.tracker import TrackState
@@ -275,11 +276,12 @@ def _persist_event(
     evidence_path = None
     vehicle_evidence_path = None
     if detection is not None:
+        evidence_source = f"video_{video_id}_run_{evidence_buf.run_id}"
         evidence_path = save_evidence_snapshot(
             frame,
             detection,
             event.violation_type,
-            source_key=f"video_{video_id}",
+            source_key=evidence_source,
             frame_number=event.frame_number,
             violation_confidence=event.violation_confidence,
             detection_confidence=event.detection_confidence,
@@ -287,7 +289,7 @@ def _persist_event(
         vehicle_evidence_path = save_vehicle_crop(
             frame,
             detection,
-            source_key=f"video_{video_id}",
+            source_key=evidence_source,
             frame_number=event.frame_number,
         )
 
@@ -336,6 +338,9 @@ def _persist_event(
         still_path=evidence_path,
         vehicle_crop_path=vehicle_evidence_path,
         review_id=review_id,
+        track_identity_epoch=(
+            detection.get("track_identity_epoch") if detection is not None else None
+        ),
     )
     event.evidence_timing = evidence_timing_dict(episode)
     return int(review_id)
@@ -712,6 +717,7 @@ def process_video(
                 ctx["zones"],
                 ctx.get("scene_document"),
                 viol_ids,
+                preferred_event_keys=active_sustained_event_keys(rule_state, timestamp_sec),
             )
             if writer is not None:
                 writer.write(annotated)

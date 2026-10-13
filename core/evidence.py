@@ -32,7 +32,7 @@ def save_evidence_snapshot(
     *,
     violation_confidence: float | None = None,
     detection_confidence: float | None = None,
-) -> str:
+) -> str | None:
     """
     Draw the offending detection on a copy of the frame and save it.
 
@@ -75,12 +75,49 @@ def save_evidence_snapshot(
         out_path.resolve().relative_to(Path(EVIDENCE_FOLDER).resolve())
     except ValueError as exc:
         raise ValueError("Unsafe evidence path rejected (directory traversal).") from exc
-    cv2.imwrite(str(out_path), annotated)
+    raw_path = out_dir / f"raw_{filename}"
+    # Preserve the source frame as a paired sidecar before applying overlays.
+    # A failed raw sidecar does not invalidate an otherwise complete legacy
+    # annotated snapshot, but it is never advertised as available.
+    try:
+        raw_path.resolve().relative_to(Path(EVIDENCE_FOLDER).resolve())
+        cv2.imwrite(str(raw_path), frame)
+    except (cv2.error, OSError, ValueError):
+        pass
+    try:
+        annotated_written = cv2.imwrite(str(out_path), annotated)
+    except (cv2.error, OSError):
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    if not annotated_written or not out_path.is_file():
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
     try:
         return str(out_path.resolve().relative_to(Path(__file__).resolve().parents[1])).replace("\\", "/")
     except ValueError:
         return str(out_path)
+
+
+def raw_scene_sidecar_path(stored_path: str | Path) -> Path | None:
+    """Resolve the paired unannotated still beside a trusted stored snapshot.
+
+    Legacy records simply have no sidecar. Callers must still serve the result
+    through the authenticated private-media response.
+    """
+    path = Path(stored_path)
+    raw_path = path.with_name("raw_" + path.name)
+    try:
+        raw_path.resolve().relative_to(Path(EVIDENCE_FOLDER).resolve())
+    except ValueError:
+        return None
+    return raw_path if raw_path.is_file() else None
 
 
 def _crop_bbox(frame: Any, detection: dict[str, Any]) -> Any | None:

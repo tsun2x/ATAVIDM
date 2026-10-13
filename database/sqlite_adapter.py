@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
+from database.review_revision import motorcycle_detail_review_revision
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SQLITE_PATH = "database/tavidm.db"
@@ -1237,11 +1239,12 @@ def create_user(
     password_hash: str,
     role: str = "enforcer",
     full_name: str | None = None,
+    is_active: bool = True,
 ) -> int:
     with db_session() as conn:
         cursor = conn.execute(
-            "INSERT INTO users (username, password_hash, role, full_name) VALUES (?, ?, ?, ?)",
-            (username, password_hash, role, full_name),
+            "INSERT INTO users (username, password_hash, role, full_name, is_active) VALUES (?, ?, ?, ?, ?)",
+            (username, password_hash, role, full_name, int(bool(is_active))),
         )
         return cursor.lastrowid
 
@@ -5549,6 +5552,75 @@ def find_violation_linked_to_review(review_id: int) -> int | None:
         return int(row["violation_id"]) if row else None
 
 
+def list_vehicle_grouping_provenance(
+    case_ids: list[int] | tuple[int, ...],
+) -> dict[int, list[dict[str, Any]]]:
+    """Batch-load authoritative review-to-case links for bounded grouping."""
+    ids = sorted({int(value) for value in case_ids if type(value) is int and value > 0})
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    with db_session() as conn:
+        if not _table_exists(conn, "case_action_events"):
+            return {}
+        decision_join = (
+            "LEFT JOIN review_decisions d ON d.review_id = q.id"
+            if _table_exists(conn, "review_decisions")
+            else ""
+        )
+        decision_columns = (
+            "d.decision, d.original_violation_type, d.selected_canonical_rule"
+            if decision_join
+            else "NULL AS decision, NULL AS original_violation_type, "
+                 "NULL AS selected_canonical_rule"
+        )
+        rows = conn.execute(
+            f"""
+            SELECT cae.violation_id AS case_id, cae.review_id AS source_review_id,
+                   cae.detail_json, q.video_id, q.processing_run_id, q.track_id,
+                   q.violation_type, q.status, q.evidence_path,
+                   q.evidence_sequence_dir, q.timestamp_sec,
+                   q.episode_start_sec, q.episode_end_sec, {decision_columns}
+            FROM case_action_events cae
+            JOIN review_queue q ON q.id = cae.review_id
+            {decision_join}
+            WHERE cae.violation_id IN ({placeholders})
+              AND cae.action_type = ?
+              AND cae.review_id IS NOT NULL
+            ORDER BY cae.id
+            """,
+            [*ids, ACTION_REVIEW_CONFIRMED],
+        ).fetchall()
+        policy_rules_by_case: dict[int, set[str]] = {}
+        if _table_exists(conn, "case_policy_records"):
+            policy_rows = conn.execute(
+                f"""
+                SELECT violation_id AS case_id, canonical_rule
+                FROM case_policy_records
+                WHERE violation_id IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
+            for policy_row in policy_rows:
+                if policy_row["canonical_rule"]:
+                    policy_rules_by_case.setdefault(
+                        int(policy_row["case_id"]), set()
+                    ).add(str(policy_row["canonical_rule"]))
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = _row_to_dict(row)
+        try:
+            detail = json.loads(item.pop("detail_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(detail, dict) or detail.get("link") != "review_to_violation":
+            continue
+        case_id = int(item["case_id"])
+        item["case_policy_rules"] = sorted(policy_rules_by_case.get(case_id, set()))
+        result.setdefault(case_id, []).append(item)
+    return result
+
+
 def find_orphan_violation_for_review(review_id: int) -> int | None:
     """Recover a violation created for a confirmed review when the link is missing."""
     with db_session() as conn:
@@ -6137,7 +6209,12 @@ def upsert_motorcycle_detail_candidate(
 def get_motorcycle_detail_candidate(candidate_id: int) -> dict[str, Any] | None:
     with db_session() as conn:
         row = conn.execute(
-            "SELECT * FROM motorcycle_detail_candidates WHERE id = ?", (candidate_id,)
+            """SELECT c.*, u.username AS reviewer_username,
+                      u.full_name AS reviewer_full_name
+               FROM motorcycle_detail_candidates c
+               LEFT JOIN users u ON u.id = c.reviewed_by
+               WHERE c.id = ?""",
+            (candidate_id,),
         ).fetchone()
         return _row_to_dict(row)
 
@@ -6175,7 +6252,11 @@ def list_motorcycle_detail_candidates(
         total = int(total_row["total"]) if total_row else 0
         rows = conn.execute(
             f"""
-            SELECT * FROM motorcycle_detail_candidates {where}
+            SELECT c.*, u.username AS reviewer_username,
+                   u.full_name AS reviewer_full_name
+            FROM motorcycle_detail_candidates c
+            LEFT JOIN users u ON u.id = c.reviewed_by
+            {where}
             ORDER BY created_at DESC, id DESC
             LIMIT ? OFFSET ?
             """,
@@ -6447,7 +6528,10 @@ def record_motorcycle_detail_review(
     outcome: str,
     reviewed_by: int | None,
     notes: str | None = None,
-) -> None:
+    expected_outcome: str | None = None,
+    expected_revision: str | None = None,
+    return_snapshot: bool = False,
+) -> bool | dict[str, Any] | None:
     """Record a human outcome for a detail candidate.
 
     Only review/dismiss/uncertain are accepted: this queue deliberately has no
@@ -6458,14 +6542,53 @@ def record_motorcycle_detail_review(
             f"Unsupported detail-review outcome '{outcome}'. "
             f"Expected one of: {', '.join(DETAIL_REVIEW_OUTCOMES)}."
         )
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    with db_session() as conn:
+    if expected_outcome is not None and expected_outcome not in DETAIL_HUMAN_OUTCOMES:
+        raise ValueError(f"Unsupported expected detail-review outcome '{expected_outcome}'.")
+    now = datetime.now().isoformat(sep=" ", timespec="microseconds")
+    normalized_notes = (str(notes)[:2000] if notes else None)
+    transaction = review_write_transaction if expected_revision is not None else db_session
+    with transaction() as conn:
+        def current_snapshot() -> dict[str, Any]:
+            snapshot = conn.execute(
+                """SELECT c.*, u.username AS reviewer_username,
+                          u.full_name AS reviewer_full_name
+                   FROM motorcycle_detail_candidates c
+                   LEFT JOIN users u ON u.id = c.reviewed_by
+                   WHERE c.id = ?""",
+                (int(candidate_id),),
+            ).fetchone()
+            return _row_to_dict(snapshot) or {}
+
+        def saved_result() -> bool | dict[str, Any]:
+            return current_snapshot() if return_snapshot else True
+
         row = conn.execute(
-            "SELECT id FROM motorcycle_detail_candidates WHERE id = ?", (int(candidate_id),)
+            "SELECT * FROM motorcycle_detail_candidates WHERE id = ?", (int(candidate_id),)
         ).fetchone()
         if row is None:
             raise ValueError(f"Motorcycle detail candidate {candidate_id} not found")
-        conn.execute(
+        if expected_revision is not None:
+            if motorcycle_detail_review_revision(dict(row)) != expected_revision:
+                # New clients use strict revision matching. Even an identical
+                # retry is stale; reload shows whether the lost response saved.
+                return False
+            conn.execute(
+                """UPDATE motorcycle_detail_candidates
+                   SET human_outcome = ?, reviewed_by = ?, reviewed_at = ?,
+                       reviewer_notes = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    outcome,
+                    int(reviewed_by) if reviewed_by is not None else None,
+                    now,
+                    normalized_notes,
+                    now,
+                    int(candidate_id),
+                ),
+            )
+            return saved_result()
+        if expected_outcome is None:
+            conn.execute(
             """
             UPDATE motorcycle_detail_candidates
             SET human_outcome = ?,
@@ -6475,15 +6598,42 @@ def record_motorcycle_detail_review(
                 updated_at = ?
             WHERE id = ?
             """,
+                (
+                    outcome,
+                    int(reviewed_by) if reviewed_by is not None else None,
+                    now,
+                    normalized_notes,
+                    now,
+                    int(candidate_id),
+                ),
+            )
+            return current_snapshot() if return_snapshot else None
+        cursor = conn.execute(
+            """UPDATE motorcycle_detail_candidates
+               SET human_outcome = ?, reviewed_by = ?, reviewed_at = ?,
+                   reviewer_notes = ?, updated_at = ?
+               WHERE id = ? AND human_outcome = ?""",
             (
                 outcome,
                 int(reviewed_by) if reviewed_by is not None else None,
                 now,
-                (str(notes)[:2000] if notes else None),
+                normalized_notes,
                 now,
                 int(candidate_id),
+                expected_outcome,
             ),
         )
+        if not cursor.rowcount:
+            latest = conn.execute(
+                "SELECT human_outcome, reviewed_by, reviewer_notes FROM motorcycle_detail_candidates WHERE id = ?",
+                (int(candidate_id),),
+            ).fetchone()
+            if latest is not None and latest["human_outcome"] == outcome:
+                # Idempotent replay leaves attribution untouched; when the API
+                # asks for a snapshot, return it from this same transaction.
+                return saved_result()
+            return False
+        return saved_result()
 
 
 def list_motorcycle_detail_run_keys_for_video(video_id: int) -> list[str]:

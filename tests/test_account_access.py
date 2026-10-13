@@ -87,6 +87,100 @@ def test_admin_user_access_view_shows_effective_and_explicit_policy_permissions(
     assert access["explicit_policy_grants"][0]["label"] == "Confirm enforcement case"
 
 
+def test_admin_created_account_honors_inactive_setting_and_survives_reload(admin_client, test_db):
+    response = admin_client.post("/api/users", json={
+        "username": "inactive_created",
+        "password": "test-only-password",
+        "role": "viewer",
+        "is_active": False,
+    })
+    assert response.status_code == 200
+    created = response.get_json()["user"]
+    assert created["is_active"] is False
+    reread = admin_client.get("/api/users").get_json()["users"]
+    assert next(user for user in reread if user["username"] == "inactive_created")["is_active"] is False
+    assert test_db.get_user_by_username("inactive_created")["is_active"] in (False, 0)
+
+
+def test_account_ui_serializer_exposes_raw_full_name_for_exact_edit_checks():
+    import app as flask_app
+
+    rendered = flask_app._user_to_ui({
+        "id": 23, "username": "staff", "full_name": "", "role": "enforcer", "is_active": 1,
+    })
+    assert rendered["name"] == "staff"
+    assert rendered["full_name_raw"] == ""
+
+
+def test_admin_creation_handles_unique_constraint_race_as_controlled_error(admin_client, monkeypatch):
+    import sqlite3
+    import app as flask_app
+
+    def collide(*_args, **_kwargs):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+    monkeypatch.setattr(flask_app.db, "create_user", collide)
+    response = admin_client.post("/api/users", json={
+        "username": "racing_user", "password": "test-only-password", "role": "enforcer"
+    })
+    assert response.status_code == 400
+    assert response.get_json() == {"success": False, "error": "Username already exists."}
+
+
+@pytest.mark.parametrize("role", ["enforcer", "viewer"])
+def test_admin_created_active_roles_survive_list_reload_and_login(admin_client, role):
+    import app as flask_app
+
+    username = "created_" + role
+    password = "role-test-password"
+    created = admin_client.post("/api/users", json={
+        "username": username,
+        "password": password,
+        "role": role,
+        "full_name": "Created " + role.title(),
+        "is_active": True,
+    })
+    assert created.status_code == 200
+    assert created.get_json()["user"]["is_active"] is True
+    listed = admin_client.get("/api/users").get_json()["users"]
+    assert any(user["username"] == username and user["role"] == role for user in listed)
+
+    fresh_client = flask_app.app.test_client()
+    login = fresh_client.post("/login", data={"username": username, "password": password})
+    assert login.status_code == 302
+    assert fresh_client.get("/").status_code == 200
+
+
+def test_violation_heading_uses_adviser_wording(admin_client):
+    response = admin_client.get("/violations")
+    assert response.status_code == 200
+    assert b"Violation Type" in response.data
+
+
+@pytest.mark.parametrize(
+    "rule_score,legacy_score,expected",
+    [(0.0, 0.0, 0.0), (None, None, None)],
+)
+def test_violation_ui_keeps_zero_distinct_from_unavailable(
+    admin_client, rule_score, legacy_score, expected
+):
+    import app as flask_app
+
+    item = flask_app._violation_to_ui({
+        "id": 987654,
+        "video_id": None,
+        "violation_type": "Counterflow",
+        "confidence": legacy_score,
+        "violation_confidence": rule_score,
+        "detection_confidence": 0.0,
+        "status": "confirmed",
+        "detected_at": "2026-10-13 12:00:00",
+    }, {})
+    assert item["confidence"] is expected
+    assert item["violation_confidence"] is expected
+    assert item["detection_confidence"] == 0.0
+
+
 def test_user_access_api_is_admin_only_and_does_not_allow_client_grants(client, test_db):
     user_id = test_db.create_user(
         "access_target",

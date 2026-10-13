@@ -6,6 +6,11 @@
     "use strict";
 
     let allViolations = [];
+    let vehicleGroups = [];
+    let displayMode = "individual";
+    let groupedEventTotal = 0;
+    let verifiedVehicleTotal = 0;
+    let unassociatedEventTotal = 0;
     let totalRecords = Number(window.TAVIDM_VIOLATION_TOTAL || 0);
     let currentPage = 1;
     let pageSize = 8;
@@ -21,6 +26,7 @@
     const filterDate = document.getElementById("filterDate");
     const sortSelect = document.getElementById("sortSelect");
     const pageSizeSelect = document.getElementById("pageSize");
+    const groupingSelect = document.getElementById("vehicleGrouping");
     const tbody = document.getElementById("violationsBody");
     const pagination = document.getElementById("pagination");
     const paginationInfo = document.getElementById("paginationInfo");
@@ -33,6 +39,13 @@
         if (c >= 0.85) return "high";
         if (c >= 0.65) return "medium";
         return "low";
+    }
+
+    function formatRuleScore(v) {
+        const score = v && v.violation_confidence !== undefined
+            ? v.violation_confidence : (v && v.confidence);
+        return score === null || score === undefined || !Number.isFinite(Number(score))
+            ? "Unavailable" : Math.round(Number(score) * 100) + "%";
     }
 
     function escapeHtml(s) {
@@ -106,15 +119,26 @@
             date_to: filterDate?.value || "",
         };
         Object.keys(active).forEach(function (key) { if (active[key]) params.set(key, active[key]); });
-        fetch("/api/violations?" + params.toString())
+        const endpoint = displayMode === "vehicle"
+            ? "/api/violations/vehicle-groups?" : "/api/violations?";
+        fetch(endpoint + params.toString())
             .then(function (response) {
-                if (!response.ok) throw new Error(response.status === 401 ? "Session expired. Sign in again." : "Could not load violations.");
-                return response.json();
+                return response.json().catch(function () { return {}; }).then(function (payload) {
+                    if (!response.ok) {
+                        throw new Error(response.status === 401 ? "Session expired. Sign in again."
+                            : (payload.error || "Could not load violations."));
+                    }
+                    return payload;
+                });
             })
             .then(function (payload) {
                 if (sequence !== requestSequence) return;
                 if (!payload.success) throw new Error(payload.error || "Could not load violations.");
                 allViolations = payload.items || [];
+                vehicleGroups = payload.groups || [];
+                groupedEventTotal = Number(payload.event_total) || 0;
+                verifiedVehicleTotal = Number(payload.verified_vehicle_total) || 0;
+                unassociatedEventTotal = Number(payload.unassociated_event_total) || 0;
                 currentCaseActions = payload.case_actions || {};
                 totalRecords = Number(payload.total) || 0;
                 currentPage = payload.page || currentPage;
@@ -125,34 +149,65 @@
                 if (sequence !== requestSequence) return;
                 if (tbody) tbody.innerHTML = '<tr><td colspan="9" class="text-center text-danger py-4">' + escapeHtml(error.message) + '</td></tr>';
                 totalRecords = 0;
+                groupedEventTotal = 0;
+                verifiedVehicleTotal = 0;
+                unassociatedEventTotal = 0;
+                if (resultCount) resultCount.textContent = displayMode === "vehicle"
+                    ? "0 display groups · 0 proven vehicles · 0 unassociated events · 0 events" : "0";
                 renderPagination();
                 updatePaginationInfo();
             });
     }
 
     function render() {
-        if (resultCount) resultCount.textContent = totalRecords;
+        if (resultCount) resultCount.textContent = displayMode === "vehicle"
+            ? totalRecords + (totalRecords === 1 ? " display group · " : " display groups · ") +
+                verifiedVehicleTotal + (verifiedVehicleTotal === 1 ? " proven vehicle · " : " proven vehicles · ") +
+                unassociatedEventTotal + (unassociatedEventTotal === 1 ? " unassociated event · " : " unassociated events · ") +
+                groupedEventTotal + (groupedEventTotal === 1 ? " event" : " events")
+            : totalRecords;
 
         if (tbody) {
-            tbody.innerHTML = allViolations.map(function (v) {
+            const eventRow = function (v, nested) {
                 const plate = plateBadge(v);
                 return (
-                    "<tr data-violation='" + escapeHtml(JSON.stringify(v)) + "'>" +
+                    "<tr data-violation='" + escapeHtml(JSON.stringify(v)) + "'" + (nested ? ' class="vehicle-child-event"' : "") + ">" +
                     "<td><code>" + escapeHtml(v.id) + "</code></td>" +
                     '<td><span class="vtype-badge vtype-' + escapeHtml(v.type_slug) + '">' + escapeHtml(v.type) + "</span></td>" +
                     '<td class="small">' + escapeHtml(v.video_name) + "</td>" +
                     "<td>" + escapeHtml(v.timestamp) + "</td>" +
-                    '<td><span class="confidence-badge confidence-' + getConfidenceClass(v.confidence) + '">' +
-                    Math.round(v.confidence * 100) + "%</span></td>" +
+                    '<td><span class="confidence-badge confidence-' + getConfidenceClass(v.confidence) + '" title="Rule engine evidence score; not a probability of guilt">' +
+                    escapeHtml(formatRuleScore(v)) + "</span></td>" +
                     '<td><span class="badge status-badge status-' + escapeHtml(v.status) + '">' + escapeHtml(v.status) + "</span></td>" +
                     '<td class="small">' + (v.vehicle_class && v.vehicle_class !== "—" ? escapeHtml(v.vehicle_class) : "—") + "</td>" +
                     "<td>" + plate + "</td>" +
                     '<td><div class="btn-group btn-group-sm">' +
-                    '<button class="btn btn-outline-danger btn-view-detail"><i class="bi bi-eye"></i></button>' +
-                    '<button class="btn btn-outline-secondary btn-view-evidence"><i class="bi bi-image"></i></button>' +
+                    '<button class="btn btn-outline-danger btn-view-detail" title="View Details" aria-label="View details for ' + escapeHtml(v.id) + '"><i class="bi bi-eye"></i></button>' +
+                    '<button class="btn btn-outline-secondary btn-view-evidence" title="View Evidence" aria-label="View evidence for ' + escapeHtml(v.id) + '"><i class="bi bi-image"></i></button>' +
                     "</div></td></tr>"
                 );
-            }).join("");
+            };
+            if (displayMode === "vehicle") {
+                tbody.innerHTML = vehicleGroups.length ? vehicleGroups.map(function (group, index) {
+                    const first = group.events[0] || {};
+                    const detailsId = "vehicleEvents-" + index;
+                    const label = group.vehicle_identity_verified
+                        ? (first.vehicle_class && first.vehicle_class !== "—" ? first.vehicle_class : "Vehicle") +
+                            " · track " + group.track_id
+                        : "Identity unavailable · individual event";
+                    const typeLabel = (group.violation_types || []).join(", ") || "Event";
+                    const childRows = (group.events || []).map(function (event) { return eventRow(event, true); }).join("");
+                    return '<tr class="vehicle-group-summary">' +
+                        '<td colspan="3"><button type="button" class="btn btn-sm btn-link p-0 btn-toggle-vehicle-events" aria-expanded="false" aria-controls="' + detailsId + '"><i class="bi bi-chevron-right me-1"></i>' + escapeHtml(label) + '</button>' +
+                        '<div class="small text-muted">' + escapeHtml(first.video_name || "") + ' · ' + escapeHtml(typeLabel) + '</div></td>' +
+                        '<td>' + escapeHtml(first.timestamp || "") + '</td>' +
+                        '<td colspan="2"><span class="badge bg-secondary-subtle text-secondary">' + Number(group.event_count || 0) + ' event(s)</span></td>' +
+                        '<td>' + escapeHtml(first.vehicle_class || "—") + '</td><td>—</td><td>—</td></tr>' +
+                        '<tr id="' + detailsId + '" class="vehicle-group-children d-none"><td colspan="9"><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>ID</th><th>Violation Type</th><th>Video</th><th>Date / Time</th><th>Rule Evidence Score</th><th>Status</th><th>Vehicle</th><th>Plate</th><th>Actions</th></tr></thead><tbody>' + childRows + '</tbody></table></div></td></tr>';
+                }).join("") : '<tr><td colspan="9" class="text-center text-muted py-4">No violation display groups match these filters.</td></tr>';
+            } else {
+                tbody.innerHTML = allViolations.map(function (v) { return eventRow(v, false); }).join("");
+            }
         }
         renderPagination();
         updatePaginationInfo();
@@ -177,8 +232,12 @@
     function updatePaginationInfo() {
         if (!paginationInfo) return;
         const start = totalRecords ? (currentPage - 1) * pageSize + 1 : 0;
-        const end = Math.min((currentPage - 1) * pageSize + allViolations.length, totalRecords);
-        paginationInfo.textContent = "Showing " + start + "\u2013" + end + " of " + totalRecords;
+        const end = Math.min((currentPage - 1) * pageSize + (displayMode === "vehicle" ? vehicleGroups.length : allViolations.length), totalRecords);
+        paginationInfo.textContent = "Showing " + start + "\u2013" + end + " of " + totalRecords +
+            (displayMode === "vehicle" ? (totalRecords === 1 ? " display group (" : " display groups (") +
+                verifiedVehicleTotal + (verifiedVehicleTotal === 1 ? " proven vehicle, " : " proven vehicles, ") +
+                unassociatedEventTotal + (unassociatedEventTotal === 1 ? " unassociated event, " : " unassociated events, ") +
+                groupedEventTotal + (groupedEventTotal === 1 ? " matching event)" : " matching events)") : "");
     }
 
     function showDetail(v) {
@@ -242,7 +301,8 @@
             detailField("Notice Printed", v.notice_printed ? "Yes (attested)" : "No") +
             detailField("Frame", v.frame_number) +
             detailField("Detected At", escapeHtml(v.timestamp)) +
-            detailField("Confidence", Math.round(v.confidence * 100) + "%") +
+            detailField("Rule Evidence Score", escapeHtml(formatRuleScore(v)) + " (not a probability of guilt)") +
+            detailField("Detector Model Score", v.detection_confidence == null ? "Unavailable" : (Math.round(Number(v.detection_confidence) * 100) + "%")) +
             detailField("Status", '<span class="badge status-badge status-' + escapeHtml(v.status) + '">' + escapeHtml(v.status) + "</span>") +
             detailField("Reason Log", escapeHtml(v.reason_log || ""), true) +
             "</div>" +
@@ -444,7 +504,13 @@
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
         const sceneImg = evidenceImage(v.evidence_url, "No scene evidence snapshot available.");
+        const rawSceneImg = evidenceImage(v.raw_evidence_url, "Raw scene is unavailable for this older or incomplete evidence record.");
         const vehicleImg = evidenceImage(v.vehicle_evidence_url, "No vehicle crop captured for this detection.");
+        const preferredScene = v.preferred_evidence_url
+            ? '<section class="mt-3"><h6>Suggested clearer event frame</h6>' +
+                evidenceImage(v.preferred_evidence_url, "Suggested event frame") +
+                '<p class="small text-muted mt-1">' + escapeHtml(v.preferred_evidence_reason || "Selected from this event’s bounded temporal window.") +
+                ' The trigger snapshot and event clip remain the primary evidence record.</p></section>' : "";
         const clipPane = v.evidence_clip_url
             ? (v.annotated_evidence_clip_url
                 ? '<div class="btn-group btn-group-sm mb-2" role="group" aria-label="Evidence clip view">' +
@@ -458,13 +524,18 @@
             : '<div class="text-muted py-5"><i class="bi bi-film fs-1 d-block mb-2"></i>No finalized evidence clip available.</div>';
         body.innerHTML =
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
-            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#paneScene" type="button" role="tab">Scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#paneScene" type="button" role="tab">Annotated scene</button></li>' +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneRawScene" type="button" role="tab">Raw scene</button></li>' +
             '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneVehicle" type="button" role="tab">Vehicle</button></li>' +
             '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#paneClip" type="button" role="tab">Clip (3s before / 3s after)</button></li>' +
             "</ul>" +
             '<div class="tab-content">' +
-            '<div class="tab-pane fade show active" id="paneScene" role="tabpanel">' + sceneImg +
+            '<div class="tab-pane fade show active" id="paneScene" role="tabpanel"><div class="row g-3 align-items-start"><div class="col-lg-8">' + sceneImg +
+            '</div><div class="col-lg-4"><h6>Enlarged vehicle/object crop</h6>' + vehicleImg +
+            '<p class="small text-muted mt-2">Original crop pixels are shown at a larger screen size; no missing detail is reconstructed.</p>' + preferredScene + '</div></div>' +
             "<p class=\"mt-2 text-muted small\">" + escapeHtml(v.id) + " · " + escapeHtml(v.type) + " · Track #" + escapeHtml(v.track_id) + " · " + escapeHtml(v.timestamp) + "</p></div>" +
+            '<div class="tab-pane fade" id="paneRawScene" role="tabpanel">' + rawSceneImg +
+            '<p class="small text-muted mt-2">The raw view is the saved source frame without TAVIDM overlays. Browser zoom does not recover missing image detail.</p></div>' +
             '<div class="tab-pane fade" id="paneVehicle" role="tabpanel">' + vehicleImg +
             "<p class=\"mt-2 text-muted small\">Vehicle/object crop. Plate recognition is not performed in this build.</p></div>" +
             '<div class="tab-pane fade" id="paneClip" role="tabpanel">' + clipPane + "</div>" +
@@ -504,6 +575,11 @@
     });
 
     sortSelect?.addEventListener("change", function () { currentPage = 1; loadPage(); });
+    groupingSelect?.addEventListener("change", function () {
+        displayMode = groupingSelect.value === "vehicle" ? "vehicle" : "individual";
+        currentPage = 1;
+        loadPage();
+    });
 
     document.getElementById("resetFilters")?.addEventListener("click", function () {
         [searchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) { if (el) el.value = ""; });
@@ -527,6 +603,18 @@
     });
 
     tbody?.addEventListener("click", function (e) {
+        const toggle = e.target.closest(".btn-toggle-vehicle-events");
+        if (toggle) {
+            const details = document.getElementById(toggle.getAttribute("aria-controls"));
+            if (details) {
+                const expanded = !details.classList.contains("d-none");
+                details.classList.toggle("d-none", expanded);
+                toggle.setAttribute("aria-expanded", String(!expanded));
+                const icon = toggle.querySelector("i");
+                if (icon) icon.className = "bi " + (expanded ? "bi-chevron-right" : "bi-chevron-down") + " me-1";
+            }
+            return;
+        }
         const row = e.target.closest("tr");
         if (!row) return;
         let v;

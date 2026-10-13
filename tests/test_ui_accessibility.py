@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
+
+UI_TEST_BOOTSTRAP_PASSWORD = "ui-accessibility-test-only-2026"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_bootstrap_admin(monkeypatch):
+    monkeypatch.setenv("TAVIDM_BOOTSTRAP_ADMIN_PASSWORD", UI_TEST_BOOTSTRAP_PASSWORD)
+
 
 def _login(client, username: str, password: str):
+    if username == "admin" and password == "admin123":
+        password = os.environ["TAVIDM_BOOTSTRAP_ADMIN_PASSWORD"]
     response = client.post("/login", data={"username": username, "password": password})
     assert response.status_code in (302, 303)
 
@@ -55,7 +69,7 @@ def test_review_queue_exposes_filter_and_action_state(client):
     assert 'aria-label="Dismiss detection' in html
     assert 'data-confirm-message=' in html
     assert 'data-loading-label="Confirming…"' in html
-    assert "/static/evidence/review-accessibility/evidence_clip.mp4" in html
+    assert "/api/review-queue/" in html and "/evidence/clip" in html
 
     review_js = open("static/js/review_queue.js", encoding="utf-8").read()
     assert "evidence_clip_url" in review_js
@@ -86,8 +100,8 @@ def test_icon_actions_and_dialog_closers_have_names(client):
     )
     violations = client.get("/violations").get_data(as_text=True)
     assert 'aria-label="Reset violation filters"' in violations
-    assert 'aria-label="View details for' in violations
-    assert 'aria-label="View evidence for' in violations
+    assert 'aria-label="View details for ' in open("static/js/violations.js", encoding="utf-8").read()
+    assert 'aria-label="View evidence for ' in open("static/js/violations.js", encoding="utf-8").read()
     assert violations.count('class="btn-close" data-bs-dismiss="modal" aria-label="Close"') >= 2
 
     settings = client.get("/settings").get_data(as_text=True)

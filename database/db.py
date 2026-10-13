@@ -116,6 +116,7 @@ approve_legal_policy_version = _adapter.approve_legal_policy_version
 create_case_policy_record = _adapter.create_case_policy_record
 record_case_action = _adapter.record_case_action
 get_case_actions = _adapter.get_case_actions
+list_vehicle_grouping_provenance = _adapter.list_vehicle_grouping_provenance
 user_has_permission = _adapter.user_has_permission
 assign_policy_permission = _adapter.assign_policy_permission
 revoke_policy_permission = _adapter.revoke_policy_permission

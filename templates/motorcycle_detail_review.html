@@ -136,7 +136,13 @@
                                 <i class="bi bi-image"></i>
                             </button>
                         </td>
-                        <td><span class="badge bg-secondary" data-outcome-badge>{{ item.human_outcome }}</span></td>
+                        <td>
+                            <span class="badge bg-secondary" data-outcome-badge>{{ item.human_outcome }}</span>
+                            <div class="small text-muted" data-review-meta>
+                                {% if item.reviewed_at %}{{ item.reviewer_name or 'Reviewer' }} · {{ item.reviewed_at }}{% endif %}
+                                {% if item.reviewer_notes %}<br>{{ item.reviewer_notes }}{% endif %}
+                            </div>
+                        </td>
                         <td>
                             <div class="btn-group btn-group-sm">
                                 <button class="btn btn-outline-primary btn-detail-outcome" data-outcome="reviewed"

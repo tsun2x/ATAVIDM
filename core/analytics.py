@@ -58,12 +58,12 @@ def violation_summary() -> list[dict[str, Any]]:
     ]
 
 
-def _avg_confidence() -> float:
+def _avg_confidence() -> float | None:
     with db.db_session() as conn:
         row = conn.execute(
-            "SELECT AVG(confidence) AS avg_conf FROM violations WHERE status != 'dismissed'"
+            "SELECT AVG(COALESCE(violation_confidence, confidence)) AS avg_conf FROM violations WHERE status != 'dismissed'"
         ).fetchone()
-        return round((row["avg_conf"] or 0) * 100, 1)
+        return round(row["avg_conf"] * 100, 1) if row["avg_conf"] is not None else None
 
 
 def dashboard_stats() -> dict[str, Any]:
@@ -127,9 +127,9 @@ def analytics_data() -> dict[str, Any]:
         band_row = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN confidence >= 0.95 THEN 1 ELSE 0 END) AS auto_q,
-              SUM(CASE WHEN confidence >= 0.80 AND confidence < 0.95 THEN 1 ELSE 0 END) AS careful,
-              SUM(CASE WHEN confidence < 0.80 THEN 1 ELSE 0 END) AS low
+              SUM(CASE WHEN COALESCE(violation_confidence, confidence) >= 0.95 THEN 1 ELSE 0 END) AS auto_q,
+              SUM(CASE WHEN COALESCE(violation_confidence, confidence) >= 0.80 AND COALESCE(violation_confidence, confidence) < 0.95 THEN 1 ELSE 0 END) AS careful,
+              SUM(CASE WHEN COALESCE(violation_confidence, confidence) < 0.80 THEN 1 ELSE 0 END) AS low
             FROM violations WHERE status != 'dismissed'
             """
         ).fetchone()
@@ -149,7 +149,7 @@ def analytics_data() -> dict[str, Any]:
         "breakdown_values": [row["count"] for row in breakdown],
         "vehicle_labels": [row["vehicle_class"] for row in vehicle_rows],
         "vehicle_values": [row["count"] for row in vehicle_rows],
-        "confidence_labels": ["≥95% (auto-queued)", "80–94% (careful review)", "<80% (monitoring)"],
+        "confidence_labels": ["≥95% rule score (queued)", "80–94% rule score (careful review)", "<80% rule score (monitoring)"],
         "confidence_values": [band_row["auto_q"] or 0, band_row["careful"] or 0, band_row["low"] or 0],
         "kpi": {
             "total_week": total_week,
