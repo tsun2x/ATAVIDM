@@ -53,6 +53,41 @@
         startAtEditor: false,
     };
 
+    function annotationDraftKey(videoId) {
+        return "tavidm.annotation-draft." + String(videoId);
+    }
+
+    function readAnnotationDraft(videoId) {
+        if (videoId == null) return null;
+        try {
+            const raw = window.localStorage.getItem(annotationDraftKey(videoId));
+            return raw ? JSON.parse(raw) : null;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    function saveAnnotationDraft() {
+        if (!zoneEditor || !wizardState.video || wizardState.video.db_id == null) return;
+        try {
+            window.localStorage.setItem(
+                annotationDraftKey(wizardState.video.db_id),
+                JSON.stringify(zoneEditor.getSceneDocument())
+            );
+        } catch (err) {
+            // Keep editing usable if browser storage is unavailable or full.
+        }
+    }
+
+    function clearAnnotationDraft(videoId) {
+        if (videoId == null) return;
+        try {
+            window.localStorage.removeItem(annotationDraftKey(videoId));
+        } catch (err) {
+            // The server copy is authoritative once save succeeds.
+        }
+    }
+
     if (wizardModalEl && window.bootstrap) {
         wizardModal = new bootstrap.Modal(wizardModalEl);
     }
@@ -218,7 +253,10 @@
             zoneTypes: zoneTypes,
             sceneDocument: sceneDoc || window.TAVIDMZoneEditor.emptySceneV2(),
             activeZone: zoneTypes[0] && zoneTypes[0].key,
-            onChange: refreshSceneFields,
+            onChange: function () {
+                refreshSceneFields();
+                saveAnnotationDraft();
+            },
         });
         buildZoneTabs();
     }
@@ -242,8 +280,9 @@
         wizardState.templates = payload.templates || [];
         wizardState.mode = wizardState.templates.length ? "choose" : "new";
         wizardState.sourceTemplateId = null;
-        wizardState.existingScene = payload.existing_scene || null;
-        wizardState.startAtEditor = !!payload.start_at_editor;
+        const draft = readAnnotationDraft(payload.video && payload.video.db_id);
+        wizardState.existingScene = draft || payload.existing_scene || null;
+        wizardState.startAtEditor = !!payload.start_at_editor || !!draft;
 
         populateTemplateSelect(wizardState.templates);
         document.getElementById("optionUseTemplate")?.classList.toggle("d-none", !wizardState.templates.length);
@@ -270,6 +309,27 @@
         if (!videoList) return;
         const empty = videoList.querySelector(".text-center.text-muted");
         if (empty) empty.remove();
+
+        const existingCheckbox = videoList.querySelector('.bulk-video-check[value="' + video.db_id + '"]');
+        const existingRow = existingCheckbox && existingCheckbox.closest(".camera-item-row");
+        if (existingRow) {
+            const existingButton = existingRow.querySelector(".camera-item");
+            const statusLabel = existingRow.querySelector(".video-status-label");
+            const ready = !!(video.has_annotation && (video.status === "ready" || video.status === "processed"));
+            existingCheckbox.disabled = !ready;
+            existingCheckbox.checked = false;
+            existingCheckbox.setAttribute("data-ready", ready ? "1" : "0");
+            if (existingButton) existingButton.dataset.video = JSON.stringify(video);
+            if (statusLabel) {
+                const condition = video.condition || "peak";
+                statusLabel.textContent = condition.charAt(0).toUpperCase() + condition.slice(1) +
+                    " · " + (video.status || (video.has_annotation ? "ready" : "annotating"));
+            }
+            existingRow.querySelector(".cam-status-dot")?.classList.toggle("online", !!video.processed);
+            existingRow.querySelector(".cam-status-dot")?.classList.toggle("offline", !video.processed);
+            existingButton?.click();
+            return;
+        }
 
         const row = document.createElement("div");
         row.className = "camera-item-row d-flex align-items-stretch";
@@ -350,6 +410,7 @@
                     return;
                 }
                 showToast("Annotation Saved", payload.message, "success");
+                clearAnnotationDraft(dbId);
                 appendVideoToList(payload.video);
                 wizardModal?.hide();
                 resetSelection();
@@ -534,6 +595,7 @@
                 selectedFile = null;
                 fileInput.value = "";
                 if (payload.requires_annotation) {
+                    appendVideoToList(payload.video);
                     openAnnotationWizard(payload);
                 } else {
                     appendVideoToList(payload.video);

@@ -14,6 +14,7 @@
     const activeSourceName = document.getElementById("activeSourceName");
     const sourceMeta = document.getElementById("sourceMeta");
     const btnProcess = document.getElementById("btnProcessVideo");
+    const btnEditAnnotation = document.getElementById("btnEditAnnotation");
     const btnStopStream = document.getElementById("btnStopStream");
     const cameraList = document.getElementById("cameraList");
     const videoList = document.getElementById("videoList");
@@ -67,6 +68,7 @@
         activeVideo = null;
         watchingLive = false;
         btnProcess?.classList.add("d-none");
+        btnEditAnnotation?.classList.add("d-none");
         btnCancelProcessing?.classList.add("d-none");
         btnStopStream?.classList.add("d-none");
         liveIndicator?.classList.add("d-none");
@@ -209,6 +211,43 @@
         });
         document.getElementById("btnModeLivePreview")?.classList.toggle("d-none", !video.processing);
         document.getElementById("btnModeAnnotated")?.classList.toggle("d-none", !video.annotated_video_ready);
+        if (btnEditAnnotation) {
+            btnEditAnnotation.classList.toggle("d-none", !!video.processing);
+            const label = btnEditAnnotation.querySelector("span");
+            if (label) label.textContent = video.has_annotation ? "View / Edit Annotation" : "Start / Resume Annotation";
+        }
+    }
+
+    function openAnnotationEditor(video) {
+        if (!video || video.processing || !window.TAVIDM_upload) return;
+        const videoId = video.db_id;
+        Promise.all([
+            fetch("/api/videos/" + videoId + "/annotation").then(function (response) {
+                if (!response.ok) throw new Error("Could not load this video's annotation.");
+                return response.json();
+            }),
+            fetch("/api/zone-templates").then(function (response) {
+                if (!response.ok) throw new Error("Could not load zone templates.");
+                return response.json();
+            }),
+        ]).then(function (results) {
+            if (!activeVideo || Number(activeVideo.db_id) !== Number(videoId)) return;
+            const annotation = results[0].annotation;
+            const templates = results[1].templates || [];
+            const existingScene = annotation
+                ? window.TAVIDMZoneEditor.parseSceneDocument(annotation.zones_json, window.TAVIDM_ZONE_TYPES || [])
+                : null;
+            window.TAVIDM_upload.openAnnotationWizard({
+                video: video,
+                frame_url: video.frame_url || ("/api/videos/" + videoId + "/frame"),
+                templates: templates,
+                frame_ready: true,
+                existing_scene: existingScene,
+                start_at_editor: !!annotation,
+            });
+        }).catch(function (error) {
+            showToast("Annotation", error.message || "Could not reopen the annotation editor.", "danger");
+        });
     }
 
     function syncVideoRow(videoId, changes) {
@@ -337,6 +376,10 @@
         let video;
         try { video = JSON.parse(btn.dataset.video); } catch (err) { return; }
         selectVideo(video, btn);
+    });
+
+    btnEditAnnotation?.addEventListener("click", function () {
+        openAnnotationEditor(activeVideo);
     });
 
     function formatSec(sec) {
@@ -643,27 +686,7 @@
             window.location.href = activeVideo.annotated_video_url + "?download=1";
         } else if (action === "history") openHistory(activeVideo.db_id);
         else if (action === "edit_annotation") {
-            fetch("/api/videos/" + activeVideo.db_id + "/annotation")
-                .then(function (r) { return r.json(); })
-                .then(function (payload) {
-                    if (!payload.success || !payload.annotation) {
-                        showToast("Annotation", payload.error || "No saved annotation to edit.", "warning");
-                        return;
-                    }
-                    const raw = payload.annotation.zones_json;
-                    const scene = window.TAVIDMZoneEditor.parseSceneDocument(raw, window.TAVIDM_ZONE_TYPES || []);
-                    window.TAVIDM_upload.openAnnotationWizard({
-                        video: activeVideo,
-                        frame_url: activeVideo.frame_url,
-                        templates: window.TAVIDM_ZONE_TEMPLATES || [],
-                        frame_ready: true,
-                        existing_scene: scene,
-                        start_at_editor: true,
-                    });
-                })
-                .catch(function () {
-                    showToast("Annotation", "Could not load saved annotation.", "danger");
-                });
+            openAnnotationEditor(activeVideo);
         }
         else if (action === "reprocess") openProcessConfirm(activeVideo);
         else if (action === "remove_results") {
