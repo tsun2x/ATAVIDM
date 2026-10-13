@@ -276,6 +276,19 @@ def _evidence_media_response(stored_path: str | None):
     )
 
 
+def _annotated_clip_path(stored_path: str | None) -> Path | None:
+    """Resolve the fixed annotated sidecar beside an authorized raw clip."""
+    roots = [config.EVIDENCE_FOLDER, Path(config.BASE_DIR) / "static" / "evidence"]
+    clip_path = _private_file_path(stored_path, roots)
+    if clip_path is None:
+        return None
+    for name in ("evidence_clip_annotated_browser.mp4", "evidence_clip_annotated.mp4"):
+        candidate = _private_file_path(str(clip_path.parent / name), roots)
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
+
+
 @app.before_request
 def _block_public_private_static_files():
     path = request.path.lower()
@@ -357,6 +370,10 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "evidence_url": _record_evidence_url(vid, "scene") if row.get("evidence_path") else None,
         "vehicle_evidence_url": _record_evidence_url(vid, "vehicle") if row.get("vehicle_evidence_path") else None,
         "evidence_clip_url": _record_evidence_url(vid, "clip") if row.get("evidence_clip_path") else None,
+        "annotated_evidence_clip_url": (
+            _record_evidence_url(vid, "annotated-clip")
+            if _annotated_clip_path(row.get("evidence_clip_path")) else None
+        ),
         "plate_text": (plate_row or {}).get("accepted_plate_text") or row.get("plate_text") or None,
         "plate_status": (plate_row or {}).get("plate_status") or row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
@@ -427,6 +444,10 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "evidence_url": _record_evidence_url(row["id"], "scene", review=True) if row.get("evidence_path") else None,
         "vehicle_evidence_url": _record_evidence_url(row["id"], "vehicle", review=True) if row.get("vehicle_evidence_path") else None,
         "evidence_clip_url": _record_evidence_url(row["id"], "clip", review=True) if row.get("evidence_clip_path") else None,
+        "annotated_evidence_clip_url": (
+            _record_evidence_url(row["id"], "annotated-clip", review=True)
+            if _annotated_clip_path(row.get("evidence_clip_path")) else None
+        ),
         "plate_text": row.get("plate_text") or None,
         "plate_status": row.get("plate_status") or "not_attempted",
         "reason_log": row.get("reason_log") or "",
@@ -723,6 +744,27 @@ def live_monitor():
     )
 
 
+@app.route("/annotation-help")
+@auth.login_required
+def annotation_help():
+    return render_template("annotation_help.html")
+
+
+@app.route("/annotation-help/documents/<path:relative_path>")
+@auth.login_required
+def annotation_help_document(relative_path: str):
+    allowed_documents = {
+        "testing/2026-10-13/annotation-visual-guide/index.html",
+        "testing/2026-10-13/annotation-visual-guide/overlap-use-cases.html",
+        "testing/2026-10-10/ANNOTATION-GUIDE.md",
+    }
+    if relative_path not in allowed_documents:
+        return "Guide document not found.", 404
+    docs_dir = Path(config.BASE_DIR) / "docs"
+    mimetype = "text/markdown" if relative_path.endswith(".md") else "text/html"
+    return send_from_directory(docs_dir, relative_path, mimetype=mimetype)
+
+
 @app.route("/violations")
 @auth.login_required
 def violations():
@@ -773,6 +815,12 @@ def api_list_violations():
 @app.route("/api/violations/<int:record_id>/evidence/<kind>")
 @auth.login_required
 def api_violation_evidence(record_id: int, kind: str):
+    if kind == "annotated-clip":
+        row = db.get_violation(record_id)
+        path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
+        if path is None:
+            return jsonify({"success": False, "error": "Annotated evidence clip not found."}), 404
+        return _evidence_media_response(str(path))
     path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
     row = db.get_violation(record_id)
     if path_key is None or row is None:
@@ -783,6 +831,12 @@ def api_violation_evidence(record_id: int, kind: str):
 @app.route("/api/review-queue/<int:record_id>/evidence/<kind>")
 @auth.role_required("enforcer")
 def api_review_evidence(record_id: int, kind: str):
+    if kind == "annotated-clip":
+        row = db.get_review_item(record_id)
+        path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
+        if path is None:
+            return jsonify({"success": False, "error": "Annotated evidence clip not found."}), 404
+        return _evidence_media_response(str(path))
     path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
     row = db.get_review_item(record_id)
     if path_key is None or row is None:

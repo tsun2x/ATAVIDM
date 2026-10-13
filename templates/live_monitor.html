@@ -154,17 +154,27 @@
                             {% endfor %}
                         </select>
                     </div>
-                    <div class="mb-2">
-                        <label class="form-label small mb-1" for="uploadRecordedAt">
-                            Recording date/time <span class="text-muted fw-normal">(optional)</span>
-                        </label>
-                        <input type="datetime-local" class="form-control form-control-sm" id="uploadRecordedAt"
-                               step="1" autocomplete="off">
-                        <div class="form-text">
-                            Scene recording time only — not upload time. Leave blank if unknown
-                            (truck-ban stays fail-closed until known).
+                    <fieldset class="mb-2">
+                        <legend class="form-label small mb-1">
+                            Recording date and time <span class="text-muted fw-normal">(optional)</span>
+                        </legend>
+                        <div class="row g-2">
+                            <div class="col-12 col-sm-6">
+                                <label class="form-label small mb-1" for="uploadRecordedDate">Date</label>
+                                <input type="date" class="form-control form-control-sm" id="uploadRecordedDate"
+                                       autocomplete="off" aria-describedby="uploadRecordedAtHelp">
+                            </div>
+                            <div class="col-12 col-sm-6">
+                                <label class="form-label small mb-1" for="uploadRecordedTime">Time</label>
+                                <input type="time" class="form-control form-control-sm" id="uploadRecordedTime"
+                                       step="1" autocomplete="off" aria-describedby="uploadRecordedAtHelp">
+                            </div>
                         </div>
-                    </div>
+                        <div class="form-text" id="uploadRecordedAtHelp">
+                            Enter the footage's local recording date and time, not its upload time. Type either field or use its picker.
+                            Fill both, or leave both blank if unknown.
+                        </div>
+                    </fieldset>
                     <div class="progress mb-2 d-none" id="uploadProgressWrap" style="height: 8px;">
                         <div class="progress-bar bg-danger" id="uploadProgressBar" style="width: 0%;"></div>
                     </div>
@@ -269,6 +279,11 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title" id="annotationWizardLabel"><i class="bi bi-bounding-box me-2"></i>Zone Annotation</h5>
+                <a class="btn btn-sm btn-outline-secondary ms-auto me-2"
+                   href="{{ url_for('annotation_help') }}" target="_blank" rel="noopener noreferrer"
+                   aria-label="Open annotation guides in a new tab" title="Open annotation guides in a new tab">
+                    <i class="bi bi-question-circle me-1" aria-hidden="true"></i>Help
+                </a>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" id="btnCloseWizard"></button>
             </div>
             <div class="modal-body">

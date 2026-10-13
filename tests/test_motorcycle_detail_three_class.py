@@ -1168,6 +1168,59 @@ class TestFourClassContract:
         assert four.class_map()["3"] == "no_helmet"
         assert "no_helmet" not in three.class_names
 
+    def test_repeated_attributable_uncovered_head_queues_pending_review_only(
+        self, test_db, video_id, evidence_root
+    ):
+        from database.sqlite_adapter import (
+            create_processing_run, finish_processing_run, start_processing_run,
+        )
+
+        run_id = create_processing_run(video_id, json.dumps(["No Helmet"]))
+        assert run_id == 1
+        start_processing_run(run_id)
+        finish_processing_run(run_id, status="completed")
+        candidate_id = _seed(test_db, video_id, occurrence_key="positive-no-helmet",
+                             frames=(1, 2))
+
+        def predictor(image):
+            return [{"class_label": "no_helmet", "confidence": 0.8,
+                     "bbox": _to_crop(HELMET_SRC)}]
+
+        report = _scanner(test_db, predictor, loader=_ok_4c_checkpoint).run_once()
+        assert report["ready"] == 1
+        candidate = test_db.get_motorcycle_detail_candidate(candidate_id)
+        assert candidate["scan_state"] == "ready"
+        import core.motorcycle_detail_scan as detail_scan
+        payload = detail_scan._no_helmet_review_payload(
+            candidate, {"observations_json": candidate["observations_json"]},
+            _ok_4c_checkpoint(), confidence_floor=0.25,
+        )
+        assert payload is not None, candidate["observations_json"]
+        pending, total = test_db.list_review_queue(status="pending")
+        assert total == 1
+        assert len(pending) == 1
+        item = pending[0]
+        assert item["violation_type"] == "No Helmet"
+        assert item["track_id"] == 7 and item["processing_run_id"] == run_id
+        assert "motorcycle_detail_candidate:" + str(candidate_id) in item["reason_log"]
+        assert "human confirmation required" in item["reason_log"]
+        assert Path(item["evidence_path"]).is_file()
+        assert _protected_counts(test_db)["violations"] == 0
+
+        # Replaying the atomic completion call cannot duplicate the ordinary row.
+        checkpoint = _ok_4c_checkpoint()
+        test_db.finish_motorcycle_detail_scan(
+            candidate_id=candidate_id,
+            observations_json=candidate["observations_json"],
+            association_json=candidate["association_json"],
+            uncertainty_json=candidate["uncertainty_json"],
+            scan_model=checkpoint.identity,
+            scan_class_map_json=json.dumps(list(DETAIL_4)),
+            no_helmet_review_candidate=payload,
+        )
+        pending, total = test_db.list_review_queue(status="pending")
+        assert total == 1 and len(pending) == 1
+
     @pytest.mark.parametrize(
         ("names", "code"),
         [

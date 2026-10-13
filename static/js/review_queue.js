@@ -140,7 +140,15 @@ if (typeof document !== "undefined") {
             ? '<img src="' + escapeHtml(item.vehicle_evidence_url) + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4"><i class="bi bi-car-front fs-1 d-block mb-2"></i>No vehicle crop captured.</div>';
         const clipPane = item.evidence_clip_url
-            ? '<video controls preload="metadata" class="evidence-preview w-100 rounded" src="' + escapeHtml(item.evidence_clip_url) + '">Your browser does not support evidence video playback.</video>'
+            ? (item.annotated_evidence_clip_url
+                ? '<div class="btn-group btn-group-sm mb-2" role="group" aria-label="Evidence clip view">' +
+                    '<button type="button" class="btn btn-secondary" data-evidence-clip-mode="raw" aria-pressed="true">Raw</button>' +
+                    '<button type="button" class="btn btn-outline-secondary" data-evidence-clip-mode="annotated" aria-pressed="false">Annotated</button>' +
+                  '</div>'
+                : '') +
+                '<video controls preload="metadata" class="evidence-preview w-100 rounded" data-evidence-clip-player data-raw-src="' + escapeHtml(item.evidence_clip_url) + '"' +
+                (item.annotated_evidence_clip_url ? ' data-annotated-src="' + escapeHtml(item.annotated_evidence_clip_url) + '"' : '') +
+                ' src="' + escapeHtml(item.evidence_clip_url) + '">Your browser does not support evidence video playback.</video>'
             : '<div class="text-muted py-5"><i class="bi bi-film fs-1 d-block mb-2"></i>No finalized evidence clip available.</div>';
         const clipTab = '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqClip" type="button" role="tab">Clip (3s before / 3s after)</button></li>';
         const plateStatus = item.plate_status || "not_attempted";
@@ -166,6 +174,28 @@ if (typeof document !== "undefined") {
             "<p class=\"small text-muted\">Proposed official: " + escapeHtml(item.proposed_official_category || "—") +
             (item.verified_official_category ? " · Verified: " + escapeHtml(item.verified_official_category) : " · Verified: none") + "</p>" +
             "<p class=\"small text-muted\">Timestamp OCR: unavailable — confirm event time after case materialization.</p>";
+        body.querySelectorAll("[data-evidence-clip-mode]").forEach(function (button) {
+            button.addEventListener("click", function () {
+                const player = body.querySelector("[data-evidence-clip-player]");
+                const mode = button.getAttribute("data-evidence-clip-mode");
+                if (!player) return;
+                const position = player.currentTime || 0;
+                const wasPlaying = !player.paused;
+                player.src = mode === "annotated" ? player.dataset.annotatedSrc : player.dataset.rawSrc;
+                player.load();
+                player.addEventListener("loadedmetadata", function restorePosition() {
+                    player.removeEventListener("loadedmetadata", restorePosition);
+                    if (Number.isFinite(position) && position < player.duration) player.currentTime = position;
+                    if (wasPlaying) player.play().catch(function () {});
+                });
+                body.querySelectorAll("[data-evidence-clip-mode]").forEach(function (choice) {
+                    const active = choice === button;
+                    choice.classList.toggle("btn-secondary", active);
+                    choice.classList.toggle("btn-outline-secondary", !active);
+                    choice.setAttribute("aria-pressed", String(active));
+                });
+            });
+        });
         renderPlateOcr(item);
         evidenceModal.show();
     }

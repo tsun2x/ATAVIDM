@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from config import EVIDENCE_FOLDER
+from core.frame_annotate import annotate_frame
 
 EVIDENCE_PRE_SEC = 3.0
 EVIDENCE_POST_SEC = 3.0
@@ -33,7 +34,9 @@ class TemporalEvidenceFinalizationError(RuntimeError):
     """Episode could not be written as durable temporal evidence."""
 
 
-def _browser_compatible_clip(source_path: Path) -> Path | None:
+def _browser_compatible_clip(
+    source_path: Path, *, target_name: str = "evidence_clip_browser.mp4"
+) -> Path | None:
     """Create an H.264 MP4 sidecar that browsers can play reliably.
 
     OpenCV's ``mp4v`` writer creates valid MPEG-4 Part 2 files, but several
@@ -45,8 +48,8 @@ def _browser_compatible_clip(source_path: Path) -> Path | None:
     if not ffmpeg:
         return None
 
-    target = source_path.with_name("evidence_clip_browser.mp4")
-    temporary = source_path.with_name(f".evidence_clip_browser_{uuid.uuid4().hex}.tmp.mp4")
+    target = source_path.with_name(target_name)
+    temporary = source_path.with_name(f".{target.stem}_{uuid.uuid4().hex}.tmp.mp4")
     command = [
         ffmpeg,
         "-nostdin",
@@ -121,6 +124,10 @@ class BufferedFrame:
     timestamp_sec: float
     jpeg: bytes = field(default=b"", repr=False)
     path: str | None = None
+    overlay_detections: list[dict[str, Any]] | None = field(default=None, repr=False)
+    overlay_zones: dict[str, Any] | None = field(default=None, repr=False)
+    overlay_scene: Any | None = field(default=None, repr=False)
+    overlay_violation_ids: tuple[int, ...] = field(default=(), repr=False)
 
 
 @dataclass
@@ -133,6 +140,7 @@ class EvidenceEpisode:
     still_path: str | None = None
     vehicle_crop_path: str | None = None
     clip_path: str | None = None
+    annotated_clip_path: str | None = None
     sequence_dir: str | None = None
     finalized: bool = False
     review_id: int | None = None
@@ -215,6 +223,10 @@ class TemporalEvidenceBuffer:
                     timestamp_sec=bf.timestamp_sec,
                     jpeg=b"",
                     path=str(dest),
+                    overlay_detections=bf.overlay_detections,
+                    overlay_zones=bf.overlay_zones,
+                    overlay_scene=bf.overlay_scene,
+                    overlay_violation_ids=bf.overlay_violation_ids,
                 )
             )
             ep.spilled_ids.add(bf.frame_number)
@@ -225,12 +237,23 @@ class TemporalEvidenceBuffer:
                     timestamp_sec=bf.timestamp_sec,
                     jpeg=b"",
                     path=bf.path,
+                    overlay_detections=bf.overlay_detections,
+                    overlay_zones=bf.overlay_zones,
+                    overlay_scene=bf.overlay_scene,
+                    overlay_violation_ids=bf.overlay_violation_ids,
                 )
             )
             ep.spilled_ids.add(bf.frame_number)
 
-    def push(self, frame: np.ndarray, frame_number: int, timestamp_sec: float) -> list[EvidenceEpisode]:
-        """Append a frame; finalize any episodes whose post-roll just completed."""
+    def push(
+        self,
+        frame: np.ndarray,
+        frame_number: int,
+        timestamp_sec: float,
+        *,
+        finalize_due: bool = True,
+    ) -> list[EvidenceEpisode]:
+        """Append a frame and optionally finalize episodes whose post-roll ended."""
         ok, encoded = cv2.imencode(
             ".jpg",
             frame,
@@ -248,7 +271,38 @@ class TemporalEvidenceBuffer:
         for ep in self._open_episodes.values():
             self._maybe_spill(ep, bf)
 
-        return self.finalize_due(float(timestamp_sec))
+        return self.finalize_due(float(timestamp_sec)) if finalize_due else []
+
+    def set_frame_annotations(
+        self,
+        frame_number: int,
+        detections: list[dict[str, Any]],
+        zones: dict[str, Any],
+        scene: Any | None,
+        violation_track_ids: set[int],
+    ) -> None:
+        """Attach overlays to the ring/spool copies of one processed frame."""
+        frame_number = int(frame_number)
+        for frame in self._frames:
+            if frame.frame_number == frame_number:
+                self._set_overlay(frame, detections, zones, scene, violation_track_ids)
+        for episode in self._open_episodes.values():
+            for frame in episode.spill:
+                if frame.frame_number == frame_number:
+                    self._set_overlay(frame, detections, zones, scene, violation_track_ids)
+
+    @staticmethod
+    def _set_overlay(
+        frame: BufferedFrame,
+        detections: list[dict[str, Any]],
+        zones: dict[str, Any],
+        scene: Any | None,
+        violation_track_ids: set[int],
+    ) -> None:
+        frame.overlay_detections = detections
+        frame.overlay_zones = zones
+        frame.overlay_scene = scene
+        frame.overlay_violation_ids = tuple(violation_track_ids)
 
     def _maybe_spill(self, ep: EvidenceEpisode, bf: BufferedFrame) -> None:
         window_start = self._window_start(ep)
@@ -376,6 +430,10 @@ class TemporalEvidenceBuffer:
                 timestamp_sec=ref.timestamp_sec,
                 jpeg=jpeg,
                 path=ref.path,
+                overlay_detections=ref.overlay_detections,
+                overlay_zones=ref.overlay_zones,
+                overlay_scene=ref.overlay_scene,
+                overlay_violation_ids=ref.overlay_violation_ids,
             )
 
     def finalize_episode(
@@ -407,10 +465,13 @@ class TemporalEvidenceBuffer:
             + (f"_r{ep.review_id}" if ep.review_id is not None else ""),
         )
         writer = None
+        annotated_writer = None
+        annotated_failed = False
         written = 0
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
             clip_path = out_dir / "evidence_clip.mp4"
+            annotated_clip_path = out_dir / "evidence_clip_annotated.mp4"
             h = w = 0
             for i, bf in enumerate(self._iter_window_frames(ep, float(ts))):
                 jpeg = bf.jpeg
@@ -444,10 +505,43 @@ class TemporalEvidenceBuffer:
                 elif img.shape[0] != h or img.shape[1] != w:
                     img = cv2.resize(img, (w, h))
                 writer.write(img)
+                try:
+                    if annotated_failed:
+                        continue
+                    annotated = annotate_frame(
+                        img,
+                        bf.overlay_detections or [],
+                        zones=bf.overlay_zones,
+                        violation_track_ids=bf.overlay_violation_ids,
+                        scene=bf.overlay_scene,
+                    )
+                    if annotated_writer is None:
+                        annotated_writer = cv2.VideoWriter(
+                            str(annotated_clip_path),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            float(self.fps) if self.fps > 0 else 1.0,
+                            (w, h),
+                        )
+                        if not annotated_writer.isOpened():
+                            annotated_writer.release()
+                            annotated_writer = None
+                            raise TemporalEvidenceFinalizationError(
+                                "failed to open annotated evidence clip writer"
+                            )
+                    annotated_writer.write(annotated)
+                except Exception:
+                    annotated_failed = True
+                    if annotated_writer is not None:
+                        annotated_writer.release()
+                        annotated_writer = None
+                    annotated_clip_path.unlink(missing_ok=True)
 
             if writer is not None:
                 writer.release()
                 writer = None
+            if annotated_writer is not None:
+                annotated_writer.release()
+                annotated_writer = None
 
             if written < 1:
                 raise TemporalEvidenceFinalizationError(
@@ -460,11 +554,23 @@ class TemporalEvidenceBuffer:
                 )
 
             browser_clip_path = _browser_compatible_clip(clip_path) if write_clip else None
+            annotated_browser_clip_path = (
+                _browser_compatible_clip(
+                    annotated_clip_path,
+                    target_name="evidence_clip_annotated_browser.mp4",
+                )
+                if write_clip and annotated_clip_path.is_file()
+                else None
+            )
 
             self._open_episodes.pop(key, None)
             selected_clip_path = browser_clip_path or clip_path
             if write_clip and selected_clip_path.exists():
                 ep.clip_path = _project_relative(selected_clip_path)
+            if write_clip and annotated_clip_path.is_file():
+                ep.annotated_clip_path = _project_relative(
+                    annotated_browser_clip_path or annotated_clip_path
+                )
             ep.sequence_dir = _project_relative(out_dir)
             ep.finalized = True
             marker = out_dir / ".finalized"
@@ -475,11 +581,14 @@ class TemporalEvidenceBuffer:
         except Exception:
             if writer is not None:
                 writer.release()
+            if annotated_writer is not None:
+                annotated_writer.release()
             if out_dir.exists() and not (out_dir / ".finalized").exists():
                 shutil.rmtree(out_dir, ignore_errors=True)
             ep.finalized = False
             ep.sequence_dir = None
             ep.clip_path = None
+            ep.annotated_clip_path = None
             self._open_episodes[key] = ep
             raise
 

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Annotation Help{% endblock %}
+{% block page_title %}Annotation Help{% endblock %}
+{% block page_subtitle %}Visual references for choosing and combining scene annotations{% endblock %}
+
+{% block extra_css %}
+<style>
+    .annotation-guide-frame {
+        display: block;
+        width: 100%;
+        height: 76vh;
+        min-height: 34rem;
+        border: 1px solid var(--bs-border-color);
+        border-radius: var(--bs-border-radius);
+        background: #fff;
+    }
+
+    @media (max-width: 575.98px) {
+        .annotation-guide-frame {
+            height: 70vh;
+            min-height: 30rem;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<section class="card card-panel">
+    <div class="card-body">
+        <p class="text-muted mb-3">
+            Use the first guide to understand each annotation. Use the second to see which annotations work together.
+            Your Zone Annotation window stays open while this page is in its own browser tab.
+        </p>
+
+        <ul class="nav nav-tabs" id="annotationHelpTabs" role="tablist" aria-label="Annotation guides">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="annotation-basics-tab" data-bs-toggle="tab"
+                        data-bs-target="#annotation-basics-panel" type="button" role="tab"
+                        aria-controls="annotation-basics-panel" aria-selected="true">
+                    Annotation Basics
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="annotation-overlap-tab" data-bs-toggle="tab"
+                        data-bs-target="#annotation-overlap-panel" type="button" role="tab"
+                        aria-controls="annotation-overlap-panel" aria-selected="false">
+                    Overlapping Annotations
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content pt-3">
+            <div class="tab-pane fade show active" id="annotation-basics-panel" role="tabpanel"
+                 aria-labelledby="annotation-basics-tab" tabindex="0">
+                <iframe class="annotation-guide-frame" title="Annotation Basics visual guide"
+                        src="{{ url_for('annotation_help_document', relative_path='testing/2026-10-13/annotation-visual-guide/index.html') }}"
+                        loading="eager" sandbox="allow-scripts"></iframe>
+            </div>
+            <div class="tab-pane fade" id="annotation-overlap-panel" role="tabpanel"
+                 aria-labelledby="annotation-overlap-tab" tabindex="0">
+                <iframe class="annotation-guide-frame" title="Overlapping Annotations visual guide"
+                        src="{{ url_for('annotation_help_document', relative_path='testing/2026-10-13/annotation-visual-guide/overlap-use-cases.html') }}"
+                        loading="eager" sandbox="allow-scripts"></iframe>
+            </div>
+        </div>
+    </div>
+</section>
+{% endblock %}

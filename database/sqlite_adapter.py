@@ -6252,10 +6252,21 @@ def finish_motorcycle_detail_scan(
     scan_model: str | None,
     scan_class_map_json: str,
     scan_seconds: float | None = None,
+    no_helmet_review_candidate: dict[str, Any] | None = None,
 ) -> None:
-    """Mark one candidate ``ready`` with its stored observations."""
+    """Atomically finish a detail scan and optionally queue positive evidence.
+
+    The optional No Helmet row is still an ordinary pending review item. It is
+    created only for a current, completed source run that enabled the rule and
+    only while the detail item has no recorded human outcome.
+    """
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    with db_session() as conn:
+    with review_write_transaction() as conn:
+        source = conn.execute(
+            """SELECT video_id, track_id, processing_run_id, human_outcome
+               FROM motorcycle_detail_candidates WHERE id = ?""",
+            (int(candidate_id),),
+        ).fetchone()
         conn.execute(
             """
             UPDATE motorcycle_detail_candidates
@@ -6282,6 +6293,48 @@ def finish_motorcycle_detail_scan(
                 now,
                 int(candidate_id),
             ),
+        )
+        if no_helmet_review_candidate is None or source is None:
+            return
+        if source["human_outcome"] != "pending" or source["processing_run_id"] is None:
+            return
+        video_id = int(source["video_id"])
+        run_id = int(source["processing_run_id"])
+        current_run = get_current_completed_result_run(video_id)
+        if not current_run or int(current_run.get("id") or 0) != run_id:
+            return
+        try:
+            enabled = json.loads(current_run.get("enabled_violations_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            enabled = []
+        if not isinstance(enabled, list) or "No Helmet" not in enabled:
+            return
+
+        marker = f"[motorcycle_detail_candidate:{int(candidate_id)}]"
+        existing = conn.execute(
+            """SELECT id FROM review_queue
+               WHERE processing_run_id = ? AND track_id = ? AND violation_type = ?
+                 AND instr(COALESCE(reason_log, ''), ?) > 0
+               ORDER BY id LIMIT 1""",
+            (run_id, int(source["track_id"]), "No Helmet", marker),
+        ).fetchone()
+        if existing is not None:
+            return
+        values = dict(no_helmet_review_candidate)
+        insert_review_queue(
+            video_id=video_id,
+            track_id=int(source["track_id"]),
+            violation_type="No Helmet",
+            confidence=float(values["confidence"]),
+            detection_confidence=float(values["detection_confidence"]),
+            violation_confidence=float(values["violation_confidence"]),
+            frame_number=int(values["frame_number"]),
+            timestamp_sec=float(values["timestamp_sec"]),
+            evidence_path=str(values["evidence_path"]),
+            reason_log=f"{marker} {str(values['reason_log'])}",
+            vehicle_class="motorcycle",
+            processing_run_id=run_id,
+            unavailable_factors_json=json.dumps([]),
         )
 
 

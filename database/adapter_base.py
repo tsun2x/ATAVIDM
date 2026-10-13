@@ -234,6 +234,7 @@ class DatabaseAdapter(Protocol):
         scan_model: str | None,
         scan_class_map_json: str,
         scan_seconds: float | None = None,
+        no_helmet_review_candidate: dict[str, Any] | None = None,
     ) -> None: ...
     def record_motorcycle_detail_scan_failure(
         self, *, candidate_id: int, error: str, max_attempts: int

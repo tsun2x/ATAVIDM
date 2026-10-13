@@ -67,7 +67,7 @@ def _motorcycle(**overrides):
     return row
 
 
-def _vehicle(track_id, label, t, x, *, y=100.0, w=120.0, h=60.0):
+def _vehicle(track_id, label, t, x, *, y=100.0, w=120.0, h=60.0, cargo_region_observable=None):
     return {
         "track_id": track_id,
         "class_label": label,
@@ -78,6 +78,7 @@ def _vehicle(track_id, label, t, x, *, y=100.0, w=120.0, h=60.0):
         "bbox_h": h,
         "confidence": 0.92,
         "timestamp_sec": t,
+        "cargo_region_observable": cargo_region_observable,
     }
 
 
@@ -338,7 +339,9 @@ class TestPickupTrackEvidence:
         rows = []
         for index, (t, label) in enumerate(labels):
             x = 4000.0 if jump_at is not None and t >= jump_at else 100.0 + index * 30.0
-            veh = _vehicle(1, label, t, x)
+            # Unit boundary only: simulate an upstream visibility observation.
+            # The production detector/tracker currently has no such producer.
+            veh = _vehicle(1, label, t, x, cargo_region_observable=True)
             person = _cargo_person(t, x)
             annotated = track.update([veh, person], now=t)
             rows.append(annotated[0])
@@ -403,6 +406,26 @@ class TestPickupTrackEvidence:
         assert reviews
         assert all(event.outcome == "review" for event in reviews)
 
+    def test_cargo_candidate_requires_explicit_cargo_visibility(self):
+        track = TrackState()
+        state = RuleEngineState()
+        events = []
+        for index in range(17):
+            t = index * 0.5
+            tracked = track.update(
+                [_vehicle(1, "pickup_truck", t, 100.0 + index * 30.0,
+                          cargo_region_observable=False), _cargo_person(t, 100.0 + index * 30.0)],
+                now=t,
+            )
+            events.extend(evaluate_detection_rules(
+                tracked, state, index,
+                enabled_violations=(VIOLATION_CARGO_PASSENGERS,),
+                model_classes=("person", "pickup_truck", "truck", "car"),
+                now_sec=t,
+                history=track.history_view(t),
+            ))
+        assert not [e for e in events if e.violation_type == VIOLATION_CARGO_PASSENGERS]
+
     def test_sustained_car_label_resets_a_pickup_identity(self):
         labels = [(round(i * 0.5, 2), "pickup_truck") for i in range(0, 5)]
         labels += [(round(2.0 + i * 0.5, 2), "car") for i in range(1, 6)]
@@ -451,7 +474,7 @@ class TestPickupTrackEvidence:
             t = index * 0.5
             x = 100.0 + index * 30.0 + (5000.0 if index >= 15 else 0.0)
             tracked = track.update(
-                [_vehicle(1, "pickup_truck", t, x), _cargo_person(t, x)],
+                [_vehicle(1, "pickup_truck", t, x, cargo_region_observable=True), _cargo_person(t, x)],
                 now=t,
             )
             epochs.add(tracked[0]["track_identity_epoch"])

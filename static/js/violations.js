@@ -446,7 +446,15 @@
         const sceneImg = evidenceImage(v.evidence_url, "No scene evidence snapshot available.");
         const vehicleImg = evidenceImage(v.vehicle_evidence_url, "No vehicle crop captured for this detection.");
         const clipPane = v.evidence_clip_url
-            ? '<video controls preload="metadata" class="evidence-preview w-100 rounded" src="' + escapeHtml(v.evidence_clip_url) + '">Your browser does not support evidence video playback.</video>'
+            ? (v.annotated_evidence_clip_url
+                ? '<div class="btn-group btn-group-sm mb-2" role="group" aria-label="Evidence clip view">' +
+                    '<button type="button" class="btn btn-secondary" data-evidence-clip-mode="raw" aria-pressed="true">Raw</button>' +
+                    '<button type="button" class="btn btn-outline-secondary" data-evidence-clip-mode="annotated" aria-pressed="false">Annotated</button>' +
+                  '</div>'
+                : '') +
+                '<video controls preload="metadata" class="evidence-preview w-100 rounded" data-evidence-clip-player data-raw-src="' + escapeHtml(v.evidence_clip_url) + '"' +
+                (v.annotated_evidence_clip_url ? ' data-annotated-src="' + escapeHtml(v.annotated_evidence_clip_url) + '"' : '') +
+                ' src="' + escapeHtml(v.evidence_clip_url) + '">Your browser does not support evidence video playback.</video>'
             : '<div class="text-muted py-5"><i class="bi bi-film fs-1 d-block mb-2"></i>No finalized evidence clip available.</div>';
         body.innerHTML =
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
@@ -461,6 +469,28 @@
             "<p class=\"mt-2 text-muted small\">Vehicle/object crop. Plate recognition is not performed in this build.</p></div>" +
             '<div class="tab-pane fade" id="paneClip" role="tabpanel">' + clipPane + "</div>" +
             "</div>";
+        body.querySelectorAll("[data-evidence-clip-mode]").forEach(function (button) {
+            button.addEventListener("click", function () {
+                const player = body.querySelector("[data-evidence-clip-player]");
+                const mode = button.getAttribute("data-evidence-clip-mode");
+                if (!player) return;
+                const position = player.currentTime || 0;
+                const wasPlaying = !player.paused;
+                player.src = mode === "annotated" ? player.dataset.annotatedSrc : player.dataset.rawSrc;
+                player.load();
+                player.addEventListener("loadedmetadata", function restorePosition() {
+                    player.removeEventListener("loadedmetadata", restorePosition);
+                    if (Number.isFinite(position) && position < player.duration) player.currentTime = position;
+                    if (wasPlaying) player.play().catch(function () {});
+                });
+                body.querySelectorAll("[data-evidence-clip-mode]").forEach(function (choice) {
+                    const active = choice === button;
+                    choice.classList.toggle("btn-secondary", active);
+                    choice.classList.toggle("btn-outline-secondary", !active);
+                    choice.setAttribute("aria-pressed", String(active));
+                });
+            });
+        });
         evidenceModal.show();
     }
 

@@ -591,8 +591,7 @@ def process_video(
 
             timestamp_sec = frame_number / fps
             last_ts = timestamp_sec
-            for ep in evidence_buf.push(frame, frame_number, timestamp_sec):
-                _apply_finalized_episode(ep)
+            evidence_buf.push(frame, frame_number, timestamp_sec, finalize_due=False)
 
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
@@ -707,6 +706,13 @@ def process_video(
                     violation_track_ids=viol_ids,
                     scene=ctx.get("scene_document"),
                 )
+            evidence_buf.set_frame_annotations(
+                frame_number,
+                [dict(det) for det in tracked],
+                ctx["zones"],
+                ctx.get("scene_document"),
+                viol_ids,
+            )
             if writer is not None:
                 writer.write(annotated)
 

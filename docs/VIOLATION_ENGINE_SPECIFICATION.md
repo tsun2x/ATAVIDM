@@ -1469,8 +1469,8 @@ At processing start, loaded model class names are compared to each enabled rule�
 | 2 | Obstruction | implemented | — | active lane / crossing zone | zone missing | engine + remediation |
 | 3 | Counterflow | implemented | — | active lane + flow degrees | heading unknown | engine |
 | 4 | Truck-Ban Violation | implemented | `truck` (configurable) | truck_ban zone + **recording datetime** | recording time UNKNOWN; pickup not auto-included | remediation + engine |
-| 5 | No Helmet | implemented (model-dependent) | motorcycle, person/rider, helmet_acceptable, helmet_nut_shell (or legacy helmet set) | usable rider visibility | missing classes; UNKNOWN visibility | remediation |
-| 6 | No Side Mirror | partial (NEEDS DECISION) | `side_mirror` | affirmative absence + genuine visibility/orientation | non-detection alone; size/confidence heuristics | remediation |
+| 5 | No Helmet | partial (detail review only) | four-class detail contract plus main motorcycle/rider context | positive uncovered-head observation with unambiguous rider attribution | three-class scan, helmet nondetection, conflict, or unclear view | remediation |
+| 6 | No Side Mirror | partial (review-only) | `side_mirror` | affirmative absence + genuine mounting-area visibility/orientation | non-detection alone; unknown visibility; size/confidence heuristics | remediation |
 | 7 | Motorcycle Overloading | implemented | motorcycle, person/rider | rider association | uncertain association | engine |
 | 8 | Disregarding Traffic Sign | partial | — | supported sign annotations (STOP/speed-limit excluded) | no signs configured | roster + remediation |
 | 9 | Failure to Follow Road/Pavement Markings | partial | — | operator marking geometry (restricted_lane proxy) | no geometry | engine |
@@ -1478,7 +1478,7 @@ At processing start, loaded model class names are compared to each enabled rule�
 | 11 | Unauthorized Passenger in Applicable Truck/Pickup Cargo Area | partial | person, truck, pickup_truck | cargo ROI + shared motion persistence | one-frame overlap only | remediation |
 | 12 | Substandard / Nut-Shell Helmet | partial | motorcycle, person, helmet_acceptable, helmet_nut_shell | rider association | missing classes; ACCEPTABLE ≠ certification | remediation |
 
-Statuses: **implemented** = automatic candidates with working logic under stated prerequisites. **partial** = explicit evaluator exists but is review/fail-closed or incomplete vs full legal/spec behavior. A fail-closed evaluator is **not** production-complete.
+Statuses: **implemented** = automatic candidates with working logic under stated prerequisites. **partial** = explicit evaluator exists but is review/fail-closed or incomplete vs full legal/spec behavior. A compatible four-class motorcycle detail scan can create an ordinary pending No Helmet review item after repeated clear positive observations for the same main-detector rider, provided the source run is current and enabled. It does not confirm a violation; the main No Helmet rule remains blocked. A fail-closed evaluator is **not** production-complete. Cargo-passenger evaluation also remains unavailable in production until a source supplies explicit positive cargo-region observability.
 
 ## 43.9 Vehicle detector roster (aligned 2026-08-24)
 

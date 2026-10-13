@@ -397,6 +397,8 @@ class TestCargoGate8:
                 timestamp_sec=t,
                 centroid_x=x + 60,
                 centroid_y=130,
+                # Explicit evaluator input; no production producer exists yet.
+                cargo_region_observable=True,
             )
             # Person in trailing (left) cargo region while moving right.
             person = _det(
@@ -425,6 +427,26 @@ class TestCargoGate8:
             e.violation_type == VIOLATION_CARGO_PASSENGERS and e.outcome == "review"
             for e in events
         )
+
+    def test_missing_cargo_visibility_stays_unavailable(self):
+        state = RuleEngineState()
+        track = TrackState()
+        events = []
+        for i in range(13):
+            t = i * 0.5
+            x = 100 + i * 30
+            truck = _det(track_id=1, class_label="truck", bbox_x=x, bbox_y=100,
+                         bbox_w=120, bbox_h=60, speed_px_per_sec=40.0,
+                         timestamp_sec=t, centroid_x=x + 60, centroid_y=130)
+            person = _det(track_id=2, class_label="person", bbox_x=x + 5,
+                          bbox_y=120, bbox_w=25, bbox_h=35, speed_px_per_sec=40.0,
+                          timestamp_sec=t, centroid_x=x + 17, centroid_y=137)
+            tracked = track.update([truck, person], now=t)
+            events.extend(check_cargo_passenger(
+                tracked, state, i, model_classes=("person", "truck"),
+                params={"_track_history": track.history_view(t)},
+            ))
+        assert events == []
 
     def test_unknown_direction_fail_closed(self):
         state = RuleEngineState()

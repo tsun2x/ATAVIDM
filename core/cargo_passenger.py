@@ -274,7 +274,9 @@ def evaluate_cargo_passenger_candidates(
             dx, dy = math.cos(rad) * speed, math.sin(rad) * speed
             motion_ok = True
 
-        if veh.get("cargo_region_observable") is False:
+        # Missing visibility metadata is unknown, not evidence that the
+        # estimated cargo ROI is genuinely observable.
+        if veh.get("cargo_region_observable") is not True:
             state.note_condition(VIOLATION_CARGO_PASSENGERS, track_id, False, ts)
             continue
 

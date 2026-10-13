@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TAVIDM Annotation Visual Guide</title>
+<style>
+:root{color-scheme:light;--page:#f4f6f9;--surface:#fff;--ink:#18212f;--muted:#526075;--line:#7b8798;--softline:#d5dce6;--accent:#155bb5;--focus:#155bb5;--blue:#2867b2;--green:#16805d;--amber:#bb7900;--red:#bd3d3d;--purple:#7550a5;--pink:#ad4c82;--road:#394454;--roadedge:#98a3b2}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.5 "Segoe UI",Arial,sans-serif}main{width:100%;max-width:1240px;margin:0 auto;padding:26px 22px 40px}h1{font-size:26px;line-height:1.23;margin:0 0 8px;font-weight:650}h2{font-size:19px;line-height:1.3;margin:0 0 10px}h3{font-size:16px;line-height:1.35;margin:0 0 6px}p{margin:5px 0;color:var(--muted)}.lede{max-width:75ch;margin-bottom:20px}.scope{border-left:4px solid var(--accent);padding:9px 12px;background:#eaf1fb;color:#21344e;margin-top:12px}.workspace{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(340px,.9fr);gap:18px;align-items:start}.panel{background:var(--surface);border:1px solid var(--softline);border-radius:8px;padding:16px;min-width:0}.visual-panel{position:sticky;top:12px}.eyebrow{font-size:12px;line-height:16px;text-transform:uppercase;letter-spacing:.07em;font-weight:600;color:var(--muted);margin-bottom:5px}.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.tab{border:1px solid var(--line);background:white;color:var(--ink);border-radius:5px;padding:7px 9px;font:inherit;cursor:pointer}.tab[aria-selected="true"]{border-color:var(--accent);color:#104888;background:#eaf1fb;font-weight:600}.tab:focus-visible,select:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.picker{display:block;width:100%;max-width:100%;padding:9px 10px;margin:10px 0 12px;border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--ink);font:inherit}.diagram-wrap{border:1px solid var(--softline);border-radius:6px;overflow:hidden;background:#e8edf3}.diagram{display:block;width:100%;height:auto}.diagram .layer{display:none}.diagram[data-kind="zones"] .layer-zones,.diagram[data-kind="lanes"] .layer-lanes,.diagram[data-kind="flow_arrows"] .layer-flow,.diagram[data-kind="threshold_lines"] .layer-thresholds,.diagram[data-kind="markings"] .layer-markings,.diagram[data-kind="signs"] .layer-signs,.diagram[data-kind="activity_regions"] .layer-activity{display:block}.diagram[data-kind="zones"][data-type="no_parking"] .zone-parking,.diagram[data-kind="zones"][data-type="active_lane"] .zone-lane,.diagram[data-kind="zones"][data-type="pedestrian_crossing"] .zone-crossing,.diagram[data-kind="zones"][data-type="truck_ban_zone"] .zone-truck,.diagram[data-kind="zones"][data-type="loading_unloading"] .zone-loading,.diagram[data-kind="zones"][data-type="restricted_lane"] .zone-restricted{display:block}.diagram[data-kind="markings"][data-type="double_solid"] .mark-double,.diagram[data-kind="markings"][data-type="single_solid"] .mark-single,.diagram[data-kind="markings"][data-type="solid_broken"] .mark-broken,.diagram[data-kind="markings"][data-type="restricted_lane_boundary"] .mark-boundary,.diagram[data-kind="markings"][data-type="generic_marking"] .mark-generic{display:block}.diagram[data-kind="threshold_lines"][data-type="threshold"] .threshold-general,.diagram[data-kind="threshold_lines"][data-type="counting_line"] .threshold-count,.diagram[data-kind="threshold_lines"][data-type="no_entry_threshold"] .threshold-entry{display:block}.diagram[data-kind="signs"][data-type="no_entry"] .sign-entry,.diagram[data-kind="signs"][data-type="no_left_turn"] .sign-left,.diagram[data-kind="signs"][data-type="no_right_turn"] .sign-right,.diagram[data-kind="signs"][data-type="no_u_turn"] .sign-uturn,.diagram[data-kind="signs"][data-type="no_overtaking"] .sign-overtaking,.diagram[data-kind="signs"][data-type="generic_sign"] .sign-generic{display:block}.diagram[data-kind="activity_regions"][data-type="passenger_activity"] .activity-passenger,.diagram[data-kind="activity_regions"][data-type="boarding_alighting"] .activity-boarding{display:block}.road-line{fill:none;stroke:#f6f7f9;stroke-width:4;stroke-dasharray:18 15;opacity:.8}.center-line{fill:none;stroke:#f4cc4a;stroke-width:6}.zone-shape{fill:#16805d33;stroke:var(--green);stroke-width:5}.zone-amber{fill:#d49a2730;stroke:var(--amber);stroke-width:5}.zone-purple{fill:#7550a533;stroke:var(--purple);stroke-width:5}.zone-pink{fill:#ad4c8230;stroke:var(--pink);stroke-width:5}.lane-border{fill:#2867b220;stroke:var(--blue);stroke-width:6}.arrow-line{fill:none;stroke:#24a8a4;stroke-width:9;stroke-linecap:round}.measure-line{stroke:#e7a833;stroke-width:8;stroke-linecap:round}.mark-line{fill:none;stroke:#f4cf47;stroke-width:8;stroke-linecap:round}.sign-disc{fill:#fff;stroke:var(--red);stroke-width:7}.activity-shape{fill:#7550a544;stroke:var(--purple);stroke-width:5;stroke-dasharray:12 8}.threshold-general,.threshold-count,.threshold-entry,.mark-double,.mark-single,.mark-broken,.mark-boundary,.mark-generic,.sign-entry,.sign-left,.sign-right,.sign-uturn,.sign-overtaking,.sign-generic,.activity-passenger,.activity-boarding{display:none}.diagram-label{font:700 26px "Segoe UI",Arial,sans-serif;fill:#18212f;paint-order:stroke;stroke:white;stroke-width:7px;stroke-linejoin:round}.diagram-small{font:600 19px "Segoe UI",Arial,sans-serif;fill:#18212f;paint-order:stroke;stroke:white;stroke-width:5px;stroke-linejoin:round}.road-caption{font:600 16px "Segoe UI",Arial,sans-serif;fill:#fff}.caption{font-size:13px;margin-top:8px}.type-title{margin-top:3px}.details{display:grid;gap:12px}.detail-block{padding-bottom:10px;border-bottom:1px solid var(--softline)}.detail-block:last-child{border-bottom:0;padding-bottom:0}.detail-label{font-size:12px;text-transform:uppercase;letter-spacing:.05em;font-weight:700;color:#344257;margin-bottom:3px}.eval{padding:10px 12px;border-radius:5px;background:#eef2f6;color:#253248}.eval strong{color:var(--ink)}.shared{margin-top:18px}.shared-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.shared-item{border-left:3px solid var(--softline);padding-left:11px}.shared-item p{margin-top:3px}.source{margin-top:18px;font-size:13px}.source a{color:#104888}.skip{position:absolute;left:-9999px}.skip:focus{position:static;display:inline-block;margin-bottom:10px}.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:800px){main{padding:20px 16px 32px}.workspace{grid-template-columns:1fr}.visual-panel{position:static}.shared-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:480px){main{padding:16px}.panel{padding:12px}.tabs{gap:5px}.tab{padding:7px 8px}.shared-grid{grid-template-columns:1fr}h1{font-size:23px}.diagram-label{font-size:30px}.diagram-small{font-size:24px}}
+</style>
+</head>
+<body>
+<main>
+  <a class="skip" href="#guide-details">Skip to selected annotation instructions</a>
+  <header class="lede">
+    <div class="eyebrow">TAVIDM · reusable visual reference</div>
+    <h1>Choose the annotation, then draw what the rule needs</h1>
+    <p>Explore the same road scene with each annotation type. Pick a tab and type to see what to outline or mark, when it helps, and what the current system can evaluate.</p>
+    <div class="scope"><strong>Important:</strong> the road below is a schematic example, not a real camera view. Draw on each camera’s actual road layout and use restrictions confirmed for that location. An annotation describes the scene; it does not make a restriction legally valid.</div>
+  </header>
+  <div class="workspace">
+    <section class="panel visual-panel" aria-labelledby="visual-title">
+      <div class="eyebrow">Step 1 · choose an editor tab</div>
+      <h2 id="visual-title">What are you annotating?</h2>
+      <div id="categoryTabs" class="tabs" role="tablist" aria-label="Annotation categories"></div>
+      <label for="typePicker" class="detail-label">Annotation type</label>
+      <select id="typePicker" class="picker"></select>
+      <div class="diagram-wrap">
+        <svg id="diagram" class="diagram" data-kind="zones" data-type="no_parking" viewBox="0 0 900 560" role="img" aria-labelledby="diagramTitle diagramDesc">
+          <title id="diagramTitle">Illustrative top-down road and selected annotation</title>
+          <desc id="diagramDesc">Schematic example, not a camera image. A two-way road with a crossing and curbside area.</desc>
+          <rect width="900" height="560" fill="#e8edf3"/>
+          <rect x="238" y="24" width="424" height="512" rx="8" fill="#394454"/>
+          <rect x="215" y="24" width="23" height="512" fill="#c7d1dd"/><rect x="662" y="24" width="23" height="512" fill="#c7d1dd"/>
+          <path d="M450 25V535" class="center-line"/>
+          <path d="M343 25V535 M557 25V535" class="road-line"/>
+          <path d="M238 250H662 M238 315H662" stroke="#f7f8fa" stroke-width="5" opacity=".65"/>
+          <g aria-hidden="true">
+            <rect x="300" y="259" width="24" height="48" fill="#fff"/><rect x="337" y="259" width="24" height="48" fill="#fff"/><rect x="374" y="259" width="24" height="48" fill="#fff"/><rect x="411" y="259" width="24" height="48" fill="#fff"/><rect x="465" y="259" width="24" height="48" fill="#fff"/><rect x="502" y="259" width="24" height="48" fill="#fff"/><rect x="539" y="259" width="24" height="48" fill="#fff"/><rect x="576" y="259" width="24" height="48" fill="#fff"/>
+          </g>
+          <text x="250" y="50" class="road-caption">FAR END</text><text x="250" y="523" class="road-caption">CAMERA / NEAR END</text>
+          <text x="268" y="94" class="diagram-small">Lane A</text><text x="487" y="94" class="diagram-small">Lane B</text>
+          <g class="layer layer-zones">
+            <polygon class="layer zone-shape zone-parking" points="170,85 225,85 225,210 170,210"/><text class="layer diagram-small zone-parking" x="24" y="150">No parking area</text>
+            <polygon class="layer lane-border zone-lane" points="247,75 440,75 440,230 247,230"/><text class="layer diagram-small zone-lane" x="280" y="145">Active lane area</text>
+            <polygon class="layer zone-shape zone-crossing" points="265,245 635,245 635,319 265,319"/><text class="layer diagram-small zone-crossing" x="335" y="241">Crosswalk footprint</text>
+            <polygon class="layer zone-amber zone-truck" points="247,72 653,72 653,212 247,212"/><text class="layer diagram-small zone-truck" x="455" y="139">Truck-ban road segment</text>
+            <polygon class="layer zone-purple zone-loading" points="685,270 812,270 812,380 685,380"/><text class="layer diagram-small zone-loading" x="690" y="414">No loading area</text>
+            <polygon class="layer zone-pink zone-restricted" points="459,78 650,78 650,229 459,229"/><text class="layer diagram-small zone-restricted" x="475" y="166">Restricted segment</text>
+          </g>
+          <g class="layer layer-lanes">
+            <polygon class="lane-border" points="250,68 443,68 443,492 250,492"/><polygon class="lane-border" points="457,68 650,68 650,492 457,492"/><text x="270" y="470" class="diagram-small">Trace each lane separately</text>
+          </g>
+          <g class="layer layer-flow">
+            <path d="M335 435V130" class="arrow-line" marker-end="url(#arr)"/><path d="M565 130V435" class="arrow-line" marker-end="url(#arr)"/><text x="275" y="115" class="diagram-small">Allowed flow</text><text x="485" y="478" class="diagram-small">One arrow per lane</text>
+          </g>
+          <defs><marker id="arr" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto"><path d="M0 0L12 6L0 12Z" fill="#24a8a4"/></marker></defs>
+          <g class="layer layer-thresholds">
+            <path class="measure-line threshold-general" d="M251 180H439"/><path class="measure-line threshold-count" d="M251 360H439"/><path class="measure-line threshold-entry" d="M251 110H439"/>
+            <text class="diagram-small threshold-general" x="270" y="166">Decision boundary</text><text class="diagram-small threshold-count" x="270" y="346">Count crossings here</text><text class="diagram-small threshold-entry" x="265" y="96">No-entry boundary</text>
+          </g>
+          <g class="layer layer-markings">
+            <path class="mark-line mark-double" d="M444 100V455 M456 100V455"/><path class="mark-line mark-single" d="M450 100V455"/>
+            <path class="mark-line mark-broken" d="M442 100V455 M458 100V455" stroke-dasharray="26 14"/>
+            <polygon class="zone-pink mark-boundary" points="456,82 650,82 650,455 456,455"/><path class="mark-line mark-generic" d="M275 200L420 175"/>
+            <text class="diagram-small" x="470" y="490">Match the visible paint; set the restricted side.</text>
+          </g>
+          <g class="layer layer-signs">
+            <g class="sign-entry" transform="translate(205 185)"><circle class="sign-disc" r="31"/><path d="M-19 0H19" stroke="#bd3d3d" stroke-width="8"/></g>
+            <g class="sign-left" transform="translate(205 185)"><circle class="sign-disc" r="31"/><path d="M0 17V-8H-13 M0 -8L-12 -20 M0 -8L13 -20" fill="none" stroke="#bd3d3d" stroke-width="5"/></g>
+            <g class="sign-right" transform="translate(205 185)"><circle class="sign-disc" r="31"/><path d="M0 17V-8H13 M0 -8L-13 -20 M0 -8L13 -20" fill="none" stroke="#bd3d3d" stroke-width="5"/></g>
+            <g class="sign-uturn" transform="translate(205 185)"><circle class="sign-disc" r="31"/><path d="M-12 12V-5Q-12 -18 2 -18Q16 -18 16 -5V8" fill="none" stroke="#bd3d3d" stroke-width="5"/><path d="M8 2L16 11L24 2" fill="none" stroke="#bd3d3d" stroke-width="4"/></g>
+            <g class="sign-overtaking" transform="translate(205 185)"><circle class="sign-disc" r="31"/><path d="M-14 13V-12M13 13V-12" stroke="#bd3d3d" stroke-width="5"/></g>
+            <g class="sign-generic" transform="translate(205 185)"><circle class="sign-disc" r="31"/><text x="-7" y="9" font-size="26" font-weight="700" fill="#bd3d3d">?</text></g>
+            <path d="M238 180H317" stroke="#bd3d3d" stroke-width="3" stroke-dasharray="8 7"/><text x="325" y="176" class="diagram-small">Sign links to lane</text><text x="325" y="203" class="diagram-small">No-entry also needs threshold + allowed flow</text>
+          </g>
+          <g class="layer layer-activity">
+            <polygon class="activity-shape activity-passenger" points="678,245 829,245 829,407 678,407"/><polygon class="activity-shape activity-boarding" points="684,320 815,320 815,404 684,404"/>
+            <circle cx="710" cy="290" r="10" fill="#7550a5"/><path d="M710 300V325M710 309L696 320M710 309L724 320M710 325L698 344M710 325L722 344" stroke="#7550a5" stroke-width="5"/>
+            <text x="690" y="435" class="diagram-small">Activity region is context,</text><text x="690" y="461" class="diagram-small">not proof of boarding.</text>
+          </g>
+          <text x="25" y="540" class="diagram-small">ILLUSTRATIVE SCHEMATIC · not a real camera or legal determination</text>
+        </svg>
+      </div>
+      <p class="caption">Colored overlay shows the selected example shape. The background road and sign symbols are illustrative.</p>
+    </section>
+    <section class="panel" id="guide-details" aria-live="polite" aria-labelledby="selectedTitle">
+      <div class="eyebrow" id="selectedCategory">Zones</div>
+      <h2 id="selectedTitle" class="type-title">No Parking Zone</h2>
+      <div class="details">
+        <div class="detail-block"><div class="detail-label">What it represents</div><p id="purpose"></p></div>
+        <div class="detail-block"><div class="detail-label">When to use it</div><p id="when"></p></div>
+        <div class="detail-block"><div class="detail-label">What to draw</div><p id="draw"></p></div>
+        <div class="eval"><div class="detail-label">What TAVIDM can evaluate</div><p id="capability"></p></div>
+      </div>
+    </section>
+  </div>
+  <section class="panel shared" aria-labelledby="basicsTitle">
+    <div class="eyebrow">Applies to every camera</div><h2 id="basicsTitle">A reliable setup, step by step</h2>
+    <div class="shared-grid">
+      <div class="shared-item"><h3>1. Match the real scene</h3><p>Use the correct fixed-camera view. Trace road edges and painted lines as seen in the video, not around vehicles. If the camera moved or the clip was cropped, check or redraw the geometry.</p></div>
+      <div class="shared-item"><h3>2. Draw areas and lines correctly</h3><p>Areas need at least three points; lines and arrows need two. Follow perspective, keep polygons tidy, and use <b>New object</b> for a separate shape.</p></div>
+      <div class="shared-item"><h3>3. Link related items</h3><p>Where shown, choose <b>Apply to lane</b>. For No Entry, the sign, threshold, and allowed flow arrow must refer to the same lane.</p></div>
+      <div class="shared-item"><h3>4. Confirm meaning before saving</h3><p>Use a real known restriction. For markings, choose the actual paint type and prohibited approach side; “both” means either direction can be flagged.</p></div>
+      <div class="shared-item"><h3>5. Save and inspect</h3><p>Save for this video or a same-camera template. Reopen the drawing and check lane links, endpoints, polygon edges, and arrow direction.</p></div>
+      <div class="shared-item"><h3>6. Reprocess to test</h3><p>Annotation edits do not change old results. Process a new run and compare events with the clip; treat uncertain evidence as review, not a confirmed violation.</p></div>
+<div class="shared-item"><h3>Some checks need visual evidence</h3><p>Helmet, mirror visibility, rider count, and cargo-passenger checks are not fixed by drawing another zone. Check each rule’s evidence requirements; some evidence remains review-only or unavailable.</p></div>
+    </div>
+    <p class="source">More help: <a href="overlap-use-cases.html">see examples of annotations working together and overlapping</a>, or read the <a href="../../2026-10-10/ANNOTATION-GUIDE.md">detailed annotation guide</a> in the testing packet.</p>
+  </section>
+</main>
+<script>
+(() => {
+  const groups = [
+    {key:'zones',label:'Zones',items:[
+      {key:'no_parking',label:'No Parking Zone',purpose:'An area where parking is actually prohibited.',when:'Testing a vehicle that remains parked in a known restricted curb or bay area.',draw:'Outline only the prohibited parking footprint. Keep nearby legal parking outside the polygon.',capability:'The parking rule looks for a vehicle staying still in the area for the configured dwell time. A vehicle passing through is not automatically parked; exceptions and intent still need review.'},
+      {key:'active_lane',label:'Active Lane',purpose:'A road lane used by moving traffic. The editor also offers it under Lanes.',when:'Defining where traffic moves, stops, or where lane-linked objects apply.',draw:'Trace one travel path at a time. Keep opposing directions in separate lane objects.',capability:'Used for lane context such as obstruction and as the lane link for arrows, signs, thresholds, and markings. Being in a lane alone is not a violation.'},
+      {key:'pedestrian_crossing',label:'Pedestrian Crossing',purpose:'The road footprint occupied by a real pedestrian crossing.',when:'Testing a vehicle that blocks the crossing for a sustained interval.',draw:'Outline the crossing stripes and relevant road width, not the whole intersection.',capability:'Contributes to obstruction after the configured waiting time. A vehicle simply driving across is not the same as blocking it.'},
+      {key:'truck_ban_zone',label:'Truck Ban Zone',purpose:'A road segment covered by a verified truck-ban schedule.',when:'Checking eligible trucks during the locally configured restricted hours.',draw:'Outline the affected road segment and use the actual recording date and time.',capability:'Requires zone, applicable vehicle class, schedule, and trustworthy recording time. Upload time is not a substitute; do not assume every pickup or large vehicle is a truck covered by the rule.'},
+      {key:'loading_unloading',label:'No Loading/Unloading Zone',purpose:'A place where loading or unloading is prohibited.',when:'Testing suspected terminal or passenger pickup activity in a restricted location.',draw:'Outline the prohibited stop/activity area. Add an Activity region where passenger movement can be seen.',capability:'Illegal-terminal evaluation needs the zone plus suitable vehicle and passenger-activity evidence and configured waiting time. A vehicle stopping alone does not establish the event.'},
+      {key:'restricted_lane',label:'Restricted Lane',purpose:'A road area restricted to known vehicle classes.',when:'The applicable restriction and vehicle classes have been confirmed for the test.',draw:'Outline the restricted road segment and its real entry boundary.',capability:'Can produce a restricted-lane entry observation for review. The polygon alone does not define the law or all exceptions; an actual painted solid line uses Markings.'}
+    ]},
+    {key:'lanes',label:'Lanes',items:[{key:'active_lane',label:'Active Lane',purpose:'One distinct roadway path used by traffic in a particular direction.',when:'Setting up counterflow, obstruction, or a lane-linked sign, threshold, marking, or count.',draw:'Outline one directional lane following the visible road edges. Make a separate lane for traffic flowing the other way.',capability:'Gives rules a spatial lane and provides the lane to link other annotations to. For counterflow, each lane also needs one correct allowed-direction arrow.'}]},
+    {key:'flow_arrows',label:'Flow arrows',items:[{key:'lane_flow',label:'Lane flow',purpose:'The direction vehicles are allowed to travel in a lane.',when:'Counterflow checks and direction context for a lane-linked No Entry rule.',draw:'Select the lane, click start point A, then endpoint B along normal permitted travel. Use one consistent arrow per lane.',capability:'Counterflow compares tracked movement with the configured allowed direction. Conflicting or missing arrows can cause wrong or suppressed results. Image directions: right 0°, down 90°, left 180°, up 270°.'}]},
+    {key:'threshold_lines',label:'Thresholds',items:[
+      {key:'threshold',label:'Threshold',purpose:'A general boundary vehicles may cross.',when:'A rule or scene setup needs a specific decision boundary.',draw:'Draw a short line across the relevant vehicle path and link it to the lane if applicable.',capability:'A threshold does not create a violation by itself. Use the specific counting or No-entry threshold type for those tasks.'},
+      {key:'counting_line',label:'Vehicle counting line',purpose:'A road cross-section used to count vehicles crossing it.',when:'Counting traffic at one defined point and comparing counts with a manual tally.',draw:'Span the intended lane or road path at a visible cross-section; link it to that lane.',capability:'Counts crossings at the line. Vehicles that are merely visible elsewhere are not crossings; validate misses against manual frame-by-frame counts.'},
+      {key:'no_entry_threshold',label:'No-entry threshold',purpose:'The boundary at the mouth of an entry where entry is prohibited.',when:'Testing a real No Entry sign for a specific approach.',draw:'Place it across the entrance; link it to the same lane as the sign and allowed-flow arrow.',capability:'No Entry needs the sign, threshold, lane association, and unambiguous allowed direction together. It produces a review candidate, not final legal proof.'}
+    ]},
+    {key:'markings',label:'Markings',items:[
+      {key:'double_solid',label:'Double solid',purpose:'A visible painted double-solid road marking.',when:'Checking a vehicle that crosses this actual line.',draw:'Trace the relevant segment with two endpoints; choose the prohibited approach side based on the marking.',capability:'Can create a pavement-marking crossing candidate. Choose “both” only if crossing is prohibited from either side; the rule does not decide whether a turn was legally allowed.'},
+      {key:'single_solid',label:'Single solid',purpose:'A visible single-solid road marking.',when:'Testing a crossing where the restricted side is known.',draw:'Trace the actual solid paint and explicitly set the prohibited side.',capability:'Crossing candidates depend on the configured side and evidence. Legal turns and intersections may still require human review.'},
+      {key:'solid_broken',label:'Solid/broken',purpose:'A real adjacent solid-and-broken line.',when:'Testing a boundary where crossing permission differs by approach side.',draw:'Trace the pair and set the side restricted by the actual road rule; verify line orientation.',capability:'The system uses your configured prohibited side; it does not infer which side is solid or legally restricted from the image.'},
+      {key:'restricted_lane_boundary',label:'Restricted boundary',purpose:'A boundary associated with a restricted road area.',when:'Documenting a restricted-lane boundary as scene context.',draw:'Trace the boundary or closed outline that matches the scene; for a restricted area use Zones → Restricted Lane.',capability:'Not evaluated as a solid-line crossing type. It can supply restricted-area context, which remains review-oriented.'},
+      {key:'generic_marking',label:'Generic marking',purpose:'A visible road marking you want documented without a specific supported type.',when:'The paint matters as context but does not match a supported line type.',draw:'Trace the visible marking segment.',capability:'Saved as scene context; no generic marking-crossing rule is attached.'}
+    ]},
+    {key:'signs',label:'Signs',items:[
+      {key:'no_entry',label:'No entry',purpose:'A real sign prohibiting vehicles from entering an approach.',when:'Testing entry in the prohibited direction at a signed entrance.',draw:'Outline the visible sign and link it to its lane. Add a No-entry threshold and allowed flow arrow on that same lane.',capability:'This sign type has review-candidate support when the matching lane, threshold, and direction are all present.'},
+      {key:'no_left_turn',label:'No left turn',purpose:'A real sign prohibiting a left turn.',when:'Testing a prohibited turn from a signed approach.',draw:'Link the sign to its approach lane, and add one allowed-flow arrow plus one threshold for that same lane.',capability:'The current code has a tracked-trajectory check that can create a review candidate. A sign by itself is insufficient; reviewer must confirm sign applicability and local rule.'},
+      {key:'no_right_turn',label:'No right turn',purpose:'A real sign prohibiting a right turn.',when:'Testing a prohibited turn from a signed approach.',draw:'Link the sign to its approach lane, and add one allowed-flow arrow plus one threshold for that same lane.',capability:'The current code has a tracked-trajectory check that can create a review candidate. A sign by itself is insufficient; reviewer must confirm sign applicability and local rule.'},
+      {key:'no_u_turn',label:'No U-turn',purpose:'A real sign prohibiting a U-turn.',when:'Testing a prohibited U-turn from a signed approach.',draw:'Link the sign to its approach lane, and add one allowed-flow arrow plus one threshold for that same lane.',capability:'The current code has a tracked-trajectory check that can create a review candidate. A sign by itself is insufficient; reviewer must confirm sign applicability and local rule.'},
+      {key:'no_overtaking',label:'No overtaking',purpose:'A real sign prohibiting overtaking.',when:'Testing an observed pass in a signed lane.',draw:'Link the sign and one flow arrow to a single lane polygon. No threshold is required.',capability:'The current code compares tracked paths for two vehicles and can create an admin-review candidate. Missed/occluded tracks can prevent evidence.'},
+      {key:'generic_sign',label:'Generic sign',purpose:'A visible sign that does not fit the listed supported sign types.',when:'Documenting a sign as context without assigning an unsupported rule.',draw:'Mark the sign’s location; do not guess an unreadable sign’s meaning.',capability:'Saved as context only; no generic sign-violation rule.'}
+    ]},
+    {key:'activity_regions',label:'Activity',items:[
+      {key:'passenger_activity',label:'Passenger activity',purpose:'A place where passenger movement near a vehicle can be observed.',when:'Adding spatial context for a possible prohibited pickup or terminal event.',draw:'Outline the relevant boarding location or vehicle-side activity space with at least three corners.',capability:'Provides location context; does not prove a person is this vehicle’s passenger or that boarding occurred.'},
+      {key:'boarding_alighting',label:'Boarding/alighting',purpose:'A focused area where people may visibly get on or off a vehicle.',when:'Reviewing passenger activity together with a No Loading/Unloading Zone.',draw:'Outline the doorway/curbside interaction area visible in the clip.',capability:'A region is not action recognition. Confirm the person’s movement and vehicle association in the clip.'}
+    ]}
+  ];
+  const tabs = document.getElementById('categoryTabs');
+  const picker = document.getElementById('typePicker');
+  const diagram = document.getElementById('diagram');
+  let activeGroup = 0;
+  function fillTypes(groupIndex, preferredKey) {
+    activeGroup = groupIndex;
+    const group = groups[groupIndex];
+    picker.replaceChildren(...group.items.map(item => {
+      const option = document.createElement('option'); option.value = item.key; option.textContent = item.label; return option;
+    }));
+    picker.value = group.items.some(item => item.key === preferredKey) ? preferredKey : group.items[0].key;
+    updateGuide();
+  }
+  function selectTab(index, focus) {
+    activeGroup = (index + groups.length) % groups.length;
+    [...tabs.children].forEach((tab, i) => {tab.setAttribute('aria-selected', String(i === activeGroup)); tab.tabIndex = i === activeGroup ? 0 : -1;});
+    if (focus) tabs.children[activeGroup].focus();
+    fillTypes(activeGroup);
+  }
+  groups.forEach((group, index) => {
+    const button = document.createElement('button'); button.className = 'tab'; button.type = 'button'; button.setAttribute('role','tab'); button.id = 'tab-' + group.key; button.setAttribute('aria-controls','guide-details'); button.setAttribute('aria-selected',String(index===0)); button.tabIndex = index===0 ? 0 : -1; button.textContent = group.label;
+    button.addEventListener('click',()=>selectTab(index,false));
+    button.addEventListener('keydown',event=>{if(event.key==='ArrowRight'){event.preventDefault();selectTab(activeGroup+1,true)}else if(event.key==='ArrowLeft'){event.preventDefault();selectTab(activeGroup-1,true)}else if(event.key==='Home'){event.preventDefault();selectTab(0,true)}else if(event.key==='End'){event.preventDefault();selectTab(groups.length-1,true)}});
+    tabs.appendChild(button);
+  });
+  function updateGuide() {
+    const group = groups[activeGroup]; const item = group.items.find(entry=>entry.key===picker.value) || group.items[0];
+    document.getElementById('selectedCategory').textContent = group.label;
+    document.getElementById('selectedTitle').textContent = item.label;
+    document.getElementById('purpose').textContent = item.purpose;
+    document.getElementById('when').textContent = item.when;
+    document.getElementById('draw').textContent = item.draw;
+    document.getElementById('capability').textContent = item.capability;
+    diagram.dataset.kind = group.key; diagram.dataset.type = item.key;
+    document.getElementById('diagramTitle').textContent = 'Illustrative road diagram: ' + item.label;
+    document.getElementById('diagramDesc').textContent = item.draw + ' Schematic example only, not a real camera frame.';
+  }
+  picker.addEventListener('change',updateGuide);
+  fillTypes(0);
+})();
+</script>
+</body>
+</html>
+
+
+
+
+\n

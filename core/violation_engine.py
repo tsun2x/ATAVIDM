@@ -474,8 +474,8 @@ def _helmet_labels(tracked: list[dict[str, Any]]) -> tuple[list[dict], list[dict
 _NO_HELMET_BLOCKED_DIAGNOSTIC = (
     "No Helmet: automatic candidate generation is blocked pending an "
     "owner/adviser decision. A missing helmet detection is UNKNOWN, not an "
-    "uncovered head. The motorcycle detail model is review-only and cannot "
-    "create or confirm this violation."
+    "uncovered head. The motorcycle detail scan may create a separate pending "
+    "review item, but its output does not feed this rule or confirm a violation."
 )
 
 
@@ -546,9 +546,18 @@ def _rider_helmet_state(
     """
     if _rider_visibility_unknown(rider):
         return "UNKNOWN"
-    if any(_boxes_overlap(rider, h) for h in nut_shell):
+    # Helmet labels must touch the rider's head zone. Whole-body overlap lets
+    # a lower-body box or a neighboring rider's helmet contaminate attribution.
+    rx, ry = float(rider["bbox_x"]), float(rider["bbox_y"])
+    rw, rh = float(rider["bbox_w"]), float(rider["bbox_h"])
+    head = {"bbox_x": rx + rw * 0.2, "bbox_y": ry, "bbox_w": rw * 0.6, "bbox_h": rh * 0.4}
+    has_nut_shell = any(_boxes_overlap(head, h) for h in nut_shell)
+    has_acceptable = any(_boxes_overlap(head, h) for h in acceptable)
+    if has_nut_shell and has_acceptable:
+        return "UNKNOWN"
+    if has_nut_shell:
         return "NUT_SHELL"
-    if any(_boxes_overlap(rider, h) for h in acceptable):
+    if has_acceptable:
         return "ACCEPTABLE_SHAPE"
     return "UNKNOWN"
 
@@ -818,10 +827,11 @@ def check_substandard_helmet(
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
     riders_pool = _rider_detections(tracked)
     acceptable, nut, _ = _helmet_labels(tracked)
+    riders_by_motorcycle = attributed_motorcycle_riders(motorcycles, riders_pool)
     events: list[ViolationEvent] = []
     for mc in motorcycles:
         track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, riders_pool)
+        riders = riders_by_motorcycle.get(int(mc["track_id"]), [])
         ts = float(mc.get("timestamp_sec", 0))
         if not riders:
             continue
@@ -1008,10 +1018,11 @@ def check_motorcycle_overloading(
         return []
     motorcycles = [d for d in tracked if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
     riders_pool = _rider_detections(tracked)
+    riders_by_motorcycle = attributed_motorcycle_riders(motorcycles, riders_pool)
     events: list[ViolationEvent] = []
     for mc in motorcycles:
         track_id = int(mc["track_id"])
-        riders = _associate_riders(mc, riders_pool)
+        riders = riders_by_motorcycle.get(int(mc["track_id"]), [])
         tracker = state.tracker_for("overloading", track_id)
         ts = float(mc.get("timestamp_sec", 0))
         condition = len(riders) > 2
@@ -1649,10 +1660,16 @@ def check_pavement_markings(
                         curr = (o1.x, o1.y)
                 if prev is None or curr is None or heading is None:
                     continue
-                a = (float(geom[0][0]), float(geom[0][1]))
-                b = (float(geom[-1][0]), float(geom[-1][1]))
-                if crossed_oriented_line(
-                    prev, curr, a, b, prohibited_from=str(prohibited)
+                segments = zip(geom, geom[1:])
+                if any(
+                    crossed_oriented_line(
+                        prev,
+                        curr,
+                        (float(start[0]), float(start[1])),
+                        (float(end[0]), float(end[1])),
+                        prohibited_from=str(prohibited),
+                    )
+                    for start, end in segments
                 ):
                     crossed = True
                     break

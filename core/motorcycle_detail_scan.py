@@ -5,12 +5,12 @@ The detail pass scans the bounded crops selected by
 (``md-detail-3c-v1`` or ``md-detail-4c-v1``) and records helmet / side-mirror
 observations for a **separate human-review queue**. A four-class checkpoint may
 also record ``no_helmet`` as a positive uncovered-head observation for human
-review. Hard boundaries:
+review. Two clear observations on the same main-detector rider can also create
+an ordinary pending No Helmet review item. Hard boundaries:
 
-- The scan can supply evidence or raise a review flag. It never declares,
-  confirms, or creates a violation, and it never writes to ``violations`` or
-  ``review_queue``. Its output never reaches the main tracker or
-  ``core.violation_engine``.
+- The scan can supply evidence or create a pending review item. It never
+  declares or confirms a violation and never writes to ``violations``. Its
+  output never reaches the main tracker or ``core.violation_engine``.
 - The designated checkpoint is validated against the two explicit ordered
   contracts before the first crop is scanned. A missing, unreadable, reordered,
   renamed, duplicated, or other class map fails closed: no crop is scanned and
@@ -763,6 +763,95 @@ def resolve_detail_evidence_path(stored_path: str | None) -> Path | None:
         return None
 
 
+def _no_helmet_review_payload(
+    row: Mapping[str, Any], result: Mapping[str, Any], checkpoint: DetailCheckpoint,
+    *, confidence_floor: float,
+) -> dict[str, Any] | None:
+    """Build a pending-review payload from repeated, attributable 4c evidence."""
+    if checkpoint.class_names != DETAIL_MODEL_CLASSES_4C:
+        return None
+    try:
+        observations = json.loads(str(result.get("observations_json") or "{}"))
+        stored_frames = json.loads(str(row.get("frames_json") or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(observations, dict) or not isinstance(stored_frames, list):
+        return None
+    scan, scanned_frames = observations.get("scan"), observations.get("frames")
+    expected_class_map = {str(index): name for index, name in enumerate(DETAIL_MODEL_CLASSES_4C)}
+    if (not isinstance(scan, dict)
+            or scan.get("contract") != DETAIL_CONTRACT_VERSION_4C
+            or scan.get("class_map") != expected_class_map
+            or not isinstance(scanned_frames, list)):
+        return None
+    source_by_index = {
+        int(frame.get("index") or 0): frame
+        for frame in stored_frames if isinstance(frame, dict)
+    }
+    positives: list[tuple[dict[str, Any], str, float, int]] = []
+    expected_track_id = int(row.get("track_id") or -1)
+    for scanned in scanned_frames:
+        if not isinstance(scanned, dict):
+            continue
+        association = scanned.get("association")
+        if not isinstance(association, dict):
+            continue
+        helmet, context = association.get("helmet"), association.get("context")
+        if not isinstance(helmet, dict):
+            continue
+        state = helmet.get("state")
+        if state in (HELMET_ACCEPTABLE, HELMET_NUT_SHELL, STATE_AMBIGUOUS):
+            return None
+        if state != HELMET_UNCOVERED:
+            continue
+        if not isinstance(context, dict):
+            return None
+        rider_id = context.get("rider_track_id")
+        if (context.get("source") != "main_detector"
+                or context.get("rider_state") != "associated" or rider_id is None):
+            return None
+        frame_index = int(scanned.get("index") or 0)
+        source_frame = source_by_index.get(frame_index)
+        overlay_path = scanned.get("overlay_path")
+        main_context = source_frame.get("main_context") if source_frame else None
+        source_rider = main_context.get("rider") if isinstance(main_context, dict) else None
+        if (not source_frame or not overlay_path or not isinstance(main_context, dict)
+                or int(main_context.get("target_track_id") or -1) != expected_track_id
+                or main_context.get("source") != "main_detector"
+                or not isinstance(source_rider, dict)
+                or source_rider.get("state") != "associated"
+                or int(source_rider.get("track_id") or -1) != int(rider_id)):
+            return None
+        labels = [item for item in (helmet.get("observations") or [])
+                  if isinstance(item, dict) and item.get("label") == DETAIL_CLASS_NO_HELMET]
+        if not labels:
+            return None
+        confidence = max(float(item.get("confidence") or 0.0) for item in labels)
+        if confidence < float(confidence_floor):
+            return None
+        positives.append((source_frame, str(overlay_path), confidence, int(rider_id)))
+    if len(positives) < 2 or len({item[3] for item in positives}) != 1:
+        return None
+    source_frame, overlay_path, confidence, rider_id = max(positives, key=lambda item: item[2])
+    try:
+        timestamp, frame_number = float(source_frame["timestamp_sec"]), int(source_frame["frame_number"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {
+        "confidence": confidence,
+        "detection_confidence": confidence,
+        "violation_confidence": confidence,
+        "frame_number": frame_number,
+        "timestamp_sec": timestamp,
+        "evidence_path": overlay_path,
+        "reason_log": (
+            f"Positive uncovered-head observations were associated with rider #{rider_id} "
+            f"on {len(positives)} selected frames. Detail checkpoint {checkpoint.identity}; "
+            f"contract {DETAIL_CONTRACT_VERSION_4C}. Review evidence only; human confirmation required."
+        ),
+    }
+
+
 class MotorcycleDetailScanner:
     """Scan queued detail candidates on crops, one bounded batch at a time.
 
@@ -984,6 +1073,9 @@ class MotorcycleDetailScanner:
                 candidate_id = int(row["id"])
                 try:
                     result = self._scan_candidate(row, checkpoint, predictor)
+                    no_helmet_review = _no_helmet_review_payload(
+                        row, result, checkpoint, confidence_floor=self.conf
+                    )
                     self.adapter.finish_motorcycle_detail_scan(
                         candidate_id=candidate_id,
                         observations_json=result["observations_json"],
@@ -992,6 +1084,7 @@ class MotorcycleDetailScanner:
                         scan_model=checkpoint.identity,
                         scan_class_map_json=json.dumps(list(checkpoint.class_names)),
                         scan_seconds=result["scan_seconds"],
+                        no_helmet_review_candidate=no_helmet_review,
                     )
                     report["ready"] += 1
                     self.stats["ready"] += 1
@@ -1013,6 +1106,7 @@ class MotorcycleDetailScanner:
                         report["deferred"] += 1
                         self.stats["deferred"] += 1
         return report
+
 
     # -- worker thread ---------------------------------------------------
     def start(self) -> bool:

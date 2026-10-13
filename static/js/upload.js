@@ -15,7 +15,8 @@
     const progressWrap = document.getElementById("uploadProgressWrap");
     const progressBar = document.getElementById("uploadProgressBar");
     const uploadCondition = document.getElementById("uploadCondition");
-    const uploadRecordedAt = document.getElementById("uploadRecordedAt");
+    const uploadRecordedDate = document.getElementById("uploadRecordedDate");
+    const uploadRecordedTime = document.getElementById("uploadRecordedTime");
     const videoList = document.getElementById("videoList");
 
     const wizardModalEl = document.getElementById("annotationWizardModal");
@@ -468,13 +469,20 @@
     function uploadFile() {
         if (!selectedFile || activeXhr) return;
 
+        const recordedDate = (uploadRecordedDate?.value || "").trim();
+        const recordedTime = (uploadRecordedTime?.value || "").trim();
+        if (Boolean(recordedDate) !== Boolean(recordedTime)) {
+            showToast("Recording Time Needed", "Enter both the recording date and time, or leave both blank.", "warning");
+            (recordedDate ? uploadRecordedTime : uploadRecordedDate)?.focus();
+            return;
+        }
+
         const formData = new FormData();
         formData.append("video", selectedFile);
         formData.append("condition", uploadCondition?.value || "peak");
-        const recordedRaw = (uploadRecordedAt?.value || "").trim();
-        if (recordedRaw) {
-            // datetime-local is YYYY-MM-DDTHH:MM[:SS] — normalize to space-separated.
-            formData.append("recorded_at", recordedRaw.replace("T", " "));
+        if (recordedDate && recordedTime) {
+            // Preserve the API's local wall-clock timestamp format.
+            formData.append("recorded_at", recordedDate + " " + recordedTime);
         }
 
         const xhr = new XMLHttpRequest();

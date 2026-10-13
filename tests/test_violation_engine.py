@@ -758,3 +758,59 @@ def test_saved_line_crossing_creates_only_a_manual_review_candidate():
     assert result[0].violation_type == VIOLATION_PAVEMENT_MARKINGS
     assert result[0].outcome == "review"
     assert "manual review" in result[0].reason_log
+
+
+def test_bent_marking_crossing_checks_each_polyline_segment():
+    from types import SimpleNamespace
+    from core.violation_engine import RuleEngineState, check_pavement_markings
+
+    vehicle = {
+        "class_label": "car", "track_id": 33,
+        "bbox_x": 45, "bbox_y": 35, "bbox_w": 10, "bbox_h": 10,
+        "confidence": 0.9, "timestamp_sec": 1.0, "direction_degrees": 90,
+    }
+    history = {
+        33: SimpleNamespace(observations=(
+            SimpleNamespace(x=45, y=60), SimpleNamespace(x=45, y=40),
+        ))
+    }
+    result = check_pavement_markings(
+        [vehicle], RuleEngineState(), 10,
+        {"_track_history": history},
+        marking_geometry=[{
+            "id": "bent-center-line", "type": "single_solid",
+            "points": [[0, 0], [50, 50], [100, 0]], "prohibited_from": "left",
+        }],
+    )
+
+    assert len(result) == 1
+    assert result[0].outcome == "review"
+
+
+def test_motorcycle_rider_shared_by_two_tracks_is_not_attributed():
+    from core.violation_engine import attributed_motorcycle_riders
+
+    motorcycles = [
+        {"track_id": 1, "bbox_x": 10, "bbox_y": 10, "bbox_w": 80, "bbox_h": 80},
+        {"track_id": 2, "bbox_x": 45, "bbox_y": 10, "bbox_w": 80, "bbox_h": 80},
+    ]
+    rider = {
+        "class_label": "rider", "track_id": 10,
+        "bbox_x": 48, "bbox_y": 25, "bbox_w": 35, "bbox_h": 45,
+    }
+
+    assert attributed_motorcycle_riders(motorcycles, [rider]) == {}
+
+
+def test_helmet_box_over_lower_rider_body_does_not_count_as_head_evidence():
+    from core.violation_engine import _rider_helmet_state
+
+    rider = {
+        "class_label": "rider", "bbox_x": 20, "bbox_y": 10,
+        "bbox_w": 50, "bbox_h": 100, "confidence": 0.9,
+    }
+    lower_body_helmet = {
+        "bbox_x": 30, "bbox_y": 85, "bbox_w": 20, "bbox_h": 18,
+    }
+
+    assert _rider_helmet_state(rider, [], [lower_body_helmet]) == "UNKNOWN"
