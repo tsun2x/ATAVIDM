@@ -14,7 +14,7 @@ import os
 import sqlite3
 import threading
 from urllib.parse import urljoin, urlparse
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from flask import (
@@ -112,30 +112,31 @@ STATUSES = ["confirmed", "dismissed", "pending"]
 # video_id -> {"state": "processing"|"done"|"error", "error": str|None}
 _processing_jobs: dict[int, dict] = {}
 _processing_cancel_events: dict[int, threading.Event] = {}
+_uploaded_frame_jobs: dict[int, dict[str, Any]] = {}
+_uploaded_frame_jobs_lock = threading.Lock()
 
-# One shared reservation for the single GPU inference device. The uploaded-video
-# worker, background motorcycle crop batches, the manual detail scan, and every
-# live camera frame take it in turn (see core/gpu_inference_slot.py), so two
-# YOLOv8 passes can never run at the same time.
+# Shared two-slot reservation for local inference callers. Durable SQLite claims
+# additionally cap uploaded-video jobs across app processes and apply the
+# configurable per-account processing limit.
 _gpu_slot = gpu_inference_slot()
 # Bounded wait for the device before a queued video job is put back at the head
 # of the queue and retried. Never blocks a thread forever.
 _VIDEO_JOB_GPU_WAIT_SEC = 600.0
 
-# Sequential processing queue: at most ONE process_video thread at a time
-# (RTX 3050 6GB — a single YOLOv8m + ByteTrack inference job). Each queue
-# entry carries the validated violation snapshot + its processing_runs id so a
-# run uses the exact list submitted at enqueue time.
+# Local wake-up/UI mirror only; SQLite processing_runs is the durable queue and
+# the source of truth for claims. Each mirror entry carries the validated
+# violation snapshot + run id for compatibility with the existing interface.
 # Entry shape: (video_id, enabled_violations_tuple, run_id)
 _process_queue: list[tuple[int, tuple[str, ...], int]] = []
 _queue_lock = threading.Lock()
 _queue_cv = threading.Condition(_queue_lock)
-# id of the video currently being processed by the single worker (None if idle).
-# Distinct from "in _process_queue": the worker pops before running, so a
-# waiting job can be the only queue item while another video occupies the slot.
+# Compatibility pointer for a currently processing video. With multiple workers,
+# _running_video_ids is the authoritative set of active local videos.
 _running_video_id: int | None = None
+_running_video_ids: set[int] = set()
 _worker_shutdown = threading.Event()
 _worker_thread: threading.Thread | None = None
+_worker_threads: list[threading.Thread] = []
 _worker_started = False
 _worker_start_lock = threading.Lock()
 
@@ -215,6 +216,32 @@ def _db_video_to_ui(row: dict) -> dict:
     }
 
 
+def _extract_uploaded_video_frame(video_id: int, filepath: str, actor_user_id: int | None) -> None:
+    """Prepare the annotation preview outside the long-running upload request."""
+    try:
+        frame_path = extract_first_frame(filepath, video_id)
+        if not Path(frame_path).is_file():
+            raise FrameExtractError("Reference frame was not written to disk.")
+        db.update_video(video_id, status="annotating")
+        try:
+            db.insert_video_history_event(
+                video_id,
+                "reference_frame_extracted",
+                actor_user_id=actor_user_id,
+                detail={"frame_ready": True},
+            )
+        except Exception:
+            logger.exception("Failed to record frame history for video %s", video_id)
+        state = {"state": "ready", "frame_path": frame_path}
+    except FrameExtractError as exc:
+        state = {"state": "failed", "error": str(exc)}
+    except Exception:
+        logger.exception("Reference frame extraction failed for video %s", video_id)
+        state = {"state": "failed", "error": "Reference frame extraction failed."}
+    with _uploaded_frame_jobs_lock:
+        _uploaded_frame_jobs[int(video_id)] = state
+
+
 def _template_to_ui(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -229,8 +256,71 @@ def _template_to_ui(row: dict) -> dict:
     }
 
 
-def _video_name_map() -> dict[int, dict]:
-    return {row["id"]: row for row in db.list_videos()}
+def _is_admin_actor(actor: dict[str, Any] | None = None) -> bool:
+    actor = actor or auth.current_user()
+    return bool(actor and actor.get("role") == "admin")
+
+
+def _account_video_scope(
+    actor: dict[str, Any] | None = None, *, uploader_id: int | None = None
+) -> dict[str, int]:
+    actor = actor or auth.current_user()
+    if _is_admin_actor(actor) or (actor and actor.get("role") == "viewer"):
+        return {"uploader_id": int(uploader_id)} if uploader_id is not None else {}
+    return {"owner_user_id": int(actor["id"])} if actor and actor.get("id") else {"owner_user_id": -1}
+
+
+def _requested_uploader_id(
+    raw_value: str | None, actor: dict[str, Any] | None = None
+) -> tuple[int | None, str | None, int]:
+    actor = actor or auth.current_user()
+    if not raw_value:
+        return None, None, 200
+    if not _is_admin_actor(actor):
+        return None, "Account filters are available to administrators only.", 403
+    try:
+        uploader_id = int(raw_value)
+    except (TypeError, ValueError):
+        return None, "Invalid uploader account.", 400
+    uploader = db.get_user(uploader_id) if uploader_id > 0 else None
+    if uploader is None:
+        return None, "Uploader account not found.", 400
+    return uploader_id, None, 200
+
+
+def _accessible_video(video_id: int, actor: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Return a video only when the actor may access its uploaded-video work."""
+    actor = actor or auth.current_user()
+    row = db.get_video(video_id)
+    if row is None:
+        return None
+    if _is_admin_actor(actor) or (actor and actor.get("role") == "viewer"):
+        return row
+    if actor is None or row.get("uploaded_by") is None:
+        return None
+    try:
+        return row if int(row["uploaded_by"]) == int(actor["id"]) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _accessible_video_link(video_id: int | None, actor: dict[str, Any] | None = None) -> bool:
+    """Check access through an optional source video; source-less rows stay shared."""
+    if video_id is None:
+        return True
+    return _accessible_video(int(video_id), actor) is not None
+
+
+def _accessible_video_derived_link(video_id: int | None, actor: dict[str, Any] | None = None) -> bool:
+    """Video-derived candidate rows require a real, accessible source video."""
+    return video_id is not None and _accessible_video(int(video_id), actor) is not None
+
+
+def _video_name_map(
+    *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> dict[int, dict]:
+    rows = db.list_videos(owner_user_id=owner_user_id, uploader_id=uploader_id)
+    return {row["id"]: row for row in rows}
 
 
 def _source_label(video_id: int | None, videos: dict[int, dict]) -> str:
@@ -660,9 +750,9 @@ def _camera_to_ui(row: dict) -> dict:
     }
 
 
-def _system_status() -> dict:
+def _system_status(actor: dict[str, Any] | None = None, *, uploader_id: int | None = None) -> dict:
     weights, is_custom = resolve_weights_path()
-    videos = db.list_videos()
+    videos = db.list_videos(**_account_video_scope(actor, uploader_id=uploader_id))
     last_processed = next((v["filename"] for v in videos if v.get("processed")), "—")
     return {
         "pipeline": "Configured",
@@ -680,7 +770,8 @@ def _system_status() -> dict:
 def _detail_badge_count() -> int:
     """Pending detail-review backlog for the nav badge (never breaks the shell)."""
     try:
-        return int(db.count_motorcycle_detail_pending())
+        actor = auth.current_user()
+        return int(db.count_motorcycle_detail_pending(**_account_video_scope(actor)))
     except Exception:
         logger.exception("Failed to count pending motorcycle detail candidates")
         return 0
@@ -715,6 +806,8 @@ def inject_globals():
         })
     if role == "admin":
         nav_items.append({"endpoint": "settings", "label": "Settings", "icon": "bi-gear"})
+    if user:
+        nav_items.append({"endpoint": "about_developers", "label": "About & Developers", "icon": "bi-people"})
     return {
         "app_name": "TAVIDM",
         "app_full_name": "Traffic and Vehicle Intelligence Detection and Monitoring",
@@ -777,11 +870,16 @@ def logout():
 @app.route("/")
 @auth.login_required
 def dashboard():
-    stats = analytics_core.dashboard_stats()
-    summary = analytics_core.violation_summary()
-    hourly_labels, hourly_values = analytics_core.hourly_chart_today()
-    videos = _video_name_map()
-    recent_rows, _total = db.list_violations(page=1, per_page=8, sort="newest")
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    stats = analytics_core.dashboard_stats(**scope)
+    summary = analytics_core.violation_summary(**scope)
+    hourly_labels, hourly_values = analytics_core.hourly_chart_today(**scope)
+    videos = _video_name_map(**scope)
+    recent_rows, _total = db.list_violations(page=1, per_page=8, sort="newest", **scope)
     chart_data = {
         "hourly_labels": hourly_labels,
         "hourly_values": hourly_values,
@@ -794,14 +892,25 @@ def dashboard():
         recent_violations=[_violation_to_ui(r, videos) for r in recent_rows],
         violation_summary=summary,
         chart_data=chart_data,
-        system_status=_system_status(),
+        system_status=_system_status(actor, uploader_id=selected_uploader_id),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
     )
 
 
 @app.route("/live-monitor")
 @auth.login_required
 def live_monitor():
-    videos = [_db_video_to_ui(row) for row in db.list_videos()]
+    from core.video_processor import load_rule_parameters
+
+    actor = auth.current_user()
+    selected_uploader_id, filter_error, filter_status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if filter_error:
+        return filter_error, filter_status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    videos = [_db_video_to_ui(row) for row in db.list_videos(**scope)]
     cameras = [_camera_to_ui(row) for row in db.list_cameras()]
     return render_template(
         "live_monitor.html",
@@ -813,8 +922,11 @@ def live_monitor():
         violation_catalog=violation_catalog_for_ui(),
         enabled_violations=list(load_enabled_violations()),
         max_upload_mb=config.MAX_UPLOAD_MB,
-        user_role=(auth.current_user() or {}).get("role", "viewer"),
+        user_role=(actor or {}).get("role", "viewer"),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
         vehicle_crossing_classes=list(FROZEN_VEHICLE_DETECTOR_CLASSES),
+        rule_parameters=load_rule_parameters(),
     )
 
 
@@ -842,13 +954,20 @@ def annotation_help_document(relative_path: str):
 @app.route("/violations")
 @auth.login_required
 def violations():
-    _rows, total = db.list_violations(page=1, per_page=1, sort="newest")
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    _rows, total = db.list_violations(page=1, per_page=1, sort="newest", **scope)
     return render_template(
         "violations.html",
         violations=[],
         violation_total=total,
         violation_types=list(CANONICAL_VIOLATIONS),
-        videos=[_db_video_to_ui(row) for row in db.list_videos()],
+        videos=[_db_video_to_ui(row) for row in db.list_videos(**scope)],
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
         statuses=STATUSES,
     )
 
@@ -856,6 +975,11 @@ def violations():
 @app.route("/api/violations", methods=["GET"])
 @auth.login_required
 def api_list_violations():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 8)))
     sort = request.args.get("sort", "newest")
@@ -869,13 +993,12 @@ def api_list_violations():
     video_id = request.args.get("video_id", "")
     if video_id.isdigit():
         filters["video_id"] = int(video_id)
-    rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort)
+    rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort, **scope)
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
-        rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort)
-    videos = _video_name_map()
-    actor = auth.current_user()
+        rows, total = db.list_violations(filters=filters, page=page, per_page=per_page, sort=sort, **scope)
+    videos = _video_name_map(**scope)
     return jsonify({
         "success": True,
         "items": [_violation_to_ui(row, videos) for row in rows],
@@ -907,8 +1030,13 @@ def api_list_vehicle_groups():
     # A complete bounded result is necessary to keep groups stable across pages.
     # Refuse oversized result sets instead of silently splitting a group.
     group_event_limit = 100
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     rows, event_total = db.list_violations(
-        filters=filters, page=1, per_page=group_event_limit + 1, sort=sort
+        filters=filters, page=1, per_page=group_event_limit + 1, sort=sort, **scope
     )
     if event_total > group_event_limit:
         return jsonify({
@@ -935,8 +1063,7 @@ def api_list_vehicle_groups():
     last_page = max(1, (group_total + per_page - 1) // per_page)
     page = min(page, last_page)
     start = (page - 1) * per_page
-    videos = _video_name_map()
-    actor = auth.current_user()
+    videos = _video_name_map(**scope)
     return jsonify({
         "success": True,
         "groups": [
@@ -960,19 +1087,16 @@ def api_list_vehicle_groups():
 @app.route("/api/violations/<int:record_id>/evidence/<kind>")
 @auth.login_required
 def api_violation_evidence(record_id: int, kind: str):
+    row = db.get_violation(record_id)
+    if row is None or not _accessible_video_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
     if kind == "preferred-scene":
-        row = db.get_violation(record_id)
-        if row is None:
-            return jsonify({"success": False, "error": "Evidence not found."}), 404
         directory = _private_file_path(row.get("evidence_sequence_dir"), [config.EVIDENCE_FOLDER])
         path = _private_file_path(str(directory / "preferred_scene.jpg"), [config.EVIDENCE_FOLDER]) if directory else None
         if path is None or not path.is_file():
             return jsonify({"success": False, "error": "Preferred event frame is unavailable."}), 404
         return _evidence_media_response(str(path))
     if kind == "raw-scene":
-        row = db.get_violation(record_id)
-        if row is None:
-            return jsonify({"success": False, "error": "Evidence not found."}), 404
         from core.evidence import raw_scene_sidecar_path
 
         path = _private_file_path(row.get("evidence_path"), [config.EVIDENCE_FOLDER])
@@ -981,13 +1105,11 @@ def api_violation_evidence(record_id: int, kind: str):
             return jsonify({"success": False, "error": "Raw scene evidence is unavailable."}), 404
         return _evidence_media_response(str(raw_path))
     if kind == "annotated-clip":
-        row = db.get_violation(record_id)
         path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
         if path is None:
             return jsonify({"success": False, "error": "Annotated evidence clip not found."}), 404
         return _evidence_media_response(str(path))
     path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
-    row = db.get_violation(record_id)
     if path_key is None or row is None:
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     return _evidence_media_response(row.get(path_key))
@@ -996,19 +1118,16 @@ def api_violation_evidence(record_id: int, kind: str):
 @app.route("/api/review-queue/<int:record_id>/evidence/<kind>")
 @auth.role_required("enforcer")
 def api_review_evidence(record_id: int, kind: str):
+    row = db.get_review_item(record_id)
+    if row is None or not _accessible_video_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
     if kind == "preferred-scene":
-        row = db.get_review_item(record_id)
-        if row is None:
-            return jsonify({"success": False, "error": "Evidence not found."}), 404
         directory = _private_file_path(row.get("evidence_sequence_dir"), [config.EVIDENCE_FOLDER])
         path = _private_file_path(str(directory / "preferred_scene.jpg"), [config.EVIDENCE_FOLDER]) if directory else None
         if path is None or not path.is_file():
             return jsonify({"success": False, "error": "Preferred event frame is unavailable."}), 404
         return _evidence_media_response(str(path))
     if kind == "raw-scene":
-        row = db.get_review_item(record_id)
-        if row is None:
-            return jsonify({"success": False, "error": "Evidence not found."}), 404
         from core.evidence import raw_scene_sidecar_path
 
         path = _private_file_path(row.get("evidence_path"), [config.EVIDENCE_FOLDER])
@@ -1017,13 +1136,11 @@ def api_review_evidence(record_id: int, kind: str):
             return jsonify({"success": False, "error": "Raw scene evidence is unavailable."}), 404
         return _evidence_media_response(str(raw_path))
     if kind == "annotated-clip":
-        row = db.get_review_item(record_id)
         path = _annotated_clip_path((row or {}).get("evidence_clip_path"))
         if path is None:
             return jsonify({"success": False, "error": "Annotated evidence clip not found."}), 404
         return _evidence_media_response(str(path))
     path_key = {"scene": "evidence_path", "vehicle": "vehicle_evidence_path", "clip": "evidence_clip_path"}.get(kind)
-    row = db.get_review_item(record_id)
     if path_key is None or row is None:
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     return _evidence_media_response(row.get(path_key))
@@ -1056,7 +1173,7 @@ def _plate_crop_response(attempt_id: str, name: str):
 @auth.role_required("enforcer")
 def api_review_plate_crop(record_id: int, attempt_id: str, name: str):
     row = db.get_review_item(record_id)
-    if row is None:
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     linked = {m.attempt_id for m in _linked_plate_attempts_for_review(record_id)}
     if attempt_id not in linked:
@@ -1070,7 +1187,7 @@ def api_review_plate_crop(record_id: int, attempt_id: str, name: str):
 @auth.role_required("enforcer")
 def api_case_plate_crop(violation_id: int, attempt_id: str, name: str):
     row = db.get_violation(violation_id)
-    if row is None:
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     linked = {m.attempt_id for m in _linked_plate_attempts_for_violation(violation_id)}
     if attempt_id not in linked:
@@ -1118,23 +1235,38 @@ def api_plate_ocr_status():
 @app.route("/analytics")
 @auth.login_required
 def analytics():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     return render_template(
         "analytics.html",
-        analytics=analytics_core.analytics_data(),
-        violation_summary=analytics_core.violation_summary(),
+        analytics=analytics_core.analytics_data(**scope),
+        violation_summary=analytics_core.violation_summary(**scope),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
     )
 
 
 @app.route("/reports")
 @auth.role_required("enforcer")
 def reports():
+    actor = auth.current_user()
     return render_template(
         "reports.html",
         report_history=[_report_to_ui(r) for r in db.list_reports()],
         violation_types=list(CANONICAL_VIOLATIONS),
-        videos=[_db_video_to_ui(row) for row in db.list_videos()],
+        videos=[_db_video_to_ui(row) for row in db.list_videos(**_account_video_scope(actor))],
         statuses=STATUSES,
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
     )
+
+
+@app.route("/about-developers")
+@auth.login_required
+def about_developers():
+    return render_template("about_developers.html")
 
 
 @app.route("/settings")
@@ -1146,6 +1278,7 @@ def settings():
         "settings.html",
         users=[_user_to_ui(u) for u in db.list_users()],
         settings=load_rule_parameters(),
+        processing_limits=db.get_processing_limits(),
         violation_catalog=violation_catalog_for_ui(),
         violation_groups=violation_groups_for_ui(),
         enabled_violations=list(load_enabled_violations()),
@@ -1159,14 +1292,19 @@ def settings():
 @app.route("/review-queue")
 @auth.role_required("enforcer")
 def review_queue():
-    videos = _video_name_map()
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    videos = _video_name_map(**scope)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
-    rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page)
+    rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
-        rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page)
+        rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
     return render_template(
         "review_queue.html",
         review_items=[_review_to_ui(r, videos) for r in rows],
@@ -1174,8 +1312,10 @@ def review_queue():
         review_page=page,
         review_per_page=per_page,
         canonical_violations=list(CANONICAL_VIOLATIONS),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
         recent_decisions=[
-            _decision_to_ui(item) for item in db.list_recent_review_decisions(8)
+            _decision_to_ui(item) for item in db.list_recent_review_decisions(8, **scope)
         ],
     )
 
@@ -1187,7 +1327,14 @@ def review_queue():
 @app.route("/api/videos", methods=["GET"])
 @auth.login_required
 def api_list_videos():
-    return jsonify({"success": True, "videos": [_db_video_to_ui(row) for row in db.list_videos()]})
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    return jsonify({"success": True, "videos": [_db_video_to_ui(row) for row in db.list_videos(**scope)]})
 
 
 @app.route("/api/zone-types", methods=["GET"])
@@ -1292,10 +1439,31 @@ def api_duplicate_zone_template(template_id: int):
     return jsonify({"success": True, "template": _template_to_ui(row)})
 
 
+@app.route("/api/videos/<int:video_id>/frame-status")
+@auth.login_required
+def api_video_frame_status(video_id: int):
+    row = _accessible_video(video_id)
+    if row is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    if frame_path_for_video(video_id).is_file():
+        state, error = "ready", None
+    else:
+        with _uploaded_frame_jobs_lock:
+            job = dict(_uploaded_frame_jobs.get(video_id) or {})
+        state, error = job.get("state", "pending"), job.get("error")
+    return jsonify({
+        "success": True,
+        "state": state,
+        "error": error,
+        "video": _db_video_to_ui(row),
+        "frame_url": f"/api/videos/{video_id}/frame",
+    })
+
+
 @app.route("/api/videos/<int:video_id>/frame")
 @auth.login_required
 def api_video_frame(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
 
@@ -1321,7 +1489,7 @@ def api_video_frame(video_id: int):
 @app.route("/api/videos/<int:video_id>/annotation", methods=["GET"])
 @auth.login_required
 def api_get_annotation(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     annotation = db.get_annotation_by_video(video_id)
@@ -1333,7 +1501,7 @@ def api_get_annotation(video_id: int):
 @app.route("/api/videos/<int:video_id>/annotation", methods=["POST", "PUT"])
 @auth.role_required("enforcer")
 def api_save_annotation(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
 
@@ -1487,22 +1655,30 @@ def api_upload_video():
         except Exception:
             logger.exception("Failed to record upload history for video %s", video_id)
 
-        frame_error = None
+        with _uploaded_frame_jobs_lock:
+            _uploaded_frame_jobs[video_id] = {"state": "processing", "error": None}
         try:
-            frame_path = extract_first_frame(filepath, video_id)
-            db.update_video(video_id, status="annotating")
-            try:
-                db.insert_video_history_event(
-                    video_id,
-                    "reference_frame_extracted",
-                    actor_user_id=user["id"] if user else None,
-                    detail={"frame_ready": True},
-                )
-            except Exception:
-                logger.exception("Failed to record frame history for video %s", video_id)
-        except FrameExtractError as exc:
-            frame_path = None
-            frame_error = str(exc)
+            frame_args = (video_id, filepath, int(user["id"]) if user else None)
+            if app.testing:
+                _extract_uploaded_video_frame(*frame_args)
+            else:
+                threading.Thread(
+                    target=_extract_uploaded_video_frame,
+                    args=frame_args,
+                    name=f"upload-frame-{video_id}",
+                    daemon=True,
+                ).start()
+        except RuntimeError:
+            logger.exception("Could not start reference frame extraction for video %s", video_id)
+            with _uploaded_frame_jobs_lock:
+                _uploaded_frame_jobs[video_id] = {
+                    "state": "failed", "error": "Could not start reference frame extraction."
+                }
+
+        with _uploaded_frame_jobs_lock:
+            frame_job = dict(_uploaded_frame_jobs.get(video_id) or {})
+        frame_ready = frame_job.get("state") == "ready" and frame_path_for_video(video_id).is_file()
+        frame_pending = frame_job.get("state") == "processing"
 
         row = db.get_video(video_id)
         video = _db_video_to_ui(row)
@@ -1514,8 +1690,9 @@ def api_upload_video():
             "video": video,
             "size": format_file_size(file_size),
             "frame_url": f"/api/videos/{video_id}/frame",
-            "frame_ready": frame_path is not None,
-            "frame_error": frame_error,
+            "frame_ready": frame_ready,
+            "frame_pending": frame_pending,
+            "frame_error": frame_job.get("error"),
             "templates": templates,
             "zone_types": zones_for_api(),
             "requires_annotation": True,
@@ -1534,6 +1711,8 @@ def api_upload_video():
 
 def _is_processing_or_queued(video_id: int) -> bool:
     """True if this video is currently running or waiting in the queue."""
+    if db.processing_queue_position(video_id) is not None:
+        return True
     if _processing_jobs.get(video_id, {}).get("state") == "processing":
         return True
     with _queue_lock:
@@ -1543,6 +1722,9 @@ def _is_processing_or_queued(video_id: int) -> bool:
 
 
 def _queue_position(video_id: int) -> int | None:
+    position = db.processing_queue_position(video_id)
+    if position is not None:
+        return position
     with _queue_lock:
         if _running_video_id == video_id:
             return 0
@@ -1617,36 +1799,38 @@ def _call_process_video(video_id, *, enabled_violations, processing_run_id, prog
     return process_video(video_id, **kwargs)
 
 
-def _processing_worker() -> None:
-    """Single worker: drain the queue one job at a time.
-
-    Exactly one inference job (YOLOv8m + ByteTrack) runs at any moment
-    because this is the only thread that ever calls ``process_video``, and it
-    holds the shared GPU reservation (``core.gpu_inference_slot``) for the whole
-    job so a motorcycle crop batch or a live camera frame cannot start a second
-    pass. The worker stays alive across jobs; tests may stop it via
-    ``stop_processing_worker()`` so SQLite file locks are released.
-    """
+def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
+    """Claim durable account-fair jobs until shutdown."""
     global _running_video_id
     while not _worker_shutdown.is_set():
-        with _queue_cv:
-            while not _process_queue and not _worker_shutdown.is_set():
-                _queue_cv.wait(timeout=0.5)
-            if _worker_shutdown.is_set():
-                _running_video_id = None
-                return
-            if not _process_queue:
-                continue
-            video_id, enabled_violations, run_id = _process_queue.pop(0)
-            _running_video_id = video_id
         try:
-            db.start_processing_run(run_id)
+            claimed = db.claim_next_processing_run(worker_id)
         except Exception:
-            logger.exception(
-                "Failed to mark processing run %d as running; "
-                "inference will proceed but the run row may stay 'queued'.",
-                run_id,
+            logger.exception("Worker %s could not claim the next video run", worker_id)
+            _worker_shutdown.wait(1.0)
+            continue
+        if not claimed:
+            with _queue_cv:
+                _queue_cv.wait(timeout=0.5)
+            continue
+        video_id = int(claimed["video_id"])
+        run_id = int(claimed["id"])
+        if _worker_shutdown.is_set():
+            db.release_processing_claim(run_id, worker_id)
+            return
+        try:
+            enabled_violations = tuple(
+                json.loads(claimed.get("enabled_violations_json") or "[]")
             )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.exception("Invalid violation snapshot in processing run %d", run_id)
+            db.finish_processing_run(run_id, status="failed", error_message=str(exc))
+            continue
+        with _queue_cv:
+            _running_video_ids.add(video_id)
+            _running_video_id = next(iter(_running_video_ids), None)
+            _process_queue[:] = [entry for entry in _process_queue if entry[2] != run_id]
+            _queue_cv.notify_all()
         job = _processing_jobs.get(video_id) or {}
         tracker = job.get("tracker") or ProgressTracker(
             run_id=run_id, video_id=video_id, viewer_mode=job.get("viewer_mode") or "background"
@@ -1663,6 +1847,25 @@ def _processing_worker() -> None:
         # Reserved immediately before the first GPU inference call and released
         # in the finally below, so cancellation, failure, and shutdown all free
         # the device. No queue mutex is held while waiting or while inferring.
+        lease_stop = threading.Event()
+        cancel_event = _processing_cancel_events.setdefault(run_id, threading.Event())
+
+        def _maintain_claim() -> None:
+            while not lease_stop.wait(10.0):
+                try:
+                    if not db.heartbeat_processing_run(run_id, worker_id):
+                        logger.error("Worker claim lost for processing run %d", run_id)
+                        cancel_event.set()
+                        return
+                    if db.processing_cancel_requested(run_id, worker_id):
+                        cancel_event.set()
+                except Exception:
+                    logger.exception("Worker %s heartbeat failed for run %d", worker_id, run_id)
+
+        lease_thread = threading.Thread(
+            target=_maintain_claim, daemon=True, name=f"lease-{run_id}"
+        )
+        lease_thread.start()
         gpu_token = _gpu_slot.acquire(
             f"video-job:{video_id}:{run_id}",
             timeout=_VIDEO_JOB_GPU_WAIT_SEC,
@@ -1677,12 +1880,13 @@ def _processing_worker() -> None:
                 video_id,
                 run_id,
             )
+            db.release_processing_claim(run_id, worker_id)
+            lease_stop.set()
+            lease_thread.join(timeout=1.0)
             with _queue_cv:
-                _process_queue.insert(0, (video_id, enabled_violations, run_id))
-                if _running_video_id == video_id:
-                    _running_video_id = None
+                _running_video_ids.discard(video_id)
+                _running_video_id = next(iter(_running_video_ids), None)
                 _queue_cv.notify_all()
-            _worker_shutdown.wait(0.5)
             continue
         pipeline_ok = False
         result = None
@@ -1809,13 +2013,16 @@ def _processing_worker() -> None:
                     except Exception:
                         pass
         finally:
+            lease_stop.set()
+            lease_thread.join(timeout=1.0)
             _processing_cancel_events.pop(run_id, None)
             preview_hub.clear(video_id)
             # Always release the device, including on cancellation/failure.
             _gpu_slot.release(gpu_token)
             with _queue_cv:
-                if _running_video_id == video_id:
-                    _running_video_id = None
+                _running_video_ids.discard(video_id)
+                _running_video_id = next(iter(_running_video_ids), None)
+                _queue_cv.notify_all()
 
 
 # ---------------------------------------------------------------------------
@@ -1861,7 +2068,7 @@ def _detail_gpu_idle() -> bool:
     video worker, and every live camera frame all take.
     """
     with _queue_cv:
-        return _running_video_id is None and not _process_queue
+        return not _running_video_ids and not _process_queue
 
 
 def _ensure_detail_scanner() -> MotorcycleDetailScanner:
@@ -1954,18 +2161,25 @@ def stop_detail_scanner(timeout: float = 3.0) -> None:
 
 
 def _ensure_worker() -> None:
-    """Start the sequential worker if it is not already alive."""
-    global _worker_started, _worker_thread
+    """Ensure workers exist up to the supported administrator job limit."""
+    global _worker_started, _worker_thread, _worker_threads
     with _worker_start_lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            return
         _worker_shutdown.clear()
-        _worker_thread = threading.Thread(
-            target=_processing_worker,
-            daemon=True,
-            name="tavidm-process-worker",
-        )
-        _worker_thread.start()
+        _worker_threads = [thread for thread in _worker_threads if thread.is_alive()]
+        existing = {thread.name for thread in _worker_threads}
+        for index in (1, 2):
+            name = f"tavidm-process-worker-{index}"
+            if name in existing:
+                continue
+            thread = threading.Thread(
+                target=_processing_worker,
+                args=(name,),
+                daemon=True,
+                name=name,
+            )
+            _worker_threads.append(thread)
+            thread.start()
+        _worker_thread = _worker_threads[0] if _worker_threads else None
         _worker_started = True
 
 
@@ -1975,17 +2189,20 @@ def stop_processing_worker(timeout: float = 3.0) -> None:
     Production never needs this. Tests call it so the worker releases any
     SQLite handle before the temporary database directory is deleted.
     """
-    global _worker_started, _worker_thread, _running_video_id
+    global _worker_started, _worker_thread, _worker_threads, _running_video_id
     _worker_shutdown.set()
     with _queue_cv:
         _queue_cv.notify_all()
-    thread = _worker_thread
-    if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
-        thread.join(timeout=timeout)
+    threads = list(_worker_threads)
+    for thread in threads:
+        if thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=timeout)
     with _worker_start_lock:
         _worker_started = False
         _worker_thread = None
+        _worker_threads = []
     _running_video_id = None
+    _running_video_ids.clear()
     stop_detail_scanner(timeout=timeout)
 
 
@@ -2020,22 +2237,18 @@ def _try_claim_enqueue(
     Returns (status, run_id, queued, position) where status is
     'accepted' or 'already_busy'.
     """
+    run_id = db.enqueue_processing_run(
+        video_id,
+        json.dumps(list(enabled)),
+        viewer_mode=viewer_mode,
+    )
+    if run_id is None:
+        return "already_busy", None, None, None
     with _queue_cv:
-        busy = (
-            _processing_jobs.get(video_id, {}).get("state") == "processing"
-            or _running_video_id == video_id
-            or any(entry[0] == video_id for entry in _process_queue)
-        )
-        if busy:
-            return "already_busy", None, None, None
-
-        run_id = db.create_processing_run(
-            video_id,
-            json.dumps(list(enabled)),
-            viewer_mode=viewer_mode,
-        )
         tracker = ProgressTracker(run_id=run_id, video_id=video_id, viewer_mode=viewer_mode)
-        tracker.set_queued(True, position=None)
+        position = db.processing_queue_position(video_id)
+        queued = position != 0
+        tracker.set_queued(queued, position=position)
         _processing_jobs[video_id] = {
             "state": "processing",
             "error": None,
@@ -2044,16 +2257,6 @@ def _try_claim_enqueue(
             "viewer_mode": viewer_mode,
         }
         _process_queue.append((video_id, enabled, run_id))
-        try:
-            position = [entry[0] for entry in _process_queue].index(video_id) + 1
-        except ValueError:
-            position = 0
-        slot_busy = any(
-            vid != video_id and v.get("state") == "processing"
-            for vid, v in _processing_jobs.items()
-        )
-        queued = slot_busy or position > 1 or _running_video_id is not None
-        tracker.set_queued(queued, position=position)
         _queue_cv.notify_all()
 
     _ensure_worker()
@@ -2278,7 +2481,7 @@ def _enqueue_video_job(
 @app.route("/api/videos/<int:video_id>/process", methods=["POST"])
 @auth.role_required("enforcer")
 def api_process_video(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     if _is_processing_or_queued(video_id):
@@ -2326,7 +2529,7 @@ def api_process_video(video_id: int):
         }), 409
 
     if queued:
-        message = "Processing queued. Runs sequentially after the current job."
+        message = "Processing queued for the next available account-safe slot."
     else:
         message = "Processing started."
     return jsonify({
@@ -2344,40 +2547,45 @@ def api_process_video(video_id: int):
 @app.route("/api/videos/<int:video_id>/process-cancel", methods=["POST"])
 @auth.role_required("enforcer")
 def api_cancel_processing(video_id: int):
+    if _accessible_video(video_id) is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
     payload = request.get_json(silent=True) or {}
     try:
         run_id = int(payload.get("run_id"))
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "A valid run_id is required."}), 400
-    job = _processing_jobs.get(video_id) or {}
-    if int(job.get("run_id") or -1) != run_id:
-        run = db.get_processing_run(run_id)
-        if run and run.get("status") == "cancelled":
-            return jsonify({"success": True, "state": "cancelled", "run_id": run_id})
+    run = db.get_processing_run(run_id)
+    if run and int(run.get("video_id") or -1) == video_id and run.get("status") == "cancelled":
+        return jsonify({"success": True, "state": "cancelled", "run_id": run_id})
+    latest = db.get_latest_processing_run(video_id) if hasattr(db, "get_latest_processing_run") else None
+    if not run or int(run.get("video_id") or -1) != video_id or not latest or int(latest["id"]) != run_id:
         return jsonify({"success": False, "error": "The processing run is no longer current."}), 409
+    job = _processing_jobs.get(video_id) or {}
     user = auth.current_user()
-    with _queue_cv:
-        queued_entry = next((entry for entry in _process_queue if entry[0] == video_id and entry[2] == run_id), None)
-        if queued_entry is not None:
-            _process_queue.remove(queued_entry)
+    state = db.request_processing_cancel(run_id)
+    if state == "cancelled":
+        with _queue_cv:
+            _process_queue[:] = [entry for entry in _process_queue if entry[2] != run_id]
             tracker = job.get("tracker")
             if tracker:
                 tracker.mark_cancelled()
             _processing_jobs[video_id] = {**job, "state": "cancelled", "error": None}
-            db.finish_processing_run(run_id, status="cancelled", progress=tracker.snapshot() if tracker else {"stage": "cancelled"})
             previous = db.get_current_completed_result_run(video_id)
             db.update_video(video_id, status="processed" if previous else "ready")
-            db.insert_video_history_event(video_id, "processing_cancelled", run_id=run_id,
-                                          actor_user_id=user["id"] if user else None,
-                                          detail={"was_queued": True})
             _queue_cv.notify_all()
-            return jsonify({"success": True, "state": "cancelled", "run_id": run_id})
-    event = _processing_cancel_events.setdefault(run_id, threading.Event())
-    event.set()
-    db.insert_video_history_event(video_id, "processing_cancel_requested", run_id=run_id,
-                                  actor_user_id=user["id"] if user else None,
-                                  detail={"was_queued": False})
-    return jsonify({"success": True, "state": "stopping", "run_id": run_id})
+        db.insert_video_history_event(
+            video_id, "processing_cancelled", run_id=run_id,
+            actor_user_id=user["id"] if user else None, detail={"was_queued": True},
+        )
+        return jsonify({"success": True, "state": "cancelled", "run_id": run_id})
+    if state == "stopping":
+        _processing_cancel_events.setdefault(run_id, threading.Event()).set()
+        db.insert_video_history_event(
+            video_id, "processing_cancel_requested", run_id=run_id,
+            actor_user_id=user["id"] if user else None, detail={"was_queued": False},
+        )
+        return jsonify({"success": True, "state": "stopping", "run_id": run_id})
+    return jsonify({"success": False, "error": "The processing run is no longer active."}), 409
 
 
 @app.route("/api/videos/process-bulk", methods=["POST"])
@@ -2397,6 +2605,16 @@ def api_process_bulk():
         return jsonify({"success": False, "error": str(exc)}), 400
 
     user = auth.current_user()
+    # Reject a mixed-owner batch before enqueueing any item; otherwise a caller
+    # could trigger processing of another account's video in the same request.
+    for raw_id in video_ids:
+        try:
+            requested_video_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        existing_video = db.get_video(requested_video_id)
+        if existing_video is not None and _accessible_video(requested_video_id, user) is None:
+            return jsonify({"success": False, "error": "Video not found."}), 404
     accepted = []
     rejected = []
     already_queued = []
@@ -2444,7 +2662,7 @@ def api_process_bulk():
 @app.route("/api/videos/<int:video_id>/process-status", methods=["GET"])
 @auth.login_required
 def api_process_status(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     return jsonify(_build_status_payload(video_id, row))
@@ -2464,10 +2682,44 @@ def api_processing_jobs():
             raise ValueError
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "Invalid processing-jobs query parameters."}), 400
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    if video_id is not None and _accessible_video(video_id, actor) is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
     snapshot = build_processing_jobs_snapshot(
         recent_limit=min(recent_limit, 100), video_id=video_id
     )
-    can_stop = (auth.current_user() or {}).get("role") in ("admin", "enforcer")
+    if actor and actor.get("role") == "enforcer":
+        visible_video_ids = {
+            int(row["id"])
+            for row in db.list_videos(**_account_video_scope(actor))
+        }
+        snapshot["active"] = [
+            job for job in snapshot.get("active", [])
+            if int(job.get("video_id") or -1) in visible_video_ids
+        ]
+        snapshot["recent"] = [
+            job for job in snapshot.get("recent", [])
+            if int(job.get("video_id") or -1) in visible_video_ids
+        ]
+    elif _is_admin_actor(actor) and selected_uploader_id is not None:
+        selected_video_ids = {
+            int(row["id"])
+            for row in db.list_videos(uploader_id=selected_uploader_id)
+        }
+        snapshot["active"] = [
+            job for job in snapshot.get("active", [])
+            if int(job.get("video_id") or -1) in selected_video_ids
+        ]
+        snapshot["recent"] = [
+            job for job in snapshot.get("recent", [])
+            if int(job.get("video_id") or -1) in selected_video_ids
+        ]
+    can_stop = (actor or {}).get("role") in ("admin", "enforcer")
     for job in snapshot["active"]:
         job["can_stop"] = can_stop
     return jsonify(snapshot)
@@ -2477,7 +2729,7 @@ def api_processing_jobs():
 @auth.login_required
 def api_process_preview(video_id: int):
     """MJPEG of the latest annotated processing frame (same run — no extra inference)."""
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
 
@@ -2497,7 +2749,7 @@ def api_process_preview(video_id: int):
 @app.route("/api/videos/<int:video_id>/media")
 @auth.login_required
 def api_video_media(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     return safe_media_response(
@@ -2513,7 +2765,7 @@ def api_video_media(video_id: int):
 @app.route("/api/videos/<int:video_id>/annotated/<int:run_id>")
 @auth.login_required
 def api_annotated_video(video_id: int, run_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     run = db.get_processing_run(run_id)
@@ -2537,7 +2789,7 @@ def api_annotated_video(video_id: int, run_id: int):
 @app.route("/api/videos/<int:video_id>/history")
 @auth.login_required
 def api_video_history(video_id: int):
-    row = db.get_video(video_id)
+    row = _accessible_video(video_id)
     if row is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
     annotation = db.get_annotation_by_video(video_id)
@@ -2600,6 +2852,8 @@ def api_video_history(video_id: int):
 @app.route("/api/videos/<int:video_id>/remove-results", methods=["POST"])
 @auth.role_required("enforcer")
 def api_remove_results(video_id: int):
+    if _accessible_video(video_id) is None:
+        return jsonify({"success": False, "error": "Video not found."}), 404
     user = auth.current_user()
     try:
         result = remove_processing_results(
@@ -2646,8 +2900,13 @@ def api_upload_processing_analytics():
     period = request.args.get("period", "today")
     start = request.args.get("start")
     end = request.args.get("end")
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     try:
-        data = build_upload_processing_analytics(period, start=start, end=end)
+        data = build_upload_processing_analytics(period, start=start, end=end, **scope)
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
     return jsonify({"success": True, "analytics": data})
@@ -2660,30 +2919,35 @@ def api_upload_processing_analytics():
 @app.route("/api/review-queue", methods=["GET"])
 @auth.role_required("enforcer")
 def api_review_queue():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     status = request.args.get("status", "pending")
     decision = request.args.get("decision")
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
-    videos = _video_name_map()
+    videos = _video_name_map(**scope)
     if decision:
         from core.review_decision_service import REVIEW_DECISIONS
 
         if decision not in REVIEW_DECISIONS:
             return jsonify({"success": False, "error": "Unknown review decision."}), 400
         rows, total = db.list_review_queue_by_decision(
-            decision, page=page, per_page=per_page
+            decision, page=page, per_page=per_page, **scope
         )
     else:
-        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
+        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page, **scope)
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
         if decision:
             rows, total = db.list_review_queue_by_decision(
-                decision, page=page, per_page=per_page
+                decision, page=page, per_page=per_page, **scope
             )
         else:
-            rows, total = db.list_review_queue(status=status, page=page, per_page=per_page)
+            rows, total = db.list_review_queue(status=status, page=page, per_page=per_page, **scope)
     return jsonify({
         "success": True,
         "items": [_review_to_ui(r, videos) for r in rows],
@@ -2697,6 +2961,9 @@ def api_review_queue():
 @auth.login_required
 def api_confirm_review(review_id: int):
     user = auth.current_user()
+    review_row = db.get_review_item(review_id)
+    if review_row is None or not _accessible_video_link(review_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Review item not found."}), 404
     try:
         from core.case_review_service import CaseReviewError
         from core.review_decision_service import (
@@ -2734,6 +3001,9 @@ def api_confirm_review(review_id: int):
 @auth.role_required("enforcer")
 def api_dismiss_review(review_id: int):
     user = auth.current_user()
+    review_row = db.get_review_item(review_id)
+    if review_row is None or not _accessible_video_link(review_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Review item not found."}), 404
     try:
         from core.case_review_service import CaseReviewError
         from core.review_decision_service import (
@@ -2788,8 +3058,16 @@ def _decision_to_ui(row: dict[str, Any]) -> dict[str, Any]:
 @app.route("/api/review-queue/decisions", methods=["GET"])
 @auth.role_required("enforcer")
 def api_review_decisions():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
     limit = min(50, max(1, _int_query_arg("limit", 20)))
-    rows = db.list_recent_review_decisions(limit)
+    rows = db.list_recent_review_decisions(
+        limit, **_account_video_scope(actor, uploader_id=selected_uploader_id)
+    )
     return jsonify({
         "success": True,
         "decisions": [_decision_to_ui(row) for row in rows],
@@ -2808,6 +3086,9 @@ def api_review_decision(review_id: int):
     )
 
     user = auth.current_user()
+    review_row = db.get_review_item(review_id)
+    if review_row is None or not _accessible_video_link(review_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Review item not found."}), 404
     payload = request.get_json(silent=True) or {}
     if "reviewer_user_id" in payload or "reviewed_by" in payload:
         return jsonify({
@@ -2991,10 +3272,61 @@ def _detail_frames_to_ui(row: dict[str, Any]) -> list[dict[str, Any]]:
         )
     return out
 
-def _motorcycle_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> dict[str, Any]:
+def _motorcycle_detail_can_confirm(
+    row: dict[str, Any], linked_review: dict[str, Any] | None,
+    current_run: dict[str, Any] | None = None,
+) -> bool:
+    if (not linked_review or linked_review.get("status") != "pending"
+            or row.get("scan_state") != "ready"
+            or row.get("human_outcome") not in ("pending", "reviewed")
+            or row.get("processing_run_id") is None):
+        return False
+    try:
+        observations = _detail_json(row.get("observations_json"), {})
+        association = _detail_json(row.get("association_json"), {})
+        scan = observations.get("scan") or {}
+        if scan.get("contract") != "md-detail-4c-v1":
+            return False
+        helmet = association.get("helmet") or {}
+        if helmet.get("state") != "uncovered_head":
+            return False
+        frames = observations.get("frames") or []
+        positives = [
+            detection
+            for frame in frames if isinstance(frame, dict)
+            for detection in (frame.get("detections") or [])
+            if isinstance(detection, dict)
+            and detection.get("class_label") == "no_helmet"
+            and not detection.get("evidence_limited")
+        ]
+        if len(positives) < 2:
+            return False
+        current = current_run
+        if current is None:
+            current = db.get_current_completed_result_run(int(row["video_id"]))
+        return bool(current and int(current.get("id") or 0) == int(row["processing_run_id"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def _motorcycle_detail_to_ui(
+    row: dict[str, Any], videos: dict[int, dict], linked_review: dict[str, Any] | None = None,
+    current_run: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     observations = _detail_json(row.get("observations_json"), {})
     association = _detail_json(row.get("association_json"), {})
     uncertainty = _detail_json(row.get("uncertainty_json"), [])
+    video_id = row.get("video_id")
+    run = current_run
+    if run is None and video_id and hasattr(db, "get_current_completed_result_run"):
+        run = db.get_current_completed_result_run(int(video_id))
+    annotated_url = (
+        f"/api/videos/{video_id}/annotated/{row['processing_run_id']}"
+        if run and row.get("processing_run_id")
+        and int(run.get("id") or 0) == int(row["processing_run_id"])
+        and run.get("annotated_video_ready")
+        else None
+    )
     return {
         "id": row["id"],
         "display_id": f"MD-{row['id']:05d}",
@@ -3025,16 +3357,36 @@ def _motorcycle_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> di
         "reviewer_name": row.get("reviewer_full_name") or row.get("reviewer_username"),
         "review_revision": motorcycle_detail_review_revision(row),
         "queued_at": row.get("created_at"),
-        # Explicit contract: this queue has no case-confirm action.
-        "can_confirm": False,
-        "case_action": None,
+        "source_video_url": f"/api/videos/{video_id}/media" if video_id in videos else None,
+        "annotated_video_url": annotated_url,
+        "linked_review_id": linked_review.get("id") if linked_review else None,
+        "linked_review_status": linked_review.get("status") if linked_review else None,
+        "can_confirm": _motorcycle_detail_can_confirm(row, linked_review, run),
+        "case_action": "confirm_no_helmet" if _motorcycle_detail_can_confirm(row, linked_review, run) else None,
     }
+
+
+def _motorcycle_detail_page_context(rows: list[dict[str, Any]]) -> tuple[dict[int, dict], dict[int, dict]]:
+    candidate_ids = [int(row["id"]) for row in rows]
+    review_links = db.list_motorcycle_detail_no_helmet_reviews(candidate_ids)
+    video_ids = sorted({int(row["video_id"]) for row in rows if row.get("video_id") is not None})
+    current_runs = {
+        video_id: db.get_current_completed_result_run(video_id)
+        for video_id in video_ids
+        if hasattr(db, "get_current_completed_result_run")
+    }
+    return review_links, current_runs
 
 
 @app.route("/motorcycle-detail-review")
 @auth.role_required("enforcer")
 def motorcycle_detail_review():
-    videos = _video_name_map()
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    videos = _video_name_map(**scope)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
     outcome = request.args.get("outcome", "pending")
@@ -3044,6 +3396,7 @@ def motorcycle_detail_review():
         human_outcome=None if outcome == "all" else outcome,
         page=page,
         per_page=per_page,
+        **scope,
     )
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
@@ -3052,22 +3405,34 @@ def motorcycle_detail_review():
             human_outcome=None if outcome == "all" else outcome,
             page=page,
             per_page=per_page,
+            **scope,
         )
+    review_links, current_runs = _motorcycle_detail_page_context(rows)
     return render_template(
         "motorcycle_detail_review.html",
-        detail_items=[_motorcycle_detail_to_ui(r, videos) for r in rows],
+        detail_items=[
+            _motorcycle_detail_to_ui(r, videos, review_links.get(r["id"]), current_runs.get(r.get("video_id")))
+            for r in rows
+        ],
         detail_total=total,
         detail_page=page,
         detail_per_page=per_page,
         detail_outcome=outcome,
-        detail_counts=db.count_motorcycle_detail_by_state(),
+        detail_counts=db.count_motorcycle_detail_by_state(**scope),
         detail_gate=_detail_scan_gate(),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
     )
 
 
 @app.route("/api/motorcycle-detail-review", methods=["GET"])
 @auth.role_required("enforcer")
 def api_motorcycle_detail_list():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 50)))
     scan_state = request.args.get("scan_state") or None
@@ -3078,21 +3443,43 @@ def api_motorcycle_detail_list():
         return jsonify({"success": False, "error": "Unknown scan state."}), 400
     if outcome is not None and outcome not in ("pending", "reviewed", "dismissed", "uncertain"):
         return jsonify({"success": False, "error": "Unknown outcome."}), 400
-    videos = _video_name_map()
+    videos = _video_name_map(**scope)
     rows, total = db.list_motorcycle_detail_candidates(
-        scan_state=scan_state, human_outcome=outcome, page=page, per_page=per_page
+        scan_state=scan_state, human_outcome=outcome, page=page, per_page=per_page, **scope
     )
+    review_links, current_runs = _motorcycle_detail_page_context(rows)
     return jsonify(
         {
             "success": True,
-            "items": [_motorcycle_detail_to_ui(r, videos) for r in rows],
+            "items": [_motorcycle_detail_to_ui(r, videos, db.get_motorcycle_detail_no_helmet_review(r["id"])) for r in rows],
             "total": total,
             "page": page,
             "per_page": per_page,
-            "counts": db.count_motorcycle_detail_by_state(),
+            "counts": db.count_motorcycle_detail_by_state(**scope),
             "gate": _detail_scan_gate(),
         }
     )
+
+
+@app.route("/api/motorcycle-detail-review/<int:candidate_id>", methods=["GET"])
+@auth.role_required("enforcer")
+def api_motorcycle_detail_candidate(candidate_id: int):
+    row = db.get_motorcycle_detail_candidate(candidate_id)
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Detail candidate not found."}), 404
+    videos = _video_name_map(**_account_video_scope())
+    current_run = (
+        db.get_current_completed_result_run(int(row["video_id"]))
+        if row.get("video_id") and hasattr(db, "get_current_completed_result_run")
+        else None
+    )
+    return jsonify({
+        "success": True,
+        "item": _motorcycle_detail_to_ui(
+            row, videos, db.get_motorcycle_detail_no_helmet_review(candidate_id), current_run
+        ),
+    })
+
 
 @app.route("/api/motorcycle-detail-review/<int:candidate_id>/evidence/<kind>")
 @auth.role_required("enforcer")
@@ -3100,7 +3487,7 @@ def api_motorcycle_detail_evidence(candidate_id: int, kind: str):
     if kind not in ("scene", "crop", "overlay"):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     row = db.get_motorcycle_detail_candidate(candidate_id)
-    if row is None:
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     try:
         index = int(request.args.get("index", "1"))
@@ -3136,7 +3523,8 @@ def api_motorcycle_detail_outcome(candidate_id: int):
         or any(char not in "0123456789abcdef" for char in expected_revision)
     ):
         return jsonify({"success": False, "error": "Invalid review revision."}), 400
-    if db.get_motorcycle_detail_candidate(candidate_id) is None:
+    candidate = db.get_motorcycle_detail_candidate(candidate_id)
+    if candidate is None or not _accessible_video_derived_link(candidate.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     try:
         saved_snapshot = db.record_motorcycle_detail_review(
@@ -3167,6 +3555,208 @@ def api_motorcycle_detail_outcome(candidate_id: int):
         "reviewer_notes": updated.get("reviewer_notes"),
         "review_revision": motorcycle_detail_review_revision(updated),
     })
+
+
+@app.route("/api/motorcycle-detail-review/<int:candidate_id>/confirm-no-helmet", methods=["POST"])
+@auth.role_required("enforcer")
+def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
+    """Create a No Helmet case only after an explicit human evidence decision."""
+    from core.case_review_service import CaseReviewError
+    from core.review_decision_service import (
+        DECISION_CONFIRM, ReviewDecisionConflict, ReviewDecisionError, apply_review_decision,
+    )
+
+    row = db.get_motorcycle_detail_candidate(candidate_id)
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Detail candidate not found."}), 404
+    linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason")
+    if payload.get("human_confirmed") is not True:
+        return jsonify({"success": False, "error": "Explicitly confirm that the reviewed video evidence shows a No Helmet violation."}), 400
+    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 2000:
+        return jsonify({"success": False, "error": "Enter a reviewer reason (up to 2000 characters) before confirming this case."}), 400
+    if row.get("scan_state") != "ready" or row.get("human_outcome") != "reviewed":
+        return jsonify({"success": False, "error": "Record the observation as reviewed and wait for its evidence scan before creating a case."}), 409
+    reviewer_id = int(auth.current_user()["id"])
+    if not db.can_confirm_case(reviewer_id):
+        return jsonify({"success": False, "error": "Your account does not have case-confirmation authority."}), 403
+    if linked is None:
+        # A human reviewer may confirm directly from the candidate's stored
+        # source-frame evidence. The model's helmet label/association is not
+        # treated as proof; the explicit human decision and reason are saved
+        # by the ordinary review-decision service below.
+        frames = _detail_json(row.get("frames_json"), [])
+        evidence_path = None
+        if isinstance(frames, list):
+            for frame in frames:
+                if isinstance(frame, dict) and frame.get("scene_path"):
+                    evidence_path = str(frame["scene_path"])
+                    break
+        if (not evidence_path or row.get("video_id") is None
+                or row.get("processing_run_id") is None):
+            return jsonify({"success": False, "error": "This candidate has no stored source-frame evidence. Reprocess or choose a candidate with evidence before confirming."}), 409
+        try:
+            score = float(row.get("frame_score") or 0.5)
+        except (TypeError, ValueError):
+            score = 0.5
+        score = min(1.0, max(0.0, score))
+        marker = f"[motorcycle_detail_candidate:{int(candidate_id)}]"
+        try:
+            review_id = db.insert_review_queue(
+                video_id=int(row["video_id"]),
+                track_id=int(row["track_id"]),
+                violation_type="No Helmet",
+                confidence=score,
+                frame_number=int(row.get("frame_number") or 0),
+                timestamp_sec=float(row.get("timestamp_sec") or 0.0),
+                evidence_path=evidence_path,
+                reason_log=f"{marker} [human_confirmed_motorcycle_detail] Reviewer-confirmed from stored source-frame evidence.",
+                vehicle_class="motorcycle",
+                processing_run_id=int(row["processing_run_id"]) if row.get("processing_run_id") is not None else None,
+            )
+            linked = db.get_review_item(review_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify({"success": False, "error": f"Could not create the linked review record: {exc}"}), 409
+    if not linked or linked.get("status") != "pending":
+        return jsonify({"success": False, "error": "The linked review item is no longer pending."}), 409
+    try:
+        result = apply_review_decision(
+            db,
+            int(linked["id"]),
+            reviewer_id,
+            decision=DECISION_CONFIRM,
+            reason=reason,
+            idempotency_key=f"motorcycle-detail:{candidate_id}:confirm-no-helmet",
+        )
+        return jsonify({"success": True, "review_id": linked["id"], **result})
+    except TemporalEvidenceNotReady as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except ReviewDecisionConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ReviewDecisionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+
+
+@app.route("/api/motorcycle-detail-review/<int:candidate_id>/decision", methods=["POST"])
+@auth.role_required("enforcer")
+def api_motorcycle_detail_decision(candidate_id: int):
+    """Record a human-selected motorcycle disposition through the review queue."""
+    from core.case_review_service import CaseReviewError
+    from core.detection_config import (
+        VIOLATION_NO_HELMET,
+        VIOLATION_NO_SIDE_MIRROR,
+        VIOLATION_SUBSTANDARD_HELMET,
+    )
+    from core.review_decision_service import (
+        DECISION_CONFIRM,
+        DECISION_CORRECT,
+        DECISION_NO_VIOLATION,
+        ReviewDecisionConflict,
+        ReviewDecisionError,
+        apply_review_decision,
+    )
+
+    choices = {
+        "no_helmet": ("No Helmet", VIOLATION_NO_HELMET),
+        "no_side_mirror": ("No Side Mirror", VIOLATION_NO_SIDE_MIRROR),
+        "nut_shell_helmet": ("Substandard / Nut-Shell Helmet", VIOLATION_SUBSTANDARD_HELMET),
+        "no_violation": ("No Violation", None),
+    }
+    payload = request.get_json(silent=True) or {}
+    choice = str(payload.get("choice") or "").strip()
+    if choice not in choices or payload.get("human_confirmed") is not True:
+        return jsonify({"success": False, "error": "Choose an outcome and explicitly confirm the evidence decision."}), 400
+    expected_outcome = payload.get("expected_outcome")
+    expected_revision = payload.get("expected_revision")
+    if expected_outcome not in ("pending", "reviewed", "dismissed", "uncertain"):
+        return jsonify({"success": False, "error": "Reload the candidate before recording a decision."}), 400
+    if (not isinstance(expected_revision, str) or len(expected_revision) != 64
+            or any(char not in "0123456789abcdef" for char in expected_revision)):
+        return jsonify({"success": False, "error": "Reload the candidate before recording a decision."}), 400
+
+    row = db.get_motorcycle_detail_candidate(candidate_id)
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Detail candidate not found."}), 404
+    if row.get("scan_state") != "ready":
+        return jsonify({"success": False, "error": "Wait for the evidence scan to finish before deciding."}), 409
+
+    reviewer_id = int(auth.current_user()["id"])
+    label, selected_rule = choices[choice]
+    if selected_rule is not None and not db.can_confirm_case(reviewer_id):
+        return jsonify({"success": False, "error": "Your account does not have case-confirmation authority."}), 403
+    note = "Reviewer selected: " + label
+    linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
+    frames = _detail_json(row.get("frames_json"), [])
+    evidence_path = next((frame.get("scene_path") for frame in frames
+                          if isinstance(frame, dict) and frame.get("scene_path")), None) if isinstance(frames, list) else None
+    if linked is None and (not evidence_path or row.get("video_id") is None or row.get("processing_run_id") is None):
+        return jsonify({"success": False, "error": "This candidate has no stored source-frame evidence."}), 409
+    try:
+        # Candidate outcome, linked queue item, and final case/no-case decision
+        # share the SQLite write transaction; a failed decision rolls back all
+        # three so the UI cannot say "reviewed" without recording the choice.
+        with db.review_write_transaction():
+            snapshot = db.record_motorcycle_detail_review(
+                candidate_id=candidate_id,
+                outcome="reviewed",
+                reviewed_by=reviewer_id,
+                notes=note,
+                expected_outcome=expected_outcome,
+                expected_revision=expected_revision,
+                return_snapshot=True,
+            )
+            if snapshot is False:
+                raise ReviewDecisionConflict("This observation changed in another review. Reload it before deciding.")
+            linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
+            if linked is None:
+                if not evidence_path:
+                    raise ReviewDecisionConflict("This candidate has no stored source-frame evidence.")
+                score = min(1.0, max(0.0, float(row.get("frame_score") or 0.5)))
+                review_id = db.insert_review_queue(
+                    video_id=int(row["video_id"]),
+                    track_id=int(row["track_id"]),
+                    violation_type=VIOLATION_NO_HELMET,
+                    confidence=score,
+                    frame_number=int(row.get("frame_number") or 0),
+                    timestamp_sec=float(row.get("timestamp_sec") or 0.0),
+                    evidence_path=str(evidence_path),
+                    reason_log=f"[motorcycle_detail_candidate:{candidate_id}] [human_review_choice] Candidate evidence submitted for explicit human classification.",
+                    vehicle_class="motorcycle",
+                    processing_run_id=int(row["processing_run_id"]),
+                )
+                linked = db.get_review_item(review_id)
+            if not linked or linked.get("status") != "pending":
+                raise ReviewDecisionConflict("The linked review item is already closed.")
+
+            decision = DECISION_NO_VIOLATION if choice == "no_violation" else (
+                DECISION_CONFIRM if selected_rule == linked.get("violation_type") else DECISION_CORRECT
+            )
+            result = apply_review_decision(
+                db,
+                int(linked["id"]),
+                reviewer_id,
+                decision=decision,
+                reason=f"Motorcycle Detail Review: reviewer inspected the evidence and selected {label}.",
+                selected_canonical_rule=selected_rule if decision == DECISION_CORRECT else None,
+                idempotency_key=f"motorcycle-detail:{candidate_id}:{motorcycle_detail_review_revision(snapshot)}:{choice}",
+            )
+        return jsonify({"success": True, "choice": choice, "label": label,
+                        "creates_case": choice != "no_violation", "review_id": linked["id"], **result})
+    except TemporalEvidenceNotReady as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except ReviewDecisionConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ReviewDecisionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except (CaseReviewError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
 
 
 @app.route("/api/motorcycle-detail-review/scan-now", methods=["POST"])
@@ -3210,10 +3800,11 @@ def api_motorcycle_detail_scan_now():
 @app.route("/api/cases/<int:violation_id>", methods=["GET"])
 @auth.login_required
 def api_get_case(violation_id: int):
-    videos = _video_name_map()
+    actor = auth.current_user()
     row = db.get_violation(violation_id)
-    if row is None:
+    if row is None or not _accessible_video_link(row.get("video_id"), actor):
         return jsonify({"success": False, "error": "Case not found."}), 404
+    videos = _video_name_map(**_account_video_scope(actor))
     ui = _violation_to_ui(row, videos)
     ui["case_actions"] = _case_actions_for_user(auth.current_user())
     ui["policy_records"] = db.get_case_policy_records(violation_id)
@@ -3237,9 +3828,19 @@ def api_get_case(violation_id: int):
     return jsonify({"success": True, "case": ui})
 
 
+def _case_access_or_404(violation_id: int, actor: dict[str, Any] | None = None):
+    row = db.get_violation(violation_id)
+    if row is None or not _accessible_video_link(row.get("video_id"), actor):
+        return None
+    return row
+
+
 @app.route("/api/cases/<int:violation_id>/plate", methods=["POST"])
 @auth.role_required("admin")
 def api_verify_plate(violation_id: int):
+    case_row = db.get_violation(violation_id)
+    if case_row is None or not _accessible_video_link(case_row.get("video_id")):
+        return jsonify({"success": False, "error": "Case not found."}), 404
     user = auth.current_user()
     payload = request.get_json(silent=True) or {}
     # Never trust client-supplied reviewer id or verification flag.
@@ -3298,6 +3899,9 @@ def api_verify_plate(violation_id: int):
 @auth.login_required
 def api_confirm_event_time(violation_id: int):
     user = auth.current_user()
+    case_row = db.get_violation(violation_id)
+    if case_row is None or not _accessible_video_link(case_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Case not found."}), 404
     payload = request.get_json(silent=True) or {}
     try:
         from core.case_review_service import CaseReviewError, persist_event_time_review
@@ -3322,6 +3926,9 @@ def api_confirm_event_time(violation_id: int):
 @auth.login_required
 def api_confirm_case(violation_id: int):
     user = auth.current_user()
+    case_row = db.get_violation(violation_id)
+    if case_row is None or not _accessible_video_link(case_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Case not found."}), 404
     try:
         ok = db.confirm_case(violation_id, user["id"])
         return jsonify({"success": True, "case_confirmed": ok})
@@ -3335,6 +3942,9 @@ def api_confirm_case(violation_id: int):
 @auth.login_required
 def api_notice_printed(violation_id: int):
     user = auth.current_user()
+    case_row = db.get_violation(violation_id)
+    if case_row is None or not _accessible_video_link(case_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Case not found."}), 404
     payload = request.get_json(silent=True) or {}
     try:
         ok = db.confirm_notice_printed(
@@ -3357,6 +3967,14 @@ def api_notice_printed_batch():
     membership = payload.get("violation_ids") or []
     if not isinstance(membership, list) or not membership:
         return jsonify({"success": False, "error": "violation_ids required"}), 400
+    actor = auth.current_user()
+    for value in membership:
+        try:
+            row = db.get_violation(int(value))
+        except (TypeError, ValueError):
+            row = None
+        if row is None or not _accessible_video_link(row.get("video_id"), actor):
+            return jsonify({"success": False, "error": "Case not found."}), 404
     result = db.record_print_batch(
         [int(v) for v in membership],
         user["id"],
@@ -3369,10 +3987,11 @@ def api_notice_printed_batch():
 @auth.role_required("enforcer")
 def api_printable_record(violation_id: int):
     """Return a printable review/citation record. Preview does not attest printing."""
-    videos = _video_name_map()
+    actor = auth.current_user()
     row = db.get_violation(violation_id)
-    if row is None:
+    if row is None or not _accessible_video_link(row.get("video_id"), actor):
         return jsonify({"success": False, "error": "Case not found."}), 404
+    videos = _video_name_map(**_account_video_scope(actor))
     ui = _violation_to_ui(row, videos)
     document_kind = "official_notice_draft" if ui["printable_as_official"] else "review_material"
     return jsonify(
@@ -3461,10 +4080,69 @@ def api_reject_policy_version(version_id: int):
 # Report APIs
 # ---------------------------------------------------------------------------
 
+@app.route("/api/reports/preview", methods=["GET"])
+@auth.role_required("enforcer")
+def api_report_video_preview():
+    raw_video_id = request.args.get("video_id", "")
+    try:
+        video_id = int(raw_video_id)
+        page = int(request.args.get("page", "1"))
+        per_page = int(request.args.get("per_page", "25"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid video or pagination value."}), 400
+    if video_id <= 0 or page < 1 or not 1 <= per_page <= 100:
+        return jsonify({"success": False, "error": "Invalid video or pagination value."}), 400
+
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id")
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
+
+    filters: dict[str, Any] = {}
+    violation_type = request.args.get("violation_type", "").strip()
+    if violation_type:
+        if violation_type not in CANONICAL_VIOLATIONS:
+            return jsonify({"success": False, "error": "Invalid violation type filter."}), 400
+        filters["violation_type"] = violation_type
+    selected_status = request.args.get("status", "").strip()
+    if selected_status:
+        if selected_status not in STATUSES:
+            return jsonify({"success": False, "error": "Invalid status filter."}), 400
+        filters["status"] = selected_status
+    for key in ("date_from", "date_to"):
+        value = request.args.get(key, "").strip()
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                return jsonify({"success": False, "error": f"Invalid {key} date."}), 400
+            filters[key] = value
+
+    actor = auth.current_user()
+    preview = reports_core.preview_video(
+        video_id,
+        filters,
+        page=page,
+        per_page=per_page,
+        owner_user_id=(actor["id"] if actor.get("role") != "admin" else None),
+        uploader_id=selected_uploader_id,
+    )
+    if preview is None:
+        # A missing video and another account's video have the same response.
+        return jsonify({"success": False, "error": "Video not found."}), 404
+    return jsonify({"success": True, **preview})
+
+
 @app.route("/api/reports", methods=["GET"])
 @auth.role_required("enforcer")
 def api_list_reports():
-    return jsonify({"success": True, "reports": [_report_to_ui(r) for r in db.list_reports()]})
+    actor = auth.current_user()
+    visibility = request.args.get("visibility", "all")
+    if visibility not in {"all", "mine"}:
+        return jsonify({"success": False, "error": "Invalid report history filter."}), 400
+    rows = db.list_reports(generated_by=actor["id"]) if visibility == "mine" else db.list_reports()
+    return jsonify({"success": True, "reports": [_report_to_ui(r) for r in rows]})
 
 
 @app.route("/api/reports", methods=["POST"])
@@ -3478,13 +4156,32 @@ def api_generate_report():
         if payload.get(key)
     }
     user = auth.current_user()
+    selected_uploader_id = None
+    if user.get("role") == "admin":
+        selected_uploader_id, error, status = _requested_uploader_id(
+            payload.get("uploader_id"), user
+        )
+        if error:
+            return jsonify({"success": False, "error": error}), status
+    else:
+        # Source ownership is always session-derived, never accepted from filters.
+        selected_uploader_id = None
     try:
         row = reports_core.generate_report(
             report_format=report_format,
             filters=filters,
             title=(payload.get("title") or "").strip() or None,
             generated_by=user["id"],
+            owner_user_id=(user["id"] if user.get("role") != "admin" else None),
+            uploader_id=selected_uploader_id,
         )
+    except reports_core.ReportTooLargeError as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+            "total_cases": exc.total_cases,
+            "max_rows": reports_core._MAX_ROWS,
+        }), 413
     except reports_core.ReportLogoError as exc:
         return jsonify({"success": False, "error": str(exc)}), 503
     except ValueError as exc:
@@ -3528,6 +4225,7 @@ def api_get_settings():
         {
             "success": True,
             "settings": load_rule_parameters(),
+            "processing_limits": db.get_processing_limits(),
             "enabled_violations": list(load_enabled_violations()),
             "violation_catalog": violation_catalog_for_ui(),
             "violation_groups": violation_groups_for_ui(),
@@ -3541,6 +4239,7 @@ def api_save_settings():
     from core.detection_config import DEFAULT_RULE_PARAMETERS
     from core.rule_parameter_validation import (
         RuleParameterValidationError,
+        validate_processing_limits,
         validate_rule_parameters,
     )
 
@@ -3548,6 +4247,10 @@ def api_save_settings():
     raw_values = {key: payload[key] for key in DEFAULT_RULE_PARAMETERS if key in payload}
     try:
         values = validate_rule_parameters(raw_values) if raw_values else {}
+        processing_limits = validate_processing_limits(
+            payload,
+            current=db.get_processing_limits(),
+        )
     except RuleParameterValidationError as exc:
         # Atomic rejection: do not write partial parameter updates.
         return jsonify({"success": False, "error": str(exc)}), 400
@@ -3563,16 +4266,18 @@ def api_save_settings():
     else:
         enabled = load_enabled_violations()
 
-    if not values and "enabled_violations" not in payload:
+    if not values and not processing_limits and "enabled_violations" not in payload:
         return jsonify({"success": False, "error": "No recognized settings provided."}), 400
-    if values:
-        db.set_settings(values)
+    settings_to_save = {**values, **processing_limits}
+    if settings_to_save:
+        db.set_settings(settings_to_save)
     return jsonify(
         {
             "success": True,
             "message": "Settings saved.",
             "enabled_violations": list(enabled),
-            "settings": values,
+            "settings": settings_to_save,
+            "processing_limits": db.get_processing_limits(),
         }
     )
 

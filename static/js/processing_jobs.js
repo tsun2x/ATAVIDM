@@ -119,8 +119,12 @@
         const count = document.getElementById("processingJobsCount");
         const connection = document.getElementById("processingJobsConnection");
         if (!toggle || !activeList || !recentList || !count || !connection) return null;
+        const jobsUrl = new URL("/api/processing-jobs", window.location.origin);
+        const uploaderId = new URLSearchParams(window.location.search).get("uploader_id");
+        if (uploaderId) jobsUrl.searchParams.set("uploader_id", uploaderId);
         const controller = createController({
             fetchFn: window.fetch.bind(window),
+            endpoint: jobsUrl.pathname + jobsUrl.search,
             onState: function (snapshot, meta) {
                 const active = Array.isArray(snapshot.active) ? snapshot.active : [];
                 const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];

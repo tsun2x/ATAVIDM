@@ -83,7 +83,9 @@ def _vehicle(track_id, label, t, x, *, y=100.0, w=120.0, h=60.0, cargo_region_ob
 
 
 def _cargo_person(t, x):
-    return _vehicle(2, "person", t, x + 5.0, y=120.0, w=25.0, h=35.0)
+    person = _vehicle(2, "person", t, x + 5.0, y=120.0, w=25.0, h=35.0)
+    person["lower_body_visible"] = True
+    return person
 
 
 def _activity_scene():
@@ -332,6 +334,15 @@ class TestIllegalTerminalCapability:
 
 
 class TestPickupTrackEvidence:
+    def test_unknown_or_hidden_lower_body_cannot_supply_a_ground_anchor(self):
+        from core.cargo_passenger import person_lower_anchor
+
+        person = _cargo_person(0.0, 100.0)
+        person.pop("lower_body_visible")
+        assert person_lower_anchor(person) is None
+        assert person_lower_anchor({**person, "lower_body_visible": False}) is None
+        assert person_lower_anchor({**person, "lower_body_visible": True}) == (117.5, 155.0)
+
     def _drive(self, labels, *, jump_at=None):
         track = TrackState()
         state = RuleEngineState()

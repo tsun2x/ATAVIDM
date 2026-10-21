@@ -9,13 +9,17 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator
 
 from database.review_revision import motorcycle_detail_review_revision
+from database.processing_limits import parse_processing_limits
 
 logger = logging.getLogger(__name__)
+
+MAX_CONCURRENT_VIDEO_JOBS = 3
+PROCESSING_LEASE_SECONDS = 120
 
 DEFAULT_SQLITE_PATH = "database/tavidm.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -79,6 +83,7 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 
@@ -108,6 +113,22 @@ def db_session() -> Generator[sqlite3.Connection, None, None]:
         conn.commit()
     except Exception:
         conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def immediate_db_session() -> Generator[sqlite3.Connection, None, None]:
+    """Open a short write transaction suitable for cross-process claims."""
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
         conn.close()
@@ -212,6 +233,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_011(conn)
     _apply_migration_012(conn)
     _apply_migration_013(conn)
+    _apply_migration_014(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -267,6 +289,34 @@ def _apply_migration_012(conn: sqlite3.Connection) -> None:
     migration = Path(__file__).parent / "migrations" / "012_review_decisions.sql"
     if migration.is_file():
         conn.executescript(migration.read_text(encoding="utf-8"))
+
+
+def _apply_migration_014(conn: sqlite3.Connection) -> None:
+    """Add persistent worker leases and account-fair processing dispatch."""
+    for column, declaration in (
+        ("worker_id", "TEXT"),
+        ("heartbeat_at", "DATETIME"),
+        ("lease_expires_at", "DATETIME"),
+        ("cancel_requested_at", "DATETIME"),
+    ):
+        if _table_exists(conn, "processing_runs") and not _column_exists(
+            conn, "processing_runs", column
+        ):
+            conn.execute(
+                f"ALTER TABLE processing_runs ADD COLUMN {column} {declaration}"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_processing_runs_queue_claim "
+        "ON processing_runs(status, queued_at, id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processing_account_dispatch (
+            account_id INTEGER PRIMARY KEY,
+            last_dispatched_at TEXT NOT NULL
+        )
+        """
+    )
 
 
 def _review_decisions_need_retention_rebuild(conn: sqlite3.Connection) -> bool:
@@ -1396,17 +1446,29 @@ def get_video(video_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
-def list_videos(processed: bool | None = None) -> list[dict[str, Any]]:
+def list_videos(
+    processed: bool | None = None,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> list[dict[str, Any]]:
     with db_session() as conn:
-        if processed is None:
-            rows = conn.execute(
-                "SELECT * FROM videos ORDER BY created_at DESC"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM videos WHERE processed = ? ORDER BY created_at DESC",
-                (int(processed),),
-            ).fetchall()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if processed is not None:
+            clauses.append("processed = ?")
+            params.append(int(processed))
+        if owner_user_id is not None:
+            clauses.append("uploaded_by = ?")
+            params.append(int(owner_user_id))
+        if uploader_id is not None:
+            clauses.append("uploaded_by = ?")
+            params.append(int(uploader_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM videos {where} ORDER BY created_at DESC, id DESC",
+            params,
+        ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
 
@@ -1475,6 +1537,324 @@ def create_processing_run(
                 (video_id, enabled_violations_json, viewer_mode, now),
             )
         return cursor.lastrowid
+
+
+def enqueue_processing_run(
+    video_id: int,
+    enabled_violations_json: str,
+    *,
+    viewer_mode: str = "background",
+) -> int | None:
+    """Atomically create a queued run unless that video already has one."""
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with immediate_db_session() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM processing_runs WHERE video_id = ? "
+            "AND status IN ('queued', 'running') LIMIT 1",
+            (video_id,),
+        ).fetchone()
+        if exists:
+            return None
+        cursor = conn.execute(
+            """
+            INSERT INTO processing_runs (
+                video_id, status, enabled_violations_json, started_at, finished_at,
+                stage, viewer_mode, queued_at, results_run_scoped,
+                results_scope_explicit, results_scope_origin
+            ) VALUES (?, 'queued', ?, NULL, NULL, 'queued', ?, ?, 1, 1, 'create')
+            """,
+            (video_id, enabled_violations_json, viewer_mode, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def _expire_processing_claims(conn: sqlite3.Connection, now: str) -> int:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT video_id FROM processing_runs
+        WHERE status = 'running'
+          AND (worker_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+        """,
+        (now,),
+    ).fetchall()
+    video_ids = [int(row["video_id"]) for row in rows if row["video_id"] is not None]
+    if rows:
+        conn.execute(
+            """
+            UPDATE processing_runs
+            SET status = 'failed', stage = 'failed', finished_at = ?,
+                error_message = COALESCE(error_message, 'Worker lease expired.'),
+                worker_id = NULL, heartbeat_at = NULL, lease_expires_at = NULL
+            WHERE status = 'running'
+              AND (worker_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+            """,
+            (now, now),
+        )
+    stale_video_rows = conn.execute(
+        """
+        SELECT v.id FROM videos v
+        WHERE v.status = 'processing'
+          AND NOT EXISTS (
+              SELECT 1 FROM processing_runs active
+              WHERE active.video_id = v.id AND active.status = 'running'
+          )
+        """
+    ).fetchall()
+    stale_video_ids = [int(row["id"]) for row in stale_video_rows]
+    for video_id in set(video_ids):
+        conn.execute(
+            """
+            UPDATE videos
+            SET status = CASE WHEN EXISTS (
+                SELECT 1 FROM processing_runs
+                WHERE video_id = ? AND status = 'completed'
+            ) THEN 'processed' ELSE 'ready' END
+            WHERE id = ? AND status = 'processing'
+            """,
+            (video_id, video_id),
+        )
+    for video_id in stale_video_ids:
+        conn.execute(
+            """
+            UPDATE videos
+            SET status = CASE WHEN EXISTS (
+                SELECT 1 FROM processing_runs WHERE video_id = ? AND status = 'completed'
+            ) THEN 'processed' ELSE 'ready' END
+            WHERE id = ? AND status = 'processing'
+            """,
+            (video_id, video_id),
+        )
+    return len(set(video_ids) | set(stale_video_ids))
+
+
+def claim_next_processing_run(
+    worker_id: str,
+    *,
+    lease_seconds: int = PROCESSING_LEASE_SECONDS,
+) -> dict[str, Any] | None:
+    """Claim the next eligible account's oldest queued run atomically.
+
+    A claim is global across app processes that share this SQLite database.
+    Administrator settings bound total active runs and active runs per account.
+    Videos without an uploader use account key 0.
+    """
+    worker_id = str(worker_id).strip()
+    if not worker_id:
+        raise ValueError("worker_id must be non-empty")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="microseconds")
+    expires = (now_dt + timedelta(seconds=max(30, int(lease_seconds)))).isoformat(
+        timespec="microseconds"
+    )
+    with immediate_db_session() as conn:
+        _expire_processing_claims(conn, now)
+        settings_rows = conn.execute(
+            "SELECT key, value FROM system_settings "
+            "WHERE key IN ('max_concurrent_video_jobs', 'max_concurrent_jobs_per_account')"
+        ).fetchall()
+        processing_limits = parse_processing_limits(
+            {row["key"]: row["value"] for row in settings_rows}
+        )
+        global_limit = processing_limits["max_concurrent_video_jobs"]
+        account_limit = processing_limits["max_concurrent_jobs_per_account"]
+        active = conn.execute(
+            """
+            SELECT COALESCE(v.uploaded_by, 0) AS account_id
+            FROM processing_runs pr JOIN videos v ON v.id = pr.video_id
+            WHERE pr.status = 'running'
+            """
+        ).fetchall()
+        if len(active) >= global_limit:
+            return None
+        active_counts: dict[int, int] = {}
+        for active_row in active:
+            account_id = int(active_row["account_id"])
+            active_counts[account_id] = active_counts.get(account_id, 0) + 1
+        full_accounts = {
+            account_id for account_id, count in active_counts.items()
+            if count >= account_limit
+        }
+        placeholders = ",".join("?" for _ in full_accounts)
+        exclusion = (
+            f"AND COALESCE(v.uploaded_by, 0) NOT IN ({placeholders})"
+            if full_accounts else ""
+        )
+        row = conn.execute(
+            f"""
+            SELECT pr.id, pr.video_id, pr.enabled_violations_json, pr.viewer_mode,
+                   COALESCE(v.uploaded_by, 0) AS account_id,
+                   v.uploaded_by
+            FROM processing_runs pr JOIN videos v ON v.id = pr.video_id
+            LEFT JOIN processing_account_dispatch d
+                   ON d.account_id = COALESCE(v.uploaded_by, 0)
+            WHERE pr.status = 'queued'
+              AND NOT EXISTS (
+                  SELECT 1 FROM processing_runs active_run
+                  WHERE active_run.video_id = pr.video_id
+                    AND active_run.status = 'running'
+              )
+              {exclusion}
+            ORDER BY COALESCE(d.last_dispatched_at, '') ASC,
+                     COALESCE(pr.queued_at, pr.id) ASC, pr.id ASC
+            LIMIT 1
+            """,
+            tuple(sorted(full_accounts)),
+        ).fetchone()
+        if row is None:
+            return None
+        account_id = int(row["account_id"])
+        updated = conn.execute(
+            """
+            UPDATE processing_runs
+            SET status = 'running', stage = 'loading_model',
+                started_at = COALESCE(started_at, ?), worker_id = ?,
+                heartbeat_at = ?, lease_expires_at = ?, cancel_requested_at = NULL
+            WHERE id = ? AND status = 'queued'
+            """,
+            (now, worker_id, now, expires, int(row["id"])),
+        )
+        if updated.rowcount != 1:
+            return None
+        conn.execute(
+            """
+            INSERT INTO processing_account_dispatch(account_id, last_dispatched_at)
+            VALUES (?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET last_dispatched_at = excluded.last_dispatched_at
+            """,
+            (account_id, now),
+        )
+        conn.execute(
+            "UPDATE videos SET status = 'processing' WHERE id = ?",
+            (int(row["video_id"]),),
+        )
+        claimed = conn.execute(
+            "SELECT * FROM processing_runs WHERE id = ?", (int(row["id"]),)
+        ).fetchone()
+        result = _row_to_dict(claimed) or {}
+        result["uploaded_by"] = row["uploaded_by"]
+        result["account_id"] = account_id
+        return result
+
+
+def heartbeat_processing_run(
+    run_id: int,
+    worker_id: str,
+    *,
+    lease_seconds: int = PROCESSING_LEASE_SECONDS,
+) -> bool:
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="microseconds")
+    expires = (now_dt + timedelta(seconds=max(30, int(lease_seconds)))).isoformat(
+        timespec="microseconds"
+    )
+    with db_session() as conn:
+        result = conn.execute(
+            """
+            UPDATE processing_runs
+            SET heartbeat_at = ?, lease_expires_at = ?
+            WHERE id = ? AND worker_id = ? AND status = 'running'
+            """,
+            (now, expires, int(run_id), str(worker_id)),
+        )
+        return result.rowcount == 1
+
+
+def release_processing_claim(run_id: int, worker_id: str) -> bool:
+    """Return a live claim to the durable queue when its worker cannot run it."""
+    with immediate_db_session() as conn:
+        row = conn.execute(
+            "SELECT video_id FROM processing_runs WHERE id = ? AND worker_id = ? AND status = 'running'",
+            (int(run_id), str(worker_id)),
+        ).fetchone()
+        if row is None:
+            return False
+        updated = conn.execute(
+            """UPDATE processing_runs SET status = 'queued', stage = 'queued',
+               started_at = NULL, worker_id = NULL, heartbeat_at = NULL,
+               lease_expires_at = NULL
+               WHERE id = ? AND worker_id = ? AND status = 'running'""",
+            (int(run_id), str(worker_id)),
+        )
+        if updated.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE videos SET status = 'ready' WHERE id = ? AND status = 'processing'",
+            (int(row["video_id"]),),
+        )
+        return True
+
+
+def processing_cancel_requested(run_id: int, worker_id: str) -> bool:
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT cancel_requested_at FROM processing_runs
+            WHERE id = ? AND worker_id = ? AND status = 'running'
+            """,
+            (int(run_id), str(worker_id)),
+        ).fetchone()
+        return bool(row and row["cancel_requested_at"])
+
+
+def request_processing_cancel(run_id: int) -> str | None:
+    """Cancel a queued run immediately or persist a request for a live worker."""
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with immediate_db_session() as conn:
+        row = conn.execute(
+            "SELECT video_id, status FROM processing_runs WHERE id = ?",
+            (int(run_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        status = str(row["status"])
+        if status == "queued":
+            conn.execute(
+                """UPDATE processing_runs SET status = 'cancelled', stage = 'cancelled',
+                   finished_at = ?, error_message = NULL WHERE id = ? AND status = 'queued'""",
+                (now, int(run_id)),
+            )
+            video_id = int(row["video_id"])
+            conn.execute(
+                """
+                UPDATE videos
+                SET status = CASE WHEN EXISTS (
+                    SELECT 1 FROM processing_runs WHERE video_id = ? AND status = 'completed'
+                ) THEN 'processed' ELSE 'ready' END
+                WHERE id = ? AND status = 'processing'
+                """,
+                (video_id, video_id),
+            )
+            return "cancelled"
+        if status == "running":
+            conn.execute(
+                "UPDATE processing_runs SET cancel_requested_at = ? WHERE id = ?",
+                (now, int(run_id)),
+            )
+            return "stopping"
+        return status
+
+
+def processing_queue_position(video_id: int) -> int | None:
+    with db_session() as conn:
+        row = conn.execute(
+            """
+            SELECT current.status, current.id,
+                   (SELECT COUNT(*) FROM processing_runs earlier
+                    WHERE earlier.status = 'queued'
+                      AND (COALESCE(earlier.queued_at, '') < COALESCE(current.queued_at, '')
+                           OR (COALESCE(earlier.queued_at, '') = COALESCE(current.queued_at, '')
+                               AND earlier.id < current.id))) AS ahead
+            FROM processing_runs current
+            WHERE current.video_id = ? AND current.status IN ('queued', 'running')
+            ORDER BY current.id DESC LIMIT 1
+            """,
+            (int(video_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] == "running":
+            return 0
+        return int(row["ahead"]) + 1
 
 
 def start_processing_run(run_id: int) -> None:
@@ -1600,7 +1980,8 @@ def finish_processing_run(
             UPDATE processing_runs
             SET status = ?, error_message = ?, finished_at = ?, stage = ?,
                 diagnostics_json = COALESCE(?, diagnostics_json),
-                geometry_snapshot_json = COALESCE(?, geometry_snapshot_json)
+                geometry_snapshot_json = COALESCE(?, geometry_snapshot_json),
+                worker_id = NULL, heartbeat_at = NULL, lease_expires_at = NULL
                 {extra_sets}
             WHERE id = ?
             """,
@@ -2125,13 +2506,23 @@ def detection_summary_for_video(video_id: int) -> dict[str, Any]:
     }
 
 
-def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day") -> dict[str, Any]:
+def upload_processing_analytics(
+    start_s: str, end_s: str, *, grain: str = "day", uploader_id: int | None = None
+) -> dict[str, Any]:
     """Aggregate upload + processing metrics. Upload counts use videos.created_at only."""
     with db_session() as conn:
+        # A connection-local temp table lets every aggregate use the same
+        # account population without a schema migration or repeated ID lists.
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS account_scope_video_ids (id INTEGER PRIMARY KEY)")
+        conn.execute("DELETE FROM account_scope_video_ids")
+        if uploader_id is None:
+            conn.execute("INSERT INTO account_scope_video_ids SELECT id FROM videos")
+        else:
+            conn.execute("INSERT INTO account_scope_video_ids SELECT id FROM videos WHERE uploaded_by = ?", (int(uploader_id),))
         unique_uploads = conn.execute(
             """
             SELECT COUNT(*) AS n FROM videos
-            WHERE created_at >= ? AND created_at < ?
+            WHERE id IN (SELECT id FROM account_scope_video_ids) AND created_at >= ? AND created_at < ?
             """,
             (start_s, end_s),
         ).fetchone()["n"]
@@ -2139,7 +2530,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
         status_rows = conn.execute(
             """
             SELECT status, COUNT(*) AS n FROM videos
-            WHERE created_at >= ? AND created_at < ?
+            WHERE id IN (SELECT id FROM account_scope_video_ids) AND created_at >= ? AND created_at < ?
             GROUP BY status
             """,
             (start_s, end_s),
@@ -2149,7 +2540,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
         # Current inventory (not limited to period) for operational queues
         inv = conn.execute(
             """
-            SELECT status, COUNT(*) AS n FROM videos GROUP BY status
+            SELECT status, COUNT(*) AS n FROM videos WHERE id IN (SELECT id FROM account_scope_video_ids) GROUP BY status
             """
         ).fetchall()
         inventory = {r["status"]: int(r["n"]) for r in inv}
@@ -2170,7 +2561,8 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
               SUM(COALESCE(detection_records, 0)) AS detection_records,
               SUM(COALESCE(violation_candidates, 0)) AS violation_candidates
             FROM processing_runs
-            WHERE COALESCE(queued_at, started_at, finished_at) >= ?
+            WHERE video_id IN (SELECT id FROM account_scope_video_ids)
+              AND COALESCE(queued_at, started_at, finished_at) >= ?
               AND COALESCE(queued_at, started_at, finished_at) < ?
             """,
             (start_s, end_s),
@@ -2182,6 +2574,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM detections d
             JOIN processing_runs pr ON pr.id = d.processing_run_id
             WHERE pr.status = 'completed'
+              AND pr.video_id IN (SELECT id FROM account_scope_video_ids)
               AND COALESCE(pr.results_run_scoped, 0) = 1
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
@@ -2197,6 +2590,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM detections d
             JOIN videos v ON v.id = d.video_id
             WHERE d.processing_run_id IS NULL
+              AND v.id IN (SELECT id FROM account_scope_video_ids)
               AND v.created_at >= ? AND v.created_at < ?
               AND NOT EXISTS (
                 SELECT 1 FROM processing_runs pr
@@ -2224,6 +2618,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM detections d
             JOIN processing_runs pr ON pr.id = d.processing_run_id
             WHERE pr.status = 'completed'
+              AND pr.video_id IN (SELECT id FROM account_scope_video_ids)
               AND COALESCE(pr.results_run_scoped, 0) = 1
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
@@ -2236,6 +2631,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM detections d
             JOIN videos v ON v.id = d.video_id
             WHERE d.processing_run_id IS NULL
+              AND v.id IN (SELECT id FROM account_scope_video_ids)
               AND v.created_at >= ? AND v.created_at < ?
               AND NOT EXISTS (
                 SELECT 1 FROM processing_runs pr
@@ -2254,6 +2650,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM review_queue rq
             JOIN processing_runs pr ON pr.id = rq.processing_run_id
             WHERE pr.status = 'completed'
+              AND pr.video_id IN (SELECT id FROM account_scope_video_ids)
               AND COALESCE(pr.results_run_scoped, 0) = 1
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) >= ?
               AND COALESCE(pr.queued_at, pr.started_at, pr.finished_at) < ?
@@ -2266,6 +2663,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             FROM review_queue rq
             JOIN videos v ON v.id = rq.video_id
             WHERE rq.processing_run_id IS NULL
+              AND v.id IN (SELECT id FROM account_scope_video_ids)
               AND v.created_at >= ? AND v.created_at < ?
               AND NOT EXISTS (
                 SELECT 1 FROM processing_runs pr
@@ -2292,7 +2690,7 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             f"""
             SELECT {trunc} AS bucket, COUNT(*) AS n
             FROM videos
-            WHERE created_at >= ? AND created_at < ?
+            WHERE id IN (SELECT id FROM account_scope_video_ids) AND created_at >= ? AND created_at < ?
             GROUP BY bucket
             ORDER BY bucket
             """,
@@ -2302,7 +2700,8 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
             f"""
             SELECT {run_trunc} AS bucket, COUNT(*) AS n
             FROM processing_runs
-            WHERE COALESCE(queued_at, started_at, finished_at) >= ?
+            WHERE video_id IN (SELECT id FROM account_scope_video_ids)
+              AND COALESCE(queued_at, started_at, finished_at) >= ?
               AND COALESCE(queued_at, started_at, finished_at) < ?
             GROUP BY bucket
             ORDER BY bucket
@@ -2340,51 +2739,10 @@ def upload_processing_analytics(start_s: str, end_s: str, *, grain: str = "day")
 
 
 def recover_orphaned_processing() -> int:
-    """Reset videos and runs left mid-flight after an unclean shutdown.
-
-    On startup there is no worker process, so any run left in 'queued' or
-    'running' is orphaned: mark it 'failed', fail its 'queued' siblings too,
-    and reset the stuck video back to 'ready' so it can be reprocessed.
-    Returns the number of videos reset.
-    """
-    recovered = 0
-    with db_session() as conn:
-        rows = conn.execute(
-            "SELECT id FROM videos WHERE status = 'processing'"
-        ).fetchall()
-        for row in rows:
-            video_id = row["id"]
-            conn.execute(
-                "UPDATE videos SET status = 'ready' WHERE id = ?",
-                (video_id,),
-            )
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            conn.execute(
-                """
-                UPDATE processing_runs
-                SET status = 'failed', stage = 'failed', finished_at = ?,
-                    error_message = COALESCE(error_message, 'Recovered on startup: process not running.')
-                WHERE video_id = ? AND status IN ('queued', 'running')
-                """,
-                (now, video_id),
-            )
-            recovered += 1
-    # Second pass: a job waiting in the in-memory FIFO queue can leave
-    # processing_runs.status = 'queued' (with videos.status = 'ready') if the
-    # app crashed before the worker popped it. The video is already 'ready' so
-    # the first pass never sees it; fail any stale queued/running runs here.
-    with db_session() as conn:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute(
-            """
-            UPDATE processing_runs
-            SET status = 'failed', stage = 'failed', finished_at = ?,
-                error_message = COALESCE(error_message, 'Recovered on startup: worker not running.')
-            WHERE status IN ('queued', 'running')
-            """,
-            (now,),
-        )
-    return recovered
+    """Fail only abandoned running claims and preserve durable queued work."""
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with immediate_db_session() as conn:
+        return _expire_processing_claims(conn, now)
 
 
 
@@ -2758,9 +3116,53 @@ def get_violation(violation_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
-def _build_violation_filters(filters: dict[str, Any]) -> tuple[str, list[Any]]:
+def _video_owner_scope_sql(
+    source_alias: str,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> tuple[list[str], list[Any]]:
+    """Build bound ownership predicates for a row with a direct video_id."""
     clauses: list[str] = []
     params: list[Any] = []
+    if owner_user_id is not None:
+        clauses.append(
+            f"({source_alias}.video_id IS NULL OR EXISTS ("
+            "SELECT 1 FROM videos AS owner_video "
+            f"WHERE owner_video.id = {source_alias}.video_id AND owner_video.uploaded_by = ?))"
+        )
+        params.append(int(owner_user_id))
+    if uploader_id is not None:
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM videos AS selected_video "
+            f"WHERE selected_video.id = {source_alias}.video_id AND selected_video.uploaded_by = ?)"
+        )
+        params.append(int(uploader_id))
+    return clauses, params
+
+
+def _build_violation_filters(
+    filters: dict[str, Any],
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+    source_video_only: bool = False,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if source_video_only and owner_user_id is not None:
+        ownership_clauses = [
+            "EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = violations.video_id AND owner_video.uploaded_by = ?)"
+        ]
+        ownership_params = [int(owner_user_id)]
+    else:
+        ownership_clauses, ownership_params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+    clauses.extend(ownership_clauses)
+    params.extend(ownership_params)
 
     search = filters.get("search")
     if search:
@@ -2819,9 +3221,18 @@ def list_violations(
     page: int = 1,
     per_page: int = 8,
     sort: str = "newest",
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+    source_video_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     filters = filters or {}
-    where_clause, params = _build_violation_filters(filters)
+    where_clause, params = _build_violation_filters(
+        filters,
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+        source_video_only=source_video_only,
+    )
     order_by = VIOLATION_SORT_OPTIONS.get(sort, VIOLATION_SORT_OPTIONS["newest"])
     offset = max(page - 1, 0) * per_page
 
@@ -2845,6 +3256,218 @@ def list_violations(
     return [_row_to_dict(row) for row in rows], total
 
 
+def report_export_snapshot(
+    filters: dict[str, Any],
+    *,
+    limit: int,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+    source_video_only: bool = False,
+) -> dict[str, Any]:
+    """Materialize bounded report rows and related case metadata in one snapshot."""
+    if int(limit) < 1:
+        raise ValueError("Report snapshot limit must be positive.")
+    where_clause, params = _build_violation_filters(
+        filters,
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+        source_video_only=source_video_only,
+    )
+    order_by = VIOLATION_SORT_OPTIONS["newest"]
+    with db_session() as conn:
+        # db_session joins an existing review-write transaction through a
+        # savepoint. Start a read snapshot only for a standalone export.
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS total FROM violations {where_clause}", params
+        ).fetchone()
+        total = int(count_row["total"] if count_row else 0)
+        if total > int(limit):
+            return {"rows": [], "total": total}
+
+        rows = [
+            _row_to_dict(row) or {}
+            for row in conn.execute(
+                f"SELECT * FROM violations {where_clause} "
+                f"ORDER BY {order_by}, id DESC LIMIT ?",
+                [*params, int(limit)],
+            ).fetchall()
+        ]
+        case_ids = [int(row["id"]) for row in rows]
+        policy_by_case: dict[int, list[dict[str, Any]]] = {}
+        actions_by_case: dict[int, list[dict[str, Any]]] = {}
+        has_policy_records = _table_exists(conn, "case_policy_records")
+        has_action_events = _table_exists(conn, "case_action_events")
+
+        # Stay below SQLite builds with a 999-parameter ceiling while keeping
+        # metadata access batched rather than issuing a query per case.
+        for start in range(0, len(case_ids), 500):
+            batch = case_ids[start:start + 500]
+            marks = ",".join("?" for _ in batch)
+            if has_policy_records:
+                for policy in conn.execute(
+                    f"SELECT violation_id, canonical_rule, official_category, legal_status "
+                    f"FROM case_policy_records WHERE violation_id IN ({marks}) ORDER BY id",
+                    batch,
+                ).fetchall():
+                    policy_by_case.setdefault(int(policy["violation_id"]), []).append(
+                        _row_to_dict(policy) or {}
+                    )
+            if has_action_events:
+                for action in conn.execute(
+                    f"SELECT id, violation_id, review_id, action_type, created_at "
+                    f"FROM case_action_events WHERE violation_id IN ({marks}) "
+                    f"ORDER BY id",
+                    batch,
+                ).fetchall():
+                    actions_by_case.setdefault(int(action["violation_id"]), []).append(
+                        _row_to_dict(action) or {}
+                    )
+
+        for row in rows:
+            case_id = int(row["id"])
+            policy_rows = policy_by_case.get(case_id, [])
+            actions = actions_by_case.get(case_id, [])
+            action_types = {str(action["action_type"]) for action in actions}
+            row["policy_records"] = policy_rows
+            row["case_action_records"] = actions
+            row["case_action_types"] = sorted(action_types)
+            row["case_outcome"] = (
+                "notice_printed" if "notice_printed" in action_types
+                else "case_confirmed" if "case_confirmed" in action_types
+                else "observation_only"
+            )
+            row["observation_count"] = len(policy_rows) or 1
+        return {"rows": rows, "total": total}
+
+
+def report_video_preview(
+    video_id: int,
+    filters: dict[str, Any],
+    *,
+    page: int,
+    per_page: int,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Read one scoped video and its filtered report cases from one snapshot."""
+    with db_session() as conn:
+        conn.execute("BEGIN")
+        video_clauses = ["v.id = ?"]
+        video_params: list[Any] = [int(video_id)]
+        if owner_user_id is not None:
+            video_clauses.append("v.uploaded_by = ?")
+            video_params.append(int(owner_user_id))
+        if uploader_id is not None:
+            video_clauses.append("v.uploaded_by = ?")
+            video_params.append(int(uploader_id))
+        video = conn.execute(
+            """SELECT v.id, v.filename, v.status, v.processed, v.uploaded_by,
+                      v.created_at, u.username AS uploader_username,
+                      u.full_name AS uploader_name
+               FROM videos v LEFT JOIN users u ON u.id = v.uploaded_by
+               WHERE """ + " AND ".join(video_clauses),
+            video_params,
+        ).fetchone()
+        if video is None:
+            return None
+
+        clauses = ["v.video_id = ?"]
+        params: list[Any] = [int(video_id)]
+        vtype = filters.get("violation_type")
+        if isinstance(vtype, (list, tuple, set)):
+            values = [str(value) for value in vtype if value]
+            if values:
+                clauses.append("v.violation_type IN (" + ",".join("?" for _ in values) + ")")
+                params.extend(values)
+        elif vtype:
+            clauses.append("v.violation_type = ?")
+            params.append(str(vtype))
+        for key, operator in (("date_from", ">="), ("date_to", "<=")):
+            value = filters.get(key)
+            if value:
+                clauses.append(f"date(v.detected_at) {operator} date(?)")
+                params.append(str(value))
+        status = filters.get("status")
+        if status:
+            clauses.append("v.status = ?")
+            params.append(str(status))
+        where = " WHERE " + " AND ".join(clauses)
+
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS total FROM violations v" + where, params
+        ).fetchone()
+        total = int(count_row["total"] if count_row else 0)
+        type_rows = conn.execute(
+            "SELECT v.violation_type, COUNT(*) AS count FROM violations v"
+            + where
+            + " GROUP BY v.violation_type ORDER BY v.violation_type",
+            params,
+        ).fetchall()
+        offset = (max(1, int(page)) - 1) * max(1, int(per_page))
+        rows = conn.execute(
+            """SELECT v.*, pr.status AS run_status
+               FROM violations v
+               LEFT JOIN processing_runs pr ON pr.id = v.processing_run_id"""
+            + where
+            + " ORDER BY v.detected_at DESC, v.id DESC LIMIT ? OFFSET ?",
+            [*params, int(per_page), offset],
+        ).fetchall()
+        items = [_row_to_dict(row) or {} for row in rows]
+        case_ids = [int(row["id"]) for row in items]
+        policy_by_case: dict[int, list[dict[str, Any]]] = {}
+        actions_by_case: dict[int, set[str]] = {}
+        if case_ids:
+            marks = ",".join("?" for _ in case_ids)
+            if _table_exists(conn, "case_policy_records"):
+                policy_rows = conn.execute(
+                    f"SELECT violation_id, canonical_rule, official_category, legal_status "
+                    f"FROM case_policy_records WHERE violation_id IN ({marks}) ORDER BY id",
+                    case_ids,
+                ).fetchall()
+                for policy in policy_rows:
+                    policy_by_case.setdefault(int(policy["violation_id"]), []).append(
+                        _row_to_dict(policy) or {}
+                    )
+            if _table_exists(conn, "case_action_events"):
+                action_rows = conn.execute(
+                    f"SELECT violation_id, action_type FROM case_action_events "
+                    f"WHERE violation_id IN ({marks}) AND action_type IN (?, ?)",
+                    [*case_ids, "case_confirmed", "notice_printed"],
+                ).fetchall()
+                for action in action_rows:
+                    actions_by_case.setdefault(int(action["violation_id"]), set()).add(
+                        str(action["action_type"])
+                    )
+        for item in items:
+            item["policy_records"] = policy_by_case.get(int(item["id"]), [])
+            actions = actions_by_case.get(int(item["id"]), set())
+            item["case_outcome"] = (
+                "notice_printed" if "notice_printed" in actions
+                else "case_confirmed" if "case_confirmed" in actions
+                else "observation_only"
+            )
+            item["observation_count"] = len(item["policy_records"]) or 1
+
+        latest = conn.execute(
+            "SELECT id, status, stage, queued_at, started_at, finished_at "
+            "FROM processing_runs WHERE video_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (int(video_id),),
+        ).fetchone()
+        return {
+            "video": _row_to_dict(video),
+            "latest_run": _row_to_dict(latest),
+            "items": items,
+            "total": total,
+            "type_counts": [
+                {"violation_type": row["violation_type"], "count": int(row["count"])}
+                for row in type_rows
+            ],
+        }
+
+
 def update_violation_status(
     violation_id: int,
     status: str,
@@ -2861,30 +3484,29 @@ def update_violation_status(
         )
 
 
-def count_violations_today() -> int:
+def count_violations_today(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> int:
     today = datetime.now().strftime("%Y-%m-%d")
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = ["date(detected_at) = date(?)", *ownership]
         row = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM violations
-            WHERE date(detected_at) = date(?)
-            """,
-            (today,),
+            f"SELECT COUNT(*) AS total FROM violations WHERE {' AND '.join(clauses)}",
+            [today, *params],
         ).fetchone()
         return row["total"] if row else 0
 
 
-def count_violations_by_type() -> list[dict[str, Any]]:
+def count_violations_by_type(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> list[dict[str, Any]]:
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = ["status != 'dismissed'", *ownership]
         rows = conn.execute(
-            """
-            SELECT violation_type, COUNT(*) AS count
-            FROM violations
-            WHERE status != 'dismissed'
-            GROUP BY violation_type
-            ORDER BY count DESC
-            """
+            f"SELECT violation_type, COUNT(*) AS count FROM violations WHERE {' AND '.join(clauses)} GROUP BY violation_type ORDER BY count DESC",
+            params,
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
@@ -2978,23 +3600,32 @@ def list_review_queue(
     status: str = "pending",
     page: int = 1,
     per_page: int = 20,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     offset = max(page - 1, 0) * per_page
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "review_queue", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    clauses = ["status = ?", *ownership_clauses]
+    params = [status, *ownership_params]
+    where = " AND ".join(clauses)
     with db_session() as conn:
         count_row = conn.execute(
-            "SELECT COUNT(*) AS total FROM review_queue WHERE status = ?",
-            (status,),
+            f"SELECT COUNT(*) AS total FROM review_queue WHERE {where}",
+            params,
         ).fetchone()
         total = count_row["total"] if count_row else 0
 
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM review_queue
-            WHERE status = ?
-            ORDER BY queued_at DESC
+            WHERE {where}
+            ORDER BY queued_at DESC, id DESC
             LIMIT ? OFFSET ?
             """,
-            (status, per_page, offset),
+            [*params, per_page, offset],
         ).fetchall()
 
     return [_row_to_dict(row) for row in rows], total
@@ -3451,22 +4082,34 @@ def get_review_decision(review_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
-def list_recent_review_decisions(limit: int = 8) -> list[dict[str, Any]]:
+def list_recent_review_decisions(
+    limit: int = 8,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 50))
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "q", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    if owner_user_id is not None:
+        ownership_clauses.append("q.id IS NOT NULL")
+    where = f"WHERE {' AND '.join(ownership_clauses)}" if ownership_clauses else ""
     with db_session() as conn:
         if not _table_exists(conn, "review_decisions"):
             return []
         rows = conn.execute(
-            """
+            f"""
             SELECT d.*, u.username AS reviewer_username, q.status AS review_status,
                    q.violation_type AS queue_violation_type
             FROM review_decisions d
             LEFT JOIN users u ON u.id = d.reviewer_user_id
             LEFT JOIN review_queue q ON q.id = d.review_id
+            {where}
             ORDER BY d.id DESC
             LIMIT ?
             """,
-            (limit,),
+            [*ownership_params, limit],
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
@@ -3475,23 +4118,32 @@ def list_review_queue_by_decision(
     decision: str,
     page: int = 1,
     per_page: int = 20,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     offset = max(page - 1, 0) * per_page
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "q", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    clauses = ["d.decision = ?", *ownership_clauses]
+    where = " AND ".join(clauses)
+    params = [decision, *ownership_params]
     with db_session() as conn:
         if not _table_exists(conn, "review_decisions"):
             return [], 0
         count_row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS total
             FROM review_queue q
             JOIN review_decisions d ON d.review_id = q.id
-            WHERE d.decision = ?
+            WHERE {where}
             """,
-            (decision,),
+            params,
         ).fetchone()
         total = count_row["total"] if count_row else 0
         rows = conn.execute(
-            """
+            f"""
             SELECT q.*, d.decision AS human_decision,
                    d.original_violation_type AS decision_original_violation_type,
                    d.selected_canonical_rule, d.reason AS decision_reason,
@@ -3499,11 +4151,11 @@ def list_review_queue_by_decision(
                    d.decided_at, d.id AS review_decision_id
             FROM review_queue q
             JOIN review_decisions d ON d.review_id = q.id
-            WHERE d.decision = ?
+            WHERE {where}
             ORDER BY d.id DESC
             LIMIT ? OFFSET ?
             """,
-            (decision, per_page, offset),
+            [*params, per_page, offset],
         ).fetchall()
         return [_row_to_dict(row) for row in rows], total
 
@@ -3864,10 +4516,49 @@ def get_review_item(review_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
-def count_review_pending() -> int:
+def get_motorcycle_detail_no_helmet_review(candidate_id: int) -> dict[str, Any] | None:
+    """Find only the pending No Helmet row issued for this exact detail candidate."""
+    return list_motorcycle_detail_no_helmet_reviews([candidate_id]).get(int(candidate_id))
+
+
+def list_motorcycle_detail_no_helmet_reviews(candidate_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Bulk lookup linked review rows for one page of detail candidates."""
+    ids = sorted({int(value) for value in candidate_ids if int(value) > 0})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    with db_session() as conn:
+        rows = conn.execute(
+            f"""SELECT mdc.id AS candidate_id, rq.* FROM motorcycle_detail_candidates mdc
+               JOIN review_queue rq ON rq.video_id = mdc.video_id
+                 AND rq.processing_run_id = mdc.processing_run_id
+                 AND rq.track_id = mdc.track_id
+                 AND rq.violation_type = 'No Helmet'
+                 AND instr(COALESCE(rq.reason_log, ''), '[motorcycle_detail_candidate:' || mdc.id || ']') > 0
+               WHERE mdc.id IN ({placeholders})
+               ORDER BY rq.id DESC""",
+            tuple(ids),
+        ).fetchall()
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            candidate_id = int(row["candidate_id"])
+            result.setdefault(candidate_id, _row_to_dict(row))
+        return result
+
+
+def count_review_pending(
+    *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> int:
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "review_queue", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    where = "status = 'pending'"
+    if ownership_clauses:
+        where += " AND " + " AND ".join(ownership_clauses)
     with db_session() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS total FROM review_queue WHERE status = 'pending'"
+            f"SELECT COUNT(*) AS total FROM review_queue WHERE {where}",
+            ownership_params,
         ).fetchone()
         return row["total"] if row else 0
 
@@ -3879,6 +4570,11 @@ def get_all_settings() -> dict[str, str]:
     with db_session() as conn:
         rows = conn.execute("SELECT key, value FROM system_settings").fetchall()
         return {row["key"]: row["value"] for row in rows}
+
+
+def get_processing_limits() -> dict[str, int]:
+    """Return effective system and per-account job limits."""
+    return parse_processing_limits(get_all_settings())
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -4008,17 +4704,21 @@ def get_report(report_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
-def list_reports(limit: int = 50) -> list[dict[str, Any]]:
+def list_reports(
+    limit: int = 50, *, generated_by: int | None = None
+) -> list[dict[str, Any]]:
     with db_session() as conn:
+        where = "WHERE r.generated_by = ?" if generated_by is not None else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT r.*, u.username AS generated_by_username
             FROM reports r
             LEFT JOIN users u ON u.id = r.generated_by
+            {where}
             ORDER BY r.generated_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (generated_by, limit) if generated_by is not None else (limit,),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
@@ -4026,62 +4726,63 @@ def list_reports(limit: int = 50) -> list[dict[str, Any]]:
 # --- Analytics aggregations ---
 
 
-def violations_per_day(days: int = 30) -> list[dict[str, Any]]:
+def violations_per_day(days: int = 30, *, owner_user_id: int | None = None, uploader_id: int | None = None) -> list[dict[str, Any]]:
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = ["status != 'dismissed'", "date(detected_at) >= date('now', ?)", *ownership]
         rows = conn.execute(
-            """
-            SELECT date(detected_at) AS day, COUNT(*) AS count
-            FROM violations
-            WHERE status != 'dismissed'
-              AND date(detected_at) >= date('now', ?)
-            GROUP BY date(detected_at)
-            ORDER BY day ASC
-            """,
-            (f"-{int(days)} days",),
+            f"SELECT date(detected_at) AS day, COUNT(*) AS count FROM violations WHERE {' AND '.join(clauses)} GROUP BY date(detected_at) ORDER BY day ASC",
+            [f"-{int(days)} days", *params],
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
 
-def violations_by_hour(day: str | None = None) -> list[dict[str, Any]]:
+def violations_by_hour(day: str | None = None, *, owner_user_id: int | None = None, uploader_id: int | None = None) -> list[dict[str, Any]]:
     query = """
         SELECT CAST(strftime('%H', detected_at) AS INTEGER) AS hour, COUNT(*) AS count
         FROM violations
         WHERE status != 'dismissed'
     """
     params: list[Any] = []
+    ownership, owner_params = _video_owner_scope_sql(
+        "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
     if day:
         query += " AND date(detected_at) = date(?)"
         params.append(day)
+    for clause in ownership:
+        query += f" AND {clause}"
+    params.extend(owner_params)
     query += " GROUP BY hour ORDER BY hour ASC"
     with db_session() as conn:
         rows = conn.execute(query, params).fetchall()
         return [_row_to_dict(row) for row in rows]
 
 
-def count_violations_by_type_on(day: str) -> dict[str, int]:
+def count_violations_by_type_on(day: str, *, owner_user_id: int | None = None, uploader_id: int | None = None) -> dict[str, int]:
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = ["status != 'dismissed'", "date(detected_at) = date(?)", *ownership]
         rows = conn.execute(
-            """
-            SELECT violation_type, COUNT(*) AS count
-            FROM violations
-            WHERE status != 'dismissed' AND date(detected_at) = date(?)
-            GROUP BY violation_type
-            """,
-            (day,),
+            f"SELECT violation_type, COUNT(*) AS count FROM violations WHERE {' AND '.join(clauses)} GROUP BY violation_type",
+            [day, *params],
         ).fetchall()
         return {row["violation_type"]: row["count"] for row in rows}
 
 
-def violations_by_vehicle_class() -> list[dict[str, Any]]:
+def violations_by_vehicle_class(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> list[dict[str, Any]]:
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = ["status != 'dismissed'", *ownership]
         rows = conn.execute(
-            """
-            SELECT COALESCE(vehicle_class, 'Unclassified') AS vehicle_class, COUNT(*) AS count
-            FROM violations
-            WHERE status != 'dismissed'
-            GROUP BY vehicle_class
-            ORDER BY count DESC
-            """
+            f"SELECT COALESCE(vehicle_class, 'Unclassified') AS vehicle_class, COUNT(*) AS count FROM violations WHERE {' AND '.join(clauses)} GROUP BY vehicle_class ORDER BY count DESC",
+            params,
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
@@ -4101,12 +4802,22 @@ def violations_by_video() -> list[dict[str, Any]]:
         return [_row_to_dict(row) for row in rows]
 
 
-def count_all_violations(status: str | None = None) -> int:
+def count_all_violations(
+    status: str | None = None, *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> int:
     with db_session() as conn:
+        ownership, params = _video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        clauses = [*ownership]
+        query_params = list(params)
         if status:
+            clauses.append("status = ?")
+            query_params.append(status)
+        if clauses:
             row = conn.execute(
-                "SELECT COUNT(*) AS total FROM violations WHERE status = ?",
-                (status,),
+                f"SELECT COUNT(*) AS total FROM violations WHERE {' AND '.join(clauses)}",
+                query_params,
             ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) AS total FROM violations").fetchone()
@@ -6224,6 +6935,8 @@ def list_motorcycle_detail_candidates(
     scan_state: str | None = None,
     human_outcome: str | None = None,
     video_id: int | None = None,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
     page: int = 1,
     per_page: int = 20,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -6243,11 +6956,21 @@ def list_motorcycle_detail_candidates(
     if video_id is not None:
         clauses.append("video_id = ?")
         params.append(int(video_id))
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "c", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    if owner_user_id is not None:
+        ownership_clauses[0] = (
+            "(c.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = c.video_id AND owner_video.uploaded_by = ?))"
+        )
+    clauses.extend(ownership_clauses)
+    params.extend(ownership_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     offset = max(page - 1, 0) * max(per_page, 1)
     with db_session() as conn:
         total_row = conn.execute(
-            f"SELECT COUNT(*) AS total FROM motorcycle_detail_candidates {where}", tuple(params)
+            f"SELECT COUNT(*) AS total FROM motorcycle_detail_candidates c {where}", tuple(params)
         ).fetchone()
         total = int(total_row["total"]) if total_row else 0
         rows = conn.execute(
@@ -6265,14 +6988,23 @@ def list_motorcycle_detail_candidates(
     return [_row_to_dict(r) for r in rows], total
 
 
-def count_motorcycle_detail_pending() -> int:
+def count_motorcycle_detail_pending(
+    *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> int:
     """Candidates still awaiting a human outcome (review-aid backlog)."""
+    ownership, params = _video_owner_scope_sql(
+        "motorcycle_detail_candidates", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    if owner_user_id is not None:
+        ownership[0] = (
+            "(motorcycle_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = motorcycle_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
+        )
+    where = " AND ".join(["human_outcome = 'pending'", *ownership])
     with db_session() as conn:
         row = conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM motorcycle_detail_candidates
-            WHERE human_outcome = 'pending'
-            """
+            f"SELECT COUNT(*) AS n FROM motorcycle_detail_candidates WHERE {where}",
+            params,
         ).fetchone()
         return int(row["n"]) if row else 0
 
@@ -6339,7 +7071,8 @@ def finish_motorcycle_detail_scan(
 
     The optional No Helmet row is still an ordinary pending review item. It is
     created only for a current, completed source run that enabled the rule and
-    only while the detail item has no recorded human outcome.
+    while the detail item remains pending or has been marked reviewed. This
+    permits a reviewer to inspect a candidate while its detail scan is running.
     """
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with review_write_transaction() as conn:
@@ -6377,7 +7110,7 @@ def finish_motorcycle_detail_scan(
         )
         if no_helmet_review_candidate is None or source is None:
             return
-        if source["human_outcome"] != "pending" or source["processing_run_id"] is None:
+        if source["human_outcome"] not in ("pending", "reviewed") or source["processing_run_id"] is None:
             return
         video_id = int(source["video_id"])
         run_id = int(source["processing_run_id"])
@@ -6658,20 +7391,39 @@ def purge_motorcycle_detail_candidates_for_video(video_id: int) -> int:
         return int(cursor.rowcount or 0)
 
 
-def count_motorcycle_detail_by_state() -> dict[str, int]:
+def count_motorcycle_detail_by_state(
+    *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> dict[str, int]:
     """Scan-state and human-outcome counts for the detail-review workspace."""
+    ownership_clauses, ownership_params = _video_owner_scope_sql(
+        "motorcycle_detail_candidates",
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+    )
+    if owner_user_id is not None:
+        ownership_clauses[0] = (
+            "(motorcycle_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = motorcycle_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
+        )
+    where = (
+        f"WHERE {' AND '.join(ownership_clauses)}" if ownership_clauses else ""
+    )
     with db_session() as conn:
         scan_rows = conn.execute(
-            """
+            f"""
             SELECT scan_state AS k, COUNT(*) AS n FROM motorcycle_detail_candidates
+            {where}
             GROUP BY scan_state
-            """
+            """,
+            ownership_params,
         ).fetchall()
         outcome_rows = conn.execute(
-            """
+            f"""
             SELECT human_outcome AS k, COUNT(*) AS n FROM motorcycle_detail_candidates
+            {where}
             GROUP BY human_outcome
-            """
+            """,
+            ownership_params,
         ).fetchall()
     counts = {state: 0 for state in DETAIL_SCAN_STATES}
     counts.update({str(r["k"]): int(r["n"]) for r in scan_rows})

@@ -155,7 +155,11 @@ def trailing_cargo_region(
 
 
 def person_lower_anchor(person: dict[str, Any]) -> tuple[float, float] | None:
-    """Bottom-center anchor; None when lower body appears cropped."""
+    """Bottom-center anchor only when the lower body is explicitly observable.
+
+    A detector box around an upper torso does not establish a foot/ground
+    contact point. Missing visibility metadata therefore remains unknown.
+    """
     x = float(person["bbox_x"])
     y = float(person["bbox_y"])
     w = float(person["bbox_w"])
@@ -163,7 +167,7 @@ def person_lower_anchor(person: dict[str, Any]) -> tuple[float, float] | None:
     frame_h = person.get("frame_h")
     if frame_h is not None and (y + h) >= float(frame_h) - 1.0:
         return None
-    if person.get("lower_body_visible") is False:
+    if person.get("lower_body_visible") is not True:
         return None
     return (x + w / 2.0, y + h)
 

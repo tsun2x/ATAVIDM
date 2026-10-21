@@ -1,0 +1,106 @@
+{
+  "dataset_version": "tavidm_v9_merged_provisional_20260924",
+  "created_at_utc": "2026-09-23T16:07:44.147560+00:00",
+  "status": "provisional_merged_derivative_not_training_authorized",
+  "canonical_names": [
+    "car",
+    "van",
+    "jeepney",
+    "tricycle",
+    "autorickshaw",
+    "bus",
+    "truck",
+    "pickup_truck",
+    "motorcycle",
+    "bicycle",
+    "person",
+    "rider",
+    "helmet_acceptable",
+    "helmet_nut_shell",
+    "side_mirror"
+  ],
+  "raw_archives_modified": false,
+  "training_authorized": false,
+  "promotion_authorized": false,
+  "source_archive_sha256": {
+    "TAVIDM staging autorickshaw.v1-staging-autorickshaw-raw-20260923.yolov8.zip": "52a3a9f6c09e36e5e977467c9b699d576a674bec6d9879070d4bd74daab1e353",
+    "TAVIDM Staging Bicycle.v1-staging-bicycle-raw-20260923.yolov8.zip": "01f6023380ff93b446c0d6e9f69820cdacd64b998177b58951344c3877a7fa78",
+    "TAVIDM Staging Bus Van.v1-staging-bus-van-raw-20260923.yolov8.zip": "4e7f95b3c6b797116b046c5c7a592f9b51fc4ca21c09bed2e79f8d8f00b92d3b",
+    "TAVIDM staging helmet.v1-staging-helmet-raw-20260923.yolov8.zip": "e9a0f3b31bc156005a123f3e9ff3ee2b99a5339828a2b64c20ac7793155600fa",
+    "TAVIDM staging nutshell.v1-staging-nutshell-raw-20260923.yolov8.zip": "8bd42e03a648a35a3e380ea78b671c60003714c6d8caf1a2a85914e1f6bcbf20",
+    "TAVIDM staging pickup_truck.v1-staging-pickup-truck-raw-20260923.yolov8.zip": "944f1568bc7b9c11e52ddafc82c7cb3a5cc70e908a0778c577a1940a127275c3",
+    "TAVIDM staging tricycle.v1-staging-tricycle-raw-20260923.yolov8.zip": "3a2faad9d9387adb4717a50d67b4249b82bac16ad7ea04e9d6f5862a1d8d7687",
+    "TAVIDM staging Truck.v1-staging-pickup-truck-raw-20260923.yolov8.zip": "dc5d98a1e644a6bd2784ca0672945f9dfce9b398bb235e1a247b32c7d975c908",
+    "TAVIDM V9 Development Review.v3-v9-development-review-raw-20260923.yolov8.zip": "eabebe0d720fad55ae0c3a7857c76c7a3a3733e8dd388195ce9e151e732d7f8d"
+  },
+  "supplement_sha256": {
+    "bus_heldout_provisional_15class_yolov8.zip": "c51a0f53a068b329c54bfc13fe83dc07331ee8913ad643d4be0c547af1acaa50",
+    "weakclass_heldout_provisional_15class_yolov8.zip": "b027e4f6f03d478db932ae8ef458da15b00f9f2553f146fe609f1f5dd9eedd0b"
+  },
+  "images_by_split": {
+    "train": 6280,
+    "valid": 234,
+    "test": 224
+  },
+  "instances_by_split": {
+    "train": {
+      "car": 1374,
+      "van": 1159,
+      "jeepney": 107,
+      "tricycle": 880,
+      "autorickshaw": 755,
+      "bus": 1368,
+      "truck": 915,
+      "pickup_truck": 876,
+      "motorcycle": 1457,
+      "bicycle": 1086,
+      "person": 759,
+      "rider": 1643,
+      "helmet_acceptable": 1021,
+      "helmet_nut_shell": 1020,
+      "side_mirror": 1321
+    },
+    "valid": {
+      "car": 458,
+      "van": 47,
+      "jeepney": 193,
+      "tricycle": 204,
+      "autorickshaw": 297,
+      "bus": 22,
+      "truck": 42,
+      "pickup_truck": 83,
+      "motorcycle": 786,
+      "bicycle": 19,
+      "person": 849,
+      "rider": 748,
+      "helmet_acceptable": 555,
+      "helmet_nut_shell": 15,
+      "side_mirror": 423
+    },
+    "test": {
+      "car": 328,
+      "van": 43,
+      "jeepney": 858,
+      "tricycle": 84,
+      "autorickshaw": 205,
+      "bus": 20,
+      "truck": 184,
+      "pickup_truck": 106,
+      "motorcycle": 995,
+      "bicycle": 20,
+      "person": 3387,
+      "rider": 1067,
+      "helmet_acceptable": 619,
+      "helmet_nut_shell": 15,
+      "side_mirror": 559
+    }
+  },
+  "polygon_rows_converted_to_boxes": 399,
+  "exact_duplicates_in_output": 0,
+  "known_limitations": [
+    "bus supplement lacks original-source provenance",
+    "weak-class supplement remains pending full semantic QA and stronger provenance",
+    "bicycle validation and nutshell held-out counts remain below the planning floor of 20",
+    "final promotion requires genuinely unseen Gold v3"
+  ]
+}

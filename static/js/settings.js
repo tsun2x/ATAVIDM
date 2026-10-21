@@ -8,11 +8,6 @@
     // --- Rule parameter form -------------------------------------------------
 
     const confidenceInput = document.getElementById("confidenceThreshold");
-    const confidenceValue = document.getElementById("confidenceValue");
-    confidenceInput?.addEventListener("input", function () {
-        if (confidenceValue) confidenceValue.textContent = this.value + "%";
-    });
-
     document.getElementById("btnSaveSettings")?.addEventListener("click", function () {
         const enabledViolations = [];
         document.querySelectorAll(".violation-group-toggle").forEach(function (el) {
@@ -36,10 +31,12 @@
                 enabledViolations.push(el.value);
             }
         });
+        const confidencePercent = Number(confidenceInput?.value);
         const body = {
-            confidence_threshold: (parseFloat(confidenceInput?.value || "60") / 100).toFixed(2),
             truck_ban_start: document.getElementById("truckBanStart")?.value,
             truck_ban_end: document.getElementById("truckBanEnd")?.value,
+            truck_ban_start_2: document.getElementById("truckBanStart2")?.value,
+            truck_ban_end_2: document.getElementById("truckBanEnd2")?.value,
             frame_skip: document.getElementById("frameSkip")?.value,
             stopping_dwell_sec: document.getElementById("stoppingDwell")?.value,
             parking_dwell_sec: document.getElementById("parkingDwell")?.value,
@@ -48,8 +45,13 @@
             crossing_block_sec: document.getElementById("crossingBlock")?.value,
             lane_flow_degrees: document.getElementById("laneFlow")?.value,
             flow_tolerance_degrees: document.getElementById("flowTolerance")?.value,
+            max_concurrent_video_jobs: document.getElementById("maxConcurrentVideoJobs")?.value,
+            max_concurrent_jobs_per_account: document.getElementById("maxConcurrentJobsPerAccount")?.value,
             enabled_violations: enabledViolations,
         };
+        if (Number.isFinite(confidencePercent) && confidencePercent >= 50 && confidencePercent <= 100) {
+            body.confidence_threshold = (confidencePercent / 100).toFixed(2);
+        }
         fetch("/api/settings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -58,7 +60,7 @@
             .then(function (r) { return r.json(); })
             .then(function (payload) {
                 if (payload.success) {
-                    showToast("Settings Saved", "Rule parameters and violation toggles updated.", "success");
+                    showToast("Settings Saved", "Rule parameters, processing capacity, and violation toggles updated.", "success");
                 } else {
                     showToast("Error", payload.error || "Save failed.", "danger");
                 }

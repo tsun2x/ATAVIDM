@@ -1,0 +1,7 @@
+path: D:/tavidm/dataset/derived/tavidm_v9_merged_provisional_20260924
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 15
+names: ['car', 'van', 'jeepney', 'tricycle', 'autorickshaw', 'bus', 'truck', 'pickup_truck', 'motorcycle', 'bicycle', 'person', 'rider', 'helmet_acceptable', 'helmet_nut_shell', 'side_mirror']

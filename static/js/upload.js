@@ -30,6 +30,9 @@
     const sceneLaneSelect = document.getElementById("sceneLaneSelect");
     const sceneProhibitedFrom = document.getElementById("sceneProhibitedFrom");
     const sceneSelectedLabel = document.getElementById("sceneSelectedLabel");
+    const sceneObjectLegend = document.getElementById("sceneObjectLegend");
+    const sceneObjectLegendList = document.getElementById("sceneObjectLegendList");
+    const sceneEditorLayout = document.getElementById("sceneEditorLayout");
 
     if (!dropzone || !fileInput) return;
 
@@ -161,8 +164,8 @@
         const selected = zoneEditor.selectedObject && zoneEditor.selectedObject();
         if (sceneSelectedLabel) {
             sceneSelectedLabel.textContent = selected
-                ? ("Selected: " + selected.id + " (" + selected.type + ")")
-                : "No object selected";
+                ? ((zoneEditor.isEditingSelected ? "Editing: " : "Drawing: ") + selected.id + " (" + selected.type + ")")
+                : "Choose a type, then draw on the frame";
         }
         if (sceneLaneSelect) {
             const needsLane = kind === "flow_arrows" || kind === "threshold_lines" || kind === "signs" || kind === "markings";
@@ -183,6 +186,76 @@
             sceneProhibitedFrom.classList.toggle("d-none", !showPf);
             if (selected && selected.prohibited_from) sceneProhibitedFrom.value = selected.prohibited_from;
         }
+        refreshSceneLegend();
+    }
+
+    function refreshSceneLegend() {
+        if (!zoneEditor || !sceneObjectLegend || !sceneObjectLegendList) return;
+        const scene = zoneEditor.scene.objects;
+        const kinds = window.TAVIDMZoneEditor.SCENE_KINDS || [];
+        const lanes = scene.lanes || [];
+        const entries = [];
+        Object.keys(scene).forEach(function (kindKey) {
+            const kind = kinds.find(function (item) { return item.key === kindKey; });
+            (scene[kindKey] || []).forEach(function (object, index) {
+                let label = object.type;
+                if (kindKey === "lanes") {
+                    const match = String(object.id).match(/(?:lane|lanes)[-_]?(\d+)$/i);
+                    label = "Lane " + (match ? match[1] : index + 1);
+                } else if (kindKey === "zones") {
+                    const zoneType = zoneTypes.find(function (item) { return item.key === object.type; });
+                    label = zoneType ? zoneType.label : object.type;
+                } else {
+                    const type = kind && (kind.types || []).find(function (item) { return item.key === object.type; });
+                    label = type ? type.label : object.type;
+                }
+                const laneIds = Array.isArray(object.lane_ids) ? object.lane_ids : [];
+                const laneLabels = laneIds.map(function (laneId) {
+                    const laneIndex = lanes.findIndex(function (lane) { return lane.id === laneId; });
+                    const lane = laneIndex >= 0 ? lanes[laneIndex] : null;
+                    const match = String(laneId).match(/(?:lane|lanes)[-_]?(\d+)$/i);
+                    return lane ? ("Lane " + (match ? match[1] : laneIndex + 1)) : laneId;
+                });
+                const detail = kindKey === "lanes"
+                    ? "Approach lane"
+                    : (laneLabels.length ? laneLabels.join(", ") : "No lane linked");
+                const type = kindKey === "zones"
+                    ? zoneTypes.find(function (item) { return item.key === object.type; })
+                    : kind && (kind.types || []).find(function (item) { return item.key === object.type; });
+                const color = type ? type.color : (kind && kind.color) || "#64748b";
+                entries.push({ id: object.id, label: label, detail: detail, color: color });
+            });
+        });
+
+        sceneObjectLegend.classList.toggle("d-none", entries.length === 0);
+        sceneEditorLayout?.classList.toggle("has-annotations", entries.length > 0);
+        sceneObjectLegendList.replaceChildren();
+        entries.forEach(function (entry) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "scene-object-legend-item" + (zoneEditor.scene.selectedId === entry.id ? " active" : "");
+            button.setAttribute("aria-pressed", zoneEditor.scene.selectedId === entry.id ? "true" : "false");
+            button.setAttribute("aria-label", entry.label + ", " + entry.detail + ". Select to edit points.");
+            const swatch = document.createElement("span");
+            swatch.className = "scene-object-legend-swatch";
+            swatch.style.backgroundColor = entry.color;
+            swatch.setAttribute("aria-hidden", "true");
+            const title = document.createElement("span");
+            title.textContent = entry.label;
+            const detail = document.createElement("span");
+            detail.className = "scene-object-legend-detail";
+            detail.textContent = entry.detail;
+            button.append(swatch, title, detail);
+            button.addEventListener("mouseenter", function () { zoneEditor.setHoveredObject(entry.id); });
+            button.addEventListener("mouseleave", function () { zoneEditor.setHoveredObject(null); });
+            button.addEventListener("focus", function () { zoneEditor.setHoveredObject(entry.id); });
+            button.addEventListener("blur", function () { zoneEditor.setHoveredObject(null); });
+            button.addEventListener("click", function () {
+                if (!zoneEditor.selectObjectForEditing(entry.id)) return;
+                buildZoneTabs();
+            });
+            sceneObjectLegendList.appendChild(button);
+        });
     }
 
     function buildKindTabs() {
@@ -378,6 +451,51 @@
         }
     }
 
+    function waitForUploadedFrame(payload, attempts) {
+        const videoId = payload.video && payload.video.db_id;
+        if (!videoId) return;
+        fetch("/api/videos/" + videoId + "/frame-status", { credentials: "same-origin" })
+            .then(function (response) {
+                return response.json().then(function (body) {
+                    return { ok: response.ok, body: body };
+                });
+            })
+            .then(function (result) {
+                const status = result.body;
+                if (!result.ok || !status.success) {
+                    showToast("Preview Status", "The video was uploaded, but its preview status could not be checked. Check Uploaded Videos before retrying.", "warning");
+                    return;
+                }
+                if (status.state === "ready") {
+                    payload.frame_ready = true;
+                    payload.frame_pending = false;
+                    payload.video = status.video || payload.video;
+                    const active = videoList?.querySelector(".camera-item.active[data-video]");
+                    let activeId = null;
+                    try { activeId = JSON.parse(active?.dataset.video || "{}").db_id; } catch (err) { /* keep selection */ }
+                    if (Number(activeId) === Number(videoId)) {
+                        appendVideoToList(payload.video);
+                        openAnnotationWizard(payload);
+                    } else {
+                        showToast("Preview Ready", "The upload is saved. Select it in Uploaded Videos to annotate.", "success");
+                    }
+                    return;
+                }
+                if (status.state === "failed") {
+                    showToast("Upload Saved; Preview Failed", status.error || "The video was saved, but its reference frame could not be prepared.", "danger");
+                    return;
+                }
+                if (attempts >= 120) {
+                    showToast("Upload Saved; Preview Still Preparing", "The video is saved. Its reference frame is taking longer than expected; check Uploaded Videos before retrying.", "warning");
+                    return;
+                }
+                window.setTimeout(function () { waitForUploadedFrame(payload, attempts + 1); }, 1500);
+            })
+            .catch(function () {
+                showToast("Upload Saved; Preview Status Unknown", "The video is saved. Check Uploaded Videos before retrying.", "warning");
+            });
+    }
+
     function saveAnnotation(saveMode, extra) {
         const scene = wizardState.pendingScene
             || (zoneEditor ? zoneEditor.getSceneDocument({ completeOnly: true }) : window.TAVIDMZoneEditor.emptySceneV2());
@@ -471,7 +589,11 @@
         const selected = zoneEditor && zoneEditor.selectedObject && zoneEditor.selectedObject();
         if (!selected || !sceneLaneSelect.value) return;
         selected.lane_ids = [sceneLaneSelect.value];
-        if (zoneEditor) zoneEditor.draw();
+        if (zoneEditor) {
+            zoneEditor.draw();
+            refreshSceneLegend();
+            saveAnnotationDraft();
+        }
     });
 
     sceneProhibitedFrom?.addEventListener("change", function () {
@@ -563,8 +685,8 @@
         });
 
         xhr.upload.addEventListener("load", function () {
-            // Bytes transferred; server is now saving/extracting before HTTP response.
-            setUploadStage("Extracting metadata");
+            // Bytes reached the server; it is saving the upload and recording its row.
+            setUploadStage("Saving upload");
         });
 
         xhr.addEventListener("load", function () {
@@ -572,16 +694,14 @@
             btnCancel.disabled = true;
             let payload;
             try { payload = JSON.parse(xhr.responseText); } catch (err) {
-                showToast("Upload Error", "Invalid server response.", "danger");
+                showToast("Upload Error", "Server returned a non-JSON response (HTTP " + xhr.status + "). Check Uploaded Videos before retrying.", "danger");
                 btnUpload.disabled = false;
                 btnUpload.innerHTML = '<i class="bi bi-upload me-1"></i> Upload';
                 return;
             }
             if (xhr.status >= 200 && xhr.status < 300 && payload.success) {
                 if (payload.requires_annotation) {
-                    setUploadStage(payload.frame_ready
-                        ? "Extracting reference frame · Awaiting zone annotation"
-                        : "Awaiting zone annotation");
+                    setUploadStage(payload.frame_ready ? "Awaiting zone annotation" : "Preparing reference frame");
                 } else {
                     setUploadStage("Completed");
                 }
@@ -596,7 +716,16 @@
                 fileInput.value = "";
                 if (payload.requires_annotation) {
                     appendVideoToList(payload.video);
-                    openAnnotationWizard(payload);
+                    if (payload.frame_pending) {
+                        showToast("Upload Saved", "Preparing the reference frame. The annotation step will open when it is ready.", "info");
+                        waitForUploadedFrame(payload, 0);
+                    } else if (payload.frame_ready) {
+                        openAnnotationWizard(payload);
+                    } else if (payload.frame_error) {
+                        showToast("Upload Saved; Preview Failed", payload.frame_error, "danger");
+                    } else {
+                        waitForUploadedFrame(payload, 0);
+                    }
                 } else {
                     appendVideoToList(payload.video);
                 }

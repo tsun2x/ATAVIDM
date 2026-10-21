@@ -811,8 +811,10 @@ DEFAULT_RULE_PARAMETERS = {
     "obstruction_dwell_sec": 10.0,    # stationary in active lane -> Obstruction
     "crossing_block_sec": 3.0,        # stationary on pedestrian crossing
     "loading_dwell_sec": 8.0,         # PUV stationary in no-loading zone
-    "truck_ban_start": "06:00",
-    "truck_ban_end": "09:00",
+    "truck_ban_start": "05:00",
+    "truck_ban_end": "08:00",
+    "truck_ban_start_2": "16:00",
+    "truck_ban_end_2": "19:00",
     "truck_ban_classes": list(DEFAULT_TRUCK_BAN_CLASSES),
     "lane_flow_degrees": 90.0,        # allowed travel direction in active lane
     "flow_tolerance_degrees": 60.0,   # deviation from opposite dir = counterflow

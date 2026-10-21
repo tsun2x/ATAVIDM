@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+
+{% block title %}About & Developers{% endblock %}
+{% block page_title %}About & Developers{% endblock %}
+{% block page_subtitle %}Meet the team behind TAVIDM{% endblock %}
+
+{% block extra_css %}
+<style>
+    .team-grid { align-items: stretch; }
+    .team-card {
+        height: 100%;
+        overflow: hidden;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius);
+        background: var(--card-bg);
+        box-shadow: var(--shadow-sm);
+    }
+    .team-card-header {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 1.25rem;
+        border-bottom: 1px solid var(--border-color);
+    }
+    .team-card-header > div { min-width: 0; }
+    .team-photo {
+        width: 92px;
+        height: 92px;
+        flex: 0 0 92px;
+        border-radius: var(--radius-sm);
+        object-fit: cover;
+        object-position: center 35%;
+        background: var(--body-bg);
+    }
+    .team-name { color: var(--text-primary); font-size: 1.05rem; font-weight: 700; overflow-wrap: anywhere; }
+    .team-role { color: var(--brand-accent); font-size: .84rem; font-weight: 600; }
+    .team-card-body { padding: 1.25rem; }
+    .team-card-body p { color: var(--text-secondary); }
+    .team-section-title {
+        margin: 1.15rem 0 .45rem;
+        color: var(--text-primary);
+        font-size: .78rem;
+        font-weight: 700;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+    }
+    .team-card-body ul { margin: 0; padding-left: 1.15rem; color: var(--text-secondary); }
+    .team-card-body li + li { margin-top: .25rem; }
+    .team-education { font-size: .84rem; }
+    .team-link:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 3px; }
+    .project-summary {
+        border-left: 4px solid var(--brand-accent);
+        border-radius: var(--radius-sm);
+        background: var(--card-bg);
+        box-shadow: var(--shadow-sm);
+    }
+    @media (max-width: 575.98px) {
+        .team-card-header { align-items: flex-start; padding: 1rem; }
+        .team-photo { width: 76px; height: 76px; flex-basis: 76px; }
+        .team-card-body { padding: 1rem; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<section aria-labelledby="team-heading">
+    <div class="mb-4">
+        <h2 id="team-heading" class="h4 mb-2">The TAVIDM team</h2>
+        <p class="text-secondary mb-0">TAVIDM is a BSIT capstone project developed at Western Mindanao State University.</p>
+    </div>
+
+    <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4 team-grid">
+        <div class="col">
+            <article class="team-card">
+                <header class="team-card-header">
+                    <img class="team-photo" src="{{ url_for('static', filename='images/developers/mark-christian-osumo.jpg') }}"
+                         alt="Portrait of Mark Christian E. Osumo" loading="lazy">
+                    <div class="min-w-0">
+                        <h3 class="team-name mb-1">Mark Christian E. Osumo</h3>
+                        <p class="team-role mb-0">Team Lead &amp; Senior Developer</p>
+                    </div>
+                </header>
+                <div class="team-card-body">
+                    <p>Works across the project’s full-stack development, computer vision, and network engineering areas.</p>
+                    <h4 class="team-section-title">Focus areas</h4>
+                    <ul>
+                        <li>Flask, React, JavaScript, and REST APIs</li>
+                        <li>YOLOv8, OpenCV, and traffic monitoring</li>
+                        <li>Network engineering and secure systems</li>
+                    </ul>
+                    <h4 class="team-section-title">Education</h4>
+                    <p class="team-education mb-3">BS Information Technology, Western Mindanao State University<br>Expected 2027</p>
+                    <a class="team-link" href="https://github.com/tsun2x" target="_blank" rel="noopener noreferrer">
+                        GitHub profile <i class="bi bi-box-arrow-up-right" aria-hidden="true"></i>
+                        <span class="visually-hidden"> (opens in a new tab)</span>
+                    </a>
+                </div>
+            </article>
+        </div>
+
+        <div class="col">
+            <article class="team-card">
+                <header class="team-card-header">
+                    <img class="team-photo" src="{{ url_for('static', filename='images/developers/reinelyn-parao.jpg') }}"
+                         alt="Portrait of Reinelyn S. Parao" loading="lazy">
+                    <div class="min-w-0">
+                        <h3 class="team-name mb-1">Reinelyn S. Parao</h3>
+                        <p class="team-role mb-0">QA &amp; System Testing</p>
+                    </div>
+                </header>
+                <div class="team-card-body">
+                    <p>Checks system behavior and supports testing across the project.</p>
+                    <h4 class="team-section-title">Focus areas</h4>
+                    <ul>
+                        <li>System and feature testing</li>
+                        <li>Computer hardware troubleshooting</li>
+                        <li>Windows setup and software configuration</li>
+                    </ul>
+                    <h4 class="team-section-title">Education</h4>
+                    <p class="team-education mb-0">BS Information Technology, Western Mindanao State University<br>Expected 2027</p>
+                </div>
+            </article>
+        </div>
+
+        <div class="col">
+            <article class="team-card">
+                <header class="team-card-header">
+                    <img class="team-photo" src="{{ url_for('static', filename='images/developers/rhimand-fernandez.jpg') }}"
+                         alt="Portrait of Rhimand Niño M. Fernandez" loading="lazy">
+                    <div class="min-w-0">
+                        <h3 class="team-name mb-1">Rhimand Niño M. Fernandez</h3>
+                        <p class="team-role mb-0">QA &amp; System Testing</p>
+                    </div>
+                </header>
+                <div class="team-card-body">
+                    <p>Checks system behavior and contributes a user-interface and experience perspective.</p>
+                    <h4 class="team-section-title">Focus areas</h4>
+                    <ul>
+                        <li>System and feature testing</li>
+                        <li>UI/UX design and front-end development</li>
+                        <li>React, JavaScript, and web interfaces</li>
+                    </ul>
+                    <h4 class="team-section-title">Education</h4>
+                    <p class="team-education mb-0">BS Information Technology, Western Mindanao State University<br>Expected 2027</p>
+                </div>
+            </article>
+        </div>
+    </div>
+</section>
+
+<section class="project-summary p-4 mt-4" aria-labelledby="project-heading">
+    <h2 id="project-heading" class="h5 mb-2">About the project</h2>
+    <p class="text-secondary mb-0">TAVIDM analyzes recorded traffic footage and RTSP camera streams to support traffic monitoring and violation review. It is a decision-support system: people review evidence and make enforcement decisions.</p>
+</section>
+{% endblock %}

@@ -145,6 +145,28 @@ def load_rule_parameters() -> dict[str, Any]:
                 params[key] = raw
         except (TypeError, ValueError):
             pass  # keep the default when a stored value is malformed
+    # The prior default persisted the one daytime period. Treat that exact
+    # legacy pair as the old default only when the second period is absent;
+    # any explicit two-window configuration keeps its selected values.
+    if (
+        "truck_ban_start_2" not in stored
+        and params.get("truck_ban_start") == "06:00"
+        and params.get("truck_ban_end") == "09:00"
+    ):
+        params.update({
+            "truck_ban_start": "05:00",
+            "truck_ban_end": "08:00",
+            "truck_ban_start_2": "16:00",
+            "truck_ban_end_2": "19:00",
+        })
+    # The UI/API now supports a 50–100% range. Normalize a legacy persisted
+    # threshold below that floor for runtime and settings-page consistency.
+    try:
+        params["confidence_threshold"] = min(
+            1.0, max(0.50, float(params.get("confidence_threshold", 0.60)))
+        )
+    except (TypeError, ValueError):
+        params["confidence_threshold"] = 0.60
     return params
 
 

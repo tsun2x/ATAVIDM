@@ -76,12 +76,19 @@ def build_upload_processing_analytics(
     *,
     start: str | None = None,
     end: str | None = None,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
 ) -> dict[str, Any]:
     start_dt, end_dt, grain = period_bounds(period, start=start, end=end)
     start_s = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_s = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    stats = db.upload_processing_analytics(start_s, end_s, grain=grain)
+    stats = db.upload_processing_analytics(
+        start_s,
+        end_s,
+        grain=grain,
+        uploader_id=uploader_id if uploader_id is not None else owner_user_id,
+    )
     stats["period"] = period
     stats["timezone"] = APP_TIMEZONE
     stats["start"] = start_s

@@ -257,11 +257,25 @@ CREATE TABLE IF NOT EXISTS processing_runs (
   effective_output_fps REAL,
   results_run_scoped INTEGER NOT NULL DEFAULT 0,
   results_scope_explicit INTEGER NOT NULL DEFAULT 0,
-  results_scope_origin TEXT
+  results_scope_origin TEXT,
+  worker_id TEXT,
+  heartbeat_at DATETIME,
+  lease_expires_at DATETIME,
+  cancel_requested_at DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_processing_runs_video_id ON processing_runs(video_id);
 CREATE INDEX IF NOT EXISTS idx_processing_runs_status ON processing_runs(status);
+CREATE INDEX IF NOT EXISTS idx_processing_runs_queue_claim
+  ON processing_runs(status, queued_at, id);
+
+-- Fairness cursor for round-robin dispatch across video owners. Account 0 is
+-- reserved for videos with no recorded uploader.
+CREATE TABLE IF NOT EXISTS processing_account_dispatch (
+  account_id INTEGER PRIMARY KEY,
+  last_dispatched_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_detections_run_id ON detections(processing_run_id);
 CREATE INDEX IF NOT EXISTS idx_detections_video_run ON detections(video_id, processing_run_id);
 CREATE INDEX IF NOT EXISTS idx_review_queue_run_id ON review_queue(processing_run_id);

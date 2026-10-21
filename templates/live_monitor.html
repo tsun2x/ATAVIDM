@@ -23,6 +23,20 @@
         <div id="liveCompletedJobs" class="live-jobs-list d-none"></div>
     </div>
 </section>
+{% if user_role == 'admin' %}
+<section class="card card-panel mb-4" aria-labelledby="liveTruckBanHeading">
+    <div class="card-header"><h5 class="card-title mb-0" id="liveTruckBanHeading">Truck Ban Windows</h5></div>
+    <div class="card-body">
+        <div class="row g-2 align-items-end">
+            <div class="col-sm-3"><label class="form-label" for="liveTruckBanStart">Morning start</label><input class="form-control" type="time" id="liveTruckBanStart" value="{{ rule_parameters.truck_ban_start }}"></div>
+            <div class="col-sm-3"><label class="form-label" for="liveTruckBanEnd">Morning end</label><input class="form-control" type="time" id="liveTruckBanEnd" value="{{ rule_parameters.truck_ban_end }}"></div>
+            <div class="col-sm-3"><label class="form-label" for="liveTruckBanStart2">Afternoon start</label><input class="form-control" type="time" id="liveTruckBanStart2" value="{{ rule_parameters.truck_ban_start_2 }}"></div>
+            <div class="col-sm-3"><label class="form-label" for="liveTruckBanEnd2">Afternoon end</label><input class="form-control" type="time" id="liveTruckBanEnd2" value="{{ rule_parameters.truck_ban_end_2 }}"></div>
+        </div>
+        <div class="d-flex gap-2 align-items-center mt-3"><button class="btn btn-danger btn-sm" id="saveLiveTruckBan" type="button">Save truck ban windows</button><span class="small text-muted" id="liveTruckBanStatus" role="status">Edit and save here while monitoring.</span></div>
+    </div>
+</section>
+{% endif %}
 <div class="row g-4">
     <div class="col-lg-8">
         <div class="card card-panel">
@@ -222,7 +236,21 @@
         <div class="card card-panel mb-4">
             <div class="card-header d-flex justify-content-between align-items-center gap-2">
                 <h5 class="card-title mb-0"><i class="bi bi-collection-play me-2"></i>Uploaded Videos</h5>
-                <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnProcessSelected">Process Selected</button>
+                <div class="d-flex align-items-center gap-2">
+                    {% if user_role == 'admin' %}
+                    <form method="get" action="{{ url_for('live_monitor') }}" class="d-flex align-items-center gap-2">
+                        <label for="liveMonitorUploader" class="small text-muted mb-0">Account</label>
+                        <select id="liveMonitorUploader" name="uploader_id" class="form-select form-select-sm" aria-label="Filter uploaded videos by account">
+                            <option value="">All accounts</option>
+                            {% for account in uploader_accounts %}
+                            <option value="{{ account.id }}" {% if selected_uploader_id == account.id %}selected{% endif %}>{{ account.username }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit" class="btn btn-sm btn-outline-secondary">Filter</button>
+                    </form>
+                    {% endif %}
+                    <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnProcessSelected">Process Selected</button>
+                </div>
             </div>
             <div class="card-body p-0">
                 <div class="px-3 py-2 border-bottom small">
@@ -337,9 +365,15 @@
                         </select>
                         <span class="small text-muted" id="sceneSelectedLabel"></span>
                     </div>
-                    <p class="small text-muted mb-2">Click to add points · Drag to move · Double-click point to delete · New object starts another shape · Shift+drag to pan · Scroll to zoom</p>
-                    <div class="zone-editor-wrap" id="zoneEditorWrap">
-                        <canvas id="zoneEditorCanvas"></canvas>
+                    <p class="small text-muted mb-2">Click to draw · Hover the annotation list to locate a shape · Select a shape there to edit its points · New object starts another shape · Shift+drag to pan · Scroll to zoom</p>
+                    <div class="scene-editor-layout" id="sceneEditorLayout">
+                        <aside class="scene-object-legend d-none" id="sceneObjectLegend" aria-label="Scene annotations">
+                            <div class="small fw-semibold mb-2">Scene annotations</div>
+                            <div class="scene-object-legend-list" id="sceneObjectLegendList"></div>
+                        </aside>
+                        <div class="zone-editor-wrap" id="zoneEditorWrap">
+                            <canvas id="zoneEditorCanvas"></canvas>
+                        </div>
                     </div>
                     <div class="d-flex justify-content-between mt-3">
                         <button type="button" class="btn btn-outline-secondary btn-sm" id="btnWizardBack"><i class="bi bi-arrow-left me-1"></i> Back</button>
@@ -480,4 +514,5 @@
 <script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>
+{% if user_role == 'admin' %}<script src="{{ url_for('static', filename='js/live_truck_ban_settings.js') }}"></script>{% endif %}
 {% endblock %}

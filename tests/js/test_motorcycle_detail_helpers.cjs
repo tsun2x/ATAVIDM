@@ -129,6 +129,17 @@ assert.ok(!described.includes("15-class"));
 assert.ok(detailUi.describeModel({ model: "YOLOv8m:mock" }, {}).includes("older scan"));
 assert.strictEqual(detailUi.describeModel({}, {}), "—");
 
+const evidenceMarkup = detailUi.buildEvidenceMarkup({
+    display_id: "MD-00001", timestamp_sec: 12.5,
+    source_video_url: "/api/videos/1/media",
+    annotated_video_url: "/api/videos/1/annotated/2",
+    frames: [{ index: 1, scene_url: "/scene.jpg", crop_url: "/crop.jpg", overlay_url: "/overlay.jpg" }]
+});
+assert.ok(evidenceMarkup.includes("Annotated video"));
+assert.ok(evidenceMarkup.includes("/api/videos/1/annotated/2"));
+assert.ok(evidenceMarkup.includes('id="detailEvidenceScale"'));
+assert.ok(evidenceMarkup.includes("12.5"));
+
 // Attribution context: older rows say nearby motorcycles were not recorded.
 assert.ok(detailUi.describeAttribution({ context: { recorded: false } }).includes("not recorded"));
 assert.ok(detailUi.describeAttribution({

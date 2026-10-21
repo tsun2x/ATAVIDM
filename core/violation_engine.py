@@ -1550,11 +1550,15 @@ def check_truck_ban(
         )
         return []
 
-    if not _within_time_window(
-        recording_time,
-        str(params.get("truck_ban_start", "06:00")),
-        str(params.get("truck_ban_end", "09:00")),
-    ):
+    windows = (
+        (str(params.get("truck_ban_start", "05:00")), str(params.get("truck_ban_end", "08:00"))),
+        (str(params.get("truck_ban_start_2", "16:00")), str(params.get("truck_ban_end_2", "19:00"))),
+    )
+    active_window = next(
+        (window for window in windows if _within_time_window(recording_time, *window)),
+        None,
+    )
+    if active_window is None:
         return []
 
     ban_classes = params.get("truck_ban_classes", DEFAULT_TRUCK_BAN_CLASSES)
@@ -1584,7 +1588,7 @@ def check_truck_ban(
                 det,
                 frame_number,
                 f"{label} track #{track_id} inside Truck Ban Zone during ban window "
-                f"({params['truck_ban_start']}-{params['truck_ban_end']}) "
+                f"({active_window[0]}-{active_window[1]}) "
                 f"using recording datetime.",
                 score,
             )

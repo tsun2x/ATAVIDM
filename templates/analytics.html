@@ -6,6 +6,15 @@
 
 {% block content %}
 <div class="analytics-page">
+{% if uploader_accounts %}
+<form class="mb-3 d-flex align-items-center gap-2" method="get" aria-label="Filter analytics by uploaded-video owner">
+    <label class="form-label mb-0" for="analyticsUploader">Uploaded by</label>
+    <select class="form-select form-select-sm" id="analyticsUploader" name="uploader_id" style="max-width: 260px" onchange="this.form.submit()">
+        <option value="">All accounts</option>
+        {% for account in uploader_accounts %}<option value="{{ account.id }}" {% if selected_uploader_id == account.id %}selected{% endif %}>{{ account.full_name or account.username }}</option>{% endfor %}
+    </select>
+</form>
+{% endif %}
 <div class="row g-4 mb-4">
     <div class="col-sm-6 col-xl-3">
         <div class="kpi-card">
@@ -224,6 +233,8 @@
     }
     function loadUpa() {
         let url = "/api/upload-processing-analytics?period=" + encodeURIComponent(periodEl.value || "today");
+        const uploaderId = new URLSearchParams(window.location.search).get("uploader_id");
+        if (uploaderId) url += "&uploader_id=" + encodeURIComponent(uploaderId);
         if (periodEl.value === "custom") {
             url += "&start=" + encodeURIComponent(startEl.value || "") + "&end=" + encodeURIComponent(endEl.value || "");
         }

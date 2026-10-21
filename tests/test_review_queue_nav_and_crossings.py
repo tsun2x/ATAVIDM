@@ -32,7 +32,8 @@ def _login_as(client, role: str):
 
     username = f"nav_{role}"
     password = f"{role}-nav-pass-123"
-    db.create_user(username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(), role=role)
+    if db.get_user_by_username(username) is None:
+        db.create_user(username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(), role=role)
     response = client.post("/login", data={"username": username, "password": password})
     assert response.status_code in (302, 303)
     return client
@@ -71,9 +72,15 @@ def _protected_counts():
 
 
 def _video(name="nav.mp4", status="processed"):
+    import bcrypt
     from database import db
 
-    vid = db.insert_video(filename=name, filepath=f"/tmp/{name}", status=status)
+    owner = db.get_user_by_username("nav_enforcer")
+    if owner is None:
+        password = "enforcer-nav-pass-123"
+        db.create_user("nav_enforcer", bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(), role="enforcer")
+        owner = db.get_user_by_username("nav_enforcer")
+    vid = db.insert_video(filename=name, filepath=f"/tmp/{name}", status=status, uploaded_by=owner["id"])
     app_module._processing_jobs.pop(vid, None)
     return vid
 
@@ -189,9 +196,9 @@ class TestReviewQueueSidebar:
         calls = []
         original = app_module.db.count_review_pending
 
-        def counting():
+        def counting(**_scope):
             calls.append(1)
-            return original()
+            return original(**_scope)
 
         monkeypatch.setattr(app_module.db, "count_review_pending", counting)
         for path in ("/live-monitor", "/review-queue", "/motorcycle-detail-review", "/analytics"):
@@ -463,7 +470,7 @@ class TestMetricLabels:
         assert "Violation records by vehicle class" in html
         assert "not a traffic count" in html
         source = (REPO / "core" / "analytics.py").read_text(encoding="utf-8")
-        assert "db.violations_by_vehicle_class()" in source
+        assert "db.violations_by_vehicle_class(**scope)" in source
 
     def test_analytics_page_renders_new_label(self, client):
         _login_as(client, "viewer")

@@ -7,12 +7,14 @@ from pathlib import Path
 
 
 def _video(db, name: str) -> int:
+    owner = db.get_user_by_username("enforcer_test")
     return db.insert_video(
         filename=name,
         filepath=f"/tmp/{name}",
         duration_sec=30.0,
         condition="morning",
         status="ready",
+        uploaded_by=owner["id"] if owner else None,
     )
 
 

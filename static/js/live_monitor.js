@@ -1077,9 +1077,18 @@
 
     function refreshAlerts() {
         fetch("/api/review-queue?status=pending")
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                const contentType = r.headers.get("content-type") || "";
+                if (!r.ok || !contentType.toLowerCase().includes("application/json")) {
+                    if (r.status === 401 && alertFeed) {
+                        alertFeed.innerHTML = '<div class="text-center text-muted small py-4">Your session expired. <a href="/login">Sign in again</a>.</div>';
+                    }
+                    return null;
+                }
+                return r.json();
+            })
             .then(function (payload) {
-                if (!payload.success || !alertFeed) return;
+                if (!payload || !payload.success || !alertFeed) return;
                 if (alertCount) alertCount.textContent = payload.total;
                 const items = payload.items.slice(0, 8);
                 if (!items.length) {
@@ -1104,6 +1113,10 @@
                         "</div>"
                     );
                 }).join("");
+            })
+            .catch(function () {
+                // Keep the last alert snapshot; gateway errors can return HTML
+                // and must not become an unhandled JSON parsing exception.
             });
     }
 

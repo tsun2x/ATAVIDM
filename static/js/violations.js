@@ -110,6 +110,8 @@
             per_page: String(pageSize),
             sort: sortSelect?.value || "newest",
         });
+        const uploaderId = new URLSearchParams(window.location.search).get("uploader_id");
+        if (uploaderId) params.set("uploader_id", uploaderId);
         const active = filters || {
             search: (searchInput?.value || "").trim(),
             violation_type: filterType?.value || "",

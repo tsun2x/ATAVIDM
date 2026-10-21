@@ -41,9 +41,9 @@ def _canonical_counts_from_map(type_counts: dict[str, int]) -> dict[str, int]:
     return counts
 
 
-def violation_summary() -> list[dict[str, Any]]:
+def violation_summary(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> list[dict[str, Any]]:
     """Per-type counts with share of total (non-dismissed violations)."""
-    rows = db.count_violations_by_type()
+    rows = db.count_violations_by_type(owner_user_id=owner_user_id, uploader_id=uploader_id)
     canonical = _canonical_counts_from_rows(rows)
     ordered = sorted(canonical.items(), key=lambda item: item[1], reverse=True)
     total = sum(count for _, count in ordered) or 1
@@ -58,40 +58,47 @@ def violation_summary() -> list[dict[str, Any]]:
     ]
 
 
-def _avg_confidence() -> float | None:
+def _avg_confidence(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> float | None:
     with db.db_session() as conn:
+        ownership, params = db._video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        where = " AND ".join(["status != 'dismissed'", *ownership])
         row = conn.execute(
-            "SELECT AVG(COALESCE(violation_confidence, confidence)) AS avg_conf FROM violations WHERE status != 'dismissed'"
+            f"SELECT AVG(COALESCE(violation_confidence, confidence)) AS avg_conf FROM violations WHERE {where}",
+            params,
         ).fetchone()
         return round(row["avg_conf"] * 100, 1) if row["avg_conf"] is not None else None
 
 
-def dashboard_stats() -> dict[str, Any]:
-    videos = db.list_videos()
+def dashboard_stats(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> dict[str, Any]:
+    video_scope = {k: v for k, v in {"owner_user_id": owner_user_id, "uploader_id": uploader_id}.items() if v is not None}
+    violation_scope = video_scope
+    videos = db.list_videos(**video_scope)
     today = datetime.now().date()
-    today_by_type = _canonical_counts_from_map(db.count_violations_by_type_on(today.isoformat()))
+    today_by_type = _canonical_counts_from_map(db.count_violations_by_type_on(today.isoformat(), **violation_scope))
     return {
-        "total_today": db.count_violations_today(),
-        "total_all": db.count_all_violations(),
+        "total_today": db.count_violations_today(**violation_scope),
+        "total_all": db.count_all_violations(owner_user_id=owner_user_id, uploader_id=uploader_id),
         "counterflow": today_by_type.get(VIOLATION_COUNTERFLOW, 0),
         "illegal_parking": today_by_type.get(VIOLATION_ILLEGAL_PARKING, 0),
-        "review_queue": db.count_review_pending(),
+        "review_queue": db.count_review_pending(**video_scope),
         "videos_processed": sum(1 for v in videos if v.get("processed")),
         "total_videos": len(videos),
-        "avg_confidence": _avg_confidence(),
+        "avg_confidence": _avg_confidence(**violation_scope),
     }
 
 
-def hourly_chart_today() -> tuple[list[str], list[int]]:
+def hourly_chart_today(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> tuple[list[str], list[int]]:
     today = datetime.now().date().isoformat()
-    rows = {row["hour"]: row["count"] for row in db.violations_by_hour(today)}
+    rows = {row["hour"]: row["count"] for row in db.violations_by_hour(today, owner_user_id=owner_user_id, uploader_id=uploader_id)}
     labels = [f"{h:02d}:00" for h in range(24)]
     values = [rows.get(h, 0) for h in range(24)]
     return labels, values
 
 
-def _daily_series(days: int = 7) -> tuple[list[str], list[int]]:
-    rows = {row["day"]: row["count"] for row in db.violations_per_day(days)}
+def _daily_series(days: int = 7, *, owner_user_id: int | None = None, uploader_id: int | None = None) -> tuple[list[str], list[int]]:
+    rows = {row["day"]: row["count"] for row in db.violations_per_day(days, owner_user_id=owner_user_id, uploader_id=uploader_id)}
     labels: list[str] = []
     values: list[int] = []
     today = datetime.now().date()
@@ -102,36 +109,42 @@ def _daily_series(days: int = 7) -> tuple[list[str], list[int]]:
     return labels, values
 
 
-def _hourly_series() -> tuple[list[str], list[int]]:
-    rows = {row["hour"]: row["count"] for row in db.violations_by_hour()}
+def _hourly_series(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> tuple[list[str], list[int]]:
+    rows = {row["hour"]: row["count"] for row in db.violations_by_hour(owner_user_id=owner_user_id, uploader_id=uploader_id)}
     labels = [f"{h:02d}:00" for h in range(24)]
     values = [rows.get(h, 0) for h in range(24)]
     return labels, values
 
 
-def analytics_data() -> dict[str, Any]:
-    daily_labels, daily_values = _daily_series(7)
-    monthly_labels, monthly_values = _daily_series(30)
-    hourly_labels, hourly_values = _hourly_series()
+def analytics_data(*, owner_user_id: int | None = None, uploader_id: int | None = None) -> dict[str, Any]:
+    scope = {k: v for k, v in {"owner_user_id": owner_user_id, "uploader_id": uploader_id}.items() if v is not None}
+    daily_labels, daily_values = _daily_series(7, **scope)
+    monthly_labels, monthly_values = _daily_series(30, **scope)
+    hourly_labels, hourly_values = _hourly_series(**scope)
 
-    breakdown_raw = db.count_violations_by_type()
+    breakdown_raw = db.count_violations_by_type(**scope)
     breakdown_map = _canonical_counts_from_rows(breakdown_raw)
     breakdown = [
         {"violation_type": viol_type, "count": count}
         for viol_type, count in sorted(breakdown_map.items(), key=lambda x: x[1], reverse=True)
     ]
-    vehicle_rows = db.violations_by_vehicle_class()
+    vehicle_rows = db.violations_by_vehicle_class(**scope)
 
     # Confidence bands follow the manuscript's manual-review policy thresholds.
     with db.db_session() as conn:
+        ownership, owner_params = db._video_owner_scope_sql(
+            "violations", owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
+        confidence_where = " AND ".join(["status != 'dismissed'", *ownership])
         band_row = conn.execute(
-            """
+            f"""
             SELECT
               SUM(CASE WHEN COALESCE(violation_confidence, confidence) >= 0.95 THEN 1 ELSE 0 END) AS auto_q,
               SUM(CASE WHEN COALESCE(violation_confidence, confidence) >= 0.80 AND COALESCE(violation_confidence, confidence) < 0.95 THEN 1 ELSE 0 END) AS careful,
               SUM(CASE WHEN COALESCE(violation_confidence, confidence) < 0.80 THEN 1 ELSE 0 END) AS low
-            FROM violations WHERE status != 'dismissed'
-            """
+            FROM violations WHERE {confidence_where}
+            """,
+            owner_params,
         ).fetchone()
 
     total_week = sum(daily_values)
@@ -155,7 +168,7 @@ def analytics_data() -> dict[str, Any]:
             "total_week": total_week,
             "peak_hour": peak_hour,
             "most_common": most_common,
-            "avg_confidence": _avg_confidence(),
+            "avg_confidence": _avg_confidence(**scope),
         },
         "violation_types": list(CANONICAL_VIOLATIONS),
     }

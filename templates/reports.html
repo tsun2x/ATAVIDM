@@ -5,6 +5,38 @@
 {% block page_subtitle %}Generate and export violation reports (PDF / Excel){% endblock %}
 
 {% block content %}
+<div class="card card-panel mb-4" id="videoReportBrowser">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <div>
+            <h5 class="card-title mb-1"><i class="bi bi-camera-video me-2"></i>Browse cases by video</h5>
+            <p class="text-muted small mb-0">Choose a video and filters in the report generator below to browse matching cases.</p>
+        </div>
+        <span class="badge text-bg-secondary" id="reportPreviewState">Choose a video</span>
+    </div>
+    <div class="card-body">
+        <div class="mb-3"><strong id="reportPreviewTotal">—</strong> <span class="text-muted">matching cases</span></div>
+        <div id="reportPreviewMessage" class="text-muted py-3" role="status">Choose a video to browse its cases.</div>
+        <div id="reportPreviewResults" hidden>
+            <div class="mb-3">
+                <div class="small text-muted mb-1">Cases by canonical violation type</div>
+                <div class="d-flex flex-wrap gap-2" id="reportPreviewCategories"></div>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-2">
+                    <thead><tr><th>Case</th><th>Detected</th><th>Status</th><th>Processing run</th><th>Observations</th><th>Proposed / verified category</th><th>Legal status</th><th>Outcome</th></tr></thead>
+                    <tbody id="reportPreviewCases"></tbody>
+                </table>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+                <span class="small text-muted" id="reportPreviewPage"></span>
+                <div class="btn-group btn-group-sm" role="group" aria-label="Report case pages">
+                    <button type="button" class="btn btn-outline-secondary" id="reportPreviewPrevious">Previous</button>
+                    <button type="button" class="btn btn-outline-secondary" id="reportPreviewNext">Next</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 <div class="row g-4">
     <div class="col-lg-4">
         <div class="card card-panel">
@@ -36,10 +68,19 @@
                         <select class="form-select" id="reportVideo">
                             <option value="">All Sources</option>
                             {% for vid in videos %}
-                            <option value="{{ vid.db_id }}">{{ vid.filename }}</option>
+                            <option value="{{ vid.db_id }}">{{ vid.filename }} · {{ vid.status|title }}</option>
                             {% endfor %}
                         </select>
                     </div>
+                    {% if uploader_accounts %}
+                    <div class="mb-3">
+                        <label class="form-label" for="reportUploader">Source account</label>
+                        <select class="form-select" id="reportUploader">
+                            <option value="">All accounts</option>
+                            {% for account in uploader_accounts %}<option value="{{ account.id }}">{{ account.full_name or account.username }}</option>{% endfor %}
+                        </select>
+                    </div>
+                    {% endif %}
                     <div class="mb-3">
                         <label class="form-label" for="reportStatus">Status</label>
                         <select class="form-select" id="reportStatus">
@@ -61,7 +102,13 @@
         <div class="card card-panel">
             <div class="card-header d-flex justify-content-between align-items-center">
                 <h5 class="card-title mb-0"><i class="bi bi-clock-history me-2"></i>Report History</h5>
-                <button class="btn btn-sm btn-outline-secondary" id="btnRefreshHistory"><i class="bi bi-arrow-clockwise"></i></button>
+                <div class="d-flex align-items-center gap-2">
+                    <label class="visually-hidden" for="reportHistoryVisibility">Report history visibility</label>
+                    <select class="form-select form-select-sm" id="reportHistoryVisibility" style="width:auto">
+                        <option value="all">All Completed</option><option value="mine">My Reports</option>
+                    </select>
+                    <button class="btn btn-sm btn-outline-secondary" id="btnRefreshHistory" aria-label="Refresh report history"><i class="bi bi-arrow-clockwise"></i></button>
+                </div>
             </div>
             <div class="card-body p-0">
                 <div class="table-responsive">

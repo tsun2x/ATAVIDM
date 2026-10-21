@@ -1,0 +1,9 @@
+Please start with START-HERE-CHECKLIST.md. Do Part 1 first: sign in, upload, annotate, process, check results, review, and export. Then test the batch section and your assigned settings/functions.
+
+Uploads are one video at a time; batch processing means selecting several prepared videos afterwards.
+
+Use ANNOTATION-GUIDE.md to choose and draw the right areas/lines. Use SIMPLE-RESULTS.md to record each item as Works, Problem, or Couldn't test, with one sentence saying what happened.
+
+For problems, include the steps, video filename/time, expected result, actual result, and screenshot. Don't send just “done” or “doesn't work.” If you can't test something, say what's missing.
+
+Use only the supplied test accounts/videos. Tell me which settings you changed and restore them afterwards. Send your results and screenshots together.

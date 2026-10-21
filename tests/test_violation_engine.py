@@ -38,8 +38,10 @@ def rule_params():
         "obstruction_dwell_sec": 0.5,
         "loading_dwell_sec": 8.0,
         "crossing_block_sec": 1.0,
-        "truck_ban_start": "06:00",
-        "truck_ban_end": "09:00",
+        "truck_ban_start": "05:00",
+        "truck_ban_end": "08:00",
+        "truck_ban_start_2": "16:00",
+        "truck_ban_end_2": "19:00",
         "lane_flow_degrees": 90.0,
         "flow_tolerance_degrees": 60.0,
         "min_direction_px": 40.0,
@@ -483,6 +485,21 @@ class TestIllegalTerminal:
 
 
 class TestTruckBanApplicability:
+    @pytest.mark.parametrize("hour,minute,expected", [(5, 30, True), (16, 30, True), (12, 0, False), (19, 1, False)])
+    def test_configured_two_daily_windows_gate_events(self, rule_params, hour, minute, expected):
+        from datetime import time as dtime
+        from core.violation_engine import RuleEngineState, check_truck_ban
+
+        zone = [[50, 50], [250, 50], [250, 200], [50, 200], [50, 50]]
+        truck = {"class_label": "truck", "track_id": 9, "bbox_x": 100, "bbox_y": 100,
+                 "bbox_w": 80, "bbox_h": 30, "confidence": 0.92}
+        state = RuleEngineState()
+        events = []
+        for frame in range(10):
+            truck["timestamp_sec"] = frame * 0.3
+            events.extend(check_truck_ban([truck], zone, state, frame, rule_params, now_time=dtime(hour, minute)))
+        assert bool(events) is expected
+
     def test_truck_ban_fires_for_truck(self, rule_params):
         from datetime import time as dtime
         from core.violation_engine import RuleEngineState, check_truck_ban

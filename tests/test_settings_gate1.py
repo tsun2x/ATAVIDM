@@ -13,6 +13,7 @@ from core.detection_config import (
 )
 from core.rule_parameter_validation import (
     RuleParameterValidationError,
+    validate_processing_limits,
     validate_rule_parameters,
 )
 from core.video_processor import load_rule_parameters
@@ -36,6 +37,29 @@ def admin_client(client):
 
 
 class TestRuleParameterValidation:
+    def test_processing_limits_validate_range_and_account_limit(self):
+        current = {
+            "max_concurrent_video_jobs": 3,
+            "max_concurrent_jobs_per_account": 1,
+        }
+        assert validate_processing_limits(
+            {"max_concurrent_video_jobs": "3", "max_concurrent_jobs_per_account": "2"},
+            current=current,
+        ) == {
+            "max_concurrent_video_jobs": 3,
+            "max_concurrent_jobs_per_account": 2,
+        }
+        for value in (0, 4, 1.5, True, "nope"):
+            with pytest.raises(RuleParameterValidationError):
+                validate_processing_limits(
+                    {"max_concurrent_video_jobs": value}, current=current
+                )
+        with pytest.raises(RuleParameterValidationError, match="cannot exceed"):
+            validate_processing_limits(
+                {"max_concurrent_video_jobs": 1},
+                current={**current, "max_concurrent_jobs_per_account": 2},
+            )
+
     def test_valid_payload_coerces_numbers(self):
         out = validate_rule_parameters(
             {
@@ -53,6 +77,15 @@ class TestRuleParameterValidation:
         assert out["loading_dwell_sec"] == 8.0
         assert out["frame_skip"] == 3
         assert out["confidence_threshold"] == 0.55
+
+    def test_confidence_accepts_only_the_50_to_100_percent_range_and_times_validate(self):
+        assert validate_rule_parameters({"confidence_threshold": "0.50"})["confidence_threshold"] == 0.5
+        assert validate_rule_parameters({"confidence_threshold": "1.00"})["confidence_threshold"] == 1.0
+        for value in (0.49, 1.01):
+            with pytest.raises(RuleParameterValidationError):
+                validate_rule_parameters({"confidence_threshold": value})
+        values = validate_rule_parameters({"truck_ban_start_2": "16:00", "truck_ban_end_2": "19:00"})
+        assert values == {"truck_ban_start_2": "16:00", "truck_ban_end_2": "19:00"}
 
     def test_rejects_nan_infinity_and_malformed(self):
         for raw in (float("nan"), float("inf"), "-inf", "abc", "", None, True):
@@ -87,6 +120,70 @@ class TestRuleParameterValidation:
 
 
 class TestSettingsRouteGate1:
+    def test_processing_capacity_is_admin_configurable_and_rejected_atomically(self, admin_client):
+        html = admin_client.get("/settings").get_data(as_text=True)
+        assert 'id="maxConcurrentVideoJobs"' in html
+        assert 'id="maxConcurrentJobsPerAccount"' in html
+        assert 'value="3" min="1" max="3" step="1"' in html
+        assert 'value="1" min="1" max="3" step="1"' in html
+
+        saved = admin_client.post(
+            "/api/settings",
+            json={
+                "max_concurrent_video_jobs": 3,
+                "max_concurrent_jobs_per_account": 2,
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.get_json()["processing_limits"] == {
+            "max_concurrent_video_jobs": 3,
+            "max_concurrent_jobs_per_account": 2,
+        }
+        assert db.get_processing_limits() == saved.get_json()["processing_limits"]
+
+        rejected = admin_client.post(
+            "/api/settings",
+            json={
+                "max_concurrent_video_jobs": 1,
+                "max_concurrent_jobs_per_account": 3,
+            },
+        )
+        assert rejected.status_code == 400
+        assert db.get_processing_limits() == {
+            "max_concurrent_video_jobs": 3,
+            "max_concurrent_jobs_per_account": 2,
+        }
+
+    def test_legacy_single_default_window_loads_as_both_current_ban_periods(self, admin_client):
+        db.set_settings({"truck_ban_start": "06:00", "truck_ban_end": "09:00"})
+        loaded = load_rule_parameters()
+        assert (loaded["truck_ban_start"], loaded["truck_ban_end"]) == ("05:00", "08:00")
+        assert (loaded["truck_ban_start_2"], loaded["truck_ban_end_2"]) == ("16:00", "19:00")
+
+    def test_legacy_confidence_below_new_range_normalizes_to_fifty_percent(self, admin_client):
+        db.set_settings({"confidence_threshold": "0.41"})
+        assert load_rule_parameters()["confidence_threshold"] == 0.5
+        html = admin_client.get("/settings").get_data(as_text=True)
+        assert 'id="confidenceThreshold" min="50" max="100" step="1"' in html
+        assert 'value="50"' in html
+
+    def test_settings_uses_number_field_for_confidence_and_live_monitor_has_both_windows(self, admin_client):
+        settings_html = admin_client.get("/settings").get_data(as_text=True)
+        assert 'type="number" class="form-control" id="confidenceThreshold" min="50" max="100"' in settings_html
+        assert 'type="range" class="form-range" id="confidenceThreshold"' not in settings_html
+        live_html = admin_client.get("/live-monitor").get_data(as_text=True)
+        for field in ("liveTruckBanStart", "liveTruckBanEnd", "liveTruckBanStart2", "liveTruckBanEnd2"):
+            assert f'id="{field}"' in live_html
+
+    def test_settings_save_persists_second_truck_ban_window(self, admin_client):
+        response = admin_client.post("/api/settings", json={
+            "truck_ban_start": "05:00", "truck_ban_end": "08:00",
+            "truck_ban_start_2": "16:00", "truck_ban_end_2": "19:00",
+        })
+        assert response.status_code == 200
+        assert load_rule_parameters()["truck_ban_start_2"] == "16:00"
+        assert load_rule_parameters()["truck_ban_end_2"] == "19:00"
+
     def test_settings_page_renders_dwell_values_and_links(self, admin_client):
         db.set_settings(
             {

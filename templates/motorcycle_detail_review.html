@@ -2,9 +2,19 @@
 
 {% block title %}Motorcycle Detail Review{% endblock %}
 {% block page_title %}Motorcycle Detail Review{% endblock %}
-{% block page_subtitle %}Helmet and side-mirror observations for motorcycle tracks — review aid only, never a violation case{% endblock %}
+{% block page_subtitle %}Review motorcycle evidence and confirm whether it shows No Helmet, a nut-shell helmet, No Side Mirror, or no violation.{% endblock %}
 
 {% block content %}
+{% if uploader_accounts %}
+<form class="mb-3 d-flex align-items-center gap-2" method="get" aria-label="Filter motorcycle detail reviews by uploaded-video owner">
+    <input type="hidden" name="outcome" value="{{ detail_outcome }}">
+    <label class="form-label mb-0" for="detailUploader">Uploaded by</label>
+    <select class="form-select form-select-sm" id="detailUploader" name="uploader_id" style="max-width: 260px" onchange="this.form.submit()">
+        <option value="">All accounts</option>
+        {% for account in uploader_accounts %}<option value="{{ account.id }}" {% if selected_uploader_id == account.id %}selected{% endif %}>{{ account.full_name or account.username }}</option>{% endfor %}
+    </select>
+</form>
+{% endif %}
 <div class="card card-panel mb-4">
     <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
         <div>
@@ -16,19 +26,19 @@
         </div>
         <div class="btn-group btn-group-sm" role="group" aria-label="Filter detail queue">
             <a class="btn btn-outline-secondary {% if detail_outcome == 'pending' %}active{% endif %}"
-               href="{{ url_for('motorcycle_detail_review', outcome='pending') }}"
+               href="{{ url_for('motorcycle_detail_review', outcome='pending', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'pending' else 'false' }}">Pending</a>
             <a class="btn btn-outline-secondary {% if detail_outcome == 'reviewed' %}active{% endif %}"
-               href="{{ url_for('motorcycle_detail_review', outcome='reviewed') }}"
+               href="{{ url_for('motorcycle_detail_review', outcome='reviewed', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'reviewed' else 'false' }}">Reviewed</a>
             <a class="btn btn-outline-secondary {% if detail_outcome == 'dismissed' %}active{% endif %}"
-               href="{{ url_for('motorcycle_detail_review', outcome='dismissed') }}"
+               href="{{ url_for('motorcycle_detail_review', outcome='dismissed', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'dismissed' else 'false' }}">Dismissed</a>
             <a class="btn btn-outline-secondary {% if detail_outcome == 'uncertain' %}active{% endif %}"
-               href="{{ url_for('motorcycle_detail_review', outcome='uncertain') }}"
+               href="{{ url_for('motorcycle_detail_review', outcome='uncertain', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'uncertain' else 'false' }}">Uncertain</a>
             <a class="btn btn-outline-secondary {% if detail_outcome == 'all' %}active{% endif %}"
-               href="{{ url_for('motorcycle_detail_review', outcome='all') }}"
+               href="{{ url_for('motorcycle_detail_review', outcome='all', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'all' else 'false' }}">All</a>
         </div>
     </div>
@@ -38,7 +48,7 @@
         </p>
         <p class="small text-warning mb-1">
             <i class="bi bi-info-circle me-1"></i>
-            This queue records observations only. It has <strong>no confirm action</strong> and can never create a violation case.
+            Open the evidence, choose the outcome that matches your review, then confirm it. No Helmet, Nut-shell Helmet, and No Side Mirror create violation cases; No Violation closes the review without a case.
         </p>
         <p class="small text-muted mb-0" id="detailContractNote">
             Detail model contracts: a separate three-class checkpoint
@@ -74,11 +84,11 @@
 <nav class="mb-3" aria-label="Motorcycle detail review pages">
     <ul class="pagination pagination-sm justify-content-end">
         <li class="page-item {% if detail_page <= 1 %}disabled{% endif %}">
-            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page-1, per_page=detail_per_page) }}" aria-label="Previous">Previous</a>
+            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page-1, per_page=detail_per_page, uploader_id=selected_uploader_id) }}" aria-label="Previous">Previous</a>
         </li>
         <li class="page-item disabled"><span class="page-link">Page {{ detail_page }} of {{ detail_pages }}</span></li>
         <li class="page-item {% if detail_page >= detail_pages %}disabled{% endif %}">
-            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page+1, per_page=detail_per_page) }}" aria-label="Next">Next</a>
+            <a class="page-link" href="{{ url_for('motorcycle_detail_review', outcome=detail_outcome, page=detail_page+1, per_page=detail_per_page, uploader_id=selected_uploader_id) }}" aria-label="Next">Next</a>
         </li>
     </ul>
 </nav>
@@ -145,10 +155,9 @@
                         </td>
                         <td>
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-outline-primary btn-detail-outcome" data-outcome="reviewed"
-                                        title="Record reviewed observation"
-                                        aria-label="Record reviewed observation for {{ item.display_id }}"
-                                        data-loading-label="Saving…"><i class="bi bi-clipboard-check"></i></button>
+                                <button class="btn btn-outline-primary btn-detail-evidence"
+                                        title="Review evidence and choose an outcome"
+                                        aria-label="Review evidence and choose an outcome for {{ item.display_id }}"><i class="bi bi-clipboard-check"></i><span class="ms-1">Decide</span></button>
                                 <button class="btn btn-outline-warning btn-detail-outcome" data-outcome="uncertain"
                                         title="Mark uncertain" aria-label="Mark {{ item.display_id }} uncertain"
                                         data-loading-label="Saving…"><i class="bi bi-question-circle"></i></button>
@@ -170,7 +179,7 @@
 </div>
 
 <div class="modal fade" id="detailEvidenceModal" tabindex="-1">
-    <div class="modal-dialog modal-xl modal-dialog-centered">
+    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-bicycle me-2"></i><span id="detailModalTitle">Detail Evidence</span></h5>

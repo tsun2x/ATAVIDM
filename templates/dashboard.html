@@ -5,6 +5,15 @@
 {% block page_subtitle %}Overview of detected violations and system status{% endblock %}
 
 {% block content %}
+{% if uploader_accounts %}
+<form class="mb-3 d-flex align-items-center gap-2" method="get" aria-label="Filter dashboard by uploaded-video owner">
+    <label class="form-label mb-0" for="dashboardUploader">Uploaded by</label>
+    <select class="form-select form-select-sm" id="dashboardUploader" name="uploader_id" style="max-width: 260px" onchange="this.form.submit()">
+        <option value="">All accounts</option>
+        {% for account in uploader_accounts %}<option value="{{ account.id }}" {% if selected_uploader_id == account.id %}selected{% endif %}>{{ account.full_name or account.username }}</option>{% endfor %}
+    </select>
+</form>
+{% endif %}
 <div class="row g-4 mb-4">
     <div class="col-sm-6 col-xl-4 col-xxl-2">
         <div class="stat-card stat-primary">

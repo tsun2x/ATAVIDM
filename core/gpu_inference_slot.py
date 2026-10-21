@@ -1,4 +1,4 @@
-"""One shared reservation for the single GPU inference device.
+"""Shared reservations for GPU inference.
 
 TAVIDM runs YOLOv8m + ByteTrack on one consumer GPU (RTX 3050 6GB). Several
 callers need that device at the same time:
@@ -56,16 +56,16 @@ PRIORITY_LIVE_FRAME = 20
 
 
 class GpuInferenceSlot:
-    """A fair, priority-ordered, single-holder reservation for one GPU."""
+    """A fair, priority-ordered reservation pool for one GPU."""
 
-    def __init__(self, *, name: str = "gpu") -> None:
+    def __init__(self, *, name: str = "gpu", capacity: int = 1) -> None:
         self.name = str(name)
+        self.capacity = max(1, int(capacity))
         self._cond = threading.Condition(threading.Lock())
-        self._owner: str | None = None
-        self._token: int | None = None
+        self._holders: dict[int, str] = {}
         self._tokens = itertools.count(1)
         self._waiters: list[dict[str, object]] = []
-        self._reentrant: dict[int, tuple[str, int]] = {}
+        self._reentrant: dict[int, tuple[str, int, int]] = {}
         self.stats: dict[str, int] = {
             "acquired": 0,
             "timeouts": 0,
@@ -77,11 +77,11 @@ class GpuInferenceSlot:
     def holder(self) -> str | None:
         """Owner label currently holding the slot (None when free)."""
         with self._cond:
-            return self._owner
+            return next(iter(self._holders.values()), None)
 
     def is_free(self) -> bool:
         with self._cond:
-            return self._owner is None
+            return len(self._holders) < self.capacity
 
     def waiter_count(self) -> int:
         with self._cond:
@@ -91,7 +91,9 @@ class GpuInferenceSlot:
         with self._cond:
             return {
                 "name": self.name,
-                "holder": self._owner,
+                "capacity": self.capacity,
+                "holder": next(iter(self._holders.values()), None),
+                "holders": list(self._holders.values()),
                 "waiters": len(self._waiters),
                 "stats": dict(self.stats),
             }
@@ -105,8 +107,8 @@ class GpuInferenceSlot:
         with self._cond:
             nested = self._reentrant.get(threading.get_ident())
             if nested is not None and nested[0] == owner:
-                self._reentrant[threading.get_ident()] = (owner, nested[1] + 1)
-                return self._token
+                self._reentrant[threading.get_ident()] = (owner, nested[1], nested[2] + 1)
+                return nested[1]
             if not self._may_admit(priority, seq=None):
                 self.stats["refused"] += 1
                 return None
@@ -126,8 +128,8 @@ class GpuInferenceSlot:
         with self._cond:
             nested = self._reentrant.get(ident)
             if nested is not None and nested[0] == owner:
-                self._reentrant[ident] = (owner, nested[1] + 1)
-                return self._token
+                self._reentrant[ident] = (owner, nested[1], nested[2] + 1)
+                return nested[1]
             entry: dict[str, object] = {
                 "owner": owner,
                 "priority": int(priority),
@@ -143,7 +145,7 @@ class GpuInferenceSlot:
                     if self._may_admit(int(priority), seq=int(entry["seq"])):  # type: ignore[arg-type]
                         entry["granted"] = True
                         token = self._take(owner)
-                        self._reentrant[ident] = (owner, 1)
+                        self._reentrant[ident] = (owner, token, 1)
                         return token
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -166,22 +168,22 @@ class GpuInferenceSlot:
         with self._cond:
             ident = threading.get_ident()
             nested = self._reentrant.get(ident)
-            if nested is not None and token == self._token:
-                if nested[1] > 1:
-                    self._reentrant[ident] = (nested[0], nested[1] - 1)
+            if nested is not None and token == nested[1]:
+                if nested[2] > 1:
+                    self._reentrant[ident] = (nested[0], nested[1], nested[2] - 1)
                     return
                 self._reentrant.pop(ident, None)
-            if token != self._token or self._owner is None:
+            owner = self._holders.get(token)
+            if owner is None:
                 # Mismatched or double release: never free someone else's slot.
                 logger.warning(
                     "ignoring stale GPU reservation release for '%s' (token=%s holder=%s)",
                     nested[0] if nested else "unknown",
                     token,
-                    self._owner,
+                    owner,
                 )
                 return
-            self._owner = None
-            self._token = None
+            self._holders.pop(token, None)
             self._cond.notify_all()
 
     @contextlib.contextmanager
@@ -216,26 +218,28 @@ class GpuInferenceSlot:
         must queue behind every waiter that is already present, and it never
         displaces one, so a waiting video job is admitted first.
         """
-        if self._owner is not None:
+        if len(self._holders) >= self.capacity:
             return False
+        better_ahead = 0
         for other in self._waiters:
             other_priority = int(other["priority"])  # type: ignore[arg-type]
             if other_priority < priority:
-                return False
-            if other_priority == priority and seq is not None:
+                better_ahead += 1
+            elif other_priority == priority and seq is None:
+                better_ahead += 1
+            elif other_priority == priority and seq is not None:
                 if int(other["seq"]) < seq:  # type: ignore[arg-type]
-                    return False
-        return True
+                    better_ahead += 1
+        return len(self._holders) + better_ahead < self.capacity
 
     def _take(self, owner: str) -> int:
         token = next(self._tokens)
-        self._owner = owner
-        self._token = token
+        self._holders[token] = owner
         self.stats["acquired"] += 1
         return token
 
 
-_GLOBAL_SLOT = GpuInferenceSlot(name="tavidm-gpu")
+_GLOBAL_SLOT = GpuInferenceSlot(name="tavidm-gpu", capacity=2)
 
 
 def gpu_inference_slot() -> GpuInferenceSlot:

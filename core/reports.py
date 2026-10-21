@@ -155,6 +155,17 @@ def _wrap_pdf_cell_text(pdf: FPDF, value: str, cell_width: float) -> list[str]:
 _MAX_ROWS = 5000
 
 
+class ReportTooLargeError(ValueError):
+    """The complete selection exceeds the explicit bounded export size."""
+
+    def __init__(self, total_cases: int) -> None:
+        self.total_cases = int(total_cases)
+        super().__init__(
+            f"This selection contains {self.total_cases} cases; exports are limited to "
+            f"{_MAX_ROWS:,}. Narrow the filters and try again."
+        )
+
+
 def _expand_filters(filters: dict[str, Any]) -> dict[str, Any]:
     """Expand violation_type filters to include legacy aliases for DB reads."""
     expanded = dict(filters)
@@ -162,6 +173,125 @@ def _expand_filters(filters: dict[str, Any]) -> dict[str, Any]:
     if isinstance(vtype, str) and vtype:
         expanded["violation_type"] = list(violation_type_query_names(vtype))
     return expanded
+
+
+def preview_video(
+    video_id: int,
+    filters: dict[str, Any],
+    *,
+    page: int,
+    per_page: int,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Return one video page plus complete, case-ID-based totals."""
+    from core.detection_config import canonicalize_violation
+    from core.violation_policy import (
+        legal_status_for,
+        proposed_official_category_for,
+        verified_official_category_for,
+    )
+
+    result = db.report_video_preview(
+        int(video_id),
+        _expand_filters(filters),
+        page=page,
+        per_page=per_page,
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+    )
+    if result is None:
+        return None
+
+    counts: dict[str, int] = {}
+    for entry in result["type_counts"]:
+        canonical = canonicalize_violation(str(entry["violation_type"]))
+        counts[canonical] = counts.get(canonical, 0) + int(entry["count"])
+    result["category_counts"] = [
+        {"violation_type": name, "count": count}
+        for name, count in sorted(counts.items())
+    ]
+
+    output_items = []
+    for row in result["items"]:
+        vtype = str(row.get("violation_type") or "")
+        policy_rows = row.pop("policy_records", [])
+        if policy_rows:
+            pairs = []
+            for policy in policy_rows:
+                pair = (
+                    str(policy.get("canonical_rule") or vtype),
+                    str(policy.get("official_category") or "No official category"),
+                    str(policy.get("legal_status") or "unknown"),
+                )
+                if pair not in pairs:
+                    pairs.append(pair)
+            official_category = "; ".join(
+                f"{rule}: {category} [{status}]"
+                for rule, category, status in pairs
+            )
+            legal_status = "; ".join(
+                f"{rule}: {status}" for rule, _category, status in pairs
+            )
+            observation_count = len(policy_rows)
+        else:
+            official_category = (
+                verified_official_category_for(vtype)
+                or proposed_official_category_for(vtype)
+                or ""
+            )
+            status = legal_status_for(vtype)
+            legal_status = status.value if status else ""
+            observation_count = int(row.get("observation_count") or 1)
+        output_items.append(
+            {
+                "id": int(row["id"]),
+                "violation_type": canonicalize_violation(vtype),
+                "detected_at": row.get("detected_at"),
+                "status": row.get("status"),
+                "track_id": row.get("track_id"),
+                "processing_run_id": row.get("processing_run_id"),
+                "run_status": row.get("run_status"),
+                "observation_count": observation_count,
+                "official_category": official_category,
+                "legal_status": legal_status,
+                "case_outcome": row.get("case_outcome"),
+            }
+        )
+
+    video = result["video"]
+    latest = result.get("latest_run")
+    total = int(result["total"])
+    if latest and latest.get("status") in {"queued", "running"}:
+        result_state = "processing"
+    elif latest and latest.get("status") == "completed":
+        result_state = "completed_with_cases" if total else "completed_empty"
+    elif latest and latest.get("status") in {"failed", "cancelled"}:
+        result_state = "previous_results_available" if total else "failed_no_results"
+    elif total:
+        result_state = "legacy_results_available"
+    elif video.get("status") == "processed" or video.get("processed"):
+        result_state = "legacy_processed_no_run"
+    else:
+        result_state = "not_processed"
+
+    return {
+        "video": video,
+        "latest_run": latest,
+        "result_state": result_state,
+        "items": output_items,
+        "total_cases": total,
+        "category_counts": result["category_counts"],
+        "pagination": {
+            "page": int(page),
+            "per_page": int(per_page),
+            "pages": (total + int(per_page) - 1) // int(per_page),
+        },
+        "export_limit": {
+            "max_rows": _MAX_ROWS,
+            "exceeded": total > _MAX_ROWS,
+        },
+    }
 
 
 def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -174,7 +304,12 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
 
     enriched = dict(row)
     vid = row.get("id")
-    policy_rows = db.get_case_policy_records(vid) if vid is not None else []
+    snapshot_actions = row.get("case_action_records")
+    policy_rows = (
+        row.get("policy_records", [])
+        if "policy_records" in row
+        else db.get_case_policy_records(vid) if vid is not None else []
+    )
     if policy_rows:
         policy_pairs = []
         for policy in policy_rows:
@@ -202,8 +337,13 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
         enriched["legal_status"] = status.value if status else ""
         enriched["observation_count"] = 1
 
-    case_confirmed = db.is_case_confirmed(vid) if vid is not None else False
-    notice_printed = db.is_notice_printed(vid) if vid is not None else False
+    if "case_action_types" in row:
+        actions = set(row.get("case_action_types") or [])
+        case_confirmed = "case_confirmed" in actions
+        notice_printed = "notice_printed" in actions
+    else:
+        case_confirmed = db.is_case_confirmed(vid) if vid is not None else False
+        notice_printed = db.is_notice_printed(vid) if vid is not None else False
     if notice_printed:
         enriched["case_outcome"] = "notice_printed"
     elif case_confirmed:
@@ -223,8 +363,19 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 from core.plate_review import machine_result_for_violation
 
-                machine = machine_result_for_violation(db, int(vid))
-                candidates = machine.get("candidates") or []
+                if snapshot_actions is not None:
+                    if any(action.get("review_id") is not None for action in snapshot_actions):
+                        class SnapshotActions:
+                            @staticmethod
+                            def get_case_actions(_violation_id: int) -> list[dict[str, Any]]:
+                                return snapshot_actions
+
+                        machine = machine_result_for_violation(SnapshotActions(), int(vid))
+                    else:
+                        machine = None
+                else:
+                    machine = machine_result_for_violation(db, int(vid))
+                candidates = (machine or {}).get("candidates") or []
                 primary = next(
                     (c for c in candidates if c.get("candidate_id") == machine.get("primary_candidate_id")),
                     candidates[0] if candidates else None,
@@ -240,8 +391,22 @@ def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
-def _fetch_rows(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    rows, _total = db.list_violations(filters=_expand_filters(filters), page=1, per_page=_MAX_ROWS)
+def _fetch_rows(
+    filters: dict[str, Any],
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> list[dict[str, Any]]:
+    snapshot = db.report_export_snapshot(
+        _expand_filters(filters),
+        limit=_MAX_ROWS,
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+        source_video_only=owner_user_id is not None or uploader_id is not None,
+    )
+    if snapshot["total"] > _MAX_ROWS:
+        raise ReportTooLargeError(snapshot["total"])
+    rows = snapshot["rows"]
     return [_enrich_report_row(row) for row in rows]
 
 
@@ -489,13 +654,21 @@ def generate_report(
     filters: dict[str, Any] | None = None,
     title: str | None = None,
     generated_by: int | None = None,
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
 ) -> dict[str, Any]:
     """Build the report file, record it in the database, return the record."""
     if report_format not in ("pdf", "excel"):
         raise ValueError(f"Unsupported report format: {report_format}")
 
     filters = filters or {}
-    rows = _fetch_rows(filters)
+    if owner_user_id is None and uploader_id is None:
+        rows = _fetch_rows(filters)
+    else:
+        rows = _fetch_rows(
+            filters, owner_user_id=owner_user_id, uploader_id=uploader_id
+        )
     title = title or f"Violation Report {datetime.now().strftime('%Y-%m-%d')}"
 
     _validated_report_logo()

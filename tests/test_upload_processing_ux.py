@@ -26,11 +26,20 @@ ZONES = json.dumps({"no_parking": [[10, 10], [100, 10], [100, 100], [10, 100]]})
 
 
 @pytest.fixture(autouse=True)
-def _reset_processing_state(test_db_path):
+def _reset_processing_state(test_db_path, monkeypatch):
     app_module.stop_processing_worker()
     app_module._process_queue.clear()
     app_module._processing_jobs.clear()
     app_module._running_video_id = None
+    from database import sqlite_adapter
+    original_insert_video = sqlite_adapter.insert_video
+    def insert_as_test_enforcer(*args, **kwargs):
+        if kwargs.get("uploaded_by") is None:
+            owner = sqlite_adapter.get_user_by_username("enforcer_test")
+            if owner:
+                kwargs["uploaded_by"] = owner["id"]
+        return original_insert_video(*args, **kwargs)
+    monkeypatch.setattr(sqlite_adapter, "insert_video", insert_as_test_enforcer)
     yield
     app_module.stop_processing_worker()
     app_module._process_queue.clear()

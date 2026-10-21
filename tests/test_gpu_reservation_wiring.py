@@ -19,6 +19,7 @@ import pytest
 import app as app_module
 import config
 from core.gpu_inference_slot import (
+    GpuInferenceSlot,
     PRIORITY_DETAIL_SCAN,
     PRIORITY_LIVE_FRAME,
     PRIORITY_VIDEO_JOB,
@@ -36,6 +37,26 @@ def _wait_until(predicate, timeout: float = 10.0) -> bool:
             return True
         time.sleep(0.01)
     return bool(predicate())
+
+
+def test_gpu_slot_admits_two_inference_jobs_but_not_a_third():
+    """Catches a hard-coded one-holder lock after the two-job benchmark passes."""
+    slot = GpuInferenceSlot(name="test-gpu", capacity=2)
+    first = slot.acquire("video-a", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
+    second = slot.acquire("video-b", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
+    third = slot.acquire("video-c", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
+
+    assert first is not None
+    assert second is not None
+    assert third is None
+    assert slot.snapshot()["holders"] == ["video-a", "video-b"]
+
+    slot.release(first)
+    third = slot.acquire("video-c", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
+    assert third is not None
+    slot.release(second)
+    slot.release(third)
+    assert slot.is_free()
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +114,10 @@ class TestVideoJobHoldsTheReservation:
             return None
 
         monkeypatch.setattr(app_module, "process_video", fake_process)
-        vid = test_db.insert_video(filename="a.mp4", filepath="/tmp/a.mp4", status="ready")
+        owner = test_db.get_user_by_username("enforcer_test")
+        vid = test_db.insert_video(
+            filename="a.mp4", filepath="/tmp/a.mp4", status="ready", uploaded_by=owner["id"]
+        )
         test_db.upsert_annotation(vid, ZONES)
         response = enforcer_client.post(
             f"/api/videos/{vid}/process",
@@ -103,10 +127,12 @@ class TestVideoJobHoldsTheReservation:
         assert response.status_code == 200, response.get_json()
         try:
             assert inside.wait(10.0)
-            # Nothing else may start a pass while the job holds the device.
+            # The second reservation is intentionally available at capacity two.
             assert observed[0].startswith(f"video-job:{vid}:")
-            assert slot.acquire("detail-scan", timeout=0.0, priority=PRIORITY_DETAIL_SCAN) is None
+            detail_token = slot.acquire("detail-scan", timeout=0.0, priority=PRIORITY_DETAIL_SCAN)
+            assert detail_token is not None
             assert slot.acquire("live-frame", timeout=0.0, priority=PRIORITY_LIVE_FRAME) is None
+            slot.release(detail_token)
         finally:
             release.set()
         assert _wait_until(slot.is_free)
@@ -134,30 +160,35 @@ class TestVideoJobHoldsTheReservation:
         slot.release(next_holder)
         assert next_holder is not None
 
-    def test_job_is_requeued_when_the_reservation_never_arrives(self, monkeypatch):
-        """A bounded wait re-queues the job instead of inferring unreserved."""
+    def test_job_is_requeued_when_the_reservation_never_arrives(self, test_db, monkeypatch):
+        """A bounded wait releases its durable claim instead of inferring unreserved."""
         monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 0.05)
         monkeypatch.setattr(
             app_module,
             "_call_process_video",
             lambda *a, **k: pytest.fail("inference must not start unreserved"),
         )
-        blocker = gpu_inference_slot().acquire(
-            "video-job:blocker", timeout=0.0, priority=PRIORITY_VIDEO_JOB
+        blockers = [gpu_inference_slot().acquire(
+            f"video-job:blocker-{index}", timeout=0.0, priority=PRIORITY_VIDEO_JOB
+        ) for index in (1, 2)]
+        assert all(blocker is not None for blocker in blockers)
+        owner = test_db.create_user("slot-owner", "test-hash", role="enforcer")
+        video_id = test_db.insert_video(
+            filename="slot.mp4", filepath="/tmp/slot.mp4", status="ready", uploaded_by=owner
         )
-        assert blocker is not None
+        run_id = test_db.enqueue_processing_run(video_id, "[]")
         with app_module._queue_cv:
-            app_module._process_queue.append((42, (), 4242))
+            app_module._process_queue.append((video_id, (), run_id))
         thread = threading.Thread(target=app_module._processing_worker, daemon=True)
         thread.start()
         try:
-            # The popped job is put back at the head of the queue.
+            # The run remains queued and can be claimed again.
             assert _wait_until(
-                lambda: [e[0] for e in app_module._process_queue] == [42]
+                lambda: test_db.get_processing_run(run_id)["status"] == "queued"
             )
-            assert app_module._process_queue[0][2] == 4242  # the same run, not a new one
         finally:
-            gpu_inference_slot().release(blocker)
+            for blocker in blockers:
+                gpu_inference_slot().release(blocker)
             app_module._worker_shutdown.set()
             with app_module._queue_cv:
                 app_module._queue_cv.notify_all()
@@ -363,14 +394,15 @@ class TestManualScanBusyResponse:
     ):
         _designated_checkpoint(monkeypatch)
         candidate_id = _queue_one_candidate(test_db)
-        token = gpu_inference_slot().acquire(
-            "video-job:held", timeout=0.0, priority=PRIORITY_VIDEO_JOB
-        )
-        assert token is not None
+        tokens = [gpu_inference_slot().acquire(
+            f"video-job:held-{index}", timeout=0.0, priority=PRIORITY_VIDEO_JOB
+        ) for index in (1, 2)]
+        assert all(token is not None for token in tokens)
         try:
             response = enforcer_client.post("/api/motorcycle-detail-review/scan-now")
         finally:
-            gpu_inference_slot().release(token)
+            for token in tokens:
+                gpu_inference_slot().release(token)
         assert response.status_code == 409, response.get_json()
         body = response.get_json()
         assert body["success"] is False
@@ -388,14 +420,15 @@ class TestManualScanBusyResponse:
         _designated_checkpoint(monkeypatch)
         _queue_one_candidate(test_db)
         monkeypatch.setattr(app_module, "_detail_gpu_idle", lambda: True)
-        token = gpu_inference_slot().acquire(
-            "live-frame:camera-1", timeout=0.0, priority=PRIORITY_LIVE_FRAME
-        )
-        assert token is not None
+        tokens = [gpu_inference_slot().acquire(
+            f"live-frame:camera-{index}", timeout=0.0, priority=PRIORITY_LIVE_FRAME
+        ) for index in (1, 2)]
+        assert all(token is not None for token in tokens)
         try:
             response = enforcer_client.post("/api/motorcycle-detail-review/scan-now")
         finally:
-            gpu_inference_slot().release(token)
+            for token in tokens:
+                gpu_inference_slot().release(token)
         assert response.status_code == 409
         body = response.get_json()
         assert body["report"]["skipped"] == "gpu_slot_busy"
@@ -476,8 +509,11 @@ class TestLiveStreamFrameReservation:
 
         worker = live.LiveStreamWorker({"id": 3, "name": "Gate", "rtsp_url": "rtsp://cam-3"})
         slot = gpu_inference_slot()
-        token = slot.acquire("video-job:1", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
-        assert token is not None
+        tokens = [
+            slot.acquire(f"video-job:{index}", timeout=0.0, priority=PRIORITY_VIDEO_JOB)
+            for index in (1, 2)
+        ]
+        assert all(token is not None for token in tokens)
         calls: list[int] = []
 
         class _Detector:
@@ -495,7 +531,8 @@ class TestLiveStreamFrameReservation:
         try:
             worker.run()
         finally:
-            slot.release(token)
+            for token in tokens:
+                slot.release(token)
         assert calls == []
         assert capture.released is True
         assert worker.status == "stopped"

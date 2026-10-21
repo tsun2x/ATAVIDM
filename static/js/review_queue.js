@@ -167,6 +167,8 @@ if (typeof document !== "undefined") {
             ? "Plate (human-verified): " + item.plate_text
             : (plateStatus === "unreadable" ? "Plate: unreadable" : "Plate: no human-verified plate");
         body.innerHTML =
+            '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="reviewEvidenceScale">Evidence size</label>' +
+            '<input id="reviewEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
             '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">Annotated scene</button></li>' +
             '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqRawScene" type="button" role="tab">Raw scene</button></li>' +
@@ -191,6 +193,17 @@ if (typeof document !== "undefined") {
             "<p class=\"small text-muted\">Proposed official: " + escapeHtml(item.proposed_official_category || "—") +
             (item.verified_official_category ? " · Verified: " + escapeHtml(item.verified_official_category) : " · Verified: none") + "</p>" +
             "<p class=\"small text-muted\">Timestamp OCR: unavailable — confirm event time after case materialization.</p>";
+        const resizeEvidence = function (value) {
+            const percent = Math.max(50, Math.min(100, Number(value) || 100));
+            body.querySelectorAll(".evidence-preview").forEach(function (media) {
+                media.style.width = percent + "%";
+                media.style.maxWidth = "none";
+                media.style.height = "auto";
+            });
+        };
+        const evidenceScale = body.querySelector("#reviewEvidenceScale");
+        evidenceScale?.addEventListener("input", function () { resizeEvidence(this.value); });
+        resizeEvidence(100);
         body.querySelectorAll("[data-evidence-clip-mode]").forEach(function (button) {
             button.addEventListener("click", function () {
                 const player = body.querySelector("[data-evidence-clip-player]");

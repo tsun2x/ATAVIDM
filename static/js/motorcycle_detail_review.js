@@ -1,10 +1,10 @@
 /**
- * TAVIDM - Motorcycle Detail Review (separate queue; never a violation case)
+ * TAVIDM - Motorcycle Detail Review
  *
  * Shows scene / padded crop / mapped-box overlay per selected frame, model
  * confidence, association states, and the reasons an observation is uncertain.
- * Records reviewed / uncertain / dismissed outcomes only — there is no
- * confirm-case action in this workflow.
+ * Human-selected outcomes are explicitly confirmed and sent to the audited
+ * review-decision service; model outputs only provide review evidence.
  */
 
 function escapeHtml(value) {
@@ -136,9 +136,6 @@ function uncertaintyList(item) {
 
 function buildEvidenceMarkup(item) {
     const frames = Array.isArray(item.frames) ? item.frames : [];
-    if (!frames.length) {
-        return '<p class="text-muted py-4 mb-0">No stored detail frames for this candidate.</p>';
-    }
     const tabs = [];
     const panes = [];
     frames.forEach(function (frame, i) {
@@ -212,9 +209,29 @@ function buildEvidenceMarkup(item) {
           "</ul>"
         : "<p class='small text-muted mt-3 mb-0'>No recorded uncertainty reasons.</p>";
 
-    return '<ul class="nav nav-tabs mb-3" role="tablist">' + tabs.join("") + "</ul>" +
-        '<div class="tab-content">' + panes.join("") + "</div>" +
-        '<dl class="row small mt-3 mb-0">' + facts + "</dl>" + reasonMarkup;
+    const rawVideo = item.source_video_url
+        ? '<video controls preload="metadata" playsinline class="evidence-preview rounded w-100" data-detail-video data-start-sec="' + escapeHtml(String(item.timestamp_sec || 0)) + '" data-raw-src="' + escapeHtml(item.source_video_url) + '"' + (item.annotated_video_url ? ' data-annotated-src="' + escapeHtml(item.annotated_video_url) + '"' : '') + ' src="' + escapeHtml(item.source_video_url) + '"></video>'
+        : '<p class="text-muted">Source video is unavailable.</p>';
+    const videoMarkup = '<section class="border-bottom pb-3 mb-3"><h6>Evidence video playback</h6>' +
+        '<div class="btn-group btn-group-sm mb-2" role="group" aria-label="Evidence video view">' +
+        '<button type="button" class="btn btn-secondary" data-detail-video-mode="raw">Raw video</button>' +
+        (item.annotated_video_url ? '<button type="button" class="btn btn-outline-secondary" data-detail-video-mode="annotated">Annotated video</button>' : '') +
+        '</div>' + rawVideo + '<p class="small text-muted mb-0">Playback opens near the selected observation at ' + escapeHtml(String(item.timestamp_sec || 0)) + ' seconds.</p></section>';
+    const frameMarkup = frames.length
+        ? '<ul class="nav nav-tabs mb-3" role="tablist">' + tabs.join("") + "</ul><div class='tab-content'>" + panes.join("") + "</div>"
+        : '<p class="text-muted py-3 mb-0">No stored detail-frame images for this candidate. Source video playback is still available when present.</p>';
+    const choices = [
+        ["no_helmet", "No Helmet", "Creates a No Helmet case"],
+        ["nut_shell_helmet", "Nut-shell helmet", "Creates a Substandard / Nut-Shell Helmet case"],
+        ["no_side_mirror", "No Side Mirror", "Creates a No Side Mirror case"],
+        ["no_violation", "No Violation", "Closes this review without creating a case"]
+    ];
+    const choiceMarkup = choices.map(function (choice) {
+        return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="radio" name="detailDecisionChoice" value="' + choice[0] + '"' + (item.scan_state !== "ready" ? " disabled" : "") + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
+    }).join("");
+    return '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="detailEvidenceScale">Evidence size</label><input id="detailEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
+        videoMarkup + frameMarkup + '<dl class="row small mt-3 mb-0">' + facts + "</dl>" + reasonMarkup +
+        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + (item.scan_state !== "ready" ? " disabled" : "") + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span></section>';
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -228,7 +245,8 @@ if (typeof module !== "undefined" && module.exports) {
         frameDetections: frameDetections,
         uncertaintyList: uncertaintyList,
         detailOutcomeRequestBody: detailOutcomeRequestBody,
-        isStaleDetailReviewResponse: isStaleDetailReviewResponse
+        isStaleDetailReviewResponse: isStaleDetailReviewResponse,
+        buildEvidenceMarkup: buildEvidenceMarkup
     };
 }
 
@@ -241,6 +259,8 @@ if (typeof module !== "undefined" && module.exports) {
     const modalTitle = document.getElementById("detailModalTitle");
     const pendingCount = document.getElementById("detailPendingCount");
     const queueStatus = document.getElementById("detailQueueStatus");
+    let activeDecisionItem = null;
+    let activeDecisionRow = null;
     const evidenceModal = modalEl && bootstrap && bootstrap.Modal
         ? new bootstrap.Modal(modalEl)
         : null;
@@ -254,8 +274,90 @@ if (typeof module !== "undefined" && module.exports) {
     function showEvidence(item) {
         if (!modalBody) return;
         modalBody.innerHTML = buildEvidenceMarkup(item);
+        const resize = function (value) {
+            const percent = Math.max(50, Math.min(100, Number(value) || 100));
+            modalBody.querySelectorAll(".evidence-preview").forEach(function (media) {
+                media.style.width = percent + "%";
+                media.style.maxWidth = "none";
+                media.style.height = "auto";
+            });
+        };
+        modalBody.querySelector("#detailEvidenceScale")?.addEventListener("input", function () { resize(this.value); });
+        resize(100);
+        const player = modalBody.querySelector("[data-detail-video]");
+        player?.addEventListener("loadedmetadata", function () {
+            const target = Number(player.dataset.startSec || 0);
+            if (Number.isFinite(target) && target > 0 && target < player.duration) player.currentTime = target;
+        }, { once: true });
+        modalBody.querySelectorAll("[data-detail-video-mode]").forEach(function (button) {
+            button.addEventListener("click", function () {
+                const source = button.dataset.detailVideoMode === "annotated" ? player.dataset.annotatedSrc : player.dataset.rawSrc;
+                if (!source || player.src === new URL(source, window.location.href).href) return;
+                const target = Number(player.dataset.startSec || 0);
+                player.src = source;
+                player.load();
+                player.addEventListener("loadedmetadata", function () {
+                    if (target > 0 && target < player.duration) player.currentTime = target;
+                }, { once: true });
+                modalBody.querySelectorAll("[data-detail-video-mode]").forEach(function (entry) {
+                    const active = entry === button;
+                    entry.classList.toggle("btn-secondary", active);
+                    entry.classList.toggle("btn-outline-secondary", !active);
+                });
+            });
+        });
         if (modalTitle) modalTitle.textContent = "Detail evidence " + item.display_id;
         if (evidenceModal) evidenceModal.show();
+    }
+
+    function submitSelectedDecision() {
+        if (!activeDecisionItem || !activeDecisionRow) return;
+        const selected = modalBody.querySelector("input[name='detailDecisionChoice']:checked");
+        if (!selected) {
+            showToast("Choose an outcome", "Select what the evidence shows before continuing.", "warning");
+            return;
+        }
+        const labels = {
+            no_helmet: "No Helmet case",
+            nut_shell_helmet: "Substandard / Nut-Shell Helmet case",
+            no_side_mirror: "No Side Mirror case",
+            no_violation: "No Violation (no case)"
+        };
+        const label = labels[selected.value];
+        if (!window.confirm("Are you sure? Save this human-reviewed decision as: " + label + "?")) return;
+        const item = activeDecisionItem;
+        const row = activeDecisionRow;
+        setRowBusy(row, true, "Saving decision…");
+        fetch("/api/motorcycle-detail-review/" + item.id + "/decision", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                choice: selected.value,
+                human_confirmed: true,
+                expected_revision: item.review_revision || null,
+                expected_outcome: item.human_outcome || "pending"
+            })
+        }).then(function (response) {
+            return response.json().then(function (payload) { return { ok: response.ok, payload: payload }; });
+        }).then(function (result) {
+            setRowBusy(row, false);
+            if (!result.ok || !result.payload.success) {
+                showToast("Decision not saved", result.payload.error || "The review decision could not be saved.", "danger");
+                return;
+            }
+            if (evidenceModal) evidenceModal.hide();
+            if (item.human_outcome === "pending") updateCounts();
+            if (result.payload.creates_case) {
+                showToast("Violation case created", label + " is now available in Violations.", "success");
+                window.location.href = "/violations";
+                return;
+            }
+            showToast("No violation recorded", "The review is closed and no violation case was created.", "success");
+            window.setTimeout(function () { window.location.reload(); }, 800);
+        }).catch(function () {
+            setRowBusy(row, false);
+            showToast("Decision status unknown", "Reload Motorcycle Detail Review before retrying.", "danger");
+        });
     }
 
     function updateCounts() {
@@ -343,6 +445,8 @@ if (typeof module !== "undefined" && module.exports) {
         try { item = JSON.parse(row.dataset.item); } catch (err) { return; }
 
         if (e.target.closest(".btn-detail-evidence")) {
+            activeDecisionItem = item;
+            activeDecisionRow = row;
             showEvidence(item);
             return;
         }
@@ -354,6 +458,11 @@ if (typeof module !== "undefined" && module.exports) {
                 return;
             }
             postOutcome(item, outcome, row, outcomeButton);
+            return;
         }
+    });
+
+    modalBody?.addEventListener("click", function (e) {
+        if (e.target.closest("[data-detail-submit-choice]")) submitSelectedDecision();
     });
 })();

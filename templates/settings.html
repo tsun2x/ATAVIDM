@@ -158,11 +158,14 @@
                 <div class="mb-4">
                     <div class="d-flex justify-content-between mb-1">
                         <label class="form-label mb-0" for="confidenceThreshold">Detection Confidence Threshold</label>
-                        <span class="threshold-value" id="confidenceValue">{{ (settings.confidence_threshold * 100)|int }}%</span>
+                        <span class="threshold-value">50–100%</span>
                     </div>
-                    <input type="range" class="form-range" id="confidenceThreshold" min="40" max="95"
-                           value="{{ (settings.confidence_threshold * 100)|int }}">
-                    <small class="text-muted">Minimum YOLOv8m confidence for a detection to be tracked</small>
+                    <div class="input-group">
+                        <input type="number" class="form-control" id="confidenceThreshold" min="50" max="100" step="1"
+                               value="{{ (settings.confidence_threshold * 100)|int }}" aria-label="Detection confidence threshold percent">
+                        <span class="input-group-text">%</span>
+                    </div>
+                    <small class="text-muted">Minimum YOLOv8m confidence for a detection to be tracked (50–100%).</small>
                 </div>
                 <div class="row g-2 mb-3">
                     <div class="col-6">
@@ -172,6 +175,14 @@
                     <div class="col-6">
                         <label class="form-label" for="truckBanEnd">Truck Ban End</label>
                         <input type="time" class="form-control" id="truckBanEnd" value="{{ settings.truck_ban_end }}">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label" for="truckBanStart2">Second Truck Ban Start</label>
+                        <input type="time" class="form-control" id="truckBanStart2" value="{{ settings.truck_ban_start_2 }}">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label" for="truckBanEnd2">Second Truck Ban End</label>
+                        <input type="time" class="form-control" id="truckBanEnd2" value="{{ settings.truck_ban_end_2 }}">
                     </div>
                 </div>
                 <div class="row g-2 mb-3">
@@ -211,6 +222,24 @@
                     <div class="col-6">
                         <label class="form-label" for="flowTolerance">Counterflow Tolerance (°)</label>
                         <input type="number" class="form-control" id="flowTolerance" value="{{ settings.flow_tolerance_degrees }}" min="10" max="90">
+                    </div>
+                </div>
+                <hr class="my-4">
+                <h6 class="mb-1">Video Processing Capacity</h6>
+                <p class="text-muted small mb-3">
+                    Limit active upload jobs across the system and per account. Up to three jobs can be active;
+                    the shared GPU inference reservation can make additional active jobs wait for a slot.
+                </p>
+                <div class="row g-2 mb-3">
+                    <div class="col-6">
+                        <label class="form-label" for="maxConcurrentVideoJobs">System-wide active jobs</label>
+                        <input type="number" class="form-control" id="maxConcurrentVideoJobs"
+                               value="{{ processing_limits.max_concurrent_video_jobs }}" min="1" max="3" step="1">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label" for="maxConcurrentJobsPerAccount">Active jobs per account</label>
+                        <input type="number" class="form-control" id="maxConcurrentJobsPerAccount"
+                               value="{{ processing_limits.max_concurrent_jobs_per_account }}" min="1" max="3" step="1">
                     </div>
                 </div>
                 <button type="button" class="btn btn-danger" id="btnSaveSettings"><i class="bi bi-check-lg me-1"></i> Save Settings</button>

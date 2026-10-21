@@ -58,7 +58,11 @@ def viewer(test_db):
 def _review(test_db, violation_type, **kwargs):
     video_id = kwargs.pop("video_id", None)
     if video_id is None:
-        video_id = test_db.insert_video("clip.mp4", "/tmp/clip.mp4", status="ready")
+        owner = next((u for u in test_db.list_users() if u.get("role") == "enforcer"), None)
+        video_id = test_db.insert_video(
+            "clip.mp4", "/tmp/clip.mp4", status="ready",
+            uploaded_by=owner["id"] if owner else None,
+        )
     defaults = dict(
         video_id=video_id,
         track_id=7,

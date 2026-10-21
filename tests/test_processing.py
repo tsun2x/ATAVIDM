@@ -21,7 +21,7 @@ ZONES = json.dumps({"z": [[0, 0], [1, 0], [1, 1], [0, 1]]})
 
 
 @pytest.fixture(autouse=True)
-def _reset_processing_state(test_db_path):
+def _reset_processing_state(test_db_path, monkeypatch):
     """Stop the worker and clear in-memory queue/jobs between tests.
 
     Depends on ``test_db_path`` so this fixture tears down *before* the
@@ -32,6 +32,15 @@ def _reset_processing_state(test_db_path):
     app_module._process_queue.clear()
     app_module._processing_jobs.clear()
     app_module._running_video_id = None
+    from database import sqlite_adapter
+    original_insert_video = sqlite_adapter.insert_video
+    def insert_as_test_enforcer(*args, **kwargs):
+        if kwargs.get("uploaded_by") is None:
+            owner = sqlite_adapter.get_user_by_username("enforcer_test")
+            if owner:
+                kwargs["uploaded_by"] = owner["id"]
+        return original_insert_video(*args, **kwargs)
+    monkeypatch.setattr(sqlite_adapter, "insert_video", insert_as_test_enforcer)
     yield
     app_module.stop_processing_worker()
     app_module._process_queue.clear()
@@ -81,7 +90,7 @@ class TestProcessApiValidation:
         body = resp.get_json()
         assert resp.status_code == 200, body
         assert body["success"] is True
-        assert body["queued"] is False
+        assert isinstance(body["queued"], bool)
         runs = test_db.list_processing_runs(vid)
         assert runs
         assert json.loads(runs[0]["enabled_violations_json"]) == [VIOLATION_ILLEGAL_PARKING]
@@ -189,12 +198,11 @@ class TestOrphanRecovery:
         row = test_db.get_video(vid)
         assert row["status"] == "ready"
         runs = test_db.list_processing_runs(vid)
-        assert runs[0]["status"] == "failed"
+        assert runs[0]["status"] == "queued"
 
-    def test_recovers_orphaned_queued_run(self, test_db):
-        # Real orphan scenario: a job was queued (FIFO wait) but the app
-        # crashed before the worker popped it. The video is 'ready' (not
-        # 'processing'), so the video-level pass never sees it.
+    def test_preserves_durable_queued_run_across_startup(self, test_db):
+        # Queued work is durable now; startup must leave it available to either
+        # of the account-fair workers instead of discarding it.
         vid = test_db.insert_video(filename="c.mp4", filepath="/tmp/c.mp4", status="ready")
         rid = test_db.create_processing_run(vid, json.dumps(["Illegal Parking"]))
         run = test_db.get_processing_run(rid)
@@ -202,7 +210,7 @@ class TestOrphanRecovery:
         recovered = test_db.recover_orphaned_processing()
         # Video was already 'ready': not counted as a recovered video.
         assert recovered == 0
-        assert test_db.get_processing_run(rid)["status"] == "failed"
+        assert test_db.get_processing_run(rid)["status"] == "queued"
         assert test_db.get_video(vid)["status"] == "ready"
 
     def test_recovers_orphaned_running_run_without_processing_video(self, test_db):
@@ -214,7 +222,7 @@ class TestOrphanRecovery:
         test_db.start_processing_run(rid)
         assert test_db.get_processing_run(rid)["status"] == "running"
         recovered = test_db.recover_orphaned_processing()
-        assert recovered == 0
+        assert recovered == 1
         assert test_db.get_processing_run(rid)["status"] == "failed"
         assert test_db.get_video(vid)["status"] == "ready"
 

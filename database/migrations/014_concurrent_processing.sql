@@ -1,0 +1,3 @@
+-- Applied idempotently by sqlite_adapter._apply_migration_014.
+-- Additive worker claims, leases, cross-process cancellation, and account fairness.
+-- Fresh-database definitions are kept in database/schema.sql.

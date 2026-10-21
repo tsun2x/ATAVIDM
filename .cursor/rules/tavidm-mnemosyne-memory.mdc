@@ -24,3 +24,5 @@ Operating loop: **Inspect → Retrieve → Reconcile → Implement → Test → 
 - Never store secrets.
 - Do not claim memory was saved unless a subsequent recall confirms the stored value.
 - If Mnemosyne is unavailable, continue development and do not pretend persistence succeeded.
+- The project commands `/save-prompt <name>` and `/use-prompt <name>` manage user-approved reusable prompts in Mnemosyne. Saving only stores the agreed plan as a prompt; it does not run it. Loading only retrieves and presents it; wait for explicit instruction before execution.
+- These commands require the Mnemosyne MCP tools to be connected in Cursor. If unavailable, report the limitation and do not claim the prompt was saved or loaded.

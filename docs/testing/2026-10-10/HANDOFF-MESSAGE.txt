@@ -1,0 +1,12 @@
+Team: use the attached TAVIDM test packet. Every assigned scenario needs a completed results row and evidence. “Works,” “done,” or an unsupported PASS will be returned as incomplete.
+
+Tester A: network, login, accounts, access permissions.
+Tester B: upload, annotation, processing, live camera and owner-supervised recovery/deletion.
+Tester C: evidence, review decisions, cases/printing, reports and analytics.
+Everyone: usability and independently labelled detection footage.
+
+Use only the coordinator's disposable test deployment/accounts/files. Record the build, account role, input IDs, exact steps, expected vs actual behavior, and result after reloading. Never include passwords, cookies or camera credentials.
+
+Use PASS only with observed evidence. Missing clips/camera/context = BLOCKED with the missing prerequisite and responsible person. Known limitations must be stated, not hidden. Review the detector's false positives and misses using the supplied event sheet; do not call every absent candidate a true negative.
+
+Submit your own test-results.csv, evidence folder, detailed bug forms, detection-events.csv and a final summary. Keep failed runs; retests get new execution IDs. Submit by the deadline the coordinator provides. The coordinator will reject incomplete rows and list all untested items before any readiness claim.

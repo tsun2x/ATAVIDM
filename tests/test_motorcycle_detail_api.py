@@ -124,7 +124,12 @@ def _create_user(username, password, role):
 @pytest.fixture
 def detail_enforcer(seeded):
     """Enforcer client created *after* the schema exists (no forced re-init)."""
-    return _create_user("detail_enforcer", "enforcer-pass-1", "enforcer")
+    client = _create_user("detail_enforcer", "enforcer-pass-1", "enforcer")
+    from database import db
+    owner = db.get_user_by_username("detail_enforcer")
+    with db.db_session() as conn:
+        conn.execute("UPDATE videos SET uploaded_by = ? WHERE id = ?", (owner["id"], seeded[0]))
+    return client
 
 
 @pytest.fixture
@@ -150,7 +155,7 @@ class TestAccessControl:
         assert response.status_code == 200
         body = response.get_data(as_text=True)
         assert "Motorcycle Detail Review" in body
-        assert "no confirm action" in body
+        assert "human confirmation is required" in body.lower()
         assert "t7g1" in body
 
     def test_list_api_requires_authentication(self, client, seeded):
@@ -171,6 +176,22 @@ class TestAccessControl:
         assert detail_enforcer.get(
             "/api/motorcycle-detail-review?scan_state=bogus"
         ).status_code == 400
+
+    def test_viewer_cannot_confirm_motorcycle_case(self, detail_viewer, seeded):
+        _, candidate_id = seeded
+        response = detail_viewer.post(
+            f"/api/motorcycle-detail-review/{candidate_id}/confirm-no-helmet",
+            json={"reason": "checked"},
+        )
+        assert response.status_code in (302, 403)
+
+    def test_candidate_without_gated_linked_review_cannot_confirm(self, detail_enforcer, seeded):
+        _, candidate_id = seeded
+        response = detail_enforcer.post(
+            f"/api/motorcycle-detail-review/{candidate_id}/confirm-no-helmet",
+            json={"reason": "checked"},
+        )
+        assert response.status_code == 409
         assert detail_enforcer.get(
             "/api/motorcycle-detail-review?outcome=confirmed"
         ).status_code == 400
@@ -204,8 +225,53 @@ class TestAccessControl:
         )
         assert response.status_code == 404
 
+    def test_gated_positive_scan_can_be_explicitly_confirmed_into_case(self, detail_enforcer, seeded, test_db):
+        video_id, candidate_id = seeded
+        run_id = test_db.create_processing_run(video_id, json.dumps(["No Helmet"]))
+        test_db.start_processing_run(run_id)
+        test_db.finish_processing_run(run_id)
+        with test_db.db_session() as conn:
+            conn.execute("UPDATE motorcycle_detail_candidates SET processing_run_id = ? WHERE id = ?", (run_id, candidate_id))
+        observations = {
+            "scan": {"contract": "md-detail-4c-v1", "class_map": {"3": "no_helmet"}},
+            "frames": [
+                {"index": index, "detections": [{"class_label": "no_helmet", "evidence_limited": False}]}
+                for index in (1, 2)
+            ],
+        }
+        test_db.finish_motorcycle_detail_scan(
+            candidate_id=candidate_id,
+            observations_json=json.dumps(observations),
+            association_json=json.dumps({"helmet": {"state": "uncovered_head"}, "rider": {"state": "associated"}}),
+            uncertainty_json="[]", scan_model="md4c:test", scan_class_map_json="[]",
+            no_helmet_review_candidate={
+                "confidence": 0.8, "detection_confidence": 0.8, "violation_confidence": 0.8,
+                "frame_number": 10, "timestamp_sec": 1.0, "evidence_path": str(detail_env_path(test_db, candidate_id)),
+                "reason_log": "Two positive review frames.",
+            },
+        )
+        item = detail_enforcer.get("/api/motorcycle-detail-review").get_json()["items"][0]
+        assert item["can_confirm"] is True
+        denied_without_reason = detail_enforcer.post(
+            f"/api/motorcycle-detail-review/{candidate_id}/confirm-no-helmet", json={"reason": " "}
+        )
+        assert denied_without_reason.status_code == 400
+        confirmed = detail_enforcer.post(
+            f"/api/motorcycle-detail-review/{candidate_id}/confirm-no-helmet",
+            json={"reason": "Reviewed two clear associated rider frames."},
+        )
+        assert confirmed.status_code == 200, confirmed.get_json()
+        assert confirmed.get_json()["creates_case"] is True
+        assert confirmed.get_json()["violation_id"]
+
+
+def detail_env_path(test_db, candidate_id):
+    row = test_db.get_motorcycle_detail_candidate(candidate_id)
+    return json.loads(row["frames_json"])[0]["scene_path"]
+
     def test_evidence_outside_the_private_root_is_refused(self, detail_enforcer, test_db, detail_env):
-        video_id = test_db.insert_video("leak.mp4", "/tmp/leak.mp4", status="processed")
+        owner = test_db.get_user_by_username("detail_enforcer")
+        video_id = test_db.insert_video("leak.mp4", "/tmp/leak.mp4", status="processed", uploaded_by=owner["id"])
         outside = detail_env.parent / "outside.jpg"
         assert cv2.imwrite(str(outside), np.full((10, 10, 3), 1, dtype=np.uint8))
         candidate_id = _seed(test_db, video_id, run_key="run_leak", occurrence_key="t1g1")
@@ -293,15 +359,16 @@ class TestOutcomeEndpoint:
         same_outcome = second_reviewer.post(path, json={
             "outcome": "uncertain", "notes": "second reviewer notes", "expected_revision": rev0,
         })
-        assert same_outcome.status_code == 409
+        # The other account cannot inspect or compare-and-set this private candidate.
+        assert same_outcome.status_code == 404
         saved_after_conflicts = test_db.get_motorcycle_detail_candidate(candidate_id)
         assert saved_after_conflicts["reviewed_by"] == saved_by
         assert saved_after_conflicts["reviewed_at"] == saved_at
         assert saved_after_conflicts["reviewer_notes"] == "first reviewer notes"
 
         # Current revision may change outcome; old token cannot perform ABA.
-        changed = second_reviewer.post(path, json={
-            "outcome": "reviewed", "notes": "second reviewer notes", "expected_revision": rev1,
+        changed = detail_enforcer.post(path, json={
+            "outcome": "reviewed", "notes": "updated reviewer notes", "expected_revision": rev1,
         })
         assert changed.status_code == 200
         aba = detail_enforcer.post(path, json={
@@ -310,8 +377,8 @@ class TestOutcomeEndpoint:
         assert aba.status_code == 409
         current = test_db.get_motorcycle_detail_candidate(candidate_id)
         assert current["human_outcome"] == "reviewed"
-        assert current["reviewed_by"] != saved_by
-        assert current["reviewer_notes"] == "second reviewer notes"
+        assert current["reviewed_by"] == saved_by
+        assert current["reviewer_notes"] == "updated reviewer notes"
 
     def test_success_response_uses_snapshot_written_by_its_transaction(
         self, detail_enforcer, seeded, test_db, monkeypatch
@@ -405,7 +472,8 @@ class TestOutcomeEndpoint:
             assert detail_enforcer.post(path, json={}).status_code == 404
 
     def test_existing_review_queue_confirm_api_is_unchanged(self, detail_enforcer, test_db):
-        video_id = test_db.insert_video("legacy.mp4", "/tmp/legacy.mp4", status="processed")
+        owner = test_db.get_user_by_username("detail_enforcer")
+        video_id = test_db.insert_video("legacy.mp4", "/tmp/legacy.mp4", status="processed", uploaded_by=owner["id"])
         review_id = test_db.insert_review_queue(
             video_id=video_id,
             track_id=1,

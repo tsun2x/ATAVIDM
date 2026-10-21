@@ -135,6 +135,8 @@
         this.offsetY = 0;
         this.image = options.image || null;
         this.dragIndex = -1;
+        this.isEditingSelected = false;
+        this.hoveredId = null;
         this.isPanning = false;
         this.panStart = null;
         this._destroyed = false;
@@ -307,14 +309,11 @@
             return;
         }
 
-        var hit = this._hitPoint(coords[0], coords[1]);
-        if (hit) {
-            this.scene.select(hit.id);
-            this.objectKind = hit.kind;
-            this.objectType = this.scene.findById(hit.id).object.type;
-            this.dragIndex = hit.pointIndex;
-            this.draw();
-            this._emitChange();
+        if (this.isEditingSelected) {
+            var hit = this._hitPoint(coords[0], coords[1]);
+            if (hit && hit.id === this.scene.selectedId) {
+                this.dragIndex = hit.pointIndex;
+            }
             return;
         }
 
@@ -345,10 +344,10 @@
     };
 
     ZoneEditor.prototype._handleDblClick = function (e) {
-        if (!this.image) return;
+        if (!this.image || !this.isEditingSelected) return;
         var coords = this._toImageCoords(e.clientX, e.clientY);
         var hit = this._hitPoint(coords[0], coords[1]);
-        if (!hit) return;
+        if (!hit || hit.id !== this.scene.selectedId) return;
         var found = this.scene.findById(hit.id);
         if (!found) return;
         found.object.points.splice(hit.pointIndex, 1);
@@ -390,6 +389,7 @@
         var points = obj.points || [];
         if (!points.length) return;
         var selected = obj.id === this.scene.selectedId;
+        var hovered = obj.id === this.hoveredId;
         var color = typeColor(kind, obj.type, this.zoneTypes);
         var closed = kind === "zones" || kind === "lanes" || kind === "activity_regions" || kind === "signs";
         ctx.beginPath();
@@ -398,8 +398,13 @@
             else ctx.lineTo(pt[0], pt[1]);
         });
         if (closed && points.length >= 3) ctx.closePath();
+        ctx.save();
+        if (hovered) {
+            ctx.shadowColor = color;
+            ctx.shadowBlur = 16;
+        }
         ctx.strokeStyle = color;
-        ctx.lineWidth = selected ? 3 : 2;
+        ctx.lineWidth = selected || hovered ? 4 : 2;
         if (closed && points.length >= 3) {
             ctx.fillStyle = this._hexToRgba(color, selected ? 0.35 : 0.18);
             ctx.fill();
@@ -423,6 +428,7 @@
             ctx.font = "12px sans-serif";
             ctx.fillText(obj.id + " · " + obj.type, points[0][0] + 8, points[0][1] - 8);
         }
+        ctx.restore();
     };
 
     ZoneEditor.prototype.draw = function () {
@@ -450,6 +456,8 @@
     };
 
     ZoneEditor.prototype.setActiveZone = function (key) {
+        this.scene.selectedId = null;
+        this.isEditingSelected = false;
         this.activeZone = key;
         if (key === "active_lane") {
             this.objectKind = "lanes";
@@ -472,12 +480,14 @@
         if (kind === "lanes") this.activeZone = "active_lane";
         else if (kind === "zones") this.activeZone = this.objectType;
         this.scene.selectedId = null;
+        this.isEditingSelected = false;
         this.draw();
         this._emitChange();
     };
 
     ZoneEditor.prototype.newObject = function () {
         this.scene.selectedId = null;
+        this.isEditingSelected = false;
         this.draw();
         this._emitChange();
         return true;
@@ -486,6 +496,8 @@
     ZoneEditor.prototype.deleteSelected = function () {
         if (!this.scene.selectedId) return false;
         var ok = this.scene.delete(this.scene.selectedId);
+        this.isEditingSelected = false;
+        this.hoveredId = null;
         this.draw();
         this._emitChange();
         return ok;
@@ -533,6 +545,25 @@
     ZoneEditor.prototype.selectedObject = function () {
         var found = this.scene.findById(this.scene.selectedId);
         return found ? found.object : null;
+    };
+
+    ZoneEditor.prototype.selectObjectForEditing = function (id) {
+        var found = this.scene.findById(id);
+        if (!found) return false;
+        this.scene.select(id);
+        this.objectKind = found.kind;
+        this.objectType = found.object.type;
+        this.isEditingSelected = true;
+        if (found.kind === "lanes") this.activeZone = "active_lane";
+        else if (found.kind === "zones") this.activeZone = found.object.type;
+        this.draw();
+        this._emitChange();
+        return true;
+    };
+
+    ZoneEditor.prototype.setHoveredObject = function (id) {
+        this.hoveredId = id && this.scene.findById(id) ? id : null;
+        this.draw();
     };
 
     ZoneEditor.prototype.destroy = function () {

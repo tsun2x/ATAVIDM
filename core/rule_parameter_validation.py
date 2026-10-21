@@ -12,11 +12,12 @@ import re
 from typing import Any
 
 from core.detection_config import DEFAULT_RULE_PARAMETERS
+from database.processing_limits import MAX_PROCESSING_LIMIT
 
 # HTML control bounds from templates/settings.html (min/max attributes).
-# confidence_threshold is stored as a fraction; the slider uses percent 40–95.
+# confidence_threshold is stored as a fraction; the field uses percent 50–100.
 RULE_PARAMETER_BOUNDS: dict[str, dict[str, float]] = {
-    "confidence_threshold": {"min": 0.40, "max": 0.95},
+    "confidence_threshold": {"min": 0.50, "max": 1.00},
     "frame_skip": {"min": 1.0, "max": 10.0},
     "stopping_dwell_sec": {"min": 1.0},
     "parking_dwell_sec": {"min": 1.0},
@@ -32,6 +33,38 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 class RuleParameterValidationError(ValueError):
     """Raised when one or more rule-parameter values fail validation."""
+
+
+def validate_processing_limits(
+    payload: dict[str, Any],
+    *,
+    current: dict[str, int],
+) -> dict[str, int]:
+    """Validate admin-edited concurrency limits without partial coercion."""
+    keys = ("max_concurrent_video_jobs", "max_concurrent_jobs_per_account")
+    result: dict[str, int] = {}
+    errors: list[str] = []
+    for key in keys:
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if isinstance(raw, bool):
+            errors.append(f"{key} must be an integer from 1 to {MAX_PROCESSING_LIMIT}.")
+            continue
+        try:
+            value = int(raw)
+            if str(raw).strip() != str(value) or not 1 <= value <= MAX_PROCESSING_LIMIT:
+                raise ValueError
+            result[key] = value
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be an integer from 1 to {MAX_PROCESSING_LIMIT}.")
+
+    effective = {**current, **result}
+    if effective["max_concurrent_jobs_per_account"] > effective["max_concurrent_video_jobs"]:
+        errors.append("Per-account concurrent jobs cannot exceed the system-wide limit.")
+    if errors:
+        raise RuleParameterValidationError(" ".join(errors))
+    return result
 
 
 def _parse_finite_number(raw: Any, *, key: str) -> float:
@@ -90,7 +123,7 @@ def validate_rule_parameters(
         raw = payload[key]
         default = defaults[key]
         try:
-            if key in ("truck_ban_start", "truck_ban_end"):
+            if key in ("truck_ban_start", "truck_ban_end", "truck_ban_start_2", "truck_ban_end_2"):
                 result[key] = _validate_time(raw, key=key)
             elif key == "truck_ban_classes":
                 if isinstance(raw, str):
