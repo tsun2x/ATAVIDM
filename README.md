@@ -1,391 +1,106 @@
-# First-Time Setup — TAVIDM
+# TAVIDM
 
-**Traffic Violation Detection and Monitoring System**
-
-Use this guide after cloning the repository from GitHub for the first time on a new machine.
-
-Repository: [https://github.com/tsun2x/ATAVIDM](https://github.com/tsun2x/ATAVIDM)
-
----
-
-## What you are setting up
-
-TAVIDM is a **Flask web application** that detects traffic violations in recorded MP4 videos and RTSP live streams. The current branch includes:
-
-- **YOLOv8m + ByteTrack** detection pipeline (Ultralytics) with a rule-based violation engine (ROI, dwell-time, direction, object counting, and time-based rules)
-- MP4 video upload, zone annotation, and reusable zone templates
-- RTSP live camera streams with on-frame detection overlays
-- Manual review queue (all detections are validated by an operator before confirmation)
-- Analytics dashboards and real PDF/Excel report generation
-- Authentication with three roles: System Administrator, Traffic Enforcement Officer, Guest Viewer
-
-Custom-trained YOLOv8m weights (with helmet/rider classes) are loaded from `models/` when present; otherwise the pretrained COCO YOLOv8m checkpoint is downloaded automatically on first processing run. Helmet-based rules stay inactive until custom weights are provided.
-
-Phase 2 full training is currently blocked pending dataset and governance evidence. See `docs/PHASE_2_AI_TRAINING_READINESS.md`, `docs/SYSTEM_TRUTH_INDEX.md`, and run `.\venv\Scripts\python.exe -m core.phase2_readiness` to view the machine-enforced entry-gate findings. The frozen pilot label contract is `config/training/class_schema.json` (schema_version **1.3.0**: **10** vehicle detector classes including `pickup_truck` and `autorickshaw`; SUV/crossover is consolidated into `car`; **24** total pilot labels).
-
----
+TAVIDM is a local Flask application for reviewing traffic footage and possible traffic violations. It stores uploaded videos and evidence in the project data folders and uses SQLite for application records.
 
 ## Requirements
 
-| Requirement | Version | Check |
-|-------------|---------|-------|
-| Python | 3.10 or newer (3.9+ may work) | `python --version` |
-| pip | Recent | `pip --version` |
-| Git | Any | `git --version` |
-| Internet | For CDN assets | Bootstrap, Chart.js, fonts load from CDN in the browser |
+- Windows, macOS, or Linux
+- Python 3.10 or newer
+- Git
+- Enough free disk space for the video and generated frames/evidence
 
-**Recommended:** 4 GB+ RAM, Windows/macOS/Linux.
+The project does not pin a GPU-specific PyTorch or CUDA installation in `requirements.txt`. Processing speed and GPU availability depend on the machine and its installed runtime. The first model load may need internet access to obtain the pretrained YOLOv8m weights if no suitable local weights are available.
 
----
+## Quick start
 
-## 1. Clone the repository
+Run these commands from the directory where you want the project cloned. Replace the password placeholder with a private password of at least 12 characters. Do not commit or share it.
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/tsun2x/ATAVIDM.git
+cd ATAVIDM
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:TAVIDM_BOOTSTRAP_ADMIN_PASSWORD = 'replace-with-a-private-password-of-12-or-more-characters'
+$env:FLASK_SECRET_KEY = (.\venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(32))").Trim()
+.\venv\Scripts\python.exe app.py
+```
+
+### macOS or Linux
 
 ```bash
 git clone https://github.com/tsun2x/ATAVIDM.git
 cd ATAVIDM
-```
-
-If you use a specific branch (for example Phase 1 work):
-
-```bash
-git checkout cursor/phase-1-foundation
-```
-
----
-
-## 2. Create a virtual environment
-
-Isolates project dependencies from your system Python.
-
-### Windows (PowerShell)
-
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks activation:
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-.\venv\Scripts\Activate.ps1
-```
-
-### Windows (Command Prompt)
-
-```cmd
-python -m venv venv
-venv\Scripts\activate.bat
-```
-
-### macOS / Linux
-
-```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-When active, your prompt shows `(venv)`.
-
----
-
-## 3. Install dependencies
-
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-This installs Flask, OpenCV, NumPy, and other packages listed in `requirements.txt`. The first install may take several minutes (OpenCV and related packages are large).
-
-**Verify Flask:**
-
-```bash
-python -c "import flask; print(flask.__version__)"
-```
-
-**Verify OpenCV (needed for frame extraction on upload):**
-
-```bash
-python -c "import cv2; print(cv2.__version__)"
-```
-
----
-
-## 4. Optional environment configuration
-
-Copy the example env file:
-
-```bash
-# Windows
-copy .env.example .env
-
-# macOS / Linux
-cp .env.example .env
-```
-
-Edit `.env` if needed:
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `FLASK_SECRET_KEY` | Random per-process in development; required in production | Flask session signing |
-| `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` | Required for first admin setup or replacement of legacy `admin123` | Initial admin password (12+ characters) |
-| `DB_BACKEND` | `sqlite` | Active database backend |
-| `DATABASE_URL` | `database/tavidm.db` | Backend connection target (sqlite path or future DSN) |
-| `SQLITE_PATH` | `database/tavidm.db` | Legacy sqlite alias (optional) |
-| `UPLOAD_FOLDER` | `dataset/raw` | Uploaded MP4 storage |
-| `MAX_UPLOAD_MB` | `3072` | Max single upload size in MB (3 GiB; env-driven; UI shows it on the upload panel) |
-| `UPLOAD_DISK_HEADROOM_MB` | `500` | Free-disk headroom (MB) required *in addition to* the file size before an upload is accepted |
-
-The app runs without a `.env` file — defaults are used. `.env` is gitignored.
-
-### Recorded-footage uploads (large files)
-
-Uploaded MP4s are saved **in full** to `dataset/raw`, so multi-GB footage is
-not "free". Two guards protect the host:
-
-- **Size limit** — `MAX_UPLOAD_MB` (default `3072`, or 3 GiB) enforces the hard cap and
-  returns a clear `413`/`400` when exceeded. Raise it only after confirming
-  there is enough free disk for the file plus headroom.
-- **Disk-space pre-check** — before saving, the upload path is checked with
-  `shutil.disk_usage`. The request must leave at least `UPLOAD_DISK_HEADROOM_MB`
-  (default `500` MB) free; otherwise it is rejected with a clear error instead
-  of filling the volume mid-write.
-
-### Sequential processing queue
-
-Only **one** video is processed at a time (a single YOLOv8m + ByteTrack
-inference job — the RTX 3050 6 GB cannot run two). Each `POST
-/api/videos/<id>/process` request:
-
-1. Opens a **pre-processing confirmation modal** listing the 12 canonical
-   violation types as toggles (defaults = current global enabled set from
-   Settings). The submitted list is the **run's frozen snapshot** — later
-   changes to global Settings do not affect an in-flight run.
-2. On submit, validates the list via `validate_enabled_violations()` and
-   persists it in the `processing_runs` table (`enabled_violations_json`).
-3. Enqueues the job. A second video is **auto-queued** (response
-   `queued: true`) and runs after the first; requesting the *same* video again
-   returns `409`.
-4. On restart, any video left in `processing` is reset to `ready` and its
-   `processing_runs` row marked `failed` (orphan recovery).
-
----
-
-## 5. Folder structure (created automatically)
-
-On first run, the app creates what it needs:
-
-```
-tavidm/
-├── database/tavidm.db      ← SQLite (created on first run)
-├── dataset/raw/            ← Uploaded MP4 files
-├── dataset/frames/         ← Extracted first frames for zone editor
-├── dataset/evidence/       ← Private evidence (served after sign-in)
-├── dataset/reports/        ← Private generated reports (served after sign-in)
-└── venv/                   ← Your virtual environment (not in git)
-```
-
-You do **not** need to run a separate database script. Starting the app calls `db.init_db()` and applies schema migrations automatically.
-
----
-
-## 6. Run the application
-
-From the project root (where `app.py` is located), with the virtual environment active:
-
-For the first launch, set the bootstrap admin password before starting the app;
-the required setup and PowerShell example are in **7.A Configure first-run credentials**.
-
-```bash
+python -m pip install -r requirements.txt
+export TAVIDM_BOOTSTRAP_ADMIN_PASSWORD='replace-with-a-private-password-of-12-or-more-characters'
+export FLASK_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 python app.py
 ```
 
-Expected output:
+Open <http://127.0.0.1:5000>. Sign in with username `admin` and the password you set above. The bootstrap password is used when the application creates the initial administrator or upgrades a legacy insecure default account. It does not reset an administrator account that already has a secure password. To change an existing account password, use **Settings → Individual Account Access → Edit**.
 
-```
- * Serving Flask app 'app'
- * Debug mode: off
- * Running on http://127.0.0.1:5000
-```
+For repeat runs, set the same `FLASK_SECRET_KEY` and administrator password in your shell before starting the app, or put them in a private `.env` file in the repository root. The quick-start command generates a key for your local session; keep that value stable across restarts so browser sessions remain valid. `.env.example` contains blank placeholders and is not ready to use as-is. Environment variables take precedence over `.env`. Production mode requires an explicit secret key and enables secure session cookies; `python app.py` starts Flask's development server and is intended for local development.
 
-Open a browser:
+## First use
 
-**http://localhost:5000**
+1. Sign in as the administrator.
+2. Open **Video Upload**, select an MP4 video, and upload it.
+3. Open the video annotation page and mark the applicable zones. The supported zone types are `no_parking`, `active_lane`, `pedestrian_crossing`, `truck_ban_zone`, `loading_unloading`, and `restricted_lane`.
+4. Save the annotations and start processing.
+5. Review generated cases and evidence. Model output is decision support; review cases before treating them as confirmed violations.
+6. Open **Reports** to preview or export cases. Reports are restricted to administrators and enforcement officers.
+7. Use the application menu to sign out, then stop the local server with `Ctrl+C` in its terminal.
 
----
+## Accounts and access
 
-## 7. First-time walkthrough
+- **System Administrator (`admin`)** manages accounts and settings and can use all application areas.
+- **Traffic Enforcement Officer (`enforcer`)** can review enforcement cases and generate reports.
+- **Guest Viewer (`viewer`)** has limited, read-only access.
 
-### A. Configure first-run credentials
+The application creates its initial administrator at first startup. Configure `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` before that startup; there is no shared default password.
 
-Before the first run, set `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` in `.env` to a
-unique password of at least 12 characters. The app uses it to create the admin
-account and will also replace the old `admin123` bootstrap password if that
-legacy account exists. Set `FLASK_SECRET_KEY` in `.env` to a stable random
-secret for deployments; development creates a temporary random key when it is
-omitted. Production mode refuses to start without an explicit key.
+## Processing and supported detections
 
-PowerShell example for one terminal session (keep the values private; a stable
-key must be reused after restarts):
+The standard detector uses the YOLOv8m model family with ByteTrack. The configured object map has 15 classes: 10 vehicle classes from `config/training/class_schema.json`, plus person, rider, acceptable helmet, nut-shell helmet, and side mirror. A custom detector must have a class map compatible with the ordered schema. When no recognized custom weights are available, the application can fall back to pretrained YOLOv8m COCO weights; that fallback does not provide TAVIDM-specific classes.
 
-```powershell
-$env:TAVIDM_BOOTSTRAP_ADMIN_PASSWORD = 'replace-this-with-your-own-unique-password'
-$env:FLASK_SECRET_KEY = (& python -c "import secrets; print(secrets.token_hex(32))").Trim()
-```
+The canonical registry contains 12 violation types. Four have a complete candidate processing path: obstruction, counterflow, truck-ban violation, and motorcycle overloading. The other eight have partial coverage; some depend on motorcycle-detail model evidence. A listed or enabled rule does not mean it is fully implemented, validated, or suitable for automatic enforcement. Missing or uncertain visual evidence must be reviewed rather than treated as proof that a violation occurred.
 
-### B. Change or reset an account password
+The optional motorcycle-detail model is configured separately. For its readiness and evidence limits, see [Phase 2 AI training readiness](docs/PHASE_2_AI_TRAINING_READINESS.md) and the [system truth index](docs/SYSTEM_TRUTH_INDEX.md).
 
-An active System Administrator can set a user's password in **Settings → Individual Account Access → Edit**. Leave the password field blank to keep the current password. Changing a password invalidates that user's existing sessions on their next request. The bootstrap variable is for first-run creation or replacing the insecure legacy `admin123` account; it does not reset an already-secured account. TAVIDM has no self-service password reset or recovery flow if every administrator account is inaccessible.
+The processing queue uses SQLite-backed claims. The default admission limits are three active jobs overall and one per account; the application starts two local worker threads. These are software limits, not a promise of processing speed or hardware capacity. Large workloads and multi-process GPU deployment need separate capacity evaluation.
 
-### C. Sign in
+Report export is capped at 5,000 matching cases per request. Narrow the report filters when a larger result set is reported as exceeding the cap.
 
-Open **http://localhost:5000** — you are redirected to the login page.
+## Files and storage
 
-| Username | Password | Role |
-|----------|----------|------|
-| `admin` | The value of `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` | System Administrator |
+- Original uploads: `dataset/raw/`
+- Extracted frames: `dataset/frames/`
+- Annotated output: `dataset/annotated/`
+- Other evidence and report files: under `dataset/`
+- SQLite application database: `database/tavidm.db` by default (overridable with `SQLITE_PATH` or `DATABASE_URL`)
 
-The in-memory video processing queue is shared by threads in one app process.
-Run one worker process; multiple WSGI worker processes would each have a separate
-queue and could process videos concurrently.
+MP4 is the default allowed upload format and the default maximum upload size is 3 GiB. Upload requires at least 500 MiB of additional free disk headroom; processing outputs need further space. Back up the database and data folders together using an application-aware maintenance procedure. Do not delete the database as a troubleshooting step: it contains account and application records.
 
-### D. Explore the UI
+## Model weights
 
-| URL | Page |
-|-----|------|
-| `/` | Dashboard (live statistics from the database) |
-| `/live-monitor` | RTSP cameras, video upload + processing |
-| `/violations` | Confirmed/dismissed violation records |
-| `/analytics` | Trends, breakdowns, vehicle classifications |
-| `/reports` | PDF / Excel report generation (enforcer/admin) |
-| `/settings` | Rule parameters, cameras, templates, users (admin) |
-| `/review-queue` | Manual validation of detections (enforcer/admin) |
+Place a compatible custom detector in `models/`. The application checks `tavidm_yolov8m.pt`, `best.pt`, and `yolov8m_custom.pt` before using the pretrained `yolov8m.pt` fallback. The model's ordered class map must match the configured TAVIDM schema. Installing weights does not establish model accuracy or validate violation decisions.
 
-### C. Upload and process your first video
+## Troubleshooting
 
-1. Go to **Live Monitor**.
-2. Drag and drop an **MP4** file (or click Browse).
-3. Choose a traffic condition (morning / peak / nighttime).
-4. Click **Upload**.
-5. The **Zone Annotation** wizard opens with the first frame extracted from the video.
-6. Choose **Use Existing Zone Template** or **Create New Zone Annotation**.
-7. Draw at least one zone polygon (3+ points each). Available zones:
-   - No Parking Zone
-   - Active Lane
-   - Pedestrian Crossing
-   - Truck Ban Zone
-   - No Loading/Unloading Zone
-   - Restricted Lane
-8. Click **Save Annotation**, then choose **Use for This Video Only** or **Save as New Template**.
-9. Select the video in the **Uploaded Videos** list and click **Process Video**.
-   The pipeline (YOLOv8m → ByteTrack → rule engine) runs in the background and
-   queues detected violations for manual review.
-10. Open the **Review Queue** to confirm or dismiss each detection.
+- **Administrator sign-in fails on a new database:** confirm that `TAVIDM_BOOTSTRAP_ADMIN_PASSWORD` was set before the first application startup and has at least 12 characters.
+- **The bootstrap password did not change an existing account:** use **Settings → Individual Account Access → Edit** while signed in as an administrator.
+- **The model cannot load while offline:** provide compatible local weights or allow access to download the pretrained fallback weights.
+- **Upload is rejected for space:** free disk space; the configured headroom is in addition to the upload itself, and processing creates more files.
+- **A port is already in use:** stop the process using port 5000 or change the port in the local `app.run(..., port=5000)` call while retaining the existing `debug_enabled` setting.
+- **A rule has incomplete evidence:** consult the system truth index and review the case manually. Do not infer a violation from a missing detection.
 
-### D. Manage templates, cameras, and users
+## Further documentation
 
-Go to **Settings** (admin) to manage zone templates, RTSP cameras, rule parameters, and user accounts.
+- [System truth index](docs/SYSTEM_TRUTH_INDEX.md)
+- [Phase 2 AI training readiness](docs/PHASE_2_AI_TRAINING_READINESS.md)
+- [Codebase explanation](CODEBASE_EXPLAINED.md)
 
----
-
-## 8. Stopping the server
-
-In the terminal running the app:
-
-```
-Ctrl + C
-```
-
-Deactivate the virtual environment:
-
-```bash
-deactivate
-```
-
----
-
-## 9. Troubleshooting
-
-### `ModuleNotFoundError: No module named 'flask'`
-
-Virtual environment is not active or dependencies were not installed:
-
-```bash
-.\venv\Scripts\Activate.ps1   # Windows PowerShell
-pip install -r requirements.txt
-```
-
-### `ModuleNotFoundError: No module named 'cv2'`
-
-OpenCV is missing:
-
-```bash
-pip install opencv-python
-```
-
-### Port 5000 already in use
-
-Edit the bottom of `app.py`:
-
-```python
-app.run(debug=True, port=5001)
-```
-
-Or stop the other process using port 5000.
-
-### Upload fails or frame extraction error
-
-- Use **MP4** only.
-- Check file size (default max 3072 MB / 3 GiB).
-- Ensure `dataset/raw/` and `dataset/frames/` are writable.
-- Confirm OpenCV imports: `python -c "import cv2"`.
-
-### Database issues after pulling new code
-
-Restart the app — migrations run on startup. If the database is corrupted, delete `database/tavidm.db` and restart (this removes uploaded videos and annotations).
-
-### Charts or styles look broken
-
-Bootstrap and Chart.js load from CDN. You need internet in the browser on first load.
-
-### PowerShell: `&&` not valid
-
-Use separate commands or semicolons:
-
-```powershell
-cd ATAVIDM; .\venv\Scripts\Activate.ps1; python app.py
-```
-
----
-
-## 10. Project status
-
-| Feature | Status |
-|---------|--------|
-| Web UI | Working |
-| Video upload + SQLite | Working |
-| Zone annotations + templates | Working |
-| First-frame extraction | Working |
-| YOLOv8m + ByteTrack detection | Working (COCO fallback; custom weights loaded from `models/`) |
-| Rule-based violation engine | Working (10 rules; helmet rules need custom weights) |
-| RTSP live streams | Working |
-| Manual review queue | Working |
-| Analytics + PDF/Excel reports | Working |
-| Authentication + roles | Working (bcrypt, admin/enforcer/viewer) |
-
-For more technical detail, see `CODEBASE_EXPLAINED.md` and `HOW_TO_RUN.md` (some sections in older docs may be outdated).
-
----
-
-## Quick reference
-
-```bash
-git clone https://github.com/tsun2x/ATAVIDM.git
-cd ATAVIDM
-python -m venv venv
-.\venv\Scripts\Activate.ps1          # Windows
-pip install -r requirements.txt
-python app.py
-# → http://localhost:5000
-```
+`HOW_TO_RUN.md` is retained for older bookmarks and points to this README. Its previous setup commands are obsolete.
