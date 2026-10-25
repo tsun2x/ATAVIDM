@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}Pickup Review{% endblock %}
+{% block page_title %}Pickup Passenger Review{% endblock %}
+{% block page_subtitle %}Review person and pickup track evidence from uploaded videos.{% endblock %}
+
+{% block content %}
+<div class="alert alert-info" role="note">
+    <strong>Evidence leads only.</strong> The main detector and ByteTrack supply the pickup/person tracks.
+    Shared movement does not prove that a person is in the cargo bed. Cargo-area and lower-body visibility
+    remain unknown unless explicit evidence is available. These leads do not create violation cases.
+</div>
+
+{% if uploader_accounts %}
+<form class="mb-3 d-flex align-items-center gap-2" method="get" aria-label="Filter pickup review by uploaded-video owner">
+    <input type="hidden" name="outcome" value="{{ pickup_outcome }}">
+    <label class="form-label mb-0" for="pickupUploader">Uploaded by</label>
+    <select class="form-select form-select-sm" id="pickupUploader" name="uploader_id" style="max-width: 260px" onchange="this.form.submit()">
+        <option value="">All accounts</option>
+        {% for account in uploader_accounts %}<option value="{{ account.id }}" {% if selected_uploader_id == account.id %}selected{% endif %}>{{ account.full_name or account.username }}</option>{% endfor %}
+    </select>
+</form>
+{% endif %}
+
+<div class="card card-panel mb-3">
+    <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <span class="badge bg-warning-subtle text-warning">{{ pickup_pending }} pending · {{ pickup_total }} shown</span>
+        <div class="btn-group btn-group-sm" role="group" aria-label="Filter pickup review leads">
+            {% for state in ('pending', 'reviewed', 'uncertain', 'dismissed', 'all') %}
+            <a class="btn btn-outline-secondary {% if pickup_outcome == state %}active{% endif %}"
+               href="{{ url_for('pickup_detail_review', outcome=state, uploader_id=selected_uploader_id) }}"
+               aria-pressed="{{ 'true' if pickup_outcome == state else 'false' }}">{{ state|capitalize }}</a>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+{% if not pickup_items %}
+<div class="card card-panel"><div class="card-body text-muted">No pickup review leads match this filter.</div></div>
+{% endif %}
+
+{% for item in pickup_items %}
+<article class="card card-panel mb-3 pickup-review-item" data-candidate-id="{{ item.id }}" data-outcome="{{ item.human_outcome }}">
+    <div class="card-header d-flex flex-wrap justify-content-between gap-2">
+        <div><code>{{ item.display_id }}</code> · {{ item.video_name }}</div>
+        <span class="badge bg-secondary" data-outcome>{{ item.human_outcome }}</span>
+    </div>
+    <div class="card-body">
+        <p class="mb-2">Pickup track <strong>#{{ item.pickup_track_id }}</strong> · Person track <strong>#{{ item.person_track_id }}</strong>
+            · Run {{ item.processing_run_id or 'unattributed' }} · {{ item.frame_count }} tracked observations</p>
+        {% if item.source_video_url %}
+        <p><a href="{{ item.source_video_url }}#t={{ item.episode_start_sec or 0 }},{{ item.timestamp_sec or 0 }}" target="_blank" rel="noopener">Open source video at evidence interval</a></p>
+        {% endif %}
+        {% for frame in item.frames %}
+        <div class="row g-3 mb-3">
+            <div class="col-md-7"><img class="img-fluid rounded border" src="{{ frame.scene_url }}" alt="Source frame showing pickup and person tracks"></div>
+            <div class="col-md-5"><img class="img-fluid rounded border" src="{{ frame.crop_url }}" alt="Context crop around pickup and person tracks"></div>
+        </div>
+        <p class="small text-muted">Frame {{ frame.frame_number }} at {{ '%.2f'|format(frame.timestamp_sec or 0) }} seconds.</p>
+        {% endfor %}
+        <details class="mb-3">
+            <summary>Association observations</summary>
+            <p class="small mt-2 mb-1">Evidence source: {{ item.association.evidence_source or 'unknown' }}. State: {{ item.association.state or 'unknown' }}.</p>
+            <p class="small mb-1">Cargo area visible: unknown · Lower body visible: unknown</p>
+            <ul class="small">
+                {% for observation in item.association.observations or [] %}
+                <li>{{ '%.2f'|format(observation.timestamp_sec) }}s — pickup/person boxes tracked in the same frame.</li>
+                {% endfor %}
+            </ul>
+        </details>
+        <div class="row g-2 align-items-end">
+            <div class="col-md-8">
+                <label class="form-label small" for="pickup-notes-{{ item.id }}">Reviewer notes</label>
+                <textarea class="form-control form-control-sm" id="pickup-notes-{{ item.id }}" maxlength="2000" rows="2">{{ item.reviewer_notes or '' }}</textarea>
+            </div>
+            <div class="col-md-4 d-flex flex-wrap gap-2 pickup-review-actions">
+                {% for state in ('reviewed', 'uncertain', 'dismissed') %}
+                <button type="button" class="btn btn-sm {% if state == 'reviewed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" data-pickup-outcome="{{ state }}">{{ state|capitalize }}</button>
+                {% endfor %}
+            </div>
+        </div>
+        <p class="small text-muted mt-2 mb-0" data-save-status aria-live="polite"></p>
+    </div>
+</article>
+{% endfor %}
+
+{% set pages = ((pickup_total + pickup_per_page - 1) // pickup_per_page) %}
+{% if pages > 1 %}
+<nav aria-label="Pickup review pages"><ul class="pagination pagination-sm justify-content-end">
+    <li class="page-item {% if pickup_page <= 1 %}disabled{% endif %}"><a class="page-link" href="{{ url_for('pickup_detail_review', outcome=pickup_outcome, page=pickup_page-1, per_page=pickup_per_page, uploader_id=selected_uploader_id) }}">Previous</a></li>
+    <li class="page-item disabled"><span class="page-link">Page {{ pickup_page }} of {{ pages }}</span></li>
+    <li class="page-item {% if pickup_page >= pages %}disabled{% endif %}"><a class="page-link" href="{{ url_for('pickup_detail_review', outcome=pickup_outcome, page=pickup_page+1, per_page=pickup_per_page, uploader_id=selected_uploader_id) }}">Next</a></li>
+</ul></nav>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}<script src="{{ url_for('static', filename='js/pickup_detail_review.js') }}"></script>{% endblock %}

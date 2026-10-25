@@ -291,7 +291,7 @@ def _normalize_confirmation(value: str | None) -> str:
 
 
 def _detail_evidence_dirs(video_id: int) -> list[Path]:
-    """Run-scoped motorcycle detail-evidence directories for a video.
+    """Run-scoped motorcycle and pickup detail-evidence directories for a video.
 
     Includes directories derived from stored candidate rows and from this
     video's processing runs, so a partially written run is covered too.
@@ -299,14 +299,16 @@ def _detail_evidence_dirs(video_id: int) -> list[Path]:
     import config as _cfg
 
     root = Path(_cfg.EVIDENCE_FOLDER) / "detail"
+    pickup_root = Path(_cfg.EVIDENCE_FOLDER) / "pickup_detail"
     keys: set[str] = set()
     try:
         keys.update(db.list_motorcycle_detail_run_keys_for_video(video_id))
+        keys.update(db.list_pickup_detail_run_keys_for_video(video_id))
     except Exception:
-        logger.exception("Failed to list detail run keys for video %s", video_id)
+        logger.exception("Failed to list detail evidence run keys for video %s", video_id)
     for run in db.list_processing_runs(video_id):
         keys.add(f"run_{run['id']}")
-    return [root / key for key in sorted(keys)]
+    return [path for key in sorted(keys) for path in (root / key, pickup_root / key)]
 
 
 def require_filename_confirmation(video: dict[str, Any], expected_filename: str | None) -> None:

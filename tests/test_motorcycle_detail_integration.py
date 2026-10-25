@@ -76,6 +76,27 @@ class _BicycleOnlyDetector:
         return [_det(9, "bicycle", timestamp_sec, cx, 110.0, 40.0, 60.0)]
 
 
+class _PickupPersonDetector:
+    """Main detector double: a person remains in and moves with one pickup."""
+
+    def load(self) -> None:
+        return None
+
+    @property
+    def class_names(self) -> set[str]:
+        return set(EXPECTED_15)
+
+    def raw_class_map(self) -> dict[int, str]:
+        return {i: n for i, n in enumerate(EXPECTED_15)}
+
+    def track_frame(self, frame, conf=0.6, timestamp_sec=0.0):
+        x = 20.0 + timestamp_sec * 24.0
+        return [
+            _det(10, "pickup_truck", timestamp_sec, x, 80, 100, 80),
+            _det(20, "person", timestamp_sec, x + 40, 95, 20, 45),
+        ]
+
+
 def _write_mp4(path: Path, frames: int = 30) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -140,17 +161,66 @@ def pipeline(test_db, tmp_path, monkeypatch):
     return evidence
 
 
-def _run(test_db, tmp_path, monkeypatch, detector, *, video_name="detail.mp4"):
+def _run(
+    test_db, tmp_path, monkeypatch, detector, *, video_name="detail.mp4", frames=30,
+    enabled_violations=(),
+):
     from core.video_processor import process_video
 
-    path = _write_mp4(tmp_path / video_name)
+    path = _write_mp4(tmp_path / video_name, frames=frames)
     video_id = test_db.insert_video(filename=video_name, filepath=str(path), status="ready")
     test_db.upsert_annotation(video_id, json.dumps({"no_parking": []}))
     monkeypatch.setattr("core.video_processor.Detector", lambda: detector)
-    return video_id, process_video(video_id, enabled_violations=())
+    return video_id, process_video(video_id, enabled_violations=enabled_violations)
 
 
 class TestPipelineIntegration:
+    def test_main_detector_tracks_create_separate_pickup_review_lead(
+        self, test_db, tmp_path, monkeypatch, pipeline
+    ):
+        video_id, result = _run(
+            test_db, tmp_path, monkeypatch, _PickupPersonDetector(),
+            video_name="pickup-review.mp4", frames=80,
+            enabled_violations=("Unauthorized Passenger in Applicable Truck/Pickup Cargo Area",),
+        )
+        assert result.pickup_detail_candidates == 1
+        assert result.violation_candidates == 0
+        rows, total = test_db.list_pickup_detail_candidates(video_id=video_id)
+        assert total == 1
+        assert rows[0]["pickup_track_id"] == 10
+        assert rows[0]["person_track_id"] == 20
+        association = json.loads(rows[0]["association_json"])
+        assert association["evidence_source"] == "main_detector_and_bytetrack"
+        assert association["cargo_region_visible"] is None
+        assert association["lower_body_visible"] is None
+        frame = json.loads(rows[0]["frames_json"])[0]
+        assert Path(frame["scene_path"]).is_file()
+        assert Path(frame["crop_path"]).is_file()
+        with test_db.db_session() as conn:
+            assert conn.execute("SELECT COUNT(*) AS n FROM violations").fetchone()["n"] == 0
+            assert conn.execute("SELECT COUNT(*) AS n FROM review_queue").fetchone()["n"] == 0
+
+    def test_removing_video_results_removes_pickup_leads_and_private_evidence(
+        self, test_db, tmp_path, monkeypatch, pipeline
+    ):
+        from core.video_lifecycle import remove_processing_results
+
+        video_id, _result = _run(
+            test_db, tmp_path, monkeypatch, _PickupPersonDetector(),
+            video_name="pickup-cleanup.mp4", frames=80,
+        )
+        rows, total = test_db.list_pickup_detail_candidates(video_id=video_id)
+        assert total == 1
+        frame = json.loads(rows[0]["frames_json"])[0]
+        scene = Path(frame["scene_path"])
+        crop = Path(frame["crop_path"])
+        assert scene.is_file() and crop.is_file()
+
+        remove_processing_results(video_id, is_busy=lambda _video_id: False)
+
+        assert test_db.list_pickup_detail_candidates(video_id=video_id)[1] == 0
+        assert not scene.exists() and not crop.exists()
+
     def test_processing_creates_bounded_detail_candidates(
         self, test_db, tmp_path, monkeypatch, pipeline
     ):

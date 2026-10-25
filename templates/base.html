@@ -34,7 +34,7 @@
                     {% set is_current = request.endpoint == item.endpoint %}
                     <li class="nav-item">
                         <a class="nav-link {% if is_current %}active{% endif %}"
-                           href="{{ url_for(item.endpoint) }}"{% if is_current %} aria-current="page"{% endif %}{% if item.badge_count and item.badge_label %} aria-label="{{ item.label }}, {{ item.badge_count }} {{ item.badge_label }}"{% endif %}>
+                           href="{{ url_for(item.endpoint) }}" data-nav-count-key="{{ item.endpoint if item.badge_count is defined else '' }}"{% if is_current %} aria-current="page"{% endif %}{% if item.badge_count and item.badge_label %} aria-label="{{ item.label }}, {{ item.badge_count }} {{ item.badge_label }}"{% endif %}>
                             <i class="bi {{ item.icon }}" aria-hidden="true"></i>
                             <span>{{ item.label }}</span>
                             {% if item.badge == 'live' %}

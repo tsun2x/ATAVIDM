@@ -320,3 +320,67 @@ def remove_detail_run(run_key: str) -> bool:
         return False
     shutil.rmtree(res, ignore_errors=True)
     return True
+
+
+def _pickup_detail_occurrence_dir(run_key: str, occurrence_key: str) -> Path:
+    root = Path(EVIDENCE_FOLDER) / "pickup_detail"
+    run_dir = root / _safe_detail_key(run_key, label="pickup run key")
+    out_dir = run_dir / _safe_detail_key(occurrence_key, label="pickup occurrence key")
+    try:
+        out_dir.resolve().relative_to(root.resolve())
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise ValueError("Unsafe pickup evidence path rejected.") from exc
+    return out_dir
+
+
+def save_pickup_detail_evidence(
+    frame: Any,
+    crop_rect: Any,
+    *,
+    run_key: str,
+    occurrence_key: str,
+    frame_index: int,
+) -> dict[str, Any] | None:
+    """Save a private pickup-review scene and crop in a separate evidence tree."""
+    out_dir = _pickup_detail_occurrence_dir(run_key, occurrence_key)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    h_img, w_img = frame.shape[:2]
+    x1, y1 = max(0, int(crop_rect.x)), max(0, int(crop_rect.y))
+    x2 = min(w_img, int(crop_rect.x + crop_rect.w))
+    y2 = min(h_img, int(crop_rect.y + crop_rect.h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    index = max(1, int(frame_index))
+    scene_path = out_dir / f"scene_f{index}.jpg"
+    crop_path = out_dir / f"crop_f{index}.jpg"
+    scene_bytes = _write_detail_image(scene_path, frame, quality=85)
+    if scene_bytes is None:
+        return None
+    crop_bytes = _write_detail_image(crop_path, frame[y1:y2, x1:x2], quality=92)
+    if crop_bytes is None:
+        scene_path.unlink(missing_ok=True)
+        return None
+    return {
+        "scene_path": _stored_path(scene_path),
+        "crop_path": _stored_path(crop_path),
+        "size_bytes": int(scene_bytes + crop_bytes),
+    }
+
+
+def remove_pickup_detail_run(run_key: str) -> bool:
+    """Remove only pickup-review evidence for one run, never motorcycle evidence."""
+    import shutil
+
+    try:
+        root = (Path(EVIDENCE_FOLDER) / "pickup_detail").resolve()
+        out_dir = (root / _safe_detail_key(run_key, label="pickup run key")).resolve()
+        out_dir.relative_to(root)
+    except (ValueError, OSError):
+        return False
+    if not out_dir.is_dir():
+        return False
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return True

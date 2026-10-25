@@ -122,6 +122,13 @@ list_motorcycle_detail_run_keys_for_video = _adapter.list_motorcycle_detail_run_
 purge_motorcycle_detail_candidates_for_video = (
     _adapter.purge_motorcycle_detail_candidates_for_video
 )
+upsert_pickup_detail_candidate = _adapter.upsert_pickup_detail_candidate
+get_pickup_detail_candidate = _adapter.get_pickup_detail_candidate
+list_pickup_detail_candidates = _adapter.list_pickup_detail_candidates
+count_pickup_detail_pending = _adapter.count_pickup_detail_pending
+record_pickup_detail_review = _adapter.record_pickup_detail_review
+list_pickup_detail_run_keys_for_video = _adapter.list_pickup_detail_run_keys_for_video
+purge_pickup_detail_candidates_for_video = _adapter.purge_pickup_detail_candidates_for_video
 detail_dedup_key = _adapter.detail_dedup_key
 
 # Stage B: Legal-policy persistence, case linkage, audit, permissions

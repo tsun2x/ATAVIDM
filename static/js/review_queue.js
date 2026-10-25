@@ -127,6 +127,7 @@ if (typeof document !== "undefined") {
     const pendingCount = document.getElementById("pendingCount");
     const filterStatus = document.getElementById("reviewFilterStatus");
     const filterButtons = Array.from(document.querySelectorAll?.("[data-review-filter]") || []);
+    const plateDetailsCache = new Map();
     const escapeHtml = window.TAVIDMMainUI?.escapeHtml || function (value) {
         return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -226,8 +227,60 @@ if (typeof document !== "undefined") {
                 });
             });
         });
-        renderPlateOcr(item);
+        if (item.plate_details_loaded) {
+            renderPlateOcr(item);
+        } else {
+            renderPlateOcrLoading();
+            loadPlateDetails(item);
+        }
         evidenceModal.show();
+    }
+
+    function renderPlateOcrLoading() {
+        const panel = document.getElementById("plateOcrPanel");
+        const body = document.getElementById("plateOcrBody");
+        const badge = document.getElementById("plateOcrStateBadge");
+        if (!panel || !body || !badge) return;
+        panel.hidden = false;
+        badge.className = "badge text-bg-secondary";
+        badge.textContent = "Loading";
+        body.textContent = "Loading optional plate evidence…";
+    }
+
+    function loadPlateDetails(item) {
+        const cached = plateDetailsCache.get(String(item.id));
+        if (cached) {
+            Object.assign(item, cached, { plate_details_loaded: true });
+            renderPlateOcr(item);
+            return;
+        }
+        fetch("/api/review-queue/" + encodeURIComponent(item.id) + "/plate-details", {
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: { "Accept": "application/json" },
+        }).then(function (response) {
+            if (!response.ok) throw new Error("Optional plate evidence is unavailable.");
+            return response.json();
+        }).then(function (payload) {
+            if (!payload || payload.success !== true) throw new Error("Optional plate evidence is unavailable.");
+            const details = {
+                plate_machine: payload.plate_machine || null,
+                review_plate_choice: payload.review_plate_choice || null,
+                plate_details_loaded: true,
+            };
+            plateDetailsCache.set(String(item.id), details);
+            Object.assign(item, details);
+            if (String(window.__tavidmEvidenceItem?.id) === String(item.id)) renderPlateOcr(item);
+        }).catch(function () {
+            if (String(window.__tavidmEvidenceItem?.id) !== String(item.id)) return;
+            const badge = document.getElementById("plateOcrStateBadge");
+            const body = document.getElementById("plateOcrBody");
+            if (badge) {
+                badge.className = "badge text-bg-secondary";
+                badge.textContent = "Unavailable";
+            }
+            if (body) body.textContent = "Optional plate evidence could not be loaded. The review evidence above is still available.";
+        });
     }
 
     // -- Experimental local plate OCR (machine candidates only) --------
@@ -383,6 +436,12 @@ if (typeof document !== "undefined") {
             }
             showToast("Plate verified", "The admin-verified plate will be attached to the case when you confirm this review.", "success");
             item.review_plate_choice = { accepted_plate_text: accepted };
+            item.plate_details_loaded = true;
+            plateDetailsCache.set(String(item.id), {
+                plate_machine: item.plate_machine || null,
+                review_plate_choice: item.review_plate_choice,
+                plate_details_loaded: true,
+            });
             const confirmation = button.closest(".border")?.querySelector(".small.text-muted.mt-1");
             if (confirmation) confirmation.textContent = "Admin-verified plate saved. It will be attached to the case and report if this review is confirmed.";
             button.textContent = "Plate saved";
@@ -424,6 +483,7 @@ if (typeof document !== "undefined") {
                 if (reviewActionClosesRow(payload)) {
                     row.remove();
                     updateCount();
+                    window.TAVIDMRefreshNavCounts?.(true);
                     if (plan.decision === "confirm_proposed") {
                         showToast("Confirmed", item.violation_type + " recorded as a violation.", "success");
                     } else {
@@ -536,6 +596,7 @@ if (typeof document !== "undefined") {
                 }
                 row.remove();
                 updateCount();
+                window.TAVIDMRefreshNavCounts?.(true);
                 decisionModal?.hide();
                 if (submit) submit.disabled = false;
                 showToast(label, (item.violation_type || "Suggestion") + " remains the original suggestion.", "success");

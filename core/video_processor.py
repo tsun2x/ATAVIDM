@@ -32,6 +32,7 @@ from core.evidence import save_evidence_snapshot, save_vehicle_crop
 from core.frame_annotate import TrajectoryOverlay, annotate_frame
 from core.geometry_profile import build_geometry_profile
 from core.motorcycle_detail import MotorcycleDetailCollector
+from core.pickup_detail_review import PickupDetailCollector
 from core.model_capability import (
     extract_model_class_names,
     baseline_capability_notes,
@@ -94,6 +95,9 @@ class ProcessVideoResult:
     # Additive motorcycle detail-review fields (no effect on violation results).
     motorcycle_detail_candidates: int = 0
     motorcycle_detail_summary: dict[str, Any] = field(default_factory=dict)
+    # Additive review-only leads; never included in violation candidate counts.
+    pickup_detail_candidates: int = 0
+    pickup_detail_summary: dict[str, Any] = field(default_factory=dict)
 
     def __iter__(self):
         return iter(self.events)
@@ -180,6 +184,16 @@ def _detail_collection_enabled() -> bool:
         import config
 
         return bool(getattr(config, "MOTORCYCLE_DETAIL_ENABLED", True))
+    except Exception:  # pragma: no cover - config import failure is not expected
+        return True
+
+
+def _pickup_detail_collection_enabled() -> bool:
+    """Whether the main-detector pickup/person review collector is enabled."""
+    try:
+        import config
+
+        return bool(getattr(config, "PICKUP_DETAIL_REVIEW_ENABLED", True))
     except Exception:  # pragma: no cover - config import failure is not expected
         return True
 
@@ -599,6 +613,14 @@ def process_video(
             processing_run_id=run_id_int,
             enabled=_detail_collection_enabled() and (frame_w or 0) > 0 and (frame_h or 0) > 0,
         )
+        pickup_detail_collector = PickupDetailCollector(
+            video_id=video_id,
+            run_key=f"run_{run_id_int}" if run_id_int is not None else f"video_{video_id}",
+            frame_w=frame_w or 0,
+            frame_h=frame_h or 0,
+            processing_run_id=run_id_int,
+            enabled=_pickup_detail_collection_enabled() and (frame_w or 0) > 0 and (frame_h or 0) > 0,
+        )
 
         while True:
             if cancel_requested is not None and cancel_requested():
@@ -631,6 +653,13 @@ def process_video(
             crossing_counter.update(tracked)
             if detail_collector.enabled:
                 detail_collector.observe(
+                    frame,
+                    tracked,
+                    frame_number=frame_number,
+                    timestamp_sec=timestamp_sec,
+                )
+            if pickup_detail_collector.enabled:
+                pickup_detail_collector.observe(
                     frame,
                     tracked,
                     frame_number=frame_number,
@@ -823,6 +852,17 @@ def process_video(
                 detail_summary,
             )
 
+        pickup_detail_summary: dict[str, Any] = {}
+        if pickup_detail_collector.enabled:
+            persisted = pickup_detail_collector.persist()
+            pickup_detail_summary = pickup_detail_collector.summary()
+            pickup_detail_summary["persisted"] = persisted
+            logger.info(
+                "pickup detail review leads persisted for run %s: %s",
+                run_id_int,
+                pickup_detail_summary,
+            )
+
         db.mark_video_processed(video_id)
         result = ProcessVideoResult(
             events=events,
@@ -843,6 +883,8 @@ def process_video(
             effective_output_fps=effective_fps,
             motorcycle_detail_candidates=int(detail_summary.get("persisted") or 0),
             motorcycle_detail_summary=detail_summary,
+            pickup_detail_candidates=int(pickup_detail_summary.get("persisted") or 0),
+            pickup_detail_summary=pickup_detail_summary,
         )
         if progress_tracker:
             url = (
@@ -885,4 +927,7 @@ def process_video(
         # partial detail evidence behind for its own run-scoped directory.
         _discard_run_detail_evidence(
             None if "detail_summary" in locals() else locals().get("detail_collector")
+        )
+        _discard_run_detail_evidence(
+            None if "pickup_detail_summary" in locals() else locals().get("pickup_detail_collector")
         )

@@ -81,6 +81,10 @@ One JSON object per reviewed frame/crop pair. These examples are synthetic and d
 
 Allowed reviewer states should include `occupied_observed`, `empty_observed`, `obstructed`, and `unknown`; person extent should distinguish full body, upper body only, clipped, and unknown. A missing person box is not an `empty_observed` label. Store any future annotation derivative separately from immutable originals, include provenance and hashes, and assign all frames from one source video/family to a single split.
 
-## Production boundary
+## Production review leads
 
-The production cargo rule now requires explicit `lower_body_visible: true` before using a person's box bottom as an anchor. Current production detections do not provide that field, so this change intentionally suppresses unsupported bed-rider candidates until a separately validated visibility producer and association contract exist. This offline tool does not provide that producer.
+Uploaded-video processing can collect a separate pickup/person evidence lead from the already-produced main-detector detections and ByteTrack tracks. The collector requires the person's box center to remain inside a resolved pickup track's box and requires persistent, similar movement with stable pickup-relative position. It runs no second model and uses no crop inference.
+
+These leads are stored in Pickup Review, separate from `review_queue`, violations, and Motorcycle Detail. They show the source frame/video interval and track observations for human inspection. `cargo_region_visible` and `lower_body_visible` remain unknown; the person/pickup association does not prove bed occupancy or body visibility. Reviewing or dismissing a lead does not create a violation.
+
+The ordinary cargo-passenger rule remains fail-closed. It still requires explicit cargo-region and lower-body visibility evidence before emitting an ordinary review case. The offline crop evaluator is not connected to this production lead collector and does not provide those visibility signals.

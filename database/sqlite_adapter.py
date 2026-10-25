@@ -234,6 +234,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_012(conn)
     _apply_migration_013(conn)
     _apply_migration_014(conn)
+    _apply_migration_015(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -627,6 +628,13 @@ def _apply_migration_011(conn: sqlite3.Connection) -> None:
     table, column, or constraint is touched.
     """
     migration = Path(__file__).parent / "migrations" / "011_motorcycle_detail_review.sql"
+    if migration.is_file():
+        conn.executescript(migration.read_text(encoding="utf-8"))
+
+
+def _apply_migration_015(conn: sqlite3.Connection) -> None:
+    """Add the independent pickup review-lead table without altering tables."""
+    migration = Path(__file__).parent / "migrations" / "015_pickup_detail_review.sql"
     if migration.is_file():
         conn.executescript(migration.read_text(encoding="utf-8"))
 
@@ -2408,6 +2416,10 @@ def delete_unconfirmed_results_for_video(video_id: int) -> None:
             conn.execute(
                 "DELETE FROM motorcycle_detail_candidates WHERE video_id = ?", (video_id,)
             )
+        if _table_exists(conn, "pickup_detail_candidates"):
+            conn.execute(
+                "DELETE FROM pickup_detail_candidates WHERE video_id = ?", (video_id,)
+            )
 
 
 def delete_video_cascade_unprotected(video_id: int) -> None:
@@ -2421,6 +2433,8 @@ def _cascade_delete_video_rows(conn: sqlite3.Connection, video_id: int) -> None:
     conn.execute("DELETE FROM review_queue WHERE video_id = ?", (video_id,))
     if _table_exists(conn, "motorcycle_detail_candidates"):
         conn.execute("DELETE FROM motorcycle_detail_candidates WHERE video_id = ?", (video_id,))
+    if _table_exists(conn, "pickup_detail_candidates"):
+        conn.execute("DELETE FROM pickup_detail_candidates WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM violations WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM annotations WHERE video_id = ?", (video_id,))
     conn.execute("DELETE FROM processing_runs WHERE video_id = ?", (video_id,))
@@ -7430,3 +7444,182 @@ def count_motorcycle_detail_by_state(
     outcomes = {state: 0 for state in DETAIL_HUMAN_OUTCOMES}
     outcomes.update({str(r["k"]): int(r["n"]) for r in outcome_rows})
     return {"scan_states": counts, "human_outcomes": outcomes}
+
+
+PICKUP_DETAIL_HUMAN_OUTCOMES = frozenset({"pending", "reviewed", "dismissed", "uncertain"})
+
+
+def upsert_pickup_detail_candidate(
+    *, video_id: int, run_key: str, processing_run_id: int | None,
+    pickup_track_id: int, person_track_id: int,
+    pickup_identity_epoch: int, person_identity_epoch: int,
+    occurrence_key: str, selector_version: str, timestamp_sec: float,
+    episode_start_sec: float, frame_number: int, source_width: int,
+    source_height: int, frame_count: int, frames_json: str,
+    association_json: str, size_bytes: int,
+) -> int:
+    """Idempotently persist one independent pickup/person review lead."""
+    run_scope = str(processing_run_id) if processing_run_id is not None else f"video:{video_id}"
+    dedup_key = f"{run_scope}|{occurrence_key}|{selector_version}"
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    with db_session() as conn:
+        conn.execute(
+            """INSERT INTO pickup_detail_candidates (
+                video_id, processing_run_id, run_key, pickup_track_id, person_track_id,
+                pickup_identity_epoch, person_identity_epoch, occurrence_key,
+                selector_version, dedup_key, frame_number, timestamp_sec,
+                episode_start_sec, source_width, source_height, frame_count,
+                frames_json, association_json, size_bytes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dedup_key) DO UPDATE SET
+                video_id = excluded.video_id,
+                processing_run_id = excluded.processing_run_id,
+                run_key = excluded.run_key,
+                frame_number = excluded.frame_number,
+                timestamp_sec = excluded.timestamp_sec,
+                episode_start_sec = excluded.episode_start_sec,
+                source_width = excluded.source_width,
+                source_height = excluded.source_height,
+                frame_count = excluded.frame_count,
+                frames_json = excluded.frames_json,
+                association_json = excluded.association_json,
+                size_bytes = excluded.size_bytes,
+                updated_at = excluded.updated_at""",
+            (
+                int(video_id), int(processing_run_id) if processing_run_id is not None else None,
+                str(run_key), int(pickup_track_id), int(person_track_id),
+                int(pickup_identity_epoch), int(person_identity_epoch),
+                str(occurrence_key), str(selector_version), dedup_key,
+                int(frame_number), float(timestamp_sec), float(episode_start_sec),
+                int(source_width), int(source_height), int(frame_count),
+                str(frames_json), str(association_json), int(size_bytes), now, now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM pickup_detail_candidates WHERE dedup_key = ?", (dedup_key,)
+        ).fetchone()
+        return int(row["id"])
+
+
+def get_pickup_detail_candidate(candidate_id: int) -> dict[str, Any] | None:
+    with db_session() as conn:
+        row = conn.execute(
+            """SELECT c.*, u.username AS reviewer_username,
+                      u.full_name AS reviewer_full_name
+               FROM pickup_detail_candidates c
+               LEFT JOIN users u ON u.id = c.reviewed_by
+               WHERE c.id = ?""",
+            (int(candidate_id),),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_pickup_detail_candidates(
+    *, human_outcome: str | None = None, video_id: int | None = None,
+    owner_user_id: int | None = None, uploader_id: int | None = None,
+    page: int = 1, per_page: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    if human_outcome is not None and human_outcome not in PICKUP_DETAIL_HUMAN_OUTCOMES:
+        raise ValueError(f"Unknown human outcome '{human_outcome}'.")
+    clauses: list[str] = []
+    params: list[Any] = []
+    if human_outcome is not None:
+        clauses.append("c.human_outcome = ?")
+        params.append(human_outcome)
+    if video_id is not None:
+        clauses.append("c.video_id = ?")
+        params.append(int(video_id))
+    ownership, ownership_params = _video_owner_scope_sql(
+        "c", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    if owner_user_id is not None:
+        ownership[0] = (
+            "(c.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = c.video_id AND owner_video.uploaded_by = ?))"
+        )
+    clauses.extend(ownership)
+    params.extend(ownership_params)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    limit = min(100, max(1, int(per_page)))
+    offset = max(0, int(page) - 1) * limit
+    with db_session() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM pickup_detail_candidates c {where}", tuple(params)
+        ).fetchone()
+        total = int(row["n"] if row else 0)
+        rows = conn.execute(
+            f"""SELECT c.*, u.username AS reviewer_username,
+                       u.full_name AS reviewer_full_name
+                FROM pickup_detail_candidates c
+                LEFT JOIN users u ON u.id = c.reviewed_by
+                {where}
+                ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        ).fetchall()
+    return [_row_to_dict(item) for item in rows], total
+
+
+def count_pickup_detail_pending(
+    *, owner_user_id: int | None = None, uploader_id: int | None = None
+) -> int:
+    ownership, params = _video_owner_scope_sql(
+        "pickup_detail_candidates", owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    if owner_user_id is not None:
+        ownership[0] = (
+            "(pickup_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
+            "WHERE owner_video.id = pickup_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
+        )
+    where = " AND ".join(["human_outcome = 'pending'", *ownership])
+    with db_session() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM pickup_detail_candidates WHERE {where}", params
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+
+def record_pickup_detail_review(
+    *, candidate_id: int, outcome: str, reviewed_by: int | None,
+    notes: str | None = None, expected_outcome: str = "pending",
+) -> bool:
+    if outcome not in PICKUP_DETAIL_HUMAN_OUTCOMES - {"pending"}:
+        raise ValueError("Outcome must be reviewed, dismissed, or uncertain.")
+    if expected_outcome not in PICKUP_DETAIL_HUMAN_OUTCOMES:
+        raise ValueError("Invalid expected outcome.")
+    normalized_notes = str(notes or "").strip() or None
+    if normalized_notes is not None and len(normalized_notes) > 2000:
+        raise ValueError("Reviewer notes must be at most 2000 characters.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db_session() as conn:
+        cursor = conn.execute(
+            """UPDATE pickup_detail_candidates
+               SET human_outcome = ?, reviewed_by = ?, reviewed_at = ?,
+                   reviewer_notes = ?, updated_at = ?
+               WHERE id = ? AND human_outcome = ?""",
+            (outcome, int(reviewed_by) if reviewed_by is not None else None,
+             now, normalized_notes, now, int(candidate_id), expected_outcome),
+        )
+        if cursor.rowcount:
+            return True
+        row = conn.execute(
+            "SELECT human_outcome FROM pickup_detail_candidates WHERE id = ?",
+            (int(candidate_id),),
+        ).fetchone()
+        return bool(row and row["human_outcome"] == outcome)
+
+
+def list_pickup_detail_run_keys_for_video(video_id: int) -> list[str]:
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT run_key FROM pickup_detail_candidates WHERE video_id = ?",
+            (int(video_id),),
+        ).fetchall()
+    return [str(row["run_key"]) for row in rows]
+
+
+def purge_pickup_detail_candidates_for_video(video_id: int) -> int:
+    with db_session() as conn:
+        cursor = conn.execute(
+            "DELETE FROM pickup_detail_candidates WHERE video_id = ?", (int(video_id),)
+        )
+        return int(cursor.rowcount or 0)

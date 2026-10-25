@@ -37,6 +37,10 @@ MOTORCYCLE_DETAIL_WEIGHTS = os.environ.get("TAVIDM_MOTORCYCLE_DETAIL_WEIGHTS", "
 MOTORCYCLE_DETAIL_ENABLED = os.environ.get(
     "TAVIDM_MOTORCYCLE_DETAIL_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
+# Set to 0 to disable review-only pickup/person candidate collection.
+PICKUP_DETAIL_REVIEW_ENABLED = os.environ.get(
+    "TAVIDM_PICKUP_DETAIL_REVIEW_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
 
 DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower() or "sqlite"
 # DATABASE_URL is backend-agnostic. For sqlite, a local file path is also accepted.

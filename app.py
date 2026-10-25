@@ -541,7 +541,9 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
     }
 
 
-def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
+def _review_to_ui(
+    row: dict, videos: dict[int, dict], *, include_plate_details: bool = True
+) -> dict:
     from core.review_decision_service import disposition_label
     from core.violation_policy import (
         legal_status_for,
@@ -552,31 +554,33 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
     vtype = row.get("violation_type") or ""
     status = legal_status_for(vtype)
     legal_status = status.value if status else None
-    try:
-        from core.plate_review import machine_result_for_review
-
-        plate_machine = machine_result_for_review(row.get("id"))
-    except Exception:  # noqa: BLE001 - the experiment must never break the queue
-        app.logger.exception("plate machine payload unavailable for review %s", row.get("id"))
-        plate_machine = {
-            "experimental": True,
-            "state": "unavailable",
-            "outcome_is_ambiguous": True,
-            "eligible_for_confirmation": False,
-            "candidates": [],
-            "notes": "Experimental local OCR payload unavailable.",
-        }
+    plate_machine = None
     plate_choice = None
-    try:
-        event = db.get_review_plate_choice(int(row["id"]))
-        detail = json.loads(event.get("detail_json") or "{}") if event else {}
-        if detail.get("pending_review_plate_choice"):
-            plate_choice = {
-                "accepted_plate_text": detail.get("accepted_plate_text"),
-                "verified_by": event.get("actor_user_id"),
+    if include_plate_details:
+        try:
+            from core.plate_review import machine_result_for_review
+
+            plate_machine = machine_result_for_review(row.get("id"))
+        except Exception:  # noqa: BLE001 - the experiment must never break the queue
+            app.logger.exception("plate machine payload unavailable for review %s", row.get("id"))
+            plate_machine = {
+                "experimental": True,
+                "state": "unavailable",
+                "outcome_is_ambiguous": True,
+                "eligible_for_confirmation": False,
+                "candidates": [],
+                "notes": "Experimental local OCR payload unavailable.",
             }
-    except Exception:  # noqa: BLE001 - optional plate review must not break the queue
-        app.logger.exception("pending plate choice unavailable for review %s", row.get("id"))
+        try:
+            event = db.get_review_plate_choice(int(row["id"]))
+            detail = json.loads(event.get("detail_json") or "{}") if event else {}
+            if detail.get("pending_review_plate_choice"):
+                plate_choice = {
+                    "accepted_plate_text": detail.get("accepted_plate_text"),
+                    "verified_by": event.get("actor_user_id"),
+                }
+        except Exception:  # noqa: BLE001 - optional plate review must not break the queue
+            app.logger.exception("pending plate choice unavailable for review %s", row.get("id"))
     return {
         "id": row["id"],
         "display_id": f"RQ-{row['id']:05d}",
@@ -631,6 +635,7 @@ def _review_to_ui(row: dict, videos: dict[int, dict]) -> dict:
         "decided_at": row.get("decided_at"),
         "plate_machine": plate_machine,
         "review_plate_choice": plate_choice,
+        "plate_details_loaded": bool(include_plate_details),
     }
 
 
@@ -777,11 +782,24 @@ def _detail_badge_count() -> int:
         return 0
 
 
+def _pickup_detail_badge_count() -> int:
+    """Pending pickup evidence leads scoped to the signed-in account."""
+    try:
+        actor = auth.current_user()
+        return int(db.count_pickup_detail_pending(**_account_video_scope(actor)))
+    except Exception:
+        logger.exception("Failed to count pending pickup detail candidates")
+        return 0
+
+
 @app.context_processor
 def inject_globals():
     user = auth.current_user()
     role = user["role"] if user else None
-    review_queue_count = db.count_review_pending() if user else 0
+    scope = _account_video_scope(user) if user else {}
+    review_queue_count = (
+        db.count_review_pending(**scope) if role in ("admin", "enforcer") else 0
+    )
     nav_items = [
         {"endpoint": "dashboard", "label": "Dashboard", "icon": "bi-speedometer2"},
         {"endpoint": "live_monitor", "label": "Live Monitor", "icon": "bi-camera-video", "badge": "live"},
@@ -803,6 +821,14 @@ def inject_globals():
             "label": "Motorcycle Detail",
             "icon": "bi-bicycle",
             "badge_count": _detail_badge_count(),
+        })
+        pickup_detail_count = _pickup_detail_badge_count()
+        nav_items.append({
+            "endpoint": "pickup_detail_review",
+            "label": "Pickup Review",
+            "icon": "bi-truck-front",
+            "badge_count": pickup_detail_count,
+            "badge_label": "pending pickup review lead" if pickup_detail_count == 1 else "pending pickup review leads",
         })
     if role == "admin":
         nav_items.append({"endpoint": "settings", "label": "Settings", "icon": "bi-gear"})
@@ -1299,7 +1325,7 @@ def review_queue():
     scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     videos = _video_name_map(**scope)
     page = max(1, _int_query_arg("page", 1))
-    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
+    per_page = min(100, max(1, _int_query_arg("per_page", 20)))
     rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
@@ -1307,7 +1333,7 @@ def review_queue():
         rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
     return render_template(
         "review_queue.html",
-        review_items=[_review_to_ui(r, videos) for r in rows],
+        review_items=[_review_to_ui(r, videos, include_plate_details=False) for r in rows],
         review_total=total,
         review_page=page,
         review_per_page=per_page,
@@ -2957,6 +2983,60 @@ def api_review_queue():
     })
 
 
+@app.route("/api/review-queue/<int:review_id>/plate-details", methods=["GET"])
+@auth.role_required("enforcer")
+def api_review_plate_details(review_id: int):
+    """Load optional OCR evidence only when a reviewer opens its detail panel."""
+    row = db.get_review_item(review_id)
+    if row is None or not _accessible_video_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Review item not found."}), 404
+    try:
+        from core.plate_review import machine_result_for_review
+
+        machine = machine_result_for_review(review_id)
+    except Exception:  # noqa: BLE001 - optional OCR must not block core review
+        app.logger.exception("plate machine payload unavailable for review %s", review_id)
+        machine = {
+            "experimental": True,
+            "state": "unavailable",
+            "outcome_is_ambiguous": True,
+            "eligible_for_confirmation": False,
+            "candidates": [],
+            "notes": "Experimental local OCR payload unavailable.",
+        }
+    choice = None
+    try:
+        event = db.get_review_plate_choice(review_id)
+        detail = json.loads(event.get("detail_json") or "{}") if event else {}
+        if detail.get("pending_review_plate_choice"):
+            choice = {
+                "accepted_plate_text": detail.get("accepted_plate_text"),
+                "verified_by": event.get("actor_user_id"),
+            }
+    except Exception:  # noqa: BLE001 - optional plate review must not block core review
+        app.logger.exception("pending plate choice unavailable for review %s", review_id)
+    return jsonify({
+        "success": True,
+        "plate_machine": machine,
+        "review_plate_choice": choice,
+    })
+
+
+@app.route("/api/navigation-counts", methods=["GET"])
+@auth.login_required
+def api_navigation_counts():
+    """Refresh account-scoped sidebar badges when a browser tab becomes active."""
+    actor = auth.current_user()
+    role = (actor or {}).get("role")
+    counts = {"review_queue": 0, "motorcycle_detail_review": 0, "pickup_detail_review": 0}
+    if role in ("admin", "enforcer"):
+        scope = _account_video_scope(actor)
+        counts["review_queue"] = int(db.count_review_pending(**scope))
+        counts["motorcycle_detail_review"] = int(db.count_motorcycle_detail_pending(**scope))
+        counts["pickup_detail_review"] = int(db.count_pickup_detail_pending(**scope))
+    return jsonify({"success": True, "counts": counts})
+
+
 @app.route("/api/review-queue/<int:review_id>/confirm", methods=["POST"])
 @auth.login_required
 def api_confirm_review(review_id: int):
@@ -3376,6 +3456,191 @@ def _motorcycle_detail_page_context(rows: list[dict[str, Any]]) -> tuple[dict[in
         if hasattr(db, "get_current_completed_result_run")
     }
     return review_links, current_runs
+
+
+def _pickup_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> dict[str, Any]:
+    frames = _detail_json(row.get("frames_json"), [])
+    association = _detail_json(row.get("association_json"), {})
+    video_id = row.get("video_id")
+    out_frames = []
+    for frame in frames[:2] if isinstance(frames, list) else []:
+        if not isinstance(frame, dict):
+            continue
+        index = int(frame.get("index") or 1)
+        out_frames.append({
+            "index": index,
+            "frame_number": frame.get("frame_number"),
+            "timestamp_sec": frame.get("timestamp_sec"),
+            "scene_url": f"/api/pickup-detail-review/{row['id']}/evidence/scene?index={index}",
+            "crop_url": f"/api/pickup-detail-review/{row['id']}/evidence/crop?index={index}",
+            "pickup_bbox": frame.get("pickup_bbox"),
+            "person_bbox": frame.get("person_bbox"),
+        })
+    return {
+        "id": int(row["id"]),
+        "display_id": f"PU-{int(row['id']):05d}",
+        "video_id": video_id,
+        "video_name": _source_label(video_id, videos),
+        "source_video_url": f"/api/videos/{video_id}/media" if video_id in videos else None,
+        "pickup_track_id": row.get("pickup_track_id"),
+        "person_track_id": row.get("person_track_id"),
+        "occurrence_key": row.get("occurrence_key"),
+        "processing_run_id": row.get("processing_run_id"),
+        "frame_number": row.get("frame_number"),
+        "timestamp_sec": row.get("timestamp_sec"),
+        "episode_start_sec": row.get("episode_start_sec"),
+        "frame_count": row.get("frame_count"),
+        "human_outcome": row.get("human_outcome"),
+        "association": association if isinstance(association, dict) else {},
+        "frames": out_frames,
+        "reviewer_notes": row.get("reviewer_notes"),
+        "reviewed_at": row.get("reviewed_at"),
+        "reviewer_name": row.get("reviewer_full_name") or row.get("reviewer_username"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@app.route("/pickup-detail-review")
+@auth.role_required("enforcer")
+def pickup_detail_review():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return error, status
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    outcome = request.args.get("outcome", "pending")
+    if outcome not in ("pending", "reviewed", "dismissed", "uncertain", "all"):
+        return "Unknown pickup review outcome.", 400
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 20)))
+    rows, total = db.list_pickup_detail_candidates(
+        human_outcome=None if outcome == "all" else outcome,
+        page=page,
+        per_page=per_page,
+        **scope,
+    )
+    last_page = max(1, (total + per_page - 1) // per_page)
+    if page > last_page:
+        page = last_page
+        rows, total = db.list_pickup_detail_candidates(
+            human_outcome=None if outcome == "all" else outcome,
+            page=page,
+            per_page=per_page,
+            **scope,
+        )
+    videos = _video_name_map(**scope)
+    return render_template(
+        "pickup_detail_review.html",
+        pickup_items=[_pickup_detail_to_ui(row, videos) for row in rows],
+        pickup_total=total,
+        pickup_page=page,
+        pickup_per_page=per_page,
+        pickup_outcome=outcome,
+        pickup_pending=db.count_pickup_detail_pending(**scope),
+        uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
+        selected_uploader_id=selected_uploader_id,
+    )
+
+
+@app.route("/api/pickup-detail-review", methods=["GET"])
+@auth.role_required("enforcer")
+def api_pickup_detail_list():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
+    outcome = request.args.get("outcome", "pending")
+    if outcome not in ("pending", "reviewed", "dismissed", "uncertain", "all"):
+        return jsonify({"success": False, "error": "Unknown pickup review outcome."}), 400
+    page = max(1, _int_query_arg("page", 1))
+    per_page = min(100, max(1, _int_query_arg("per_page", 50)))
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
+    rows, total = db.list_pickup_detail_candidates(
+        human_outcome=None if outcome == "all" else outcome,
+        page=page,
+        per_page=per_page,
+        **scope,
+    )
+    videos = _video_name_map(**scope)
+    return jsonify({
+        "success": True,
+        "items": [_pickup_detail_to_ui(row, videos) for row in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pending": db.count_pickup_detail_pending(**scope),
+    })
+
+
+@app.route("/api/pickup-detail-review/<int:candidate_id>/evidence/<kind>")
+@auth.role_required("enforcer")
+def api_pickup_detail_evidence(candidate_id: int, kind: str):
+    if kind not in ("scene", "crop"):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    row = db.get_pickup_detail_candidate(candidate_id)
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    try:
+        index = int(request.args.get("index", "1"))
+    except ValueError:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    frames = _detail_json(row.get("frames_json"), [])
+    frame = next((item for item in frames if isinstance(item, dict) and int(item.get("index") or 0) == index), None) if isinstance(frames, list) else None
+    stored = (frame or {}).get(f"{kind}_path")
+    if not stored:
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    path = Path(str(stored))
+    if not path.is_absolute():
+        path = Path(config.BASE_DIR) / path
+    root = (Path(config.EVIDENCE_FOLDER) / "pickup_detail").resolve()
+    try:
+        path = path.resolve()
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    if not path.is_file():
+        return jsonify({"success": False, "error": "Evidence not found."}), 404
+    return _evidence_media_response(str(path))
+
+
+@app.route("/api/pickup-detail-review/<int:candidate_id>/outcome", methods=["POST"])
+@auth.role_required("enforcer")
+def api_pickup_detail_outcome(candidate_id: int):
+    row = db.get_pickup_detail_candidate(candidate_id)
+    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+        return jsonify({"success": False, "error": "Pickup candidate not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    notes = payload.get("notes")
+    expected = payload.get("expected_outcome", row.get("human_outcome"))
+    if outcome not in ("reviewed", "uncertain", "dismissed"):
+        return jsonify({"success": False, "error": "Outcome must be reviewed, uncertain, or dismissed."}), 400
+    if expected not in ("pending", "reviewed", "uncertain", "dismissed"):
+        return jsonify({"success": False, "error": "Invalid expected outcome."}), 400
+    if notes is not None and (not isinstance(notes, str) or len(notes.strip()) > 2000):
+        return jsonify({"success": False, "error": "Reviewer notes must be at most 2000 characters."}), 400
+    saved = db.record_pickup_detail_review(
+        candidate_id=candidate_id,
+        outcome=outcome,
+        reviewed_by=int(auth.current_user()["id"]),
+        notes=notes,
+        expected_outcome=expected,
+    )
+    if not saved:
+        return jsonify({"success": False, "error": "This lead changed; reload it before deciding."}), 409
+    updated = db.get_pickup_detail_candidate(candidate_id) or {}
+    return jsonify({
+        "success": True,
+        "id": candidate_id,
+        "outcome": updated.get("human_outcome"),
+        "reviewed_at": updated.get("reviewed_at"),
+        "reviewer_name": updated.get("reviewer_full_name") or updated.get("reviewer_username"),
+        "reviewer_notes": updated.get("reviewer_notes"),
+    })
 
 
 @app.route("/motorcycle-detail-review")

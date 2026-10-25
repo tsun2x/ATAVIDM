@@ -81,6 +81,85 @@ if (typeof module !== "undefined" && module.exports) {
         });
     }
 
+    // Refresh account-scoped sidebar counts when a background tab becomes active.
+    const navCountLinks = Array.from(document.querySelectorAll("[data-nav-count-key]")).filter(function (link) {
+        return !!link.dataset.navCountKey;
+    });
+    if (navCountLinks.length) {
+        const badgeLabels = {
+            review_queue: ["pending review item", "pending review items"],
+            motorcycle_detail_review: ["pending motorcycle detail candidate", "pending motorcycle detail candidates"],
+            pickup_detail_review: ["pending pickup review lead", "pending pickup review leads"],
+        };
+        let navCountRequest = null;
+        let lastNavCountRefresh = 0;
+        let navWasInactive = false;
+        const refreshNavCounts = function (force) {
+            const now = Date.now();
+            if (document.visibilityState === "hidden" || navCountRequest || (!force && now - lastNavCountRefresh < 3000)) {
+                return navCountRequest || Promise.resolve();
+            }
+            lastNavCountRefresh = now;
+            navCountRequest = fetch("/api/navigation-counts", {
+                credentials: "same-origin",
+                cache: "no-store",
+                headers: { "Accept": "application/json" },
+            }).then(function (response) {
+                if (!response.ok) return null;
+                return response.json();
+            }).then(function (payload) {
+                if (!payload || payload.success !== true || !payload.counts) return;
+                navCountLinks.forEach(function (link) {
+                    const key = link.dataset.navCountKey;
+                    const count = Math.max(0, Number(payload.counts[key]) || 0);
+                    const labels = badgeLabels[key] || ["pending item", "pending items"];
+                    const label = labels[count === 1 ? 0 : 1];
+                    let badge = link.querySelector(".nav-badge-count");
+                    if (!badge && count > 0) {
+                        badge = document.createElement("span");
+                        badge.className = "nav-badge nav-badge-count";
+                        badge.setAttribute("aria-hidden", "true");
+                        link.appendChild(badge);
+                    }
+                    if (badge) {
+                        badge.textContent = String(count);
+                        badge.hidden = count === 0;
+                    }
+                    if (count > 0) {
+                        const title = link.querySelector("span:not(.nav-badge)")?.textContent.trim() || "Notifications";
+                        link.setAttribute("aria-label", title + ", " + count + " " + label);
+                    } else {
+                        link.removeAttribute("aria-label");
+                    }
+                });
+            }).catch(function () {
+                // Keep the server-rendered counts when a refresh is unavailable.
+            }).finally(function () {
+                navCountRequest = null;
+            });
+            return navCountRequest;
+        };
+        window.TAVIDMRefreshNavCounts = refreshNavCounts;
+        window.addEventListener("blur", function () { navWasInactive = true; });
+        window.addEventListener("focus", function () {
+            if (navWasInactive) {
+                navWasInactive = false;
+                refreshNavCounts(false);
+            }
+        });
+        window.addEventListener("pageshow", function (event) {
+            if (event.persisted) refreshNavCounts(false);
+        });
+        document.addEventListener("visibilitychange", function () {
+            if (document.visibilityState === "hidden") {
+                navWasInactive = true;
+            } else if (navWasInactive) {
+                navWasInactive = false;
+                refreshNavCounts(false);
+            }
+        });
+    }
+
     /**
      * Show Bootstrap toast notification
      * @param {string} title
