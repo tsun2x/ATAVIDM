@@ -90,6 +90,7 @@ class LiveStreamWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
+        self._latest_raw_jpeg: bytes | None = None
         self.status = "starting"
         self.error: str | None = None
         self.diagnostics: list[str] = []
@@ -101,6 +102,10 @@ class LiveStreamWorker(threading.Thread):
     def latest_jpeg(self) -> bytes | None:
         with self._frame_lock:
             return self._latest_jpeg
+
+    def latest_raw_jpeg(self) -> bytes | None:
+        with self._frame_lock:
+            return self._latest_raw_jpeg
 
     def _annotate(self, frame: Any, tracked: list[dict[str, Any]]) -> Any:
         try:
@@ -189,6 +194,7 @@ class LiveStreamWorker(threading.Thread):
         conf_threshold = float(params["confidence_threshold"])
         frame_number = -1
         skipped_frames = 0
+        last_raw_snapshot = 0.0
 
         try:
             while not self._stop_event.is_set():
@@ -236,6 +242,13 @@ class LiveStreamWorker(threading.Thread):
                         continue
                     raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
                 tracked = track_state.update(raw, now=timestamp_sec)
+                snapshot_time = time.monotonic()
+                if snapshot_time - last_raw_snapshot >= 1.0:
+                    ok_snapshot, snapshot = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    if ok_snapshot:
+                        with self._frame_lock:
+                            self._latest_raw_jpeg = snapshot.tobytes()
+                        last_raw_snapshot = snapshot_time
                 self._publish(self._annotate(frame, tracked))
 
                 events = evaluate_detection_rules(

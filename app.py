@@ -4725,6 +4725,18 @@ def api_camera_stream_status(camera_id: int):
     return jsonify({"success": True, **stream_manager.status(camera_id)})
 
 
+@app.route("/api/cameras/<int:camera_id>/annotation-frame")
+@auth.login_required
+def api_camera_annotation_frame(camera_id: int):
+    if db.get_camera(camera_id) is None:
+        return jsonify({"success": False, "error": "Camera not found."}), 404
+    worker = stream_manager.get(camera_id)
+    frame = worker.latest_raw_jpeg() if worker else None
+    if frame is None:
+        return jsonify({"success": False, "error": "Start the camera and wait for a frame."}), 409
+    return Response(frame, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.route("/api/cameras/<int:camera_id>/stop", methods=["POST"])
 @auth.role_required("enforcer")
 def api_camera_stop(camera_id: int):

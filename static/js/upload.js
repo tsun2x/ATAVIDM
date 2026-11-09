@@ -322,7 +322,7 @@
         destroyEditor();
         if (!zoneEditorCanvas || !wizardState.frameUrl) return;
         zoneEditor = window.TAVIDMZoneEditor.create(zoneEditorCanvas, {
-            imageUrl: wizardState.frameUrl + "?t=" + Date.now(),
+            imageUrl: wizardState.camera ? wizardState.frameUrl : wizardState.frameUrl + "?t=" + Date.now(),
             zoneTypes: zoneTypes,
             sceneDocument: sceneDoc || window.TAVIDMZoneEditor.emptySceneV2(),
             activeZone: zoneTypes[0] && zoneTypes[0].key,
@@ -348,12 +348,15 @@
     }
 
     function openAnnotationWizard(payload) {
+        wizardState.camera = payload.camera || null;
+        wizardState.onCameraSaved = payload.on_camera_saved || null;
+        wizardState.pendingScene = null;
         wizardState.video = payload.video;
         wizardState.frameUrl = payload.frame_url;
         wizardState.templates = payload.templates || [];
         wizardState.mode = wizardState.templates.length ? "choose" : "new";
         wizardState.sourceTemplateId = null;
-        const draft = readAnnotationDraft(payload.video && payload.video.db_id);
+        const draft = wizardState.camera ? null : readAnnotationDraft(payload.video && payload.video.db_id);
         wizardState.existingScene = draft || payload.existing_scene || null;
         wizardState.startAtEditor = !!payload.start_at_editor || !!draft;
 
@@ -362,6 +365,7 @@
         document.getElementById("optionNewAnnotation")?.classList.add("active");
         document.getElementById("optionUseTemplate")?.classList.remove("active");
         wizardTemplateSelect.value = "";
+        document.getElementById("btnWizardBack")?.classList.toggle("d-none", !!wizardState.camera);
 
         document.getElementById("templateNameFields")?.classList.add("d-none");
         document.getElementById("btnUpdateTemplate")?.classList.add("d-none");
@@ -611,6 +615,28 @@
             showToast("Incomplete Zones", "Draw at least one zone or lane; each drawn polygon needs at least 3 points.", "warning");
             return;
         }
+        if (wizardState.camera) {
+            const check = window.TAVIDMZoneEditor.validateSceneDocument(wizardState.pendingScene);
+            if (!check.ok) {
+                showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
+                return;
+            }
+            const saveButton = document.getElementById("btnWizardSaveAnnotation");
+            saveButton.disabled = true;
+            fetch("/api/cameras/" + wizardState.camera.id, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ zones_json: wizardState.pendingScene }),
+            }).then(function (response) { return response.json(); }).then(function (result) {
+                if (!result.success) throw new Error(result.error || "Could not save camera annotation.");
+                if (wizardState.onCameraSaved) wizardState.onCameraSaved(result.camera);
+                wizardModal?.hide();
+                showToast("Camera Annotation Saved", "The live stream is reconnecting with the saved scene.", "success");
+            }).catch(function (error) {
+                showToast("Save Error", error.message || "Could not save camera annotation.", "danger");
+            }).finally(function () { saveButton.disabled = false; });
+            return;
+        }
         const updateBtn = document.getElementById("btnUpdateTemplate");
         if (wizardState.sourceTemplateId) {
             updateBtn?.classList.remove("d-none");
@@ -647,6 +673,8 @@
 
     wizardModalEl?.addEventListener("hidden.bs.modal", function () {
         destroyEditor();
+        if (wizardState.camera && wizardState.frameUrl) URL.revokeObjectURL(wizardState.frameUrl);
+        wizardState.camera = null;
     });
 
     function uploadFile() {

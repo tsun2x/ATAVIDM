@@ -144,6 +144,11 @@
         feedStatus.textContent = "Connecting to stream…";
         liveIndicator?.classList.remove("d-none");
         btnStopStream?.classList.remove("d-none");
+        if (window.TAVIDM_USER_ROLE === "admin") {
+            btnEditAnnotation?.classList.remove("d-none");
+            const label = btnEditAnnotation?.querySelector("span");
+            if (label) label.textContent = "Edit Camera Annotation";
+        }
         showImage(camera.stream_url + "?t=" + Date.now());
 
         statusPoll = setInterval(function () {
@@ -379,7 +384,31 @@
     });
 
     btnEditAnnotation?.addEventListener("click", function () {
-        openAnnotationEditor(activeVideo);
+        if (!activeCamera) { openAnnotationEditor(activeVideo); return; }
+        const camera = activeCamera;
+        fetch("/api/cameras/" + camera.id + "/annotation-frame", { cache: "no-store" })
+            .then(function (response) {
+                if (!response.ok) throw new Error("Start the camera and wait for a frame before editing.");
+                return response.blob();
+            }).then(function (blob) {
+                if (!activeCamera || activeCamera.id !== camera.id) return;
+                window.TAVIDM_upload.openAnnotationWizard({
+                    camera: camera,
+                    frame_url: URL.createObjectURL(blob),
+                    frame_ready: true,
+                    existing_scene: camera.zones_json,
+                    start_at_editor: true,
+                    on_camera_saved: function (updated) {
+                        Object.assign(camera, updated);
+                        const row = cameraList?.querySelector('.camera-item.active');
+                        if (row) row.dataset.camera = JSON.stringify(camera);
+                        if (activeCamera && activeCamera.id === camera.id) {
+                            showImage(camera.stream_url + "?t=" + Date.now());
+                            feedStatus.textContent = "Reconnecting with saved annotation…";
+                        }
+                    },
+                });
+            }).catch(function (error) { showToast("Camera Annotation", error.message, "danger"); });
     });
 
     function formatSec(sec) {
