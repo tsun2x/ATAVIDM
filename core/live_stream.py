@@ -455,8 +455,10 @@ class StreamManager:
             # Explicit Stop cancels any delayed restart scheduled by a save.
             self._restart_states.pop(camera_id, None)
             worker = self._workers.get(camera_id)
-        if worker is not None:
-            worker.stop()
+            if worker is not None:
+                # Publish stop_requested before releasing the same lock used by
+                # restart(), so an explicit stop cannot lose this race.
+                worker.stop()
 
     def get(self, camera_id: int) -> LiveStreamWorker | None:
         with self._lock:

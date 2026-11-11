@@ -152,3 +152,80 @@ def test_restart_timeout_is_reported_and_does_not_overlap_workers(monkeypatch):
     replacement = manager.get(43)
     assert replacement is not old_worker
     assert not replacement.overlap
+
+
+def test_explicit_stop_wins_when_restart_races_after_stop_begins(monkeypatch):
+    import core.live_stream as live_stream
+
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    restart_lock_attempted = threading.Event()
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "concurrent-restart":
+                restart_lock_attempted.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self.lock.release()
+
+    factory = WorkerFactory()
+    Worker = factory.worker_class()
+
+    class StopGateWorker(Worker):
+        def stop(self):
+            stop_entered.set()
+            assert release_stop.wait(2)
+            super().stop()
+
+    monkeypatch.setattr(live_stream, "LiveStreamWorker", StopGateWorker)
+    monkeypatch.setattr(live_stream.db, "get_camera", lambda camera_id: {"id": camera_id})
+    manager = StreamManager(restart_timeout_seconds=1, restart_thread_factory=factory.thread_factory)
+    manager._lock = TrackingLock()
+    worker = manager.start(44)
+    stop_thread = threading.Thread(target=manager.stop, args=(44,), name="explicit-stop")
+    stop_thread.start()
+    assert stop_entered.wait(1)
+
+    results = []
+    restart_thread = threading.Thread(
+        target=lambda: results.append(manager.restart(44)),
+        name="concurrent-restart",
+    )
+    restart_thread.start()
+    assert restart_lock_attempted.wait(1)
+    release_stop.set()
+    stop_thread.join(timeout=2)
+    restart_thread.join(timeout=2)
+
+    assert not stop_thread.is_alive()
+    assert not restart_thread.is_alive()
+    assert results == [False]
+    assert worker.stop_requested
+    assert len(factory.instances) == 1
+    assert not factory.waiters
+
+
+def test_restart_then_explicit_stop_cancels_replacement(monkeypatch):
+    import core.live_stream as live_stream
+
+    factory = WorkerFactory()
+    monkeypatch.setattr(live_stream, "LiveStreamWorker", factory.worker_class())
+    monkeypatch.setattr(live_stream.db, "get_camera", lambda camera_id: {"id": camera_id})
+    manager = StreamManager(restart_timeout_seconds=2, restart_thread_factory=factory.thread_factory)
+    worker = manager.start(45)
+
+    assert manager.restart(45)
+    assert factory.old_join_entered.wait(1)
+    manager.stop(45)
+    factory.release_old.set()
+    assert factory.waiters[0].completed.wait(1)
+
+    assert len(factory.instances) == 1
+    assert worker.stop_requested
+    assert manager.status(45)["status"] == "stopped"

@@ -43,6 +43,16 @@
     let pendingDeleteVideo = null;
     const MAX_CAMERA_RECONNECT_ATTEMPTS = 24;
     const cameraReconnect = window.TAVIDMCameraReconnect.create(MAX_CAMERA_RECONNECT_ATTEMPTS);
+    const cameraReconnectUI = window.TAVIDMLiveCameraReconnectUI.create(cameraReconnect, {
+        showImage: showImage,
+        setStatus: function (message) { if (feedStatus) feedStatus.textContent = message; },
+    });
+    feedImage?.addEventListener("load", function () {
+        cameraReconnectUI.imageLoaded(feedImage.getAttribute("src"));
+    });
+    feedImage?.addEventListener("error", function () {
+        cameraReconnectUI.imageFailed(feedImage.getAttribute("src"));
+    });
 
     function esc(value) {
         return String(value == null ? "" : value)
@@ -68,7 +78,7 @@
         hideCrossingSummary();
         activeCamera = null;
         activeVideo = null;
-        cameraReconnect.reset();
+        cameraReconnectUI.reset();
         watchingLive = false;
         btnProcess?.classList.add("d-none");
         btnEditAnnotation?.classList.add("d-none");
@@ -141,7 +151,7 @@
     function selectCamera(camera, btn) {
         clearActive();
         activeCamera = camera;
-        cameraReconnect.reset();
+        cameraReconnectUI.reset();
         btn.classList.add("active");
         activeSourceName.textContent = camera.name;
         sourceMeta.textContent = camera.location || "RTSP stream";
@@ -165,15 +175,7 @@
                         ((payload.diagnostics || []).length
                             ? " — " + payload.diagnostics.join("; ")
                             : "");
-                    const reconnectResult = cameraReconnect.observe(payload.status, payload.running);
-                    if (reconnectResult === "reconnect") {
-                        showImage(camera.stream_url + "?reconnect=" + Date.now());
-                        feedStatus.textContent = "Reconnected to the updated camera stream.";
-                    } else if (reconnectResult === "timeout") {
-                        feedStatus.textContent = "Camera restart is taking too long. Select the camera again to retry.";
-                    } else if (reconnectResult === "stopped") {
-                        feedStatus.textContent = "Camera stream was stopped during restart. Select the camera again to start it.";
-                    }
+                    cameraReconnectUI.observe(camera, payload.status, payload.running);
                 });
         }, 5000);
     }
@@ -417,16 +419,13 @@
                         if (row) row.dataset.camera = JSON.stringify(camera);
                         if (activeCamera && activeCamera.id === camera.id) {
                             const stream = updated.stream_status || {};
-                            if (stream.status === "stopping" || stream.status === "starting") {
-                                cameraReconnect.begin();
-                                feedStatus.textContent = "Saved. Waiting for the updated camera worker to restart…";
-                            } else if (stream.running && stream.status === "running") {
-                                cameraReconnect.reset();
-                                showImage(camera.stream_url + "?reconnect=" + Date.now());
-                                feedStatus.textContent = "Reconnected to the updated camera stream.";
-                            } else {
-                                cameraReconnect.reset();
+                            const attach = cameraReconnectUI.begin(camera, stream.status, stream.running);
+                            if (attach === "stopped") {
                                 feedStatus.textContent = "Annotation saved; camera stream remains stopped." + (stream.error ? " — " + stream.error : "");
+                            } else if (attach === "error" && stream.error) {
+                                feedStatus.textContent = "Annotation saved, but camera restart failed: " + stream.error;
+                            } else if (attach === "waiting") {
+                                feedStatus.textContent = "Saved. Waiting for the updated camera worker to restart…";
                             }
                         }
                     },

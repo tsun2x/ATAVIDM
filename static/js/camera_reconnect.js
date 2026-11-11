@@ -5,18 +5,21 @@
     function create(maxAttempts) {
         var pending = false;
         var attempts = 0;
+        var attachmentRequested = false;
         maxAttempts = Math.max(1, Number(maxAttempts) || 24);
 
         return {
             begin: function () {
                 pending = true;
                 attempts = 0;
+                attachmentRequested = false;
             },
             reset: function () {
                 pending = false;
                 attempts = 0;
+                attachmentRequested = false;
             },
-            observe: function (status, running) {
+            observe: function (status, running, requestAttachment) {
                 if (status === "stopping" && !pending) {
                     pending = true;
                     attempts = 0;
@@ -31,17 +34,39 @@
                     attempts = 0;
                     return "stopped";
                 }
-                if (status === "running" && running) {
-                    pending = false;
-                    attempts = 0;
-                    return "reconnect";
+                if (status === "live" && running) {
+                    if (!attachmentRequested) {
+                        attachmentRequested = true;
+                        if (typeof requestAttachment === "function") requestAttachment();
+                        return "attaching";
+                    }
+                } else if (status !== "starting" && status !== "reconnecting" && status !== "stopping") {
+                    attachmentRequested = false;
                 }
+                attempts += 1;
+                if (attempts >= maxAttempts) {
+                    pending = false;
+                    attachmentRequested = false;
+                    return "timeout";
+                }
+                return "waiting";
+            },
+            imageLoaded: function () {
+                if (!pending || !attachmentRequested) return false;
+                pending = false;
+                attempts = 0;
+                attachmentRequested = false;
+                return true;
+            },
+            imageFailed: function () {
+                if (!pending || !attachmentRequested) return "idle";
+                attachmentRequested = false;
                 attempts += 1;
                 if (attempts >= maxAttempts) {
                     pending = false;
                     return "timeout";
                 }
-                return "waiting";
+                return "retry";
             },
             isPending: function () { return pending; },
         };
