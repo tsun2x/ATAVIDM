@@ -949,6 +949,7 @@ def live_monitor():
         enabled_violations=list(load_enabled_violations()),
         max_upload_mb=config.MAX_UPLOAD_MB,
         user_role=(actor or {}).get("role", "viewer"),
+        current_user_id=(actor or {}).get("id"),
         uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
         selected_uploader_id=selected_uploader_id,
         vehicle_crossing_classes=list(FROZEN_VEHICLE_DETECTOR_CLASSES),
@@ -4675,9 +4676,17 @@ def api_create_camera():
 @app.route("/api/cameras/<int:camera_id>", methods=["PUT"])
 @auth.role_required("admin")
 def api_update_camera(camera_id: int):
-    if db.get_camera(camera_id) is None:
+    current_camera = db.get_camera(camera_id)
+    if current_camera is None:
         return jsonify({"success": False, "error": "Camera not found."}), 404
     payload = request.get_json(silent=True) or {}
+    if "expected_zones_json" in payload:
+        try:
+            expected_scene = dumps_zones(payload.get("expected_zones_json") or {})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
+        if expected_scene != (current_camera.get("zones_json") or "{}"):
+            return jsonify({"success": False, "error": "Camera scene changed since this editor opened. Reload it and review the current scene before saving."}), 409
     zones_json = None
     if "zones_json" in payload:
         try:

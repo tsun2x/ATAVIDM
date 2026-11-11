@@ -124,3 +124,39 @@ def test_live_consumer_only_appends_new_rule_diagnostics_per_worker():
     second.diagnostics.append("first rule note")
     _consume_live_diagnostics(output_two, seen_two, second, 0)
     assert output_two == ["first rule note"]
+
+
+def test_stream_manager_never_replaces_a_worker_while_it_is_stopping(monkeypatch):
+    import core.live_stream as live_stream
+
+    class Worker:
+        def __init__(self, camera):
+            self.camera = camera
+            self.alive = True
+            self.stop_requested = False
+            self.status = "running"
+            self.error = None
+            self.diagnostics = []
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return self.alive
+
+        def stop(self):
+            self.stop_requested = True
+
+    monkeypatch.setattr(live_stream, "LiveStreamWorker", Worker)
+    monkeypatch.setattr(live_stream.db, "get_camera", lambda camera_id: {"id": camera_id})
+    manager = StreamManager()
+
+    first = manager.start(12)
+    manager.stop(12)
+    assert manager.status(12)["status"] == "stopping"
+    assert manager.start(12) is first
+
+    first.alive = False
+    second = manager.start(12)
+    assert second is not first
+    assert manager.get(12) is second

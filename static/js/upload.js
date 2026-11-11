@@ -33,6 +33,10 @@
     const sceneObjectLegend = document.getElementById("sceneObjectLegend");
     const sceneObjectLegendList = document.getElementById("sceneObjectLegendList");
     const sceneEditorLayout = document.getElementById("sceneEditorLayout");
+    const sceneTemplateCopy = document.getElementById("sceneTemplateCopy");
+    const sceneTemplateSelect = document.getElementById("sceneTemplateSelect");
+    const btnApplySceneTemplate = document.getElementById("btnApplySceneTemplate");
+    const btnSaveCameraAsTemplate = document.getElementById("btnSaveCameraAsTemplate");
 
     if (!dropzone || !fileInput) return;
 
@@ -53,42 +57,89 @@
         pendingZones: null,
         pendingScene: null,
         existingScene: null,
+        baseScene: null,
+        draftStorageWarned: false,
         startAtEditor: false,
     };
 
-    function annotationDraftKey(videoId) {
-        return "tavidm.annotation-draft." + String(videoId);
+    function draftIdentity() {
+        if (wizardState.camera) return { type: "camera", id: wizardState.camera.id };
+        if (wizardState.video && wizardState.video.db_id != null) return { type: "video", id: wizardState.video.db_id };
+        return null;
     }
 
-    function readAnnotationDraft(videoId) {
-        if (videoId == null) return null;
+    function draftBaseScene() {
+        return wizardState.baseScene || window.TAVIDMZoneEditor.emptySceneV2();
+    }
+
+    function readCurrentDraft() {
+        const identity = draftIdentity();
+        if (!identity || !window.TAVIDMAnnotationDrafts) return { ok: true, draft: null };
+        const storage = getDraftStorage();
+        if (!storage) return { ok: false, draft: null };
+        const result = window.TAVIDMAnnotationDrafts.read(storage, window.TAVIDM_USER_ID, identity.type, identity.id);
+        if (result.draft || !result.ok || identity.type !== "video") return result;
         try {
-            const raw = window.localStorage.getItem(annotationDraftKey(videoId));
-            return raw ? JSON.parse(raw) : null;
+            const legacy = storage.getItem("tavidm.annotation-draft." + String(identity.id));
+            if (!legacy) return result;
+            const scene = JSON.parse(legacy);
+            return scene && typeof scene === "object"
+                ? { ok: true, draft: { version: 2, scene: scene, base_scene: null, updated_at: null }, legacy: true }
+                : result;
         } catch (err) {
-            return null;
+            return { ok: false, draft: null };
         }
+    }
+
+    function getDraftStorage() {
+        try { return window.localStorage; } catch (err) { return null; }
     }
 
     function saveAnnotationDraft() {
-        if (!zoneEditor || !wizardState.video || wizardState.video.db_id == null) return;
-        try {
-            window.localStorage.setItem(
-                annotationDraftKey(wizardState.video.db_id),
-                JSON.stringify(zoneEditor.getSceneDocument())
-            );
-        } catch (err) {
-            // Keep editing usable if browser storage is unavailable or full.
+        if (!zoneEditor || !window.TAVIDMAnnotationDrafts) return;
+        const identity = draftIdentity();
+        if (!identity) return;
+        const storage = getDraftStorage();
+        const result = storage && window.TAVIDMAnnotationDrafts.write(
+            storage, window.TAVIDM_USER_ID, identity.type, identity.id,
+            zoneEditor.getSceneDocument(), draftBaseScene()
+        );
+        if ((!result || !result.ok) && !wizardState.draftStorageWarned) {
+            wizardState.draftStorageWarned = true;
+            showToast("Draft Recovery Unavailable", "Browser storage is unavailable or full; unfinished annotation edits may not survive navigation.", "warning");
         }
     }
 
-    function clearAnnotationDraft(videoId) {
-        if (videoId == null) return;
-        try {
-            window.localStorage.removeItem(annotationDraftKey(videoId));
-        } catch (err) {
-            // The server copy is authoritative once save succeeds.
+    function clearAnnotationDraft() {
+        const identity = draftIdentity();
+        if (!identity || !window.TAVIDMAnnotationDrafts) return;
+        const storage = getDraftStorage();
+        if (storage) {
+            window.TAVIDMAnnotationDrafts.remove(storage, window.TAVIDM_USER_ID, identity.type, identity.id);
+            if (identity.type === "video") {
+                try { storage.removeItem("tavidm.annotation-draft." + String(identity.id)); } catch (err) { /* Keep the saved scene authoritative. */ }
+            }
         }
+    }
+
+    function sceneKey(scene) {
+        return JSON.stringify(window.TAVIDMZoneEditor.parseSceneDocument(scene, zoneTypes));
+    }
+
+    function recoverDraftOrDiscard(draft, sourceLabel, serverScene) {
+        if (!draft) return { recovered: false, scene: serverScene || null };
+        const changedOnServer = window.TAVIDMAnnotationDrafts.isStale(draft, serverScene, sceneKey);
+        const staleWarning = changedOnServer
+            ? " The saved scene has changed since this draft was made. Recovering it will replace the newer scene when you save."
+            : "";
+        const updated = draft.updated_at ? " (saved " + new Date(draft.updated_at).toLocaleString() + ")" : "";
+        const recover = window.confirm(
+            "An unfinished " + sourceLabel + " annotation draft exists" + updated + ". Recover this draft?" + staleWarning +
+            "\n\nChoose Cancel to discard the draft and use the current saved scene."
+        );
+        if (recover) return { recovered: true, scene: draft.scene };
+        clearAnnotationDraft();
+        return { recovered: false, scene: serverScene || null };
     }
 
     if (wizardModalEl && window.bootstrap) {
@@ -332,6 +383,19 @@
             },
         });
         buildZoneTabs();
+        populateSceneTemplateCopy();
+    }
+
+    function populateSceneTemplateCopy() {
+        if (!sceneTemplateCopy || !sceneTemplateSelect) return;
+        sceneTemplateSelect.innerHTML = '<option value="">— Select template —</option>';
+        (wizardState.templates || []).forEach(function (template) {
+            const option = document.createElement("option");
+            option.value = String(template.id);
+            option.textContent = template.template_name;
+            sceneTemplateSelect.appendChild(option);
+        });
+        sceneTemplateCopy.hidden = !(wizardState.templates || []).length;
     }
 
     function getInitialScene() {
@@ -353,12 +417,23 @@
         wizardState.pendingScene = null;
         wizardState.video = payload.video;
         wizardState.frameUrl = payload.frame_url;
-        wizardState.templates = payload.templates || [];
+        wizardState.templates = payload.templates || (wizardState.camera ? window.TAVIDM_ZONE_TEMPLATES : []) || [];
         wizardState.mode = wizardState.templates.length ? "choose" : "new";
         wizardState.sourceTemplateId = null;
-        const draft = wizardState.camera ? null : readAnnotationDraft(payload.video && payload.video.db_id);
-        wizardState.existingScene = draft || payload.existing_scene || null;
-        wizardState.startAtEditor = !!payload.start_at_editor || !!draft;
+        wizardState.baseScene = payload.existing_scene || null;
+        wizardState.draftStorageWarned = false;
+        const draftResult = readCurrentDraft();
+        if (!draftResult.ok) {
+            wizardState.draftStorageWarned = true;
+            showToast("Draft Recovery Unavailable", "Browser storage could not be read; only the saved scene will be opened.", "warning");
+        }
+        const recovered = recoverDraftOrDiscard(
+            draftResult.draft,
+            wizardState.camera ? "camera" : "video",
+            wizardState.baseScene
+        );
+        wizardState.existingScene = recovered.scene;
+        wizardState.startAtEditor = !!payload.start_at_editor || recovered.recovered;
 
         populateTemplateSelect(wizardState.templates);
         document.getElementById("optionUseTemplate")?.classList.toggle("d-none", !wizardState.templates.length);
@@ -366,6 +441,7 @@
         document.getElementById("optionUseTemplate")?.classList.remove("active");
         wizardTemplateSelect.value = "";
         document.getElementById("btnWizardBack")?.classList.toggle("d-none", !!wizardState.camera);
+        btnSaveCameraAsTemplate?.classList.toggle("d-none", !wizardState.camera || window.TAVIDM_USER_ROLE !== "admin");
 
         document.getElementById("templateNameFields")?.classList.add("d-none");
         document.getElementById("btnUpdateTemplate")?.classList.add("d-none");
@@ -532,7 +608,7 @@
                     return;
                 }
                 showToast("Annotation Saved", payload.message, "success");
-                clearAnnotationDraft(dbId);
+                clearAnnotationDraft();
                 appendVideoToList(payload.video);
                 wizardModal?.hide();
                 resetSelection();
@@ -606,6 +682,7 @@
         const selected = zoneEditor.selectedObject && zoneEditor.selectedObject();
         if (selected) selected.prohibited_from = sceneProhibitedFrom.value;
         zoneEditor.draw();
+        saveAnnotationDraft();
     });
 
     document.getElementById("btnWizardSaveAnnotation")?.addEventListener("click", function () {
@@ -621,20 +698,7 @@
                 showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
                 return;
             }
-            const saveButton = document.getElementById("btnWizardSaveAnnotation");
-            saveButton.disabled = true;
-            fetch("/api/cameras/" + wizardState.camera.id, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ zones_json: wizardState.pendingScene }),
-            }).then(function (response) { return response.json(); }).then(function (result) {
-                if (!result.success) throw new Error(result.error || "Could not save camera annotation.");
-                if (wizardState.onCameraSaved) wizardState.onCameraSaved(result.camera);
-                wizardModal?.hide();
-                showToast("Camera Annotation Saved", "The live stream is reconnecting with the saved scene.", "success");
-            }).catch(function (error) {
-                showToast("Save Error", error.message || "Could not save camera annotation.", "danger");
-            }).finally(function () { saveButton.disabled = false; });
+            saveCameraScene(wizardState.pendingScene, false);
             return;
         }
         const updateBtn = document.getElementById("btnUpdateTemplate");
@@ -645,6 +709,101 @@
         }
         document.getElementById("templateNameFields")?.classList.add("d-none");
         showWizardStep("template");
+    });
+
+    function saveCameraScene(scene, alsoCreateTemplate) {
+        const saveButton = document.getElementById("btnWizardSaveAnnotation");
+        const templateButton = btnSaveCameraAsTemplate;
+        if (saveButton) saveButton.disabled = true;
+        if (templateButton) templateButton.disabled = true;
+        const cameraId = wizardState.camera.id;
+        const templateName = alsoCreateTemplate
+            ? window.prompt("Name this reusable copy of the camera scene:")
+            : null;
+        if (alsoCreateTemplate && !templateName?.trim()) {
+            if (saveButton) saveButton.disabled = false;
+            if (templateButton) templateButton.disabled = false;
+            return;
+        }
+        const createTemplate = alsoCreateTemplate
+            ? fetch("/api/zone-templates", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ template_name: templateName.trim(), zones_json: scene }),
+            }).then(function (response) {
+                return response.json().then(function (body) {
+                    if (!response.ok || !body.success) throw new Error(body.error || "Could not create the template copy.");
+                    return body.template;
+                });
+            })
+            : Promise.resolve(null);
+        let templateCreated = false;
+        createTemplate.then(function () {
+            templateCreated = alsoCreateTemplate;
+            return fetch("/api/cameras/" + cameraId, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ zones_json: scene, expected_zones_json: wizardState.baseScene || {} }),
+            });
+        }).then(function (response) {
+            if (!response) return null;
+            return response.json().then(function (body) {
+                if (!response.ok || !body.success) {
+                    const error = new Error(body.error || "Could not save camera annotation.");
+                    error.status = response.status;
+                    throw error;
+                }
+                return body;
+            });
+        }).then(function (result) {
+            if (!result) return;
+            if (wizardState.onCameraSaved) wizardState.onCameraSaved(result.camera);
+            clearAnnotationDraft();
+            wizardModal?.hide();
+            showToast("Camera Annotation Saved", alsoCreateTemplate
+                ? "The camera scene and reusable template copy were saved."
+                : "The live stream is reconnecting with the saved scene.", "success");
+        }).catch(function (error) {
+            const detail = templateCreated
+                ? " The template copy was created, but the camera scene was not saved; check the camera before retrying."
+                : "";
+            const conflict = error.status === 409
+                ? " Reopen the camera editor to load and review the current saved scene before applying your changes."
+                : "";
+            showToast("Save Error", (error.message || "Could not save camera annotation.") + conflict + detail, "danger");
+        }).finally(function () {
+            if (saveButton) saveButton.disabled = false;
+            if (templateButton) templateButton.disabled = false;
+        });
+    }
+
+    btnApplySceneTemplate?.addEventListener("click", function () {
+        if (!zoneEditor || !sceneTemplateSelect?.value) {
+            showToast("Select Template", "Choose a scene template to copy.", "warning");
+            return;
+        }
+        const template = wizardState.templates.find(function (item) {
+            return String(item.id) === String(sceneTemplateSelect.value);
+        });
+        if (!template) return;
+        if (!window.confirm("Copy “" + template.template_name + "” to this scene? This copies the full scene and does not link it. Check the copied geometry against the reference frame; it assumes the same view and framing.")) return;
+        zoneEditor.loadSceneDocument(window.TAVIDMZoneEditor.parseSceneDocument(template.zones_json, zoneTypes));
+        showToast("Template Copied", "The full scene was copied. Inspect alignment against the target reference frame before saving.", "info");
+    });
+
+    btnSaveCameraAsTemplate?.addEventListener("click", function () {
+        if (!zoneEditor || !wizardState.camera) return;
+        const scene = zoneEditor.getSceneDocument({ completeOnly: true });
+        if (!window.TAVIDMZoneEditor.sceneSaveReady(scene, zoneTypes)) {
+            showToast("Incomplete Zones", "Draw at least one zone or lane before saving.", "warning");
+            return;
+        }
+        const check = window.TAVIDMZoneEditor.validateSceneDocument(scene);
+        if (!check.ok) {
+            showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
+            return;
+        }
+        saveCameraScene(scene, true);
     });
 
     document.getElementById("btnSaveVideoOnly")?.addEventListener("click", function () {

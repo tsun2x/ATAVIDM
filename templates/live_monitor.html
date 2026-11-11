@@ -319,7 +319,7 @@
             </div>
             <div class="modal-body">
                 <div id="wizardStepChoose">
-                    <p class="text-muted small mb-3">Choose a reusable zone template or create a new annotation for this video.</p>
+                    <p class="text-muted small mb-3">Choose a reusable zone template or create a new annotation for this source.</p>
                     <div class="row g-3">
                         <div class="col-md-6">
                             <div class="card card-panel h-100 wizard-option-card" id="optionUseTemplate">
@@ -365,6 +365,14 @@
                         </select>
                         <span class="small text-muted" id="sceneSelectedLabel"></span>
                     </div>
+                    <div class="row g-2 align-items-end mb-2" id="sceneTemplateCopy" hidden>
+                        <div class="col-md-5">
+                            <label class="form-label small mb-1" for="sceneTemplateSelect">Copy scene from template</label>
+                            <select class="form-select form-select-sm" id="sceneTemplateSelect"><option value="">— Select template —</option></select>
+                        </div>
+                        <div class="col-auto"><button type="button" class="btn btn-sm btn-outline-secondary" id="btnApplySceneTemplate">Apply copy</button></div>
+                        <div class="col small text-muted">This copies the full scene. Check its alignment against the reference frame; reuse assumes the same camera view and framing.</div>
+                    </div>
                     <p class="small text-muted mb-2">Click to draw · Hover the annotation list to locate a shape · Select a shape there to edit its points · New object starts another shape · Shift+drag to pan · Scroll to zoom. For live cameras, keep the camera fixed after saving; moving it invalidates the scene geometry.</p>
                     <div class="scene-editor-layout" id="sceneEditorLayout">
                         <aside class="scene-object-legend d-none" id="sceneObjectLegend" aria-label="Scene annotations">
@@ -377,7 +385,10 @@
                     </div>
                     <div class="d-flex justify-content-between mt-3">
                         <button type="button" class="btn btn-outline-secondary btn-sm" id="btnWizardBack"><i class="bi bi-arrow-left me-1"></i> Back</button>
-                        <button type="button" class="btn btn-danger btn-sm" id="btnWizardSaveAnnotation"><i class="bi bi-check-lg me-1"></i> Save Annotation</button>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-outline-danger btn-sm d-none" id="btnSaveCameraAsTemplate"><i class="bi bi-layers me-1"></i> Save Camera + Copy as Template</button>
+                            <button type="button" class="btn btn-danger btn-sm" id="btnWizardSaveAnnotation"><i class="bi bi-check-lg me-1"></i> Save Annotation</button>
+                        </div>
                     </div>
                 </div>
 
@@ -507,11 +518,13 @@
     window.TAVIDM_ENABLED_VIOLATIONS = {{ enabled_violations | tojson }};
     window.TAVIDM_MAX_UPLOAD_MB = {{ max_upload_mb }};
     window.TAVIDM_USER_ROLE = {{ user_role | tojson }};
+    window.TAVIDM_USER_ID = {{ current_user_id | tojson }};
     window.TAVIDM_VEHICLE_CROSSING_CLASSES = {{ vehicle_crossing_classes | tojson }};
 </script>
 <script src="{{ url_for('static', filename='js/violation_switch.js') }}"></script>
 <script src="{{ url_for('static', filename='js/crossing_summary.js') }}"></script>
 <script src="{{ url_for('static', filename='js/zone_editor.js') }}"></script>
+<script src="{{ url_for('static', filename='js/annotation_drafts.js') }}"></script>
 <script src="{{ url_for('static', filename='js/upload.js') }}"></script>
 <script src="{{ url_for('static', filename='js/live_monitor.js') }}"></script>
 {% if user_role == 'admin' %}<script src="{{ url_for('static', filename='js/live_truck_ban_settings.js') }}"></script>{% endif %}

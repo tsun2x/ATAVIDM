@@ -99,6 +99,10 @@ class LiveStreamWorker(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
     def latest_jpeg(self) -> bytes | None:
         with self._frame_lock:
             return self._latest_jpeg
@@ -334,18 +338,25 @@ class StreamManager:
         with self._lock:
             worker = self._workers.get(camera_id)
             if worker is not None and worker.is_alive():
+                # A stop request may still be unwinding a blocking capture read.
+                # Reuse that worker until it exits; never overlap camera workers.
                 return worker
             camera = db.get_camera(camera_id)
             if camera is None:
                 raise ValueError(f"Camera {camera_id} not found.")
             worker = LiveStreamWorker(camera)
             self._workers[camera_id] = worker
-            worker.start()
+            try:
+                worker.start()
+            except Exception:
+                if self._workers.get(camera_id) is worker:
+                    self._workers.pop(camera_id, None)
+                raise
             return worker
 
     def stop(self, camera_id: int) -> None:
         with self._lock:
-            worker = self._workers.pop(camera_id, None)
+            worker = self._workers.get(camera_id)
         if worker is not None:
             worker.stop()
 
@@ -364,7 +375,7 @@ class StreamManager:
             }
         return {
             "running": worker.is_alive(),
-            "status": worker.status,
+            "status": "stopping" if worker.is_alive() and worker.stop_requested else worker.status,
             "error": worker.error,
             "diagnostics": list(worker.diagnostics),
         }

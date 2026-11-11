@@ -37,3 +37,24 @@ def test_camera_annotation_save_preserves_scene_and_restarts_worker(client, test
     assert response.status_code == 200
     assert json.loads(test_db.get_camera(camera_id)["zones_json"]) == _v2_doc()
     assert stopped == [camera_id]
+
+
+def test_camera_annotation_save_rejects_a_newer_server_scene(client, test_db, monkeypatch):
+    import app as application
+
+    camera_id = test_db.create_camera("test", "rtsp://example/stream")
+    current = _v2_doc()
+    test_db.update_camera(camera_id, zones_json=application.dumps_zones(current))
+    stopped = []
+    monkeypatch.setattr(application.stream_manager, "stop", stopped.append)
+    monkeypatch.setattr(application.auth, "current_user", lambda: {"id": 1, "role": "admin"})
+
+    response = client.put(
+        f"/api/cameras/{camera_id}",
+        json={"expected_zones_json": {}, "zones_json": {"zones": {"no_parking": [[1, 2], [3, 4], [5, 6]]}}},
+    )
+
+    assert response.status_code == 409
+    assert "changed since this editor opened" in response.get_json()["error"]
+    assert json.loads(test_db.get_camera(camera_id)["zones_json"]) == current
+    assert stopped == []
