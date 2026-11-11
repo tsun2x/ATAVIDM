@@ -359,7 +359,8 @@ class DatabaseAdapter(Protocol):
         rtsp_url: str | None = None,
         zones_json: str | None = None,
         is_active: bool | None = None,
-    ) -> None: ...
+        expected_zones_json: str | None = None,
+    ) -> bool: ...
     def delete_camera(self, camera_id: int) -> None: ...
 
     # Reports

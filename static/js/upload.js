@@ -58,6 +58,7 @@
         pendingScene: null,
         existingScene: null,
         baseScene: null,
+        pendingCameraTemplate: null,
         draftStorageWarned: false,
         startAtEditor: false,
     };
@@ -77,18 +78,7 @@
         if (!identity || !window.TAVIDMAnnotationDrafts) return { ok: true, draft: null };
         const storage = getDraftStorage();
         if (!storage) return { ok: false, draft: null };
-        const result = window.TAVIDMAnnotationDrafts.read(storage, window.TAVIDM_USER_ID, identity.type, identity.id);
-        if (result.draft || !result.ok || identity.type !== "video") return result;
-        try {
-            const legacy = storage.getItem("tavidm.annotation-draft." + String(identity.id));
-            if (!legacy) return result;
-            const scene = JSON.parse(legacy);
-            return scene && typeof scene === "object"
-                ? { ok: true, draft: { version: 2, scene: scene, base_scene: null, updated_at: null }, legacy: true }
-                : result;
-        } catch (err) {
-            return { ok: false, draft: null };
-        }
+        return window.TAVIDMAnnotationDrafts.read(storage, window.TAVIDM_USER_ID, identity.type, identity.id);
     }
 
     function getDraftStorage() {
@@ -116,9 +106,6 @@
         const storage = getDraftStorage();
         if (storage) {
             window.TAVIDMAnnotationDrafts.remove(storage, window.TAVIDM_USER_ID, identity.type, identity.id);
-            if (identity.type === "video") {
-                try { storage.removeItem("tavidm.annotation-draft." + String(identity.id)); } catch (err) { /* Keep the saved scene authoritative. */ }
-            }
         }
     }
 
@@ -398,6 +385,44 @@
         sceneTemplateCopy.hidden = !(wizardState.templates || []).length;
     }
 
+    function rememberCameraTemplate(template) {
+        const templates = window.TAVIDMZoneTemplateCache.upsert(window.TAVIDM_ZONE_TEMPLATES || [], template);
+        window.TAVIDM_ZONE_TEMPLATES = templates;
+        wizardState.templates = templates;
+        populateTemplateSelect(templates);
+        populateSceneTemplateCopy();
+    }
+
+    function refreshCameraTemplates(createdTemplate) {
+        // Make the server-returned template selectable immediately, even if a
+        // follow-up list refresh is unavailable.
+        rememberCameraTemplate(createdTemplate);
+        return window.TAVIDMZoneTemplateCache.refresh(
+            window.TAVIDM_ZONE_TEMPLATES || [],
+            createdTemplate,
+            function () {
+                return fetch("/api/zone-templates").then(function (response) {
+                    if (!response.ok) throw new Error("Could not refresh zone templates.");
+                    return response.json().then(function (payload) {
+                        if (!payload.success || !Array.isArray(payload.templates)) {
+                            throw new Error("Template list response is invalid.");
+                        }
+                        return payload.templates;
+                    });
+                });
+            }
+        ).then(function (result) {
+            window.TAVIDM_ZONE_TEMPLATES = result.templates;
+            wizardState.templates = result.templates;
+            populateTemplateSelect(result.templates);
+            populateSceneTemplateCopy();
+            if (!result.ok) {
+                showToast("Template Saved; List Refresh Failed", "The new template remains selectable in this editor, but other template updates could not be loaded.", "warning");
+            }
+            return result.ok;
+        });
+    }
+
     function getInitialScene() {
         if (wizardState.existingScene) {
             return window.TAVIDMZoneEditor.parseSceneDocument(wizardState.existingScene, zoneTypes);
@@ -421,6 +446,7 @@
         wizardState.mode = wizardState.templates.length ? "choose" : "new";
         wizardState.sourceTemplateId = null;
         wizardState.baseScene = payload.existing_scene || null;
+        wizardState.pendingCameraTemplate = null;
         wizardState.draftStorageWarned = false;
         const draftResult = readCurrentDraft();
         if (!draftResult.ok) {
@@ -442,6 +468,7 @@
         wizardTemplateSelect.value = "";
         document.getElementById("btnWizardBack")?.classList.toggle("d-none", !!wizardState.camera);
         btnSaveCameraAsTemplate?.classList.toggle("d-none", !wizardState.camera || window.TAVIDM_USER_ROLE !== "admin");
+        if (btnSaveCameraAsTemplate) btnSaveCameraAsTemplate.textContent = "Save Camera + Copy as Template";
 
         document.getElementById("templateNameFields")?.classList.add("d-none");
         document.getElementById("btnUpdateTemplate")?.classList.add("d-none");
@@ -717,15 +744,18 @@
         if (saveButton) saveButton.disabled = true;
         if (templateButton) templateButton.disabled = true;
         const cameraId = wizardState.camera.id;
-        const templateName = alsoCreateTemplate
+        const reusingTemplate = alsoCreateTemplate && !!wizardState.pendingCameraTemplate;
+        const templateName = alsoCreateTemplate && !reusingTemplate
             ? window.prompt("Name this reusable copy of the camera scene:")
             : null;
-        if (alsoCreateTemplate && !templateName?.trim()) {
+        if (alsoCreateTemplate && !reusingTemplate && !templateName?.trim()) {
             if (saveButton) saveButton.disabled = false;
             if (templateButton) templateButton.disabled = false;
             return;
         }
-        const createTemplate = alsoCreateTemplate
+        const createTemplate = reusingTemplate
+            ? Promise.resolve(wizardState.pendingCameraTemplate)
+            : alsoCreateTemplate
             ? fetch("/api/zone-templates", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -738,8 +768,19 @@
             })
             : Promise.resolve(null);
         let templateCreated = false;
-        createTemplate.then(function () {
-            templateCreated = alsoCreateTemplate;
+        let templateRefreshFailed = false;
+        createTemplate.then(function (template) {
+            if (template && alsoCreateTemplate) {
+                if (!reusingTemplate) {
+                    wizardState.pendingCameraTemplate = template;
+                    templateCreated = true;
+                    if (templateButton) templateButton.textContent = "Retry Camera Save (template copy exists)";
+                    return refreshCameraTemplates(template).then(function (refreshed) {
+                        templateRefreshFailed = !refreshed;
+                    });
+                }
+            }
+        }).then(function () {
             return fetch("/api/cameras/" + cameraId, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
@@ -759,13 +800,21 @@
             if (!result) return;
             if (wizardState.onCameraSaved) wizardState.onCameraSaved(result.camera);
             clearAnnotationDraft();
+            wizardState.pendingCameraTemplate = null;
             wizardModal?.hide();
-            showToast("Camera Annotation Saved", alsoCreateTemplate
-                ? "The camera scene and reusable template copy were saved."
-                : "The live stream is reconnecting with the saved scene.", "success");
+            if (templateButton) templateButton.textContent = "Save Camera + Copy as Template";
+            if (templateRefreshFailed) {
+                showToast("Camera Saved; Template Refresh Failed", "The template was created and added locally, but the server list could not be refreshed.", "warning");
+            } else if (reusingTemplate) {
+                showToast("Camera Annotation Saved", "The camera scene was saved. The existing template remains an independent snapshot.", "success");
+            } else {
+                showToast("Camera Annotation Saved", alsoCreateTemplate
+                    ? "The camera scene and reusable template copy were saved."
+                    : "The saved camera scene is loading in the live stream.", "success");
+            }
         }).catch(function (error) {
-            const detail = templateCreated
-                ? " The template copy was created, but the camera scene was not saved; check the camera before retrying."
+            const detail = templateCreated || reusingTemplate
+                ? " The template copy remains saved. Retry the camera save to reuse it without creating another copy."
                 : "";
             const conflict = error.status === 409
                 ? " Reopen the camera editor to load and review the current saved scene before applying your changes."
@@ -785,7 +834,10 @@
         const template = wizardState.templates.find(function (item) {
             return String(item.id) === String(sceneTemplateSelect.value);
         });
-        if (!template) return;
+        if (!template) {
+            showToast("Template Unavailable", "That template is no longer in the current list. Refresh the page and try again.", "warning");
+            return;
+        }
         if (!window.confirm("Copy “" + template.template_name + "” to this scene? This copies the full scene and does not link it. Check the copied geometry against the reference frame; it assumes the same view and framing.")) return;
         zoneEditor.loadSceneDocument(window.TAVIDMZoneEditor.parseSceneDocument(template.zones_json, zoneTypes));
         showToast("Template Copied", "The full scene was copied. Inspect alignment against the target reference frame before saving.", "info");

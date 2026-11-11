@@ -4680,28 +4680,32 @@ def api_update_camera(camera_id: int):
     if current_camera is None:
         return jsonify({"success": False, "error": "Camera not found."}), 404
     payload = request.get_json(silent=True) or {}
+    expected_scene = None
     if "expected_zones_json" in payload:
         try:
             expected_scene = dumps_zones(payload.get("expected_zones_json") or {})
         except ValueError as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
-        if expected_scene != (current_camera.get("zones_json") or "{}"):
-            return jsonify({"success": False, "error": "Camera scene changed since this editor opened. Reload it and review the current scene before saving."}), 409
     zones_json = None
     if "zones_json" in payload:
         try:
             zones_json = dumps_zones(payload.get("zones_json") or {})
         except ValueError as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
-    db.update_camera(
+    updated = db.update_camera(
         camera_id,
         name=payload.get("name"),
         location=payload.get("location"),
         rtsp_url=payload.get("rtsp_url"),
         zones_json=zones_json,
         is_active=payload.get("is_active"),
+        expected_zones_json=expected_scene,
     )
-    stream_manager.stop(camera_id)  # restart picks up the new configuration
+    if not updated:
+        if db.get_camera(camera_id) is None:
+            return jsonify({"success": False, "error": "Camera not found."}), 404
+        return jsonify({"success": False, "error": "Camera scene changed since this editor opened. Reload it and review the current scene before saving."}), 409
+    stream_manager.restart(camera_id)  # active workers pick up the new configuration
     return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
 
 

@@ -330,17 +330,28 @@ class LiveStreamWorker(threading.Thread):
 class StreamManager:
     """Singleton registry of running camera workers."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        restart_timeout_seconds: float = 10.0,
+        restart_thread_factory: Any = None,
+    ) -> None:
         self._workers: dict[int, LiveStreamWorker] = {}
+        self._restart_states: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._restart_timeout_seconds = max(0.1, float(restart_timeout_seconds))
+        self._restart_thread_factory = restart_thread_factory or threading.Thread
 
     def start(self, camera_id: int) -> LiveStreamWorker:
         with self._lock:
             worker = self._workers.get(camera_id)
             if worker is not None and worker.is_alive():
-                # A stop request may still be unwinding a blocking capture read.
-                # Reuse that worker until it exits; never overlap camera workers.
+                # A stopping worker remains the sole worker until it exits.
                 return worker
+            if worker is not None:
+                self._workers.pop(camera_id, None)
+                # This request is an explicit stream start and may race with the
+                # restart waiter. The lock ensures only this path starts a worker.
+                self._restart_states.pop(camera_id, None)
             camera = db.get_camera(camera_id)
             if camera is None:
                 raise ValueError(f"Camera {camera_id} not found.")
@@ -354,8 +365,95 @@ class StreamManager:
                 raise
             return worker
 
+    def restart(self, camera_id: int) -> bool:
+        """Restart an active worker after its bounded shutdown, without blocking the request."""
+        with self._lock:
+            worker = self._workers.get(camera_id)
+            if worker is None or not worker.is_alive():
+                return False
+            current = self._restart_states.get(camera_id)
+            if current and current.get("status") == "stopping":
+                # A repeated config save can use the pending restart; the waiter
+                # will read the latest camera row once the old worker exits.
+                return True
+            if worker.stop_requested and not (current and current.get("status") == "error"):
+                # An explicit Stop already won this race. Do not restart it.
+                return False
+
+            token = uuid.uuid4().hex
+            self._restart_states[camera_id] = {"token": token, "status": "stopping", "error": None}
+            worker.stop()
+            waiter = self._restart_thread_factory(
+                target=self._finish_restart,
+                args=(camera_id, worker, token),
+                name=f"camera-{camera_id}-restart",
+                daemon=True,
+            )
+            try:
+                waiter.start()
+            except Exception as exc:
+                self._restart_states[camera_id] = {
+                    "token": token,
+                    "status": "error",
+                    "error": f"Could not schedule camera restart: {exc}",
+                }
+                return False
+            return True
+
+    def _finish_restart(self, camera_id: int, worker: LiveStreamWorker, token: str) -> None:
+        try:
+            worker.join(timeout=self._restart_timeout_seconds)
+        except Exception as exc:
+            wait_error = f"Could not wait for camera worker shutdown: {exc}"
+        else:
+            wait_error = None
+
+        with self._lock:
+            state = self._restart_states.get(camera_id)
+            if state is None or state.get("token") != token:
+                return
+            if wait_error:
+                state.update(status="error", error=wait_error)
+                return
+            if worker.is_alive():
+                state.update(
+                    status="error",
+                    error=f"Camera worker did not stop within {self._restart_timeout_seconds:g} seconds; retry after it exits.",
+                )
+                return
+            if self._workers.get(camera_id) is not worker:
+                self._restart_states.pop(camera_id, None)
+                return
+
+            self._workers.pop(camera_id, None)
+            replacement = None
+            try:
+                camera = db.get_camera(camera_id)
+                if camera is None:
+                    self._restart_states[camera_id] = {
+                        "token": token,
+                        "status": "error",
+                        "error": "Camera was removed before its stream could restart.",
+                    }
+                    return
+                replacement = LiveStreamWorker(camera)
+                self._workers[camera_id] = replacement
+                replacement.start()
+            except Exception as exc:
+                if replacement is not None and self._workers.get(camera_id) is replacement:
+                    self._workers.pop(camera_id, None)
+                self._restart_states[camera_id] = {
+                    "token": token,
+                    "status": "error",
+                    "error": f"Could not restart camera stream: {exc}",
+                }
+                return
+            self._restart_states.pop(camera_id, None)
+
     def stop(self, camera_id: int) -> None:
         with self._lock:
+            # Explicit Stop cancels any delayed restart scheduled by a save.
+            self._restart_states.pop(camera_id, None)
             worker = self._workers.get(camera_id)
         if worker is not None:
             worker.stop()
@@ -365,7 +463,23 @@ class StreamManager:
             return self._workers.get(camera_id)
 
     def status(self, camera_id: int) -> dict[str, Any]:
-        worker = self.get(camera_id)
+        with self._lock:
+            worker = self._workers.get(camera_id)
+            restart = self._restart_states.get(camera_id)
+        if restart and restart.get("status") == "error":
+            return {
+                "running": bool(worker and worker.is_alive()),
+                "status": "error",
+                "error": restart.get("error"),
+                "diagnostics": list(worker.diagnostics) if worker else [],
+            }
+        if restart and restart.get("status") == "stopping":
+            return {
+                "running": bool(worker and worker.is_alive()),
+                "status": "stopping",
+                "error": None,
+                "diagnostics": list(worker.diagnostics) if worker else [],
+            }
         if worker is None:
             return {
                 "running": False,

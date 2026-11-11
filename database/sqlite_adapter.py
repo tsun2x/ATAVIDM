@@ -15,6 +15,7 @@ from typing import Any, Generator
 
 from database.review_revision import motorcycle_detail_review_revision
 from database.processing_limits import parse_processing_limits
+from core.scene_annotation import serialize_scene_raw
 
 logger = logging.getLogger(__name__)
 
@@ -4660,7 +4661,8 @@ def update_camera(
     rtsp_url: str | None = None,
     zones_json: str | None = None,
     is_active: bool | None = None,
-) -> None:
+    expected_zones_json: str | None = None,
+) -> bool:
     fields: list[str] = ["updated_at = ?"]
     params: list[Any] = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
     if name is not None:
@@ -4679,8 +4681,23 @@ def update_camera(
         fields.append("is_active = ?")
         params.append(int(is_active))
     params.append(camera_id)
+    if expected_zones_json is not None:
+        with review_write_transaction() as conn:
+            row = conn.execute(
+                "SELECT zones_json FROM cameras WHERE id = ?",
+                (camera_id,),
+            ).fetchone()
+            try:
+                current_scene = serialize_scene_raw(row["zones_json"] if row else None)
+            except ValueError:
+                current_scene = None
+            if row is None or current_scene != expected_zones_json:
+                return False
+            conn.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id = ?", params)
+            return True
     with db_session() as conn:
         conn.execute(f"UPDATE cameras SET {', '.join(fields)} WHERE id = ?", params)
+    return True
 
 
 def delete_camera(camera_id: int) -> None:

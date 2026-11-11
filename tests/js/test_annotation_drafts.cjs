@@ -13,6 +13,11 @@ const scene = { schema_version: 2, zones: [{ id: "zone-a" }], lanes: [] };
 
 assert.notEqual(drafts.key(1, "camera", 5), drafts.key(2, "camera", 5));
 assert.notEqual(drafts.key(1, "camera", 5), drafts.key(1, "video", 5));
+const legacyKey = "tavidm.annotation-draft.5";
+storage.setItem(legacyKey, JSON.stringify({ scene: "belongs-to-unknown-account" }));
+assert.equal(drafts.read(storage, 1, "video", 5).draft, null);
+assert.equal(drafts.read(storage, 2, "video", 5).draft, null);
+assert.notEqual(storage.getItem(legacyKey), null);
 assert.equal(drafts.write(storage, 1, "camera", 5, scene, { schema_version: 2, zones: [] }).ok, true);
 const read = drafts.read(storage, 1, "camera", 5);
 assert.equal(read.ok, true);
@@ -25,6 +30,10 @@ assert.equal(drafts.isStale({ scene: scene, base_scene: null }, {}, serialize), 
 assert.equal(drafts.read(storage, 2, "camera", 5).draft, null);
 assert.equal(drafts.remove(storage, 1, "camera", 5).ok, true);
 assert.equal(drafts.read(storage, 1, "camera", 5).draft, null);
+assert.notEqual(storage.getItem(legacyKey), null);
+assert.equal(drafts.write(storage, 1, "video", 5, scene, {}).ok, true);
+assert.equal(drafts.read(storage, 2, "video", 5).draft, null);
+assert.deepEqual(drafts.read(storage, 1, "video", 5).draft.scene, scene);
 
 const blockedStorage = {
     getItem() { throw new Error("blocked"); },
