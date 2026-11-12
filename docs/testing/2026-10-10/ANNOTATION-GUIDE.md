@@ -4,7 +4,7 @@ An annotation tells the system **where an area is and what it means** in this ca
 
 Use real, known restrictions and the actual road layout. Drawing a No Parking Zone does not establish a legal restriction. If you do not know what an area means, ask the group leader before marking it.
 
-This guide follows the current editor and detection rules inspected on 13 October 2026. Some objects can be saved even though their automatic detection is limited; those limitations are explained below.
+This guide follows the current editor and detection rules checked on 12 November 2026. Some objects can be saved even though their automatic detection is limited; those limitations are explained below.
 
 Interactive references: [all annotation types](../2026-10-13/annotation-visual-guide/index.html) · [annotation combinations and overlaps](../2026-10-13/annotation-visual-guide/overlap-use-cases.html).
 
@@ -27,6 +27,34 @@ Interactive references: [all annotation types](../2026-10-13/annotation-visual-g
 You do **not** need every object for every video. Draw only what exists and what your test needs.
 
 ## Open the editor and draw
+
+### Uploaded video
+
+1. In Live Monitor, upload the video and enter its actual recording date/time when known. The editor uses the extracted reference frame shown in the wizard; confirm that it represents the same crop and fixed view as the video.
+2. Choose **Create New Zone Annotation** or **Use Existing Zone Template**, then click **Continue to Editor**. A copied template is only a starting point: verify every boundary against this video.
+3. Draw and save the scene as described below. Video saves offer **Use for This Video Only**, **Save as New Template**, and, when editing an existing template, **Update Existing Template**. Choose the video-only option for a one-off test.
+
+### Live camera
+
+1. In the camera row in Live Monitor, choose **Edit Annotation**. The application opens an annotation frame from that camera in the wizard.
+2. Create a new scene or copy an existing template. Confirm the displayed frame and geometry before drawing; the camera must remain in the same fixed position after saving.
+3. **Save Annotation** updates that camera's scene. An administrator can also choose **Save Camera + Copy as Template** to create an independent reusable snapshot. Saving the template does not link it to the camera; the scene save remains a separate action.
+
+### Draft recovery and editor controls
+
+The browser may offer to recover an unfinished draft for the same signed-in account and camera/video on that browser. Drafts are stored locally in that browser, not synced to teammates or devices. If the server scene changed after the draft was made, recovering it can replace the newer scene the next time you save; compare it carefully. Choosing **Cancel** in the recovery question discards the local draft and opens the saved scene.
+
+**Reset** removes the selected object when one is selected; otherwise it clears objects of the currently active type. It does not clear every category in the scene. **Delete selected** removes only the selected object; **New object** starts a separate shape. Save after reviewing the full scene. If browser storage is unavailable or full, draft recovery may not work.
+
+When leaving an unsaved editor, return to it in the same browser if you intend to recover its draft. A draft is a convenience, not a shared or server-side backup.
+
+### Current categories and selectable types
+
+The editor shows seven object categories. **Zones** lists No Parking Zone, Pedestrian Crossing, Truck Ban Zone, No Loading/Unloading Zone, and Restricted Lane; **Active Lane** is listed under **Lanes**. The other categories are **Flow arrows → Lane flow**; **Thresholds → Threshold, Vehicle counting line, No-entry threshold**; **Markings → Double solid, Single solid, Solid/broken, Restricted boundary, Generic marking**; **Signs → No entry, No left turn, No right turn, No U-turn, No overtaking, Generic sign**; and **Activity → Passenger activity, Boarding/alighting**. The interactive guide shows the same full list.
+
+The editor only shows **Apply to lane** for flow arrows, thresholds, signs, and markings. Select the intended lane ID in that control; proximity on the picture does not create a link. **Prohibited from** appears for markings. It describes the approach side relative to the marking's first and last points, so reversing point order reverses the side.
+
+Keyboard/mouse drawing controls and save choices are shown in the editor. Use the on-screen category and type controls to confirm what is active before adding points. Avoid relying on a shape's color alone; check its object type in the scene list.
 
 1. Upload the MP4 in Live Monitor. Use its actual recording time when known.
 2. Choose **Create New Zone Annotation**, or **Use Existing Zone Template** for the same camera view.
