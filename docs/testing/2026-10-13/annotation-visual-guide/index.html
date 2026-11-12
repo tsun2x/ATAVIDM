@@ -29,19 +29,19 @@
       <select id="typePicker" class="picker"></select>
       <div class="diagram-wrap">
         <svg id="diagram" class="diagram" data-kind="zones" data-type="no_parking" viewBox="0 0 900 560" role="img" aria-labelledby="diagramTitle diagramDesc">
-          <title id="diagramTitle">Illustrative top-down road and selected annotation</title>
-          <desc id="diagramDesc">Schematic example, not a camera image. A two-way road with a crossing and curbside area.</desc>
-          <rect width="900" height="560" fill="#e8edf3"/>
-          <rect x="238" y="24" width="424" height="512" rx="8" fill="#394454"/>
-          <rect x="215" y="24" width="23" height="512" fill="#c7d1dd"/><rect x="662" y="24" width="23" height="512" fill="#c7d1dd"/>
-          <path d="M450 25V535" class="center-line"/>
-          <path d="M343 25V535 M557 25V535" class="road-line"/>
-          <path d="M238 250H662 M238 315H662" stroke="#f7f8fa" stroke-width="5" opacity=".65"/>
+          <title id="diagramTitle">Illustrative camera-perspective road and selected annotation</title>
+          <desc id="diagramDesc">Schematic example, not a camera image. The road narrows toward a distant vanishing point, with a two-way carriageway, sidewalks, and a perspective crosswalk.</desc>
+          <rect width="900" height="560" fill="#dfe7ee"/>
+          <path d="M0 0H900V20H650L860 560H40L250 20H0Z" fill="#c7d1dd"/>
+          <path d="M250 20L40 560H860L650 20Z" fill="#394454"/>
+          <path d="M450 20L450 560" class="center-line"/>
+          <path d="M360 20L160 560 M540 20L740 560" class="road-line"/>
+          <path d="M350 225L550 225L610 275L290 275Z M282 287L618 287L632 304L268 304Z" stroke="#f7f8fa" stroke-width="4" opacity=".8" fill="none"/>
           <g aria-hidden="true">
-            <rect x="300" y="259" width="24" height="48" fill="#fff"/><rect x="337" y="259" width="24" height="48" fill="#fff"/><rect x="374" y="259" width="24" height="48" fill="#fff"/><rect x="411" y="259" width="24" height="48" fill="#fff"/><rect x="465" y="259" width="24" height="48" fill="#fff"/><rect x="502" y="259" width="24" height="48" fill="#fff"/><rect x="539" y="259" width="24" height="48" fill="#fff"/><rect x="576" y="259" width="24" height="48" fill="#fff"/>
+            <path d="M350 225L372 225L339 275L316 275Z M380 225L401 225L376 275L352 275Z M410 225L430 225L411 275L388 275Z M470 225L490 225L512 275L489 275Z M500 225L520 225L544 275L521 275Z M530 225L550 225L576 275L553 275Z" fill="#fff"/>
           </g>
-          <text x="250" y="50" class="road-caption">FAR END</text><text x="250" y="523" class="road-caption">CAMERA / NEAR END</text>
-          <text x="268" y="94" class="diagram-small">Lane A</text><text x="487" y="94" class="diagram-small">Lane B</text>
+          <text x="405" y="176" class="road-caption">FAR END</text><text x="358" y="510" class="road-caption">CAMERA / NEAR END</text>
+          <text x="315" y="215" class="diagram-small">Lane A</text><text x="525" y="215" class="diagram-small">Lane B</text>
           <g class="layer layer-zones">
             <polygon class="layer zone-shape zone-parking" points="170,85 225,85 225,210 170,210"/><text class="layer diagram-small zone-parking" x="24" y="150">No parking area</text>
             <polygon class="layer lane-border zone-lane" points="247,75 440,75 440,230 247,230"/><text class="layer diagram-small zone-lane" x="280" y="145">Active lane area</text>
@@ -51,10 +51,10 @@
             <polygon class="layer zone-pink zone-restricted" points="459,78 650,78 650,229 459,229"/><text class="layer diagram-small zone-restricted" x="475" y="166">Restricted segment</text>
           </g>
           <g class="layer layer-lanes">
-            <polygon class="lane-border" points="250,68 443,68 443,492 250,492"/><polygon class="lane-border" points="457,68 650,68 650,492 457,492"/><text x="270" y="470" class="diagram-small">Trace each lane separately</text>
+            <polygon class="lane-border" points="320,158 450,158 450,500 120,500"/><polygon class="lane-border" points="450,158 580,158 780,500 450,500"/><text x="270" y="470" class="diagram-small">Trace each lane separately</text>
           </g>
           <g class="layer layer-flow">
-            <path d="M335 435V130" class="arrow-line" marker-end="url(#arr)"/><path d="M565 130V435" class="arrow-line" marker-end="url(#arr)"/><text x="275" y="115" class="diagram-small">Allowed flow</text><text x="485" y="478" class="diagram-small">One arrow per lane</text>
+            <path d="M270 455L390 190" class="arrow-line" marker-end="url(#arr)"/><path d="M590 190L700 455" class="arrow-line" marker-end="url(#arr)"/><text x="275" y="115" class="diagram-small">Allowed flow</text><text x="485" y="478" class="diagram-small">One arrow per lane</text>
           </g>
           <defs><marker id="arr" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto"><path d="M0 0L12 6L0 12Z" fill="#24a8a4"/></marker></defs>
           <g class="layer layer-thresholds">
@@ -81,7 +81,6 @@
             <circle cx="710" cy="290" r="10" fill="#7550a5"/><path d="M710 300V325M710 309L696 320M710 309L724 320M710 325L698 344M710 325L722 344" stroke="#7550a5" stroke-width="5"/>
             <text x="690" y="435" class="diagram-small">Activity region is context,</text><text x="690" y="461" class="diagram-small">not proof of boarding.</text>
           </g>
-          <text x="25" y="540" class="diagram-small">ILLUSTRATIVE SCHEMATIC · not a real camera or legal determination</text>
         </svg>
       </div>
       <p class="caption">Colored overlay shows the selected example shape. The background road and sign symbols are illustrative.</p>
@@ -116,7 +115,6 @@
   const groups = [
     {key:'zones',label:'Zones',items:[
       {key:'no_parking',label:'No Parking Zone',purpose:'An area where parking is actually prohibited.',when:'Testing a vehicle that remains parked in a known restricted curb or bay area.',draw:'Outline only the prohibited parking footprint. Keep nearby legal parking outside the polygon.',capability:'The parking rule looks for a vehicle staying still in the area for the configured dwell time. A vehicle passing through is not automatically parked; exceptions and intent still need review.'},
-      {key:'active_lane',label:'Active Lane',purpose:'A road lane used by moving traffic. The editor also offers it under Lanes.',when:'Defining where traffic moves, stops, or where lane-linked objects apply.',draw:'Trace one travel path at a time. Keep opposing directions in separate lane objects.',capability:'Used for lane context such as obstruction and as the lane link for arrows, signs, thresholds, and markings. Being in a lane alone is not a violation.'},
       {key:'pedestrian_crossing',label:'Pedestrian Crossing',purpose:'The road footprint occupied by a real pedestrian crossing.',when:'Testing a vehicle that blocks the crossing for a sustained interval.',draw:'Outline the crossing stripes and relevant road width, not the whole intersection.',capability:'Contributes to obstruction after the configured waiting time. A vehicle simply driving across is not the same as blocking it.'},
       {key:'truck_ban_zone',label:'Truck Ban Zone',purpose:'A road segment covered by a verified truck-ban schedule.',when:'Checking eligible trucks during the locally configured restricted hours.',draw:'Outline the affected road segment and use the actual recording date and time.',capability:'Requires zone, applicable vehicle class, schedule, and trustworthy recording time. Upload time is not a substitute; do not assume every pickup or large vehicle is a truck covered by the rule.'},
       {key:'loading_unloading',label:'No Loading/Unloading Zone',purpose:'A place where loading or unloading is prohibited.',when:'Testing suspected terminal or passenger pickup activity in a restricted location.',draw:'Outline the prohibited stop/activity area. Add an Activity region where passenger movement can be seen.',capability:'Illegal-terminal evaluation needs the zone plus suitable vehicle and passenger-activity evidence and configured waiting time. A vehicle stopping alone does not establish the event.'},
