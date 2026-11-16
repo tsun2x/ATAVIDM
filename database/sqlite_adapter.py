@@ -2007,6 +2007,23 @@ def finish_processing_run(
         )
 
 
+def support_processing_summary(limit: int = 50) -> list[dict[str, Any]]:
+    """Return bounded, selected operational counters without filenames or paths."""
+    with db_session() as conn:
+        rows = conn.execute(
+            """SELECT p.id, p.video_id, p.status, p.stage, p.started_at, p.finished_at,
+                      p.frames_processed, p.total_frames, p.detection_records,
+                      p.unique_tracks, p.violation_candidates, p.class_counts_json, p.diagnostics_json,
+                      CASE WHEN p.error_message IS NULL OR p.error_message = '' THEN 0 ELSE 1 END AS has_error,
+                      (SELECT COUNT(*) FROM motorcycle_detail_candidates m WHERE m.processing_run_id = p.id) AS motorcycle_detail_count,
+                      (SELECT COUNT(*) FROM motorcycle_detail_candidates m WHERE m.processing_run_id = p.id AND m.scan_state = 'failed') AS motorcycle_scans_failed,
+                      (SELECT COUNT(*) FROM motorcycle_detail_candidates m WHERE m.processing_run_id = p.id AND m.scan_state = 'ready') AS motorcycle_scans_ready,
+                      (SELECT COUNT(*) FROM pickup_detail_candidates k WHERE k.processing_run_id = p.id) AS pickup_detail_count
+               FROM processing_runs p ORDER BY p.id DESC LIMIT ?""", (min(max(int(limit), 1), 50),)
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 def get_processing_run(run_id: int) -> dict[str, Any] | None:
     with db_session() as conn:
         row = conn.execute(

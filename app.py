@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 import config
 from core import analytics as analytics_core
 from core import auth
+from core import support_diagnostics
 from core import reports as reports_core
 from core.annotated_writer import (
     annotated_final_path,
@@ -42,6 +43,7 @@ from core.annotated_writer import (
 )
 from core.detection_config import (
     CANONICAL_VIOLATIONS,
+    DETECTION_CLASSES,
     FROZEN_VEHICLE_DETECTOR_CLASSES,
     MODEL_FAMILY,
 )
@@ -95,6 +97,52 @@ app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = config.SESSION_COOKIE_SECURE
+
+
+@app.after_request
+def _record_support_activity(response):
+    support_diagnostics.record_request(request.endpoint, response.status_code, request.view_args)
+    return response
+
+
+@app.route("/api/support/diagnostics")
+@auth.role_required("admin")
+def api_support_diagnostics():
+    """Export bounded operational data, with no raw logs, filenames or credentials."""
+    allowed_classes = set(DETECTION_CLASSES) | {"person", "motorcycle", "truck", "car", "bus", "bicycle"}
+    runs = db.support_processing_summary()
+    for run in runs:
+        raw_counts = run.pop("class_counts_json", None)
+        try:
+            parsed = json.loads(raw_counts or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        run["class_counts"] = {k: v for k, v in parsed.items() if k in allowed_classes and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100000000} if isinstance(parsed, dict) else {}
+        raw_diagnostics = run.pop("diagnostics_json", None)
+        try:
+            diagnostics = json.loads(raw_diagnostics or "{}")
+        except (TypeError, ValueError):
+            diagnostics = {}
+        if isinstance(diagnostics, dict):
+            classes = diagnostics.get("model_classes")
+            run["model_classes"] = [c for c in classes if isinstance(c, str) and c in allowed_classes][:30] if isinstance(classes, list) else None
+            capabilities = diagnostics.get("rule_capabilities")
+            run["rule_capabilities"] = [{"rule_name": c["rule_name"], "automatic_evaluation": c["automatic_evaluation"]}
+                for c in capabilities if isinstance(c, dict) and c.get("rule_name") in CANONICAL_VIOLATIONS
+                and isinstance(c.get("automatic_evaluation"), bool)][:20] if isinstance(capabilities, list) else None
+        else:
+            run["model_classes"] = None
+            run["rule_capabilities"] = None
+        # Database text fields may contain private data; export only known states.
+        for key, allowed in (("status", {"queued", "running", "completed", "failed", "cancelled"}),):
+            if run.get(key) not in allowed:
+                run[key] = "unknown"
+        run.pop("stage", None)
+    payload = {"format_version": 1, "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+               "notes": ["Activity covers this server process only and resets on restart.", "Free-text errors, file names, paths, media, credentials and request parameters are excluded.", "Counts are observations, not accuracy measurements."],
+               "recent_activity": support_diagnostics.recent_activity(), "recent_processing_runs": runs}
+    return Response(json.dumps(payload, separators=(",", ":")), mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=tavidm-diagnostics.json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 ensure_upload_dir()
 db.init_db()

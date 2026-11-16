@@ -6,6 +6,12 @@
 
 {% block content %}
 <div class="row g-4">
+    <div class="col-12">
+        <div class="card card-panel"><div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div><h5 class="card-title mb-1">Support diagnostics</h5><p class="text-muted mb-0">Download recent activity and processing counts to help troubleshoot. Activity resets on server restart; video and images are not included.</p></div>
+            <a class="btn btn-outline-secondary" href="{{ url_for('api_support_diagnostics') }}">Download diagnostics</a>
+        </div></div>
+    </div>
     <div class="col-lg-6">
         <div class="card card-panel">
             <div class="card-header d-flex justify-content-between align-items-center">
