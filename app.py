@@ -72,6 +72,7 @@ from core.processing_progress import ProgressTracker
 from core.processing_jobs import build_processing_jobs_snapshot
 from core.upload import UploadError, ensure_upload_dir, format_file_size, save_video_file, validate_upload
 from core.upload_analytics import build_upload_processing_analytics
+from core.upload_analytics import _tz as _application_timezone
 from core.video_lifecycle import (
     VideoLifecycleError,
     delete_video_permanently,
@@ -991,6 +992,8 @@ def live_monitor():
         videos=videos,
         cameras=cameras,
         conditions=CONDITIONS,
+        recording_today=datetime.now(_application_timezone()).date().isoformat(),
+        recording_timezone=config.APP_TIMEZONE,
         zone_types=zones_for_api(),
         zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
         violation_catalog=violation_catalog_for_ui(),
@@ -1692,6 +1695,9 @@ def api_upload_video():
         recorded_at = normalize_recorded_at(request.form.get("recorded_at"))
     except RecordingTimeError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
+
+    if recorded_at and date.fromisoformat(recorded_at[:10]) > datetime.now(_application_timezone()).date():
+        return jsonify({"success": False, "error": "Recording date cannot be in the future."}), 400
 
     try:
         validate_upload(file, request.content_length)

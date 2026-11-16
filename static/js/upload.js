@@ -19,6 +19,19 @@
     const uploadRecordedTime = document.getElementById("uploadRecordedTime");
     const videoList = document.getElementById("videoList");
 
+    function refreshRecordingDateLimit() {
+        if (!uploadRecordedDate || !uploadRecordedDate.dataset.timezone) return;
+        try {
+            const parts = new Intl.DateTimeFormat("en-US", {timeZone: uploadRecordedDate.dataset.timezone,
+                year: "numeric", month: "2-digit", day: "2-digit"}).formatToParts(new Date());
+            const value = Object.fromEntries(parts.map(function (part) { return [part.type, part.value]; }));
+            uploadRecordedDate.max = value.year + "-" + value.month + "-" + value.day;
+        } catch (err) {
+            // Keep the server-rendered limit; server validation remains authoritative.
+        }
+    }
+    uploadRecordedDate?.addEventListener("focus", refreshRecordingDateLimit);
+
     const wizardModalEl = document.getElementById("annotationWizardModal");
     const wizardStepChoose = document.getElementById("wizardStepChoose");
     const wizardStepEditor = document.getElementById("wizardStepEditor");
@@ -891,8 +904,15 @@
     function uploadFile() {
         if (!selectedFile || activeXhr) return;
 
+        refreshRecordingDateLimit();
+
         const recordedDate = (uploadRecordedDate?.value || "").trim();
         const recordedTime = (uploadRecordedTime?.value || "").trim();
+        if (recordedDate && uploadRecordedDate.max && recordedDate > uploadRecordedDate.max) {
+            showToast("Invalid Recording Date", "Recording date cannot be in the future.", "warning");
+            uploadRecordedDate.focus();
+            return;
+        }
         if (Boolean(recordedDate) !== Boolean(recordedTime)) {
             showToast("Recording Time Needed", "Enter both the recording date and time, or leave both blank.", "warning");
             (recordedDate ? uploadRecordedTime : uploadRecordedDate)?.focus();

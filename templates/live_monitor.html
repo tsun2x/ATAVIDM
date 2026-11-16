@@ -164,12 +164,13 @@
                         <span class="small fw-semibold text-truncate" id="selectedFileName">—</span>
                     </div>
                     <div class="mb-2">
-                        <label class="form-label small mb-1" for="uploadCondition">Traffic Condition</label>
+                        <label class="form-label small mb-1" for="uploadCondition">Traffic Condition (manual)</label>
                         <select class="form-select form-select-sm" id="uploadCondition">
                             {% for c in conditions %}
                             <option value="{{ c }}">{{ c|title }}</option>
                             {% endfor %}
                         </select>
+                        <div class="form-text">Select the condition that describes the footage; it is not calculated from the recording time.</div>
                     </div>
                     <fieldset class="mb-2">
                         <legend class="form-label small mb-1">
@@ -179,7 +180,7 @@
                             <div class="col-12 col-sm-6">
                                 <label class="form-label small mb-1" for="uploadRecordedDate">Date</label>
                                 <input type="date" class="form-control form-control-sm" id="uploadRecordedDate"
-                                       autocomplete="off" aria-describedby="uploadRecordedAtHelp">
+                                       max="{{ recording_today }}" data-timezone="{{ recording_timezone }}" autocomplete="off" aria-describedby="uploadRecordedAtHelp">
                             </div>
                             <div class="col-12 col-sm-6">
                                 <label class="form-label small mb-1" for="uploadRecordedTime">Time</label>
@@ -189,7 +190,7 @@
                         </div>
                         <div class="form-text" id="uploadRecordedAtHelp">
                             Enter the footage's local recording date and time, not its upload time. Type either field or use its picker.
-                            Fill both, or leave both blank if unknown.
+                            Fill both, or leave both blank if unknown. Future dates are not accepted ({{ recording_timezone }}).
                         </div>
                     </fieldset>
                     <div class="progress mb-2 d-none" id="uploadProgressWrap" style="height: 8px;">
