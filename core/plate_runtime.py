@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -292,6 +293,22 @@ def status_report() -> dict[str, Any]:
             "state": "disabled",
             "reason": _LAST_ERROR or "plate_ocr_disabled_by_default",
             "worker": None,
+        }
+    # ONNX Runtime sessions are intentionally lazy, but the Settings/status
+    # surface must still distinguish a usable configured feature from one that
+    # cannot possibly run in this interpreter. Otherwise the UI can report
+    # "enabled" until the first plate attempt fails.
+    try:
+        runtime_available = find_spec("onnxruntime") is not None
+    except (ImportError, ValueError):
+        runtime_available = False
+    if not runtime_available:
+        return {
+            "experimental": True,
+            "enabled": True,
+            "state": "unavailable",
+            "reason": "onnxruntime_not_installed",
+            "worker": runtime.worker.snapshot(),
         }
     try:
         report = runtime.status()

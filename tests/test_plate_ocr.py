@@ -483,6 +483,22 @@ class TestDisabledByDefault:
             assert key in report
         assert report["experimental"] is True
 
+    def test_status_report_exposes_missing_onnx_runtime_before_first_attempt(self, monkeypatch):
+        from types import SimpleNamespace
+        from core import plate_runtime
+
+        worker = SimpleNamespace(snapshot=lambda: {"state": "idle"})
+        runtime = SimpleNamespace(worker=worker, status=lambda: pytest.fail("status must fail closed"))
+        monkeypatch.setattr(plate_runtime, "get_runtime", lambda: runtime)
+        monkeypatch.setattr(plate_runtime, "find_spec", lambda _name: None)
+
+        report = plate_runtime.status_report()
+
+        assert report["enabled"] is True
+        assert report["state"] == "unavailable"
+        assert report["reason"] == "onnxruntime_not_installed"
+        assert report["worker"] == {"state": "idle"}
+
 
 # ----------------------------------------------------------------------
 # 2. Configuration validation

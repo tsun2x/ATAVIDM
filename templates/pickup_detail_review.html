@@ -36,7 +36,10 @@
 </div>
 
 {% if not pickup_items %}
-<div class="card card-panel"><div class="card-body text-muted">No pickup review leads match this filter.</div></div>
+<div class="card card-panel"><div class="card-body">
+    <p class="mb-2"><strong>No pickup passenger review leads match this filter.</strong></p>
+    <p class="text-muted mb-0">This queue is for a tracked person repeatedly inside a tracked pickup box while moving with that pickup. A pickup detection by itself does not create a lead. Check the processed video’s detections and the selected account/outcome filter; these leads are separate from vehicle-classification review and do not create violation cases.</p>
+</div></div>
 {% endif %}
 
 {% for item in pickup_items %}
