@@ -30,7 +30,13 @@ from core.gpu_inference_slot import PRIORITY_LIVE_FRAME, gpu_inference_slot
 from core.model_capability import extract_model_class_names
 from core.scene_annotation import load_scene_annotation
 from core.tracker import TrackState
-from core.video_processor import load_rule_parameters
+from core.motorcycle_detail import MotorcycleDetailCollector
+from core.pickup_detail_review import PickupDetailCollector
+from core.video_processor import (
+    _detail_collection_enabled,
+    _pickup_detail_collection_enabled,
+    load_rule_parameters,
+)
 from core.violation_config import load_enabled_violations
 from core.violation_engine import RuleDiagnostics, RuleEngineState, evaluate_detection_rules
 from database import db
@@ -199,6 +205,10 @@ class LiveStreamWorker(threading.Thread):
         frame_number = -1
         skipped_frames = 0
         last_raw_snapshot = 0.0
+        motorcycle_collector = None
+        pickup_collector = None
+        persisted_motorcycle_candidates = 0
+        persisted_pickup_candidates = 0
 
         try:
             while not self._stop_event.is_set():
@@ -231,6 +241,26 @@ class LiveStreamWorker(threading.Thread):
                 if frame_number % frame_skip != 0:
                     continue
 
+                if motorcycle_collector is None:
+                    frame_h, frame_w = frame.shape[:2]
+                    source_run_key = f"camera_{self.camera['id']}_{live_session_id}"
+                    motorcycle_collector = MotorcycleDetailCollector(
+                        video_id=None,
+                        run_key=source_run_key,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        processing_run_id=None,
+                        enabled=_detail_collection_enabled(),
+                    )
+                    pickup_collector = PickupDetailCollector(
+                        video_id=None,
+                        run_key=source_run_key,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        processing_run_id=None,
+                        enabled=_pickup_detail_collection_enabled(),
+                    )
+
                 timestamp_sec = time.monotonic() - started
                 # Lowest-priority user of the single GPU: never wait and never
                 # queue. If an uploaded-video job, a detail crop batch, or a
@@ -246,6 +276,18 @@ class LiveStreamWorker(threading.Thread):
                         continue
                     raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
                 tracked = track_state.update(raw, now=timestamp_sec)
+                motorcycle_collector.observe(
+                    frame, tracked, frame_number=frame_number, timestamp_sec=timestamp_sec
+                )
+                pickup_collector.observe(
+                    frame, tracked, frame_number=frame_number, timestamp_sec=timestamp_sec
+                )
+                motorcycle_candidates = motorcycle_collector.candidates()
+                if len(motorcycle_candidates) > persisted_motorcycle_candidates:
+                    persisted_motorcycle_candidates += motorcycle_collector.persist_new()
+                pickup_candidates = pickup_collector.candidates()
+                if len(pickup_candidates) > persisted_pickup_candidates:
+                    persisted_pickup_candidates += pickup_collector.persist_new()
                 snapshot_time = time.monotonic()
                 if snapshot_time - last_raw_snapshot >= 1.0:
                     ok_snapshot, snapshot = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -298,7 +340,8 @@ class LiveStreamWorker(threading.Thread):
                         plate_status="not_attempted",
                         reason_log=(
                             f"[{confidence_band(event.confidence)}] "
-                            f"[camera:{self.camera['name']}] {event.reason_log}"
+                            f"[camera:{self.camera['name']}] "
+                            f"[camera_id:{self.camera['id']}] {event.reason_log}"
                         ),
                         vehicle_class=event.vehicle_class,
                         timestamp_sec=event.timestamp_sec,
@@ -315,6 +358,25 @@ class LiveStreamWorker(threading.Thread):
                 if plate_collector is not None:
                     plate_collector.observe(frame, frame_number, timestamp_sec, tracked)
         finally:
+            if motorcycle_collector is not None:
+                try:
+                    motorcycle_collector.wrap_up()
+                    persisted_motorcycle_candidates += motorcycle_collector.persist_new()
+                    logger.info(
+                        "camera %s motorcycle detail candidates persisted: %d",
+                        self.camera["id"], persisted_motorcycle_candidates,
+                    )
+                except Exception:
+                    logger.exception("camera %s motorcycle review persistence failed", self.camera["id"])
+            if pickup_collector is not None:
+                try:
+                    persisted_pickup_candidates += pickup_collector.persist_new()
+                    logger.info(
+                        "camera %s pickup detail candidates persisted: %d",
+                        self.camera["id"], persisted_pickup_candidates,
+                    )
+                except Exception:
+                    logger.exception("camera %s pickup review persistence failed", self.camera["id"])
             if plate_collector is not None:
                 plate_collector.flush("stream_stopped")
             cap.release()

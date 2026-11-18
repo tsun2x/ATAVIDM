@@ -13,6 +13,7 @@
     let previewController = null;
     let previewRequestId = 0;
     let videoOptionsRequestId = 0;
+    let videoGroupsRequestId = 0;
     let videoOptionsLoading = false;
     let videoOptionsReady = true;
 
@@ -23,6 +24,7 @@
             date_to: document.getElementById("dateTo")?.value || null,
             violation_type: document.getElementById("reportViolationType")?.value || null,
             video_id: document.getElementById("reportVideo")?.value || null,
+            source_type: document.getElementById("reportSourceType")?.value || null,
             status: document.getElementById("reportStatus")?.value || null,
             uploader_id: document.getElementById("reportUploader")?.value || null,
         };
@@ -44,6 +46,7 @@
         const filters = collectFilters();
         return {
             video_id: filters.video_id,
+            source_type: filters.source_type,
             uploader_id: filters.uploader_id,
             date_from: filters.date_from,
             date_to: filters.date_to,
@@ -88,6 +91,8 @@
     function resultStateLabel(state) {
         const labels = {
             processing: "Processing",
+            live_cases_available: "Live CCTV · cases available",
+            live_no_cases: "Live CCTV · no matching cases",
             completed_with_cases: "Completed · cases available",
             completed_empty: "Completed · no matching cases",
             previous_results_available: "Latest attempt failed · previous cases available",
@@ -152,17 +157,75 @@
         previewResults.hidden = false;
     }
 
+    function renderVideoGroups(payload) {
+        const container = document.getElementById("reportVideoGroups");
+        const count = document.getElementById("reportVideoGroupCount");
+        if (!container || !count) return;
+        const groups = Array.isArray(payload.groups) ? payload.groups : [];
+        count.textContent = String(groups.length);
+        if (!groups.length) {
+            container.innerHTML = '<div class="text-muted py-2" role="status">No uploaded video sources have cases matching these filters.</div>';
+            return;
+        }
+        container.innerHTML = groups.map(function (group) {
+            const types = Array.isArray(group.violation_types) ? group.violation_types : [];
+            const badges = types.map(function (type) {
+                return '<span class="badge text-bg-light border me-1">' + escapeHtml(type) + "</span>";
+            }).join("");
+            const browseButton = group.source_type === "live"
+                ? '<button type="button" class="btn btn-sm btn-outline-primary" data-browse-live-cases>Browse cases</button>'
+                : '<button type="button" class="btn btn-sm btn-outline-primary" data-browse-video-cases="' +
+                    escapeHtml(group.video_id) + '">Browse cases</button>';
+            return '<article class="card border"><div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-3">' +
+                '<div class="flex-grow-1"><h6 class="mb-1">' + escapeHtml(group.filename || ("Video #" + group.video_id)) + "</h6>" +
+                '<div class="small text-muted mb-2">' + escapeHtml(group.case_count) +
+                (Number(group.case_count) === 1 ? " case" : " cases") +
+                (group.latest_case_at ? " · Latest case " + escapeHtml(group.latest_case_at) : "") + "</div>" +
+                '<div class="d-flex flex-wrap gap-1">' + badges + "</div></div>" +
+                browseButton + '</div></article>';
+        }).join("");
+    }
+
+    function refreshVideoGroups() {
+        const requestId = ++videoGroupsRequestId;
+        const container = document.getElementById("reportVideoGroups");
+        const filters = previewFilters();
+        delete filters.video_id;
+        const query = new URLSearchParams();
+        Object.keys(filters).forEach(function (key) {
+            if (filters[key]) query.set(key, filters[key]);
+        });
+        return fetch("/api/reports/video-groups?" + query.toString())
+            .then(function (response) {
+                return response.json().then(function (payload) {
+                    if (!response.ok || !payload.success) throw new Error(payload.error || "Could not load video groups.");
+                    return payload;
+                });
+            }).then(function (payload) {
+                if (requestId !== videoGroupsRequestId) return;
+                renderVideoGroups(payload);
+                if (previewState) previewState.textContent = "" + payload.total + " video sources";
+            }).catch(function (error) {
+                if (requestId !== videoGroupsRequestId) return;
+                if (container) container.innerHTML = '<div class="text-danger py-2" role="status">' +
+                    escapeHtml(error.message || "Could not load video sources.") + "</div>";
+                const count = document.getElementById("reportVideoGroupCount");
+                if (count) count.textContent = "—";
+                if (previewState) previewState.textContent = "Sources unavailable";
+            });
+    }
+
     function loadPreview(page) {
         const requestId = ++previewRequestId;
         if (previewController) previewController.abort();
         previewController = null;
         if (videoOptionsLoading || !videoOptionsReady) return Promise.resolve();
         const filters = previewFilters();
-        if (!filters.video_id) {
+        if (!filters.video_id && filters.source_type !== "live") {
             const videoSelect = document.getElementById("reportVideo");
             const noVideos = videoSelect && videoSelect.dataset && videoSelect.dataset.empty === "true";
             setPreviewMessage(noVideos ? "No videos are available for this account." :
-                "Choose a video in the report generator to browse its cases.", noVideos ? "No videos" : "Choose a video");
+            "Choose a video or source group to browse its cases.", noVideos ? "No videos" : "Choose a source");
             return Promise.resolve();
         }
         previewPage = page || 1;
@@ -308,13 +371,44 @@
         });
     });
     document.getElementById("reportHistoryVisibility")?.addEventListener("change", refreshHistory);
-    document.getElementById("reportVideo")?.addEventListener("change", function () { loadPreview(1); });
+    document.getElementById("reportVideo")?.addEventListener("change", function () {
+        if (this.value) document.getElementById("reportSourceType").value = "video";
+        loadPreview(1);
+    });
+    document.getElementById("reportSourceType")?.addEventListener("change", function () {
+        if (this.value === "live") document.getElementById("reportVideo").value = "";
+        loadPreview(1);
+        refreshVideoGroups();
+    });
     ["dateFrom", "dateTo", "reportViolationType", "reportStatus"].forEach(function (id) {
-        document.getElementById(id)?.addEventListener("change", function () { loadPreview(1); });
+        document.getElementById(id)?.addEventListener("change", function () {
+            loadPreview(1);
+            refreshVideoGroups();
+        });
     });
     document.getElementById("reportUploader")?.addEventListener("change", function () {
         refreshVideoOptions().catch(function (error) {
             setPreviewMessage(error.message || "Could not load videos.", "Unavailable");
+        }).then(refreshVideoGroups);
+    });
+    document.getElementById("reportVideoGroups")?.addEventListener("click", function (event) {
+        const liveButton = event.target.closest("[data-browse-live-cases]");
+        if (liveButton) {
+            document.getElementById("reportSourceType").value = "live";
+            document.getElementById("reportVideo").value = "";
+            loadPreview(1).then(function () {
+                document.getElementById("reportPreviewResults")?.scrollIntoView({ behavior: "smooth", block: "start" });
+            });
+            return;
+        }
+        const button = event.target.closest("[data-browse-video-cases]");
+        if (!button) return;
+        const videoSelect = document.getElementById("reportVideo");
+        if (!videoSelect) return;
+        document.getElementById("reportSourceType").value = "video";
+        videoSelect.value = button.dataset.browseVideoCases;
+        loadPreview(1).then(function () {
+            document.getElementById("reportPreviewResults")?.scrollIntoView({ behavior: "smooth", block: "start" });
         });
     });
     document.getElementById("reportPreviewPrevious")?.addEventListener("click", function () {
@@ -323,4 +417,5 @@
     document.getElementById("reportPreviewNext")?.addEventListener("click", function () {
         loadPreview(previewPage + 1);
     });
+    refreshVideoGroups();
 })();

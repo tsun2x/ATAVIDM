@@ -268,6 +268,12 @@
                 "Confirm Case</button>"
             );
         }
+        if (currentCaseActions.dismiss_case && v.status !== "dismissed" && !v.notice_printed) {
+            caseActionButtons.push(
+                '<button type="button" class="btn btn-sm btn-outline-danger" id="btnDismissCase">' +
+                "Undo Confirmation / Dismiss Case</button>"
+            );
+        }
         if (currentCaseActions.prepare_notice) {
             caseActionButtons.push(
                 '<button type="button" class="btn btn-sm btn-outline-secondary" id="btnPrintable">' +
@@ -450,6 +456,18 @@
         document.getElementById("btnConfirmCase")?.addEventListener("click", function () {
             postJson("/api/cases/" + id + "/confirm-case", {});
         });
+        document.getElementById("btnDismissCase")?.addEventListener("click", function () {
+            const reason = window.prompt(
+                "Explain why this case is being dismissed. The original record and evidence will be retained."
+            );
+            if (reason === null) return;
+            if (!reason.trim()) {
+                showToast("Reason required", "Enter a short reason to record this correction.", "warning");
+                return;
+            }
+            if (!window.confirm("Dismiss this case from active results? This cannot be undone here.")) return;
+            postJson("/api/cases/" + id + "/dismiss", { reason: reason.trim() });
+        });
         document.getElementById("btnPrintable")?.addEventListener("click", function () {
             fetch("/api/cases/" + id + "/printable")
                 .then(function (r) { return r.json(); })
@@ -480,6 +498,10 @@
             .then(function (res) {
                 if (res.j.success) {
                     showToast("Saved", "Case update recorded.", "success");
+                    if (url.endsWith("/dismiss")) {
+                        selectedViolation = null;
+                        detailModal.hide();
+                    }
                     const selectedId = selectedViolation ? Number(selectedViolation.db_id) : null;
                     loadPage(null, function () {
                         if (selectedId === null) return;

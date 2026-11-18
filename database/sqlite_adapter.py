@@ -3183,6 +3183,12 @@ def _build_violation_filters(
     clauses: list[str] = []
     params: list[Any] = []
 
+    source_type = filters.get("source_type")
+    if source_type == "live":
+        clauses.append("violations.video_id IS NULL")
+    elif source_type == "video":
+        clauses.append("violations.video_id IS NOT NULL")
+
     if source_video_only and owner_user_id is not None:
         ownership_clauses = [
             "EXISTS (SELECT 1 FROM videos AS owner_video "
@@ -3375,7 +3381,7 @@ def report_export_snapshot(
 
 
 def report_video_preview(
-    video_id: int,
+    video_id: int | None,
     filters: dict[str, Any],
     *,
     page: int,
@@ -3386,27 +3392,37 @@ def report_video_preview(
     """Read one scoped video and its filtered report cases from one snapshot."""
     with db_session() as conn:
         conn.execute("BEGIN")
-        video_clauses = ["v.id = ?"]
-        video_params: list[Any] = [int(video_id)]
-        if owner_user_id is not None:
-            video_clauses.append("v.uploaded_by = ?")
-            video_params.append(int(owner_user_id))
-        if uploader_id is not None:
-            video_clauses.append("v.uploaded_by = ?")
-            video_params.append(int(uploader_id))
-        video = conn.execute(
-            """SELECT v.id, v.filename, v.status, v.processed, v.uploaded_by,
-                      v.created_at, u.username AS uploader_username,
-                      u.full_name AS uploader_name
-               FROM videos v LEFT JOIN users u ON u.id = v.uploaded_by
-               WHERE """ + " AND ".join(video_clauses),
-            video_params,
-        ).fetchone()
-        if video is None:
-            return None
-
-        clauses = ["v.video_id = ?"]
-        params: list[Any] = [int(video_id)]
+        if video_id is None:
+            if uploader_id is not None:
+                return None
+            video = {
+                "id": None, "filename": "Live CCTV", "status": "live",
+                "processed": True, "uploaded_by": None, "created_at": None,
+                "uploader_username": None, "uploader_name": None,
+            }
+            clauses = ["v.video_id IS NULL"]
+            params: list[Any] = []
+        else:
+            video_clauses = ["v.id = ?"]
+            video_params: list[Any] = [int(video_id)]
+            if owner_user_id is not None:
+                video_clauses.append("v.uploaded_by = ?")
+                video_params.append(int(owner_user_id))
+            if uploader_id is not None:
+                video_clauses.append("v.uploaded_by = ?")
+                video_params.append(int(uploader_id))
+            video = conn.execute(
+                """SELECT v.id, v.filename, v.status, v.processed, v.uploaded_by,
+                          v.created_at, u.username AS uploader_username,
+                          u.full_name AS uploader_name
+                   FROM videos v LEFT JOIN users u ON u.id = v.uploaded_by
+                   WHERE """ + " AND ".join(video_clauses),
+                video_params,
+            ).fetchone()
+            if video is None:
+                return None
+            clauses = ["v.video_id = ?"]
+            params = [int(video_id)]
         vtype = filters.get("violation_type")
         if isinstance(vtype, (list, tuple, set)):
             values = [str(value) for value in vtype if value]
@@ -3482,7 +3498,7 @@ def report_video_preview(
             )
             item["observation_count"] = len(item["policy_records"]) or 1
 
-        latest = conn.execute(
+        latest = None if video_id is None else conn.execute(
             "SELECT id, status, stage, queued_at, started_at, finished_at "
             "FROM processing_runs WHERE video_id = ? "
             "ORDER BY id DESC LIMIT 1",
@@ -3500,6 +3516,54 @@ def report_video_preview(
         }
 
 
+def report_videos_with_cases(
+    filters: dict[str, Any],
+    *,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Group report cases by uploaded video and shared live CCTV source."""
+    selected_source = filters.get("source_type")
+    video_filters = dict(filters)
+    if selected_source != "live":
+        video_filters["source_type"] = "video"
+    where_clause, params = _build_violation_filters(
+        video_filters, owner_user_id=owner_user_id, uploader_id=uploader_id
+    )
+    with db_session() as conn:
+        rows = conn.execute(
+            """SELECT videos.id AS video_id, videos.filename,
+                      COUNT(violations.id) AS case_count,
+                      MAX(violations.detected_at) AS latest_case_at,
+                      GROUP_CONCAT(DISTINCT violations.violation_type) AS violation_types
+               FROM videos
+               JOIN violations ON violations.video_id = videos.id"""
+            + "\n"
+            + where_clause
+            + " GROUP BY videos.id, videos.filename ORDER BY latest_case_at DESC, videos.id DESC",
+            params,
+        ).fetchall()
+        groups = [_row_to_dict(row) or {} for row in rows]
+        if selected_source != "video" and uploader_id is None:
+            live_filters = dict(filters, source_type="live")
+            live_where, live_params = _build_violation_filters(
+                live_filters, owner_user_id=owner_user_id
+            )
+            live_row = conn.execute(
+                "SELECT COUNT(*) AS case_count, MAX(violations.detected_at) AS latest_case_at, "
+                "GROUP_CONCAT(DISTINCT violations.violation_type) AS violation_types "
+                "FROM violations " + live_where,
+                live_params,
+            ).fetchone()
+            if live_row and int(live_row["case_count"] or 0) > 0:
+                live_group = _row_to_dict(live_row) or {}
+                live_group.update({"video_id": None, "filename": "Live CCTV", "source_type": "live"})
+                groups.append(live_group)
+        for group in groups:
+            group.setdefault("source_type", "video")
+        return groups
+
+
 def update_violation_status(
     violation_id: int,
     status: str,
@@ -3513,6 +3577,39 @@ def update_violation_status(
             WHERE id = ?
             """,
             (status, reviewed_by, violation_id),
+        )
+
+
+def dismiss_violation_case(violation_id: int, actor_user_id: int, reason: str) -> None:
+    """Soft-dismiss a case with a retained, reviewer-attributed reason."""
+    if not can_confirm_case(actor_user_id):
+        raise PermissionError("Your account cannot dismiss confirmed cases.")
+    note = str(reason or "").strip()
+    if not note or len(note) > 2000:
+        raise ValueError("A dismissal reason between 1 and 2000 characters is required.")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT status, reason_log FROM violations WHERE id = ?", (int(violation_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Violation {violation_id} not found")
+        if row["status"] == "dismissed":
+            raise ValueError("This case is already dismissed.")
+        if _table_exists(conn, "case_action_events"):
+            printed = conn.execute(
+                "SELECT 1 FROM case_action_events WHERE violation_id = ? "
+                "AND action_type IN (?, ?) LIMIT 1",
+                (int(violation_id), ACTION_NOTICE_PRINTED, ACTION_NOTICE_PRINTER_ATTESTED),
+            ).fetchone()
+            if printed:
+                raise ValueError("A printed notice is recorded; this case cannot be dismissed here.")
+        existing_log = str(row["reason_log"] or "").strip()
+        audit_line = f"[Case dismissed {now}; reviewer user #{int(actor_user_id)}; reason: {note}]"
+        updated_log = f"{existing_log}\n{audit_line}" if existing_log else audit_line
+        conn.execute(
+            "UPDATE violations SET status = 'dismissed', reviewed_by = ?, reason_log = ? WHERE id = ?",
+            (int(actor_user_id), updated_log, int(violation_id)),
         )
 
 
@@ -3635,6 +3732,7 @@ def list_review_queue(
     *,
     owner_user_id: int | None = None,
     uploader_id: int | None = None,
+    video_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     offset = max(page - 1, 0) * per_page
     ownership_clauses, ownership_params = _video_owner_scope_sql(
@@ -3642,6 +3740,9 @@ def list_review_queue(
     )
     clauses = ["status = ?", *ownership_clauses]
     params = [status, *ownership_params]
+    if video_id is not None:
+        clauses.append("video_id = ?")
+        params.append(int(video_id))
     where = " AND ".join(clauses)
     with db_session() as conn:
         count_row = conn.execute(
@@ -4153,14 +4254,18 @@ def list_review_queue_by_decision(
     *,
     owner_user_id: int | None = None,
     uploader_id: int | None = None,
+    video_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     offset = max(page - 1, 0) * per_page
     ownership_clauses, ownership_params = _video_owner_scope_sql(
         "q", owner_user_id=owner_user_id, uploader_id=uploader_id
     )
     clauses = ["d.decision = ?", *ownership_clauses]
-    where = " AND ".join(clauses)
     params = [decision, *ownership_params]
+    if video_id is not None:
+        clauses.append("q.video_id = ?")
+        params.append(int(video_id))
+    where = " AND ".join(clauses)
     with db_session() as conn:
         if not _table_exists(conn, "review_decisions"):
             return [], 0
@@ -6255,11 +6360,19 @@ def list_pending_reviews_for_event(
     ]
 
 
+def _live_source_marker(source_key: str) -> str:
+    """Return the stable camera marker embedded in live review evidence logs."""
+    if source_key.startswith("id:"):
+        return f"[camera_id:{source_key[3:]}]"
+    return f"[camera:{source_key}]"
+
+
 def list_reviews_for_event(
     *,
-    video_id: int,
+    video_id: int | None,
     track_id: int,
     processing_run_id: int | None,
+    source_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Pending and confirmed reviews sharing source/run/track event key.
 
@@ -6267,30 +6380,20 @@ def list_reviews_for_event(
     before treating rows as the same logical case.
     """
     with db_session() as conn:
+        clauses = ["status IN ('pending', 'confirmed')", "video_id IS ?", "track_id = ?"]
+        params: list[Any] = [video_id, track_id]
         if processing_run_id is None:
-            rows = conn.execute(
-                """
-                SELECT * FROM review_queue
-                WHERE status IN ('pending', 'confirmed')
-                  AND video_id = ?
-                  AND track_id = ?
-                  AND processing_run_id IS NULL
-                ORDER BY id ASC
-                """,
-                (video_id, track_id),
-            ).fetchall()
+            clauses.append("processing_run_id IS NULL")
         else:
-            rows = conn.execute(
-                """
-                SELECT * FROM review_queue
-                WHERE status IN ('pending', 'confirmed')
-                  AND video_id = ?
-                  AND track_id = ?
-                  AND processing_run_id = ?
-                ORDER BY id ASC
-                """,
-                (video_id, track_id, processing_run_id),
-            ).fetchall()
+            clauses.append("processing_run_id = ?")
+            params.append(processing_run_id)
+        if video_id is None and source_key:
+            clauses.append("instr(COALESCE(reason_log, ''), ?) > 0")
+            params.append(_live_source_marker(source_key))
+        rows = conn.execute(
+            "SELECT * FROM review_queue WHERE " + " AND ".join(clauses) + " ORDER BY id ASC",
+            params,
+        ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
 
@@ -6482,10 +6585,11 @@ def _episode_windows_overlap(
 
 def find_fused_case_violation(
     *,
-    video_id: int,
+    video_id: int | None,
     processing_run_id: int | None,
     track_id: int,
     contributing_rules: tuple[str, ...] | list[str],
+    source_key: str | None = None,
     episode_start_sec: float | None = None,
     episode_end_sec: float | None = None,
     timestamp_sec: float | None = None,
@@ -6504,28 +6608,20 @@ def find_fused_case_violation(
     rules = set(contributing_rules)
     fusion_pair = {VIOLATION_ILLEGAL_PARKING, VIOLATION_OBSTRUCTION}
     with db_session() as conn:
+        clauses = ["video_id IS ?", "track_id = ?", "status != 'dismissed'"]
+        params: list[Any] = [video_id, track_id]
         if processing_run_id is None:
-            rows = conn.execute(
-                """
-                SELECT * FROM violations
-                WHERE video_id = ? AND track_id = ?
-                  AND processing_run_id IS NULL
-                  AND status != 'dismissed'
-                ORDER BY id ASC
-                """,
-                (video_id, track_id),
-            ).fetchall()
+            clauses.append("processing_run_id IS NULL")
         else:
-            rows = conn.execute(
-                """
-                SELECT * FROM violations
-                WHERE video_id = ? AND track_id = ?
-                  AND processing_run_id = ?
-                  AND status != 'dismissed'
-                ORDER BY id ASC
-                """,
-                (video_id, track_id, processing_run_id),
-            ).fetchall()
+            clauses.append("processing_run_id = ?")
+            params.append(processing_run_id)
+        if video_id is None and source_key:
+            clauses.append("instr(COALESCE(reason_log, ''), ?) > 0")
+            params.append(_live_source_marker(source_key))
+        rows = conn.execute(
+            "SELECT * FROM violations WHERE " + " AND ".join(clauses) + " ORDER BY id ASC",
+            params,
+        ).fetchall()
         for row in rows:
             vid = int(row["id"])
             if not _episode_windows_overlap(
@@ -6830,14 +6926,22 @@ def detail_dedup_key(run_scope: str, occurrence_key: str, selector_version: str)
     return f"{run_scope}|{occurrence_key}|{selector_version}"
 
 
-def _detail_run_scope(processing_run_id: int | None, video_id: int) -> str:
+def _detail_run_scope(
+    processing_run_id: int | None, video_id: int | None, run_key: str | None = None
+) -> str:
     """Run identity for dedup.
 
-    Real processing runs dedup on the run row. Direct (run-less) calls dedup on
-    the video identity instead, so two videos sharing a ByteTrack ID in separate
-    direct calls can never collapse into one candidate row.
+    Real processing runs dedup on the run row. Direct uploaded-video calls use
+    their video identity; live-camera calls use the unique source run key, so
+    repeated ByteTrack IDs from separate cameras or sessions cannot collapse.
     """
-    return f"run:{int(processing_run_id)}" if processing_run_id is not None else f"video:{int(video_id)}"
+    if processing_run_id is not None:
+        return f"run:{int(processing_run_id)}"
+    if video_id is not None:
+        return f"video:{int(video_id)}"
+    if run_key:
+        return f"source:{str(run_key)}"
+    raise ValueError("A source identity is required for run-less detail candidates.")
 
 
 def _detail_primary_bbox(frames_json: str, frame_number: int | None) -> str:
@@ -6863,7 +6967,7 @@ def _detail_primary_bbox(frames_json: str, frame_number: int | None) -> str:
 
 def upsert_motorcycle_detail_candidate(
     *,
-    video_id: int,
+    video_id: int | None,
     run_key: str,
     track_id: int,
     occurrence_index: int,
@@ -6888,7 +6992,7 @@ def upsert_motorcycle_detail_candidate(
     reviewer's recorded outcome is preserved.
     """
     dedup = detail_dedup_key(
-        _detail_run_scope(processing_run_id, video_id), occurrence_key, selector_version
+        _detail_run_scope(processing_run_id, video_id, run_key), occurrence_key, selector_version
     )
     bbox_json = detection_bbox_json if detection_bbox_json and detection_bbox_json != "{}" else ""
     if not bbox_json:
@@ -6934,7 +7038,7 @@ def upsert_motorcycle_detail_candidate(
                 updated_at = excluded.updated_at
             """,
             (
-                int(video_id),
+                int(video_id) if video_id is not None else None,
                 int(processing_run_id) if processing_run_id is not None else None,
                 str(run_key),
                 int(track_id),
@@ -7007,11 +7111,6 @@ def list_motorcycle_detail_candidates(
     ownership_clauses, ownership_params = _video_owner_scope_sql(
         "c", owner_user_id=owner_user_id, uploader_id=uploader_id
     )
-    if owner_user_id is not None:
-        ownership_clauses[0] = (
-            "(c.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
-            "WHERE owner_video.id = c.video_id AND owner_video.uploaded_by = ?))"
-        )
     clauses.extend(ownership_clauses)
     params.extend(ownership_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -7043,11 +7142,6 @@ def count_motorcycle_detail_pending(
     ownership, params = _video_owner_scope_sql(
         "motorcycle_detail_candidates", owner_user_id=owner_user_id, uploader_id=uploader_id
     )
-    if owner_user_id is not None:
-        ownership[0] = (
-            "(motorcycle_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
-            "WHERE owner_video.id = motorcycle_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
-        )
     where = " AND ".join(["human_outcome = 'pending'", *ownership])
     with db_session() as conn:
         row = conn.execute(
@@ -7448,11 +7542,6 @@ def count_motorcycle_detail_by_state(
         owner_user_id=owner_user_id,
         uploader_id=uploader_id,
     )
-    if owner_user_id is not None:
-        ownership_clauses[0] = (
-            "(motorcycle_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
-            "WHERE owner_video.id = motorcycle_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
-        )
     where = (
         f"WHERE {' AND '.join(ownership_clauses)}" if ownership_clauses else ""
     )
@@ -7484,7 +7573,7 @@ PICKUP_DETAIL_HUMAN_OUTCOMES = frozenset({"pending", "reviewed", "dismissed", "u
 
 
 def upsert_pickup_detail_candidate(
-    *, video_id: int, run_key: str, processing_run_id: int | None,
+    *, video_id: int | None, run_key: str, processing_run_id: int | None,
     pickup_track_id: int, person_track_id: int,
     pickup_identity_epoch: int, person_identity_epoch: int,
     occurrence_key: str, selector_version: str, timestamp_sec: float,
@@ -7493,7 +7582,11 @@ def upsert_pickup_detail_candidate(
     association_json: str, size_bytes: int,
 ) -> int:
     """Idempotently persist one independent pickup/person review lead."""
-    run_scope = str(processing_run_id) if processing_run_id is not None else f"video:{video_id}"
+    run_scope = (
+        str(processing_run_id) if processing_run_id is not None
+        else f"video:{int(video_id)}" if video_id is not None
+        else f"source:{run_key}"
+    )
     dedup_key = f"{run_scope}|{occurrence_key}|{selector_version}"
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with db_session() as conn:
@@ -7520,7 +7613,8 @@ def upsert_pickup_detail_candidate(
                 size_bytes = excluded.size_bytes,
                 updated_at = excluded.updated_at""",
             (
-                int(video_id), int(processing_run_id) if processing_run_id is not None else None,
+                int(video_id) if video_id is not None else None,
+                int(processing_run_id) if processing_run_id is not None else None,
                 str(run_key), int(pickup_track_id), int(person_track_id),
                 int(pickup_identity_epoch), int(person_identity_epoch),
                 str(occurrence_key), str(selector_version), dedup_key,
@@ -7566,11 +7660,6 @@ def list_pickup_detail_candidates(
     ownership, ownership_params = _video_owner_scope_sql(
         "c", owner_user_id=owner_user_id, uploader_id=uploader_id
     )
-    if owner_user_id is not None:
-        ownership[0] = (
-            "(c.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
-            "WHERE owner_video.id = c.video_id AND owner_video.uploaded_by = ?))"
-        )
     clauses.extend(ownership)
     params.extend(ownership_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -7599,11 +7688,6 @@ def count_pickup_detail_pending(
     ownership, params = _video_owner_scope_sql(
         "pickup_detail_candidates", owner_user_id=owner_user_id, uploader_id=uploader_id
     )
-    if owner_user_id is not None:
-        ownership[0] = (
-            "(pickup_detail_candidates.video_id IS NOT NULL AND EXISTS (SELECT 1 FROM videos AS owner_video "
-            "WHERE owner_video.id = pickup_detail_candidates.video_id AND owner_video.uploaded_by = ?))"
-        )
     where = " AND ".join(["human_outcome = 'pending'", *ownership])
     with db_session() as conn:
         row = conn.execute(

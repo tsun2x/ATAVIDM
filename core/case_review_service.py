@@ -666,6 +666,7 @@ def _load_sibling_observations(adapter: Any, primary: ObservationRef) -> list[Ob
             video_id=primary.video_id,
             track_id=primary.track_id,
             processing_run_id=primary.processing_run_id,
+            source_key=primary.source_key,
         )
     else:
         rows = adapter.list_pending_reviews_for_event(

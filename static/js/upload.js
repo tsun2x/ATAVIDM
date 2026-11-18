@@ -23,14 +23,22 @@
         if (!uploadRecordedDate || !uploadRecordedDate.dataset.timezone) return;
         try {
             const parts = new Intl.DateTimeFormat("en-US", {timeZone: uploadRecordedDate.dataset.timezone,
-                year: "numeric", month: "2-digit", day: "2-digit"}).formatToParts(new Date());
+                year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit",
+                minute: "2-digit", second: "2-digit", hourCycle: "h23"}).formatToParts(new Date());
             const value = Object.fromEntries(parts.map(function (part) { return [part.type, part.value]; }));
             uploadRecordedDate.max = value.year + "-" + value.month + "-" + value.day;
+            if (uploadRecordedTime) {
+                uploadRecordedTime.max = uploadRecordedDate.value === uploadRecordedDate.max
+                    ? value.hour + ":" + value.minute + ":" + value.second
+                    : "";
+            }
         } catch (err) {
             // Keep the server-rendered limit; server validation remains authoritative.
         }
     }
     uploadRecordedDate?.addEventListener("focus", refreshRecordingDateLimit);
+    uploadRecordedDate?.addEventListener("change", refreshRecordingDateLimit);
+    uploadRecordedTime?.addEventListener("focus", refreshRecordingDateLimit);
 
     const wizardModalEl = document.getElementById("annotationWizardModal");
     const wizardStepChoose = document.getElementById("wizardStepChoose");
@@ -911,6 +919,12 @@
         if (recordedDate && uploadRecordedDate.max && recordedDate > uploadRecordedDate.max) {
             showToast("Invalid Recording Date", "Recording date cannot be in the future.", "warning");
             uploadRecordedDate.focus();
+            return;
+        }
+        if (recordedDate && recordedTime && recordedDate === uploadRecordedDate.max &&
+                uploadRecordedTime.max && recordedTime > uploadRecordedTime.max) {
+            showToast("Invalid Recording Time", "Recording time cannot be in the future.", "warning");
+            uploadRecordedTime.focus();
             return;
         }
         if (Boolean(recordedDate) !== Boolean(recordedTime)) {

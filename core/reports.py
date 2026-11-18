@@ -176,7 +176,7 @@ def _expand_filters(filters: dict[str, Any]) -> dict[str, Any]:
 
 
 def preview_video(
-    video_id: int,
+    video_id: int | None,
     filters: dict[str, Any],
     *,
     page: int,
@@ -193,7 +193,7 @@ def preview_video(
     )
 
     result = db.report_video_preview(
-        int(video_id),
+        int(video_id) if video_id is not None else None,
         _expand_filters(filters),
         page=page,
         per_page=per_page,
@@ -262,7 +262,9 @@ def preview_video(
     video = result["video"]
     latest = result.get("latest_run")
     total = int(result["total"])
-    if latest and latest.get("status") in {"queued", "running"}:
+    if video.get("id") is None:
+        result_state = "live_cases_available" if total else "live_no_cases"
+    elif latest and latest.get("status") in {"queued", "running"}:
         result_state = "processing"
     elif latest and latest.get("status") == "completed":
         result_state = "completed_with_cases" if total else "completed_empty"
@@ -292,6 +294,25 @@ def preview_video(
             "exceeded": total > _MAX_ROWS,
         },
     }
+
+
+def preview_live(
+    filters: dict[str, Any],
+    *,
+    page: int,
+    per_page: int,
+    owner_user_id: int | None = None,
+    uploader_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Browse shared CCTV cases that have no uploaded-video relationship."""
+    return preview_video(
+        None,
+        dict(filters, source_type="live"),
+        page=page,
+        per_page=per_page,
+        owner_user_id=owner_user_id,
+        uploader_id=uploader_id,
+    )
 
 
 def _enrich_report_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -402,7 +423,10 @@ def _fetch_rows(
         limit=_MAX_ROWS,
         owner_user_id=owner_user_id,
         uploader_id=uploader_id,
-        source_video_only=owner_user_id is not None or uploader_id is not None,
+        source_video_only=(
+            (owner_user_id is not None or uploader_id is not None)
+            and filters.get("source_type") != "live"
+        ),
     )
     if snapshot["total"] > _MAX_ROWS:
         raise ReportTooLargeError(snapshot["total"])
@@ -412,6 +436,10 @@ def _fetch_rows(
 
 def _filters_label(filters: dict[str, Any]) -> str:
     parts: list[str] = []
+    if filters.get("source_type") == "live":
+        parts.append("Live CCTV")
+    elif filters.get("source_type") == "video":
+        parts.append("Uploaded videos")
     if filters.get("date_from") or filters.get("date_to"):
         parts.append(f"{filters.get('date_from', '...')} to {filters.get('date_to', '...')}")
     if filters.get("violation_type"):

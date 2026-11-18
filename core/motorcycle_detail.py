@@ -1454,7 +1454,7 @@ class MotorcycleDetailCollector:
     def __init__(
         self,
         *,
-        video_id: int,
+        video_id: int | None,
         run_key: str,
         frame_w: int,
         frame_h: int,
@@ -1471,7 +1471,7 @@ class MotorcycleDetailCollector:
         conf_floor: float = 0.25,
         scan_min_side: int = 320,
     ) -> None:
-        self.video_id = int(video_id)
+        self.video_id = int(video_id) if video_id is not None else None
         self.run_key = str(run_key)
         # Run identity is part of the dedup key: reprocessing the same video
         # under a new run must not overwrite the previous run's candidate.
@@ -1491,6 +1491,7 @@ class MotorcycleDetailCollector:
         )
         self._occurrences: dict[str, _OccurrenceSlots] = {}
         self._candidates: list[dict[str, Any]] = []
+        self._persisted_occurrences: set[str] = set()
         self._budget_exhausted = False
         self.stats: dict[str, int] = {
             "frames_observed": 0,
@@ -1729,6 +1730,25 @@ class MotorcycleDetailCollector:
                 logger.exception("failed to persist motorcycle detail candidate %s", payload.get("occurrence_key"))
         return written
 
+    def persist_new(self, adapter: Any | None = None) -> int:
+        """Persist only candidates not yet written by this live worker."""
+        if adapter is None:
+            from database import db as adapter_module
+
+            adapter = adapter_module
+        written = 0
+        for payload in self._candidates:
+            key = str(payload.get("occurrence_key") or "")
+            if not key or key in self._persisted_occurrences:
+                continue
+            try:
+                adapter.upsert_motorcycle_detail_candidate(**payload)
+                self._persisted_occurrences.add(key)
+                written += 1
+            except Exception:
+                logger.exception("failed to persist motorcycle detail candidate %s", key)
+        return written
+
     def discard(self) -> None:
         """Remove this run's detail evidence directory (failure path)."""
         try:
@@ -1749,7 +1769,7 @@ class MotorcycleDetailCollector:
 
 def build_detail_candidate_payload(
     *,
-    video_id: int,
+    video_id: int | None,
     run_key: str,
     occ: _OccurrenceSlots,
     source_width: int = 0,
@@ -1761,7 +1781,7 @@ def build_detail_candidate_payload(
     assert best is not None  # callers guard on empty slots
     frames = [slot.as_dict() for slot in occ.ordered()]
     return {
-        "video_id": int(video_id),
+        "video_id": int(video_id) if video_id is not None else None,
         "run_key": str(run_key),
         "processing_run_id": (
             int(processing_run_id) if processing_run_id is not None else None

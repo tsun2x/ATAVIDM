@@ -8,14 +8,22 @@
 <div class="card card-panel mb-4" id="videoReportBrowser">
     <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
         <div>
-            <h5 class="card-title mb-1"><i class="bi bi-camera-video me-2"></i>Browse cases by video</h5>
-            <p class="text-muted small mb-0">Choose a video and filters in the report generator below to browse matching cases.</p>
+            <h5 class="card-title mb-1"><i class="bi bi-camera-video me-2"></i>Browse cases by source</h5>
+            <p class="text-muted small mb-0">Choose a video or Live CCTV source and filters below to browse matching cases.</p>
         </div>
-        <span class="badge text-bg-secondary" id="reportPreviewState">Choose a video</span>
+        <span class="badge text-bg-secondary" id="reportPreviewState">Loading video sources…</span>
     </div>
     <div class="card-body">
+        <div class="mb-3">
+            <strong id="reportVideoGroupCount">—</strong>
+            <span class="text-muted">sources with matching cases</span>
+        </div>
+        <div id="reportVideoGroups" class="d-grid gap-2 mb-4" aria-live="polite">
+            <div class="text-muted py-2" role="status">Loading sources with detected cases…</div>
+        </div>
+        <hr>
         <div class="mb-3"><strong id="reportPreviewTotal">—</strong> <span class="text-muted">matching cases</span></div>
-        <div id="reportPreviewMessage" class="text-muted py-3" role="status">Choose a video to browse its cases.</div>
+        <div id="reportPreviewMessage" class="text-muted py-3" role="status">Choose a video group above to browse its cases.</div>
         <div id="reportPreviewResults" hidden>
             <div class="mb-3">
                 <div class="small text-muted mb-1">Cases by canonical violation type</div>
@@ -61,6 +69,14 @@
                             {% for t in violation_types %}
                             <option value="{{ t }}">{{ t }}</option>
                             {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="reportSourceType">Source Type</label>
+                        <select class="form-select" id="reportSourceType">
+                            <option value="">All Sources</option>
+                            <option value="video">Uploaded Videos</option>
+                            <option value="live">Live CCTV</option>
                         </select>
                     </div>
                     <div class="mb-3">

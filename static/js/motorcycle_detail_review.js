@@ -229,9 +229,15 @@ function buildEvidenceMarkup(item) {
     const choiceMarkup = choices.map(function (choice) {
         return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="radio" name="detailDecisionChoice" value="' + choice[0] + '"' + (item.scan_state !== "ready" ? " disabled" : "") + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
     }).join("");
+    const scanGateMessage = item.scan_state === "ready" ? ""
+        : item.scan_state === "queued"
+            ? '<p class="small text-warning mt-2 mb-0" role="status">Decision choices unlock when this candidate\'s evidence scan is ready. Start queued work with “Scan queued evidence” when that button is available.</p>'
+            : item.scan_state === "scanning"
+                ? '<p class="small text-warning mt-2 mb-0" role="status">Decision choices unlock when the current evidence scan finishes.</p>'
+                : '<p class="small text-warning mt-2 mb-0" role="status">Decision choices are unavailable because this evidence scan did not finish successfully. Check the scan status and error before retrying.</p>';
     return '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="detailEvidenceScale">Evidence size</label><input id="detailEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
         videoMarkup + frameMarkup + '<dl class="row small mt-3 mb-0">' + facts + "</dl>" + reasonMarkup +
-        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + (item.scan_state !== "ready" ? " disabled" : "") + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span></section>';
+        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + (item.scan_state !== "ready" ? " disabled" : "") + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span>' + scanGateMessage + "</section>";
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -259,6 +265,7 @@ if (typeof module !== "undefined" && module.exports) {
     const modalTitle = document.getElementById("detailModalTitle");
     const pendingCount = document.getElementById("detailPendingCount");
     const queueStatus = document.getElementById("detailQueueStatus");
+    const scanQueuedButton = document.getElementById("btnScanQueuedDetails");
     let activeDecisionItem = null;
     let activeDecisionRow = null;
     const evidenceModal = modalEl && bootstrap && bootstrap.Modal
@@ -464,5 +471,29 @@ if (typeof module !== "undefined" && module.exports) {
 
     modalBody?.addEventListener("click", function (e) {
         if (e.target.closest("[data-detail-submit-choice]")) submitSelectedDecision();
+    });
+
+    scanQueuedButton?.addEventListener("click", function () {
+        scanQueuedButton.disabled = true;
+        scanQueuedButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>Scanning…';
+        fetch("/api/motorcycle-detail-review/scan-now", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}"
+        }).then(function (response) {
+            return response.json().then(function (payload) {
+                return { ok: response.ok, payload: payload };
+            });
+        }).then(function (result) {
+            if (!result.ok || !result.payload.success) {
+                throw new Error(result.payload.error || "The queued evidence scan could not start.");
+            }
+            showToast("Evidence scan finished", "Reloading the queue to show the latest scan states.", "success");
+            window.setTimeout(function () { window.location.reload(); }, 500);
+        }).catch(function (error) {
+            scanQueuedButton.disabled = false;
+            scanQueuedButton.innerHTML = '<i class="bi bi-cpu me-1"></i>Scan queued evidence';
+            showToast("Evidence scan unavailable", error.message || "Try again when video processing is idle.", "warning");
+        });
     });
 })();

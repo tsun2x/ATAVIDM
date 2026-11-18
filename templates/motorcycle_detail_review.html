@@ -23,6 +23,11 @@
                 Scan: {{ detail_counts.scan_states.queued }} queued · {{ detail_counts.scan_states.scanning }} scanning ·
                 {{ detail_counts.scan_states.ready }} ready · {{ detail_counts.scan_states.failed }} failed
             </span>
+            {% if detail_counts.scan_states.queued and detail_gate.configured and detail_gate.exists %}
+            <button type="button" class="btn btn-sm btn-outline-primary ms-2" id="btnScanQueuedDetails">
+                <i class="bi bi-cpu me-1"></i>Scan queued evidence
+            </button>
+            {% endif %}
         </div>
         <div class="btn-group btn-group-sm" role="group" aria-label="Filter detail queue">
             <a class="btn btn-outline-secondary {% if detail_outcome == 'pending' %}active{% endif %}"
@@ -60,6 +65,7 @@
             Class <code>no_helmet</code> means “Uncovered head observed” — review evidence requiring human verification, not a confirmed no-helmet violation or a compliance decision.
             {% endfor %}
             Rider and motorcycle attribution comes from the main detector; a missing detection is unknown, not proof of absence. Ambiguous cases stay marked ambiguous.
+            Human confirmation is required for every case; a model scan only provides evidence for review.
         </p>
     </div>
 </div>

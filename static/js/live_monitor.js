@@ -1114,6 +1114,22 @@
     if (initialJobsSnapshot) renderLiveJobs(initialJobsSnapshot);
     setJobsTab(jobsTarget.tab);
 
+    // A page refresh does not start another processing run. Re-select the
+    // active upload so the operator immediately sees the existing run's
+    // persisted progress and the page resumes its status polling.
+    if (!jobsTarget.videoId && !jobsTarget.runId && videoList) {
+        const activeRow = Array.from(videoList.querySelectorAll(".camera-item"))
+            .map(function (button) {
+                try {
+                    return { button: button, video: JSON.parse(button.dataset.video || "{}") };
+                } catch (_error) {
+                    return null;
+                }
+            })
+            .find(function (entry) { return entry && entry.video.processing; });
+        if (activeRow) selectVideo(activeRow.video, activeRow.button);
+    }
+
     // --- Violation alerts -------------------------------------------------------
 
     function alertIcon(type) {

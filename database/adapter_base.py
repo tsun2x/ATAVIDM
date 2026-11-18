@@ -165,6 +165,7 @@ class DatabaseAdapter(Protocol):
     ) -> dict[str, list[dict[str, Any]]]: ...
     def recover_orphaned_processing(self) -> int: ...
     def get_violation(self, violation_id: int) -> dict[str, Any] | None: ...
+    def dismiss_violation_case(self, violation_id: int, actor_user_id: int, reason: str) -> None: ...
     def list_violations(
         self,
         filters: dict[str, Any] | None = None,
@@ -185,6 +186,13 @@ class DatabaseAdapter(Protocol):
         uploader_id: int | None = None,
         source_video_only: bool = False,
     ) -> dict[str, Any]: ...
+    def report_videos_with_cases(
+        self,
+        filters: dict[str, Any],
+        *,
+        owner_user_id: int | None = None,
+        uploader_id: int | None = None,
+    ) -> list[dict[str, Any]]: ...
     def report_video_preview(
         self,
         video_id: int,
@@ -233,6 +241,7 @@ class DatabaseAdapter(Protocol):
         *,
         owner_user_id: int | None = None,
         uploader_id: int | None = None,
+        video_id: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]: ...
     def list_review_queue_by_decision(
         self,
@@ -242,6 +251,7 @@ class DatabaseAdapter(Protocol):
         *,
         owner_user_id: int | None = None,
         uploader_id: int | None = None,
+        video_id: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]: ...
     def get_review_item(self, review_id: int) -> dict[str, Any] | None: ...
     def get_motorcycle_detail_no_helmet_review(self, candidate_id: int) -> dict[str, Any] | None: ...
@@ -256,7 +266,7 @@ class DatabaseAdapter(Protocol):
     def upsert_motorcycle_detail_candidate(
         self,
         *,
-        video_id: int,
+        video_id: int | None,
         run_key: str,
         track_id: int,
         occurrence_index: int,

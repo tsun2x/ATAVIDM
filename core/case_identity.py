@@ -11,6 +11,7 @@ Missing or ambiguous episode evidence keeps observations separate for review.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 
 from core.detection_config import (
@@ -35,7 +36,7 @@ class ObservationRef:
     """One review-queue observation contributing to a logical case."""
 
     review_id: int
-    video_id: int
+    video_id: int | None
     track_id: int
     processing_run_id: int | None
     violation_type: str
@@ -49,6 +50,7 @@ class ObservationRef:
     reason_log: str | None = None
     episode_identity_uncertain: bool = False
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    source_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,7 @@ def observation_from_review_row(row: dict[str, Any]) -> ObservationRef:
     uncertain = ts is None and ep_start is None and ep_end is None
     return ObservationRef(
         review_id=int(row["id"]),
-        video_id=int(row["video_id"]),
+        video_id=int(row["video_id"]) if row.get("video_id") is not None else None,
         track_id=int(row["track_id"]),
         processing_run_id=(
             int(row["processing_run_id"])
@@ -101,6 +103,7 @@ def observation_from_review_row(row: dict[str, Any]) -> ObservationRef:
         reason_log=row.get("reason_log"),
         episode_identity_uncertain=uncertain,
         raw=dict(row),
+        source_key=_source_key(row),
     )
 
 
@@ -117,7 +120,7 @@ def observation_from_violation_row(
     uncertain = ts is None and ep_start is None and ep_end is None
     return ObservationRef(
         review_id=int(review_id) if review_id is not None else -int(row["id"]),
-        video_id=int(row["video_id"]),
+        video_id=int(row["video_id"]) if row.get("video_id") is not None else None,
         track_id=int(row["track_id"]),
         processing_run_id=(
             int(row["processing_run_id"])
@@ -135,6 +138,7 @@ def observation_from_violation_row(
         reason_log=row.get("reason_log"),
         episode_identity_uncertain=uncertain,
         raw=dict(row),
+        source_key=_source_key(row),
     )
 
 
@@ -147,9 +151,20 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _source_key(row: dict[str, Any]) -> str | None:
+    if row.get("video_id") is not None:
+        return None
+    reason = str(row.get("reason_log") or "")
+    camera_id = re.search(r"\[camera_id:(\d+)\]", reason)
+    if camera_id:
+        return f"id:{camera_id.group(1)}"
+    camera_name = re.search(r"\[camera:([^\]]+)\]", reason)
+    return camera_name.group(1) if camera_name else None
+
+
 def event_identity_key(obs: ObservationRef) -> tuple[Any, ...]:
     """Source + run + track key — necessary but not sufficient for a case."""
-    return (obs.video_id, obs.processing_run_id, obs.track_id)
+    return (obs.video_id, obs.source_key, obs.processing_run_id, obs.track_id)
 
 
 def episodes_overlap(a: ObservationRef, b: ObservationRef) -> bool:
@@ -307,9 +322,10 @@ def find_existing_fused_case_violation_id(
     ):
         return None
 
-    video_id, run_id, track_id = group.event_key
+    video_id, source_key, run_id, track_id = group.event_key
     return adapter.find_fused_case_violation(
         video_id=video_id,
+        source_key=source_key,
         processing_run_id=run_id,
         track_id=track_id,
         contributing_rules=group.contributing_rules

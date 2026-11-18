@@ -146,7 +146,7 @@ class PickupDetailCollector:
     def __init__(
         self,
         *,
-        video_id: int,
+        video_id: int | None,
         run_key: str,
         frame_w: int,
         frame_h: int,
@@ -157,7 +157,7 @@ class PickupDetailCollector:
         max_active_pairs: int = MAX_ACTIVE_PAIRS,
         expiry_sec: float = TRACK_EXPIRY_SEC,
     ) -> None:
-        self.video_id = int(video_id)
+        self.video_id = int(video_id) if video_id is not None else None
         self.run_key = str(run_key)
         self.frame_w, self.frame_h = int(frame_w), int(frame_h)
         self.processing_run_id = int(processing_run_id) if processing_run_id is not None else None
@@ -168,6 +168,7 @@ class PickupDetailCollector:
         self._writer = writer or save_pickup_detail_evidence
         self._pairs: dict[tuple[int, int, int, int], _PairEpisode] = {}
         self._candidates: list[dict[str, Any]] = []
+        self._persisted_occurrences: set[str] = set()
         self._emitted: set[tuple[int, int, int, int]] = set()
         self.budget_exhausted = False
 
@@ -356,6 +357,23 @@ class PickupDetailCollector:
                 count += 1
             except Exception:
                 logger.exception("failed to persist pickup review candidate %s", payload.get("occurrence_key"))
+        return count
+
+    def persist_new(self, adapter: Any | None = None) -> int:
+        """Persist only leads not yet written by this live worker."""
+        if adapter is None:
+            from database import db as adapter
+        count = 0
+        for payload in self._candidates:
+            key = str(payload.get("occurrence_key") or "")
+            if not key or key in self._persisted_occurrences:
+                continue
+            try:
+                adapter.upsert_pickup_detail_candidate(**payload)
+                self._persisted_occurrences.add(key)
+                count += 1
+            except Exception:
+                logger.exception("failed to persist pickup review candidate %s", key)
         return count
 
     def discard(self) -> None:

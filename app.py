@@ -337,6 +337,20 @@ def _requested_uploader_id(
     return uploader_id, None, 200
 
 
+def _requested_accessible_video_id(
+    raw_value: str | None, actor: dict[str, Any] | None = None
+) -> tuple[int | None, str | None, int]:
+    if not raw_value:
+        return None, None, 200
+    try:
+        video_id = int(raw_value)
+    except (TypeError, ValueError):
+        return None, "Invalid video filter.", 400
+    if video_id < 1 or _accessible_video(video_id, actor) is None:
+        return None, "Video not found.", 404
+    return video_id, None, 200
+
+
 def _accessible_video(video_id: int, actor: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Return a video only when the actor may access its uploaded-video work."""
     actor = actor or auth.current_user()
@@ -694,7 +708,15 @@ def _report_to_ui(row: dict) -> dict:
         filters = json.loads(row.get("filters_json") or "{}")
     except json.JSONDecodeError:
         pass
-    filter_parts = [str(v) for v in filters.values() if v]
+    filter_parts = []
+    if filters.get("source_type") == "live":
+        filter_parts.append("Live CCTV")
+    elif filters.get("source_type") == "video":
+        filter_parts.append("Uploaded videos")
+    filter_parts.extend(
+        str(value) for key, value in filters.items()
+        if value and key != "source_type"
+    )
     return {
         "id": row["id"],
         "name": row["title"],
@@ -781,6 +803,7 @@ def _case_actions_for_user(user: dict) -> dict[str, bool]:
     user_id = int(user["id"])
     return {
         "confirm_case": db.can_confirm_case(user_id),
+        "dismiss_case": db.can_confirm_case(user_id),
         "attest_print": db.can_attest_print(user_id),
         "confirm_event_time": db.can_confirm_event_time(user_id),
         # Preparation/preview remains an Admin/Enforcer role action.
@@ -1374,15 +1397,24 @@ def review_queue():
     selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
     if error:
         return error, status
+    selected_video_id, error, status = _requested_accessible_video_id(request.args.get("video_id"), actor)
+    if error:
+        return error, status
     scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     videos = _video_name_map(**scope)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 20)))
-    rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
+    rows, total = db.list_review_queue(
+        status="pending", page=page, per_page=per_page,
+        video_id=selected_video_id, **scope
+    )
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
-        rows, total = db.list_review_queue(status="pending", page=page, per_page=per_page, **scope)
+        rows, total = db.list_review_queue(
+            status="pending", page=page, per_page=per_page,
+            video_id=selected_video_id, **scope
+        )
     return render_template(
         "review_queue.html",
         review_items=[_review_to_ui(r, videos, include_plate_details=False) for r in rows],
@@ -1392,6 +1424,8 @@ def review_queue():
         canonical_violations=list(CANONICAL_VIOLATIONS),
         uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
         selected_uploader_id=selected_uploader_id,
+        videos=[_db_video_to_ui(row) for row in db.list_videos(**scope)],
+        selected_video_id=selected_video_id,
         recent_decisions=[
             _decision_to_ui(item) for item in db.list_recent_review_decisions(8, **scope)
         ],
@@ -1696,8 +1730,14 @@ def api_upload_video():
     except RecordingTimeError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
 
-    if recorded_at and date.fromisoformat(recorded_at[:10]) > datetime.now(_application_timezone()).date():
-        return jsonify({"success": False, "error": "Recording date cannot be in the future."}), 400
+    if recorded_at:
+        recording_time = datetime.strptime(recorded_at, "%Y-%m-%d %H:%M:%S")
+        now_local = datetime.now(_application_timezone()).replace(tzinfo=None)
+        if recording_time > now_local:
+            return jsonify({
+                "success": False,
+                "error": "Recording date and time cannot be in the future.",
+            }), 400
 
     try:
         validate_upload(file, request.content_length)
@@ -3004,6 +3044,9 @@ def api_review_queue():
     selected_uploader_id, error, status = _requested_uploader_id(request.args.get("uploader_id"), actor)
     if error:
         return jsonify({"success": False, "error": error}), status
+    selected_video_id, error, status = _requested_accessible_video_id(request.args.get("video_id"), actor)
+    if error:
+        return jsonify({"success": False, "error": error}), status
     scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     status = request.args.get("status", "pending")
     decision = request.args.get("decision")
@@ -3016,19 +3059,27 @@ def api_review_queue():
         if decision not in REVIEW_DECISIONS:
             return jsonify({"success": False, "error": "Unknown review decision."}), 400
         rows, total = db.list_review_queue_by_decision(
-            decision, page=page, per_page=per_page, **scope
+            decision, page=page, per_page=per_page,
+            video_id=selected_video_id, **scope
         )
     else:
-        rows, total = db.list_review_queue(status=status, page=page, per_page=per_page, **scope)
+        rows, total = db.list_review_queue(
+            status=status, page=page, per_page=per_page,
+            video_id=selected_video_id, **scope
+        )
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
         if decision:
             rows, total = db.list_review_queue_by_decision(
-                decision, page=page, per_page=per_page, **scope
+                decision, page=page, per_page=per_page,
+                video_id=selected_video_id, **scope
             )
         else:
-            rows, total = db.list_review_queue(status=status, page=page, per_page=per_page, **scope)
+            rows, total = db.list_review_queue(
+                status=status, page=page, per_page=per_page,
+                video_id=selected_video_id, **scope
+            )
     return jsonify({
         "success": True,
         "items": [_review_to_ui(r, videos) for r in rows],
@@ -3637,7 +3688,7 @@ def api_pickup_detail_evidence(candidate_id: int, kind: str):
     if kind not in ("scene", "crop"):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     row = db.get_pickup_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     try:
         index = int(request.args.get("index", "1"))
@@ -3666,7 +3717,7 @@ def api_pickup_detail_evidence(candidate_id: int, kind: str):
 @auth.role_required("enforcer")
 def api_pickup_detail_outcome(candidate_id: int):
     row = db.get_pickup_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Pickup candidate not found."}), 404
     payload = request.get_json(silent=True) or {}
     outcome = str(payload.get("outcome") or "").strip().lower()
@@ -3785,7 +3836,7 @@ def api_motorcycle_detail_list():
 @auth.role_required("enforcer")
 def api_motorcycle_detail_candidate(candidate_id: int):
     row = db.get_motorcycle_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     videos = _video_name_map(**_account_video_scope())
     current_run = (
@@ -3807,7 +3858,7 @@ def api_motorcycle_detail_evidence(candidate_id: int, kind: str):
     if kind not in ("scene", "crop", "overlay"):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     row = db.get_motorcycle_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     try:
         index = int(request.args.get("index", "1"))
@@ -3844,7 +3895,7 @@ def api_motorcycle_detail_outcome(candidate_id: int):
     ):
         return jsonify({"success": False, "error": "Invalid review revision."}), 400
     candidate = db.get_motorcycle_detail_candidate(candidate_id)
-    if candidate is None or not _accessible_video_derived_link(candidate.get("video_id")):
+    if candidate is None or not _accessible_video_link(candidate.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     try:
         saved_snapshot = db.record_motorcycle_detail_review(
@@ -3887,7 +3938,7 @@ def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
     )
 
     row = db.get_motorcycle_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
     payload = request.get_json(silent=True) or {}
@@ -4000,7 +4051,7 @@ def api_motorcycle_detail_decision(candidate_id: int):
         return jsonify({"success": False, "error": "Reload the candidate before recording a decision."}), 400
 
     row = db.get_motorcycle_detail_candidate(candidate_id)
-    if row is None or not _accessible_video_derived_link(row.get("video_id")):
+    if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     if row.get("scan_state") != "ready":
         return jsonify({"success": False, "error": "Wait for the evidence scan to finish before deciding."}), 409
@@ -4258,6 +4309,23 @@ def api_confirm_case(violation_id: int):
         return jsonify({"success": False, "error": str(exc)}), 400
 
 
+@app.route("/api/cases/<int:violation_id>/dismiss", methods=["POST"])
+@auth.login_required
+def api_dismiss_case(violation_id: int):
+    user = auth.current_user()
+    case_row = db.get_violation(violation_id)
+    if case_row is None or not _accessible_video_link(case_row.get("video_id"), user):
+        return jsonify({"success": False, "error": "Case not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.dismiss_violation_case(violation_id, int(user["id"]), payload.get("reason") or "")
+        return jsonify({"success": True, "status": "dismissed"})
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
 @app.route("/api/cases/<int:violation_id>/notice-printed", methods=["POST"])
 @auth.login_required
 def api_notice_printed(violation_id: int):
@@ -4400,17 +4468,67 @@ def api_reject_policy_version(version_id: int):
 # Report APIs
 # ---------------------------------------------------------------------------
 
+@app.route("/api/reports/video-groups", methods=["GET"])
+@auth.role_required("enforcer")
+def api_report_video_groups():
+    actor = auth.current_user()
+    selected_uploader_id, error, status = _requested_uploader_id(
+        request.args.get("uploader_id"), actor
+    )
+    if error:
+        return jsonify({"success": False, "error": error}), status
+
+    filters: dict[str, Any] = {}
+    source_type = request.args.get("source_type", "").strip()
+    if source_type:
+        if source_type not in ("video", "live"):
+            return jsonify({"success": False, "error": "Invalid report source type."}), 400
+        filters["source_type"] = source_type
+    violation_type = request.args.get("violation_type", "").strip()
+    if violation_type:
+        if violation_type not in CANONICAL_VIOLATIONS:
+            return jsonify({"success": False, "error": "Invalid violation type filter."}), 400
+        filters["violation_type"] = violation_type
+    selected_status = request.args.get("status", "").strip()
+    if selected_status:
+        if selected_status not in STATUSES:
+            return jsonify({"success": False, "error": "Invalid status filter."}), 400
+        filters["status"] = selected_status
+    for key in ("date_from", "date_to"):
+        value = request.args.get(key, "").strip()
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                return jsonify({"success": False, "error": f"Invalid {key} date."}), 400
+            filters[key] = value
+
+    groups = db.report_videos_with_cases(
+        filters,
+        owner_user_id=(actor["id"] if actor.get("role") != "admin" else None),
+        uploader_id=selected_uploader_id,
+    )
+    for group in groups:
+        group["violation_types"] = [
+            value for value in str(group.get("violation_types") or "").split(",") if value
+        ]
+    return jsonify({"success": True, "groups": groups, "total": len(groups)})
+
+
 @app.route("/api/reports/preview", methods=["GET"])
 @auth.role_required("enforcer")
 def api_report_video_preview():
+    source_type = request.args.get("source_type", "video").strip() or "video"
+    if source_type not in ("video", "live"):
+        return jsonify({"success": False, "error": "Invalid report source type."}), 400
     raw_video_id = request.args.get("video_id", "")
     try:
-        video_id = int(raw_video_id)
+        video_id = None if source_type == "live" else int(raw_video_id)
         page = int(request.args.get("page", "1"))
         per_page = int(request.args.get("per_page", "25"))
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "Invalid video or pagination value."}), 400
-    if video_id <= 0 or page < 1 or not 1 <= per_page <= 100:
+    if (video_id is not None and video_id <= 0) or page < 1 or not 1 <= per_page <= 100:
         return jsonify({"success": False, "error": "Invalid video or pagination value."}), 400
 
     selected_uploader_id, error, status = _requested_uploader_id(
@@ -4420,6 +4538,7 @@ def api_report_video_preview():
         return jsonify({"success": False, "error": error}), status
 
     filters: dict[str, Any] = {}
+    filters["source_type"] = source_type
     violation_type = request.args.get("violation_type", "").strip()
     if violation_type:
         if violation_type not in CANONICAL_VIOLATIONS:
@@ -4440,13 +4559,16 @@ def api_report_video_preview():
             filters[key] = value
 
     actor = auth.current_user()
-    preview = reports_core.preview_video(
-        video_id,
-        filters,
-        page=page,
-        per_page=per_page,
-        owner_user_id=(actor["id"] if actor.get("role") != "admin" else None),
-        uploader_id=selected_uploader_id,
+    preview_kwargs = {
+        "page": page,
+        "per_page": per_page,
+        "owner_user_id": (actor["id"] if actor.get("role") != "admin" else None),
+        "uploader_id": selected_uploader_id,
+    }
+    preview = (
+        reports_core.preview_live(filters, **preview_kwargs)
+        if source_type == "live"
+        else reports_core.preview_video(video_id, filters, **preview_kwargs)
     )
     if preview is None:
         # A missing video and another account's video have the same response.
@@ -4472,7 +4594,7 @@ def api_generate_report():
     report_format = (payload.get("format") or "pdf").lower()
     filters = {
         key: payload.get(key)
-        for key in ("date_from", "date_to", "violation_type", "status", "video_id")
+        for key in ("date_from", "date_to", "violation_type", "status", "video_id", "source_type")
         if payload.get(key)
     }
     user = auth.current_user()
