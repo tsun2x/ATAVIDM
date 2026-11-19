@@ -9,6 +9,52 @@ import threading
 
 import pytest
 
+
+def test_dismiss_case_retains_record_and_appends_reviewer_reason(test_db):
+    import bcrypt
+
+    password_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")
+    reviewer_id = test_db.create_user("case_reviewer", password_hash, role="enforcer")
+    video_id = test_db.insert_video(
+        filename="dismiss-case.mp4", filepath="/tmp/dismiss-case.mp4", status="processed"
+    )
+    violation_id = test_db.insert_violation(
+        video_id=video_id, track_id=4, violation_type="Illegal Parking",
+        confidence=0.91, frame_number=30, timestamp_sec=3.0,
+        reason_log="Original detection evidence.",
+    )
+
+    test_db.dismiss_violation_case(violation_id, reviewer_id, "Confirmed by mistake during testing.")
+
+    dismissed = test_db.get_violation(violation_id)
+    assert dismissed["status"] == "dismissed"
+    assert dismissed["reviewed_by"] == reviewer_id
+    assert "Original detection evidence." in dismissed["reason_log"]
+    assert "Confirmed by mistake during testing." in dismissed["reason_log"]
+
+
+def test_dismiss_case_rejects_recorded_printed_notice(test_db):
+    import bcrypt
+
+    password_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")
+    reviewer_id = test_db.create_user("case_reviewer", password_hash, role="enforcer")
+    video_id = test_db.insert_video(
+        filename="printed-case.mp4", filepath="/tmp/printed-case.mp4", status="processed"
+    )
+    violation_id = test_db.insert_violation(
+        video_id=video_id, track_id=5, violation_type="Illegal Parking",
+        confidence=0.91, frame_number=31, timestamp_sec=3.1,
+    )
+    test_db.record_case_action(
+        violation_id, action_type="notice_printed", detail={"document_reference": "TEST-1"},
+        actor_user_id=reviewer_id,
+    )
+
+    with pytest.raises(ValueError, match="printed notice"):
+        test_db.dismiss_violation_case(violation_id, reviewer_id, "Accidental confirmation")
+
+    assert test_db.get_violation(violation_id)["status"] == "confirmed"
+
 from core.case_review_service import materialize_case_from_review
 from core.detection_config import (
     VIOLATION_COUNTERFLOW,
@@ -460,5 +506,63 @@ def test_review_page_and_decision_api(test_db):
             assert legacy.status_code in (404, 409)
             assert test_db.get_review_decision(review_id)["decision"] == DECISION_INSUFFICIENT
             assert test_db.get_review_item(review_id)["violation_type"] == VIOLATION_COUNTERFLOW
+    finally:
+        flask_app.stop_processing_worker()
+
+
+def test_live_camera_review_can_be_confirmed_by_enforcer(test_db, monkeypatch):
+    import bcrypt
+
+    monkeypatch.setenv("TAVIDM_BOOTSTRAP_ADMIN_PASSWORD", "isolated-live-confirm-test")
+    import app as flask_app
+    from core import auth
+
+    auth.ensure_default_admin()
+    password = bcrypt.hashpw(b"live-confirm-pass", bcrypt.gensalt()).decode("utf-8")
+    test_db.create_user("live_confirm_enforcer", password, role="enforcer")
+    review_id = test_db.insert_review_queue(
+        video_id=None,
+        track_id=31,
+        violation_type=VIOLATION_ILLEGAL_PARKING,
+        confidence=0.9,
+        frame_number=120,
+        timestamp_sec=12.0,
+        episode_start_sec=8.0,
+        episode_end_sec=12.0,
+        evidence_path="/tmp/live-camera-scene.jpg",
+        reason_log="[camera:school-test] sustained prohibited stopping",
+        vehicle_class="car",
+        evidence_sufficiency=0.9,
+        unavailable_factors_json="[]",
+    )
+    other_camera_review_id = test_db.insert_review_queue(
+        video_id=None,
+        track_id=31,
+        violation_type=VIOLATION_ILLEGAL_PARKING,
+        confidence=0.9,
+        frame_number=120,
+        timestamp_sec=12.0,
+        episode_start_sec=8.0,
+        episode_end_sec=12.0,
+        evidence_path="/tmp/other-camera-scene.jpg",
+        reason_log="[camera:other-school-test] sustained prohibited stopping",
+        vehicle_class="car",
+        evidence_sufficiency=0.9,
+        unavailable_factors_json="[]",
+    )
+    flask_app.app.config["TESTING"] = True
+    flask_app.app.config["WTF_CSRF_ENABLED"] = False
+    try:
+        with flask_app.app.test_client() as client:
+            login = client.post(
+                "/login", data={"username": "live_confirm_enforcer", "password": "live-confirm-pass"}
+            )
+            assert login.status_code in (200, 302, 303)
+            response = client.post(f"/api/review-queue/{review_id}/confirm")
+
+        assert response.status_code == 200, response.get_json()
+        assert response.get_json()["creates_case"] is True
+        assert test_db.get_review_item(review_id)["status"] == "confirmed"
+        assert test_db.get_review_item(other_camera_review_id)["status"] == "pending"
     finally:
         flask_app.stop_processing_worker()

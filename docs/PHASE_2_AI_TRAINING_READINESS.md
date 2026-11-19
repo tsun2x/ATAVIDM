@@ -2,6 +2,8 @@
 
 **Status:** Preparation active; full training blocked by the automated entry gate.
 
+**2026-10-25 review:** The recorded gate was rerun and still returns `ready=false` for the four registry entries and pending approval/gold/pilot/threshold controls. Meanwhile, a local `models/tavidm_yolov8m.pt` checkpoint is installed and matches the ordered 15-object schema; legacy and detail weight files also exist. Thus the recorded acceptance gate is incomplete even though local model integration has progressed. This gate reports its registry/control files, not every derivative or training output on disk. Reconcile those records using traceable evidence; do not infer that no training has occurred or silently mark approvals passed. See [current project state](../project.md) for the whole-system phase and validation limits.
+
 ## Frozen pilot contract
 
 The Phase 2 pilot uses YOLOv8m with ByteTrack on the RTX 3050 6 GB target. `config/training/class_schema.json` (schema_version **1.3.0**) is the versioned annotation contract. It freezes observable labels for the pilot without freezing unfinished legal or rule-engine details. A detection label is never itself a violation. The vehicle detector roster has **10** classes (`autorickshaw`; single `van`; SUV/crossover consolidated into `car`; no canonical `uv_express_van` / `piaggio`).

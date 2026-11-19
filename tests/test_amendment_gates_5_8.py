@@ -408,6 +408,7 @@ class TestCargoGate8:
                 bbox_y=120,
                 bbox_w=25,
                 bbox_h=35,
+                lower_body_visible=True,
                 speed_px_per_sec=40.0,
                 timestamp_sec=t,
                 centroid_x=x + 17,

@@ -1,5 +1,7 @@
 # TAVIDM Violation-Policy Implementation Checklist
 
+> Historical scope: this checklist tracks the September policy implementation stages and their dated evidence. For the current whole-system phase, local model state, fresh regression results, and remaining gates, use [project.md](../project.md), reviewed 2026-10-25. Old FastALPR installation blockers do not describe the newer experimental ONNX OCR path; consult `core/plate_settings.py`, `core/plate_runtime.py`, and `docs/plate_ocr/README.md`. Neither path establishes field OCR accuracy or active legal approval.
+
 ## Overview
 
 This document tracks the staged implementation of the approved violation-policy,

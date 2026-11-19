@@ -76,8 +76,19 @@ async function run() {
     change("reportVideo", "");
     selected.gate.resolve(success(preview(3)));
     await flush();
-    assert.strictEqual(element("reportPreviewState").textContent, "Choose a video");
+    assert.strictEqual(element("reportPreviewState").textContent, "Choose a source");
     assert.ok(!element("reportPreviewCases").innerHTML.includes("VIO-000003"));
+
+    // Live CCTV is a valid browse source even without an uploaded video ID.
+    change("reportSourceType", "live");
+    const livePreview = lastRequest(url => url.includes("/api/reports/preview") && url.includes("source_type=live"));
+    livePreview.gate.resolve(success({ ...preview(24), result_state: "live_cases_available" }));
+    await flush();
+    assert.ok(element("reportPreviewCases").innerHTML.includes("VIO-000024"));
+    change("reportSourceType", "");
+    const allSourceGroups = lastRequest(url => url.includes("/api/reports/video-groups"));
+    allSourceGroups.gate.resolve(success({ groups: [], total: 0 }));
+    await flush();
 
     // Video A resolves after video B and must not replace B.
     change("reportVideo", "A");

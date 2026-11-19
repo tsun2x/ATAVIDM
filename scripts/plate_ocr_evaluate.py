@@ -71,11 +71,35 @@ def configure_environment(db_path: Path, evidence_root: Path, plate_config: Path
     os.environ["REPORTS_FOLDER"] = str(evidence_root.parent / "reports")
     os.environ["TAVIDM_PLATE_OCR_CONFIG"] = str(plate_config)
     os.environ["TAVIDM_PLATE_OCR_EVALUATION"] = "1"
+    # The repository's .env may enable app mode. Keep the harness in exactly
+    # one explicit mode even when its parent process has local app settings.
+    os.environ["TAVIDM_PLATE_OCR_APP"] = "0"
     os.environ.pop("TAVIDM_PLATE_OCR_DEMO", None)
     os.environ["TAVIDM_PLATE_OCR_ISOLATED_ROOT"] = str(isolation_root.resolve())
     os.environ["TAVIDM_PLATE_ARTIFACTS"] = str(plate_config.parent)
     os.environ["TAVIDM_BOOTSTRAP_ADMIN_PASSWORD"] = "plate-eval-harness-only-pw"
     os.environ["TAVIDM_PLATE_EVAL_HARNESS"] = "1"
+
+    # Preflight config validation imports ``config`` before this function is
+    # called. Updating the environment alone would leave already-imported
+    # constants pointing at the real application DB/evidence folders.
+    configured_paths = {
+        "DATABASE_URL": str(db_path),
+        "SQLITE_PATH": str(db_path),
+        "EVIDENCE_FOLDER": str(evidence_root),
+        "UPLOAD_FOLDER": str(evidence_root.parent / "raw"),
+        "FRAMES_FOLDER": str(evidence_root.parent / "frames"),
+        "ANNOTATED_FOLDER": str(evidence_root.parent / "annotated"),
+        "REPORTS_FOLDER": str(evidence_root.parent / "reports"),
+    }
+    config_module = sys.modules.get("config")
+    if config_module is not None:
+        for name, value in configured_paths.items():
+            setattr(config_module, name, value)
+    evidence_module = sys.modules.get("core.evidence")
+    if evidence_module is not None:
+        evidence_module.EVIDENCE_FOLDER = str(evidence_root)
+
     if create_roots:
         for folder in (evidence_root.parent / "raw", evidence_root.parent / "frames", evidence_root.parent / "annotated", evidence_root.parent / "reports"):
             folder.mkdir(parents=True, exist_ok=True)

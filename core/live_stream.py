@@ -32,9 +32,11 @@ from core.scene_annotation import load_scene_annotation
 from core.tracker import TrackState
 from core.motorcycle_detail import MotorcycleDetailCollector
 from core.pickup_detail_review import PickupDetailCollector
+from core.pickup_person_scan import PickupPersonCropScanner
 from core.video_processor import (
     _detail_collection_enabled,
     _pickup_detail_collection_enabled,
+    _pickup_person_scan_enabled,
     load_rule_parameters,
 )
 from core.violation_config import load_enabled_violations
@@ -207,6 +209,7 @@ class LiveStreamWorker(threading.Thread):
         last_raw_snapshot = 0.0
         motorcycle_collector = None
         pickup_collector = None
+        pickup_person_scanner = None
         persisted_motorcycle_candidates = 0
         persisted_pickup_candidates = 0
 
@@ -260,12 +263,16 @@ class LiveStreamWorker(threading.Thread):
                         processing_run_id=None,
                         enabled=_pickup_detail_collection_enabled(),
                     )
+                    pickup_person_scanner = PickupPersonCropScanner(
+                        enabled=_pickup_detail_collection_enabled()
+                        and _pickup_person_scan_enabled(),
+                    )
 
                 timestamp_sec = time.monotonic() - started
                 # Lowest-priority user of the single GPU: never wait and never
-                # queue. If an uploaded-video job, a detail crop batch, or a
-                # manual scan holds the device, this frame is skipped instead of
-                # starting a second YOLOv8 pass.
+                # queue. This reservation covers both the main frame detector
+                # and the optional pickup-crop person pass; if other work holds
+                # the device, this frame is skipped.
                 with gpu_slot.reservation(
                     f"live-frame:camera-{self.camera['id']}",
                     timeout=0.0,
@@ -275,12 +282,17 @@ class LiveStreamWorker(threading.Thread):
                         skipped_frames += 1
                         continue
                     raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
-                tracked = track_state.update(raw, now=timestamp_sec)
+                    tracked = track_state.update(raw, now=timestamp_sec)
+                    pickup_person_detections = pickup_person_scanner.scan(
+                        frame, tracked, timestamp_sec=timestamp_sec
+                    )
+                pickup_review_tracked = [*tracked, *pickup_person_detections]
                 motorcycle_collector.observe(
                     frame, tracked, frame_number=frame_number, timestamp_sec=timestamp_sec
                 )
                 pickup_collector.observe(
-                    frame, tracked, frame_number=frame_number, timestamp_sec=timestamp_sec
+                    frame, pickup_review_tracked,
+                    frame_number=frame_number, timestamp_sec=timestamp_sec
                 )
                 motorcycle_candidates = motorcycle_collector.candidates()
                 if len(motorcycle_candidates) > persisted_motorcycle_candidates:
@@ -295,7 +307,7 @@ class LiveStreamWorker(threading.Thread):
                         with self._frame_lock:
                             self._latest_raw_jpeg = snapshot.tobytes()
                         last_raw_snapshot = snapshot_time
-                self._publish(self._annotate(frame, tracked))
+                self._publish(self._annotate(frame, pickup_review_tracked))
 
                 events = evaluate_detection_rules(
                     tracked, rule_state, frame_number,

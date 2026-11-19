@@ -56,3 +56,17 @@ def test_pickup_candidate_lists_follow_video_owner_scope(test_db):
     rows, total = test_db.list_pickup_detail_candidates(owner_user_id=owner_a)
     assert total == 1
     assert rows[0]["video_id"] == video_a
+
+
+def test_live_pickup_candidates_are_shared_with_enforcers(test_db):
+    live = _payload(None, occurrence_key="camera_3_session_a_pickup_1_person_2")
+    live.update(run_key="camera_3_session_a", processing_run_id=None)
+    candidate_id = test_db.upsert_pickup_detail_candidate(**live)
+    owner = test_db.create_user("pickup_live_reader", "hash", role="enforcer")
+
+    rows, total = test_db.list_pickup_detail_candidates(owner_user_id=owner)
+
+    assert total == 1
+    assert rows[0]["id"] == candidate_id
+    assert rows[0]["video_id"] is None
+    assert test_db.count_pickup_detail_pending(owner_user_id=owner) == 1

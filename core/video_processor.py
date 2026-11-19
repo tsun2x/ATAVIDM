@@ -33,6 +33,7 @@ from core.frame_annotate import TrajectoryOverlay, annotate_frame
 from core.geometry_profile import build_geometry_profile
 from core.motorcycle_detail import MotorcycleDetailCollector
 from core.pickup_detail_review import PickupDetailCollector
+from core.pickup_person_scan import PickupPersonCropScanner
 from core.model_capability import (
     extract_model_class_names,
     baseline_capability_notes,
@@ -194,6 +195,16 @@ def _pickup_detail_collection_enabled() -> bool:
         import config
 
         return bool(getattr(config, "PICKUP_DETAIL_REVIEW_ENABLED", True))
+    except Exception:  # pragma: no cover - config import failure is not expected
+        return True
+
+
+def _pickup_person_scan_enabled() -> bool:
+    """Whether the third-stage person detector scans detected pickup crops."""
+    try:
+        import config
+
+        return bool(getattr(config, "PICKUP_PERSON_ENABLED", True))
     except Exception:  # pragma: no cover - config import failure is not expected
         return True
 
@@ -621,6 +632,14 @@ def process_video(
             processing_run_id=run_id_int,
             enabled=_pickup_detail_collection_enabled() and (frame_w or 0) > 0 and (frame_h or 0) > 0,
         )
+        pickup_person_scanner = PickupPersonCropScanner(
+            enabled=(
+                _pickup_detail_collection_enabled()
+                and _pickup_person_scan_enabled()
+                and (frame_w or 0) > 0
+                and (frame_h or 0) > 0
+            )
+        )
 
         while True:
             if cancel_requested is not None and cancel_requested():
@@ -644,6 +663,10 @@ def process_video(
 
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
+            pickup_person_detections = pickup_person_scanner.scan(
+                frame, tracked, timestamp_sec=timestamp_sec
+            )
+            pickup_review_tracked = [*tracked, *pickup_person_detections]
             # End an old identity's review episode before a reused ByteTrack ID
             # can emit a new event on this frame. evaluate_detection_rules also
             # observes tracks; the second call is idempotent for the same epoch.
@@ -661,7 +684,7 @@ def process_video(
             if pickup_detail_collector.enabled:
                 pickup_detail_collector.observe(
                     frame,
-                    tracked,
+                    pickup_review_tracked,
                     frame_number=frame_number,
                     timestamp_sec=timestamp_sec,
                 )
@@ -740,7 +763,7 @@ def process_video(
             try:
                 annotated = annotate_frame(
                     frame,
-                    tracked,
+                    pickup_review_tracked,
                     zones=ctx["zones"],
                     violation_track_ids=viol_ids,
                     scene=ctx.get("scene_document"),
@@ -757,7 +780,7 @@ def process_video(
                 trajectory_overlay = None
                 annotated = annotate_frame(
                     frame,
-                    tracked,
+                    pickup_review_tracked,
                     zones=ctx["zones"],
                     violation_track_ids=viol_ids,
                     scene=ctx.get("scene_document"),

@@ -1,0 +1,347 @@
+{
+  "review_date": "2026-10-25",
+  "timezone": "Australia/Perth",
+  "workspace": "D:/tavidm",
+  "source_head": "9b3a4b8d05912067f914302d285b73299c7ad7a6",
+  "branch": "cursor/phase-1-foundation",
+  "scope": "Local dirty checkout; source inventory, static checks, checkpoint loading/class maps, isolated automated tests and Flask smoke. No field accuracy, live camera, browser, deployment, or operational database verification.",
+  "phase_assessment": "Phase 2 - model integration, evaluation, and system validation; pre-field-pilot",
+  "inventory": {
+    "tracked_python_files_parsed": 179,
+    "tracked_templates_parsed": 13,
+    "flask_route_decorators": 93,
+    "python_test_modules": 83,
+    "javascript_harness_files": 12,
+    "sql_migration_files": 14
+  },
+  "static_checks": {
+    "python_parse_errors": 0,
+    "template_parse_errors": 0,
+    "application_javascript_files_syntax_checked": 16,
+    "javascript_syntax_failures": 0
+  },
+  "checkpoint_inspection": [
+    {
+      "file": "models/tavidm_yolov8m.pt",
+      "selected_by_resolver": true,
+      "sha256": "1b55b7cfa92c75043b883e0aea2a409cceed29da3dd52596f410fbaa499cd8cc",
+      "class_count": 15,
+      "exact_ordered_main_contract": true,
+      "load_succeeded": true
+    },
+    {
+      "file": "models/best.pt",
+      "selected_by_resolver": false,
+      "sha256": "a693d7909929e5f3baa6d3af254f0f0508ae4a61d2a8bb076e512abafc9e12bc",
+      "class_count": 7,
+      "contract": "accepted legacy subset",
+      "load_succeeded": true
+    },
+    {
+      "file": "models/motorcycle_detail_best.pt",
+      "selected_by_resolver": false,
+      "sha256": "e330138c3f84a0579b36dd5b4eb3a52e4680a4c8b67182a4ceee6b5a7c9b4f7e",
+      "classes": [
+        "helmet_nut_shell",
+        "helmet_acceptable",
+        "side_mirror"
+      ],
+      "contract": "separate three-class detail model",
+      "load_succeeded": true
+    }
+  ],
+  "training_entry_gate": {
+    "ready": false,
+    "dataset_count": 4,
+    "issues": [
+      {
+        "dataset_id": "tt100k",
+        "code": "dataset_not_accepted",
+        "message": "Dataset has not been accepted"
+      },
+      {
+        "dataset_id": "tt100k",
+        "code": "not_downloaded",
+        "message": "Dataset files are not downloaded"
+      },
+      {
+        "dataset_id": "tt100k",
+        "code": "inspection_incomplete",
+        "message": "Representative sample inspection has not passed"
+      },
+      {
+        "dataset_id": "tt100k",
+        "code": "annotations_incomplete",
+        "message": "Annotation quality control has not passed"
+      },
+      {
+        "dataset_id": "tt100k",
+        "code": "split_not_leakage_safe",
+        "message": "Split lacks all required source grouping dimensions"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "dataset_not_accepted",
+        "message": "Dataset has not been accepted"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "license_unverified",
+        "message": "Dataset license is not verified"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "not_downloaded",
+        "message": "Dataset files are not downloaded"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "inspection_incomplete",
+        "message": "Representative sample inspection has not passed"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "annotations_incomplete",
+        "message": "Annotation quality control has not passed"
+      },
+      {
+        "dataset_id": "bdd100k",
+        "code": "split_not_leakage_safe",
+        "message": "Split lacks all required source grouping dimensions"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "dataset_not_accepted",
+        "message": "Dataset has not been accepted"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "license_unverified",
+        "message": "Dataset license is not verified"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "not_downloaded",
+        "message": "Dataset files are not downloaded"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "inspection_incomplete",
+        "message": "Representative sample inspection has not passed"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "annotations_incomplete",
+        "message": "Annotation quality control has not passed"
+      },
+      {
+        "dataset_id": "idd",
+        "code": "split_not_leakage_safe",
+        "message": "Split lacks all required source grouping dimensions"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "dataset_not_accepted",
+        "message": "Dataset has not been accepted"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "license_unverified",
+        "message": "Dataset license is not verified"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "not_downloaded",
+        "message": "Dataset files are not downloaded"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "inspection_incomplete",
+        "message": "Representative sample inspection has not passed"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "annotations_incomplete",
+        "message": "Annotation quality control has not passed"
+      },
+      {
+        "dataset_id": "mapillary-vistas",
+        "code": "split_not_leakage_safe",
+        "message": "Split lacks all required source grouping dimensions"
+      },
+      {
+        "dataset_id": "registry",
+        "code": "no_accepted_dataset",
+        "message": "No accepted dataset is available"
+      },
+      {
+        "dataset_id": "project",
+        "code": "collection_permission_missing",
+        "message": "Local data collection permission is not approved"
+      },
+      {
+        "dataset_id": "project",
+        "code": "privacy_policy_missing",
+        "message": "Privacy and retention procedure is not approved"
+      },
+      {
+        "dataset_id": "project",
+        "code": "gold_set_incomplete",
+        "message": "Gold annotation set has not passed review"
+      },
+      {
+        "dataset_id": "project",
+        "code": "pilot_incomplete",
+        "message": "YOLOv8m pilot has not passed"
+      },
+      {
+        "dataset_id": "project",
+        "code": "thresholds_missing",
+        "message": "Acceptance thresholds are not recorded"
+      }
+    ]
+  },
+  "checked_in_legal_mapping_status_counts": {
+    "unverified": 8,
+    "flag_only": 4
+  },
+  "python_regression": {
+    "status": "completed_with_failures",
+    "command": "python -m pytest tests/ -q --tb=short",
+    "collected": 1518,
+    "collection_skipped": 1,
+    "interpreter": "Python 3.11.9",
+    "pytest": "9.1.1",
+    "isolation": "Temporary SQLite and upload/frame/annotated/evidence/report directories set before imports; disposable bootstrap credentials; development mode; optional detail weight unset.",
+    "exit_code": 1,
+    "passed": 1468,
+    "failed": 49,
+    "skipped": 2,
+    "warnings": 1,
+    "duration_seconds": 714.62,
+    "summary": "49 failed, 1468 passed, 2 skipped, 1 warning in 714.62s (0:11:54)",
+    "failure_counts_by_module": {
+      "test_annotation_editor_gate4.py": 1,
+      "test_case_policy_e2e.py": 1,
+      "test_codex_corrections.py": 6,
+      "test_integration_remediation.py": 10,
+      "test_migration_007_provenance.py": 2,
+      "test_motorcycle_detail_api.py": 3,
+      "test_motorcycle_detail_three_class.py": 8,
+      "test_object_roster_v9_1_readiness.py": 2,
+      "test_plate_ocr.py": 5,
+      "test_review_decision_regressions.py": 1,
+      "test_upload_processing_ux.py": 1,
+      "test_vehicle_grouping.py": 8,
+      "test_violation_policy.py": 1
+    },
+    "failed_nodeids": [
+      "tests/test_annotation_editor_gate4.py::test_annotation_api_preserves_v2_ids_on_save_and_reload",
+      "tests/test_case_policy_e2e.py::test_flask_case_apis_isolated",
+      "tests/test_codex_corrections.py::TestReviewConfirmGate::test_confirm_api_end_only_is_409",
+      "tests/test_codex_corrections.py::TestReviewConfirmGate::test_confirm_api_artifact_only_is_409",
+      "tests/test_codex_corrections.py::TestReviewConfirmGate::test_confirm_api_artifact_plus_end_is_allowed",
+      "tests/test_codex_corrections.py::TestProcessVideoAndWorker::test_run_row_failure_keeps_processed_status",
+      "tests/test_codex_corrections.py::TestProcessVideoAndWorker::test_pipeline_typeerror_is_not_retried",
+      "tests/test_codex_corrections.py::TestProcessVideoAndWorker::test_worker_persists_real_process_video_result",
+      "tests/test_integration_remediation.py::TestModelCapabilityDetectorClassNames::test_rules_enabled_when_required_classes_present",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_large_bbox_does_not_prove_visibility",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_high_confidence_does_not_prove_visibility",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_cropped_occluded_blurred_orientation_unknown_stay_unknown",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_present_mirror_still_recorded",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_two_associated_sides_record_both_and_emit_nothing",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_one_mirror_never_proves_both_present",
+      "tests/test_integration_remediation.py::TestSideMirrorFailClosed::test_one_mirror_with_visibility_can_emit_review",
+      "tests/test_integration_remediation.py::TestWorkerPersistsDiagnostics::test_completed_run_stores_diagnostics",
+      "tests/test_integration_remediation.py::TestWorkerPersistsDiagnostics::test_failed_run_preserves_partial_diagnostics",
+      "tests/test_migration_007_provenance.py::TestMigration007LegacySafety::test_migrations_idempotent_mixed_population",
+      "tests/test_migration_007_provenance.py::TestMigration007LegacySafety::test_video6_equivalent_large_null_legacy_visible",
+      "tests/test_motorcycle_detail_api.py::TestAccessControl::test_enforcer_sees_the_page_and_the_pending_candidate",
+      "tests/test_motorcycle_detail_api.py::TestAccessControl::test_candidate_without_gated_linked_review_cannot_confirm",
+      "tests/test_motorcycle_detail_api.py::TestAccessControl::test_gated_positive_scan_can_be_explicitly_confirmed_into_case",
+      "tests/test_motorcycle_detail_three_class.py::TestNoViolationSideEffects::test_scan_and_every_human_outcome_write_zero_protected_rows",
+      "tests/test_motorcycle_detail_three_class.py::TestReviewPageAndOldRows::test_page_shows_the_three_class_contract_and_old_rows_stay_readable",
+      "tests/test_motorcycle_detail_three_class.py::TestFourClassContract::test_four_class_scan_and_human_outcomes_write_zero_violations",
+      "tests/test_motorcycle_detail_three_class.py::TestFourClassContract::test_page_shows_both_contracts_and_old_rows_remain_readable",
+      "tests/test_motorcycle_detail_three_class.py::TestCrossFrameHelmetSummary::test_unknown_primary_then_uncovered_head_reaches_saved_json_and_reviewer",
+      "tests/test_motorcycle_detail_three_class.py::TestCrossFrameHelmetSummary::test_unknown_primary_then_ambiguous_reaches_saved_json_and_reviewer[three-class-shared-head]",
+      "tests/test_motorcycle_detail_three_class.py::TestCrossFrameHelmetSummary::test_unknown_primary_then_ambiguous_reaches_saved_json_and_reviewer[four-class-contradictory-labels]",
+      "tests/test_motorcycle_detail_three_class.py::TestCrossFrameHelmetSummary::test_cross_frame_scans_and_every_human_outcome_write_zero_protected_rows",
+      "tests/test_object_roster_v9_1_readiness.py::TestHelmetAndMirrorCapabilityGates::test_mirror_rule_enabled_with_side_mirror_class",
+      "tests/test_object_roster_v9_1_readiness.py::TestHelmetAndMirrorCapabilityGates::test_helmet_rules_enabled_for_the_full_object_roster",
+      "tests/test_plate_ocr.py::TestDisabledByDefault::test_enabled_config_does_not_start_runtime_without_explicit_mode",
+      "tests/test_plate_ocr.py::TestDisabledByDefault::test_demo_runtime_ignores_evaluation_gate_but_repository_paths_fail_closed",
+      "tests/test_plate_ocr.py::TestDisabledByDefault::test_explicit_isolated_evaluation_mode_starts_mocked_runtime",
+      "tests/test_plate_ocr.py::TestDisabledByDefault::test_runtime_rejects_inherited_external_manifest_override",
+      "tests/test_plate_ocr.py::TestHttpSurface::test_admin_can_still_use_the_route",
+      "tests/test_review_decision_regressions.py::test_legacy_routes_follow_the_decision_contract",
+      "tests/test_upload_processing_ux.py::TestUploadStatusAndHistoryUi::test_upload_js_phase_order",
+      "tests/test_vehicle_grouping.py::test_real_parking_obstruction_fusion_preserves_grouping_identity",
+      "tests/test_vehicle_grouping.py::test_fusion_identity_remains_proven_for_reverse_and_initial_materialization[obstruction_first]",
+      "tests/test_vehicle_grouping.py::test_fusion_identity_remains_proven_for_reverse_and_initial_materialization[both_pending]",
+      "tests/test_vehicle_grouping.py::test_group_api_resolves_actual_confirmed_links_when_case_ids_differ",
+      "tests/test_vehicle_grouping.py::test_group_api_keeps_identity_after_real_canonical_correction",
+      "tests/test_vehicle_grouping.py::test_grouping_provenance_supports_multiple_reviews_materialized_to_one_case",
+      "tests/test_vehicle_grouping.py::test_api_paginates_groups_after_grouping_filtered_events",
+      "tests/test_vehicle_grouping.py::test_group_api_counts_proven_vehicles_and_unassociated_events_separately",
+      "tests/test_violation_policy.py::TestLegalStatusSeparationFromDetection::test_no_helmet_is_model_dependent_but_unverified"
+    ],
+    "environment_limit": "Optional OCR execution-mode flags were not neutralized in the full run; four OCR-default failures did not reproduce in the targeted neutral-mode rerun."
+  },
+  "javascript_harnesses": {
+    "command": "node tests/js/test_*.cjs (each file separately)",
+    "node_version": "22.15.0",
+    "passed_files": 11,
+    "failed_files": 1,
+    "failure": {
+      "file": "tests/js/test_ui_ux_helpers.cjs",
+      "location": "static/js/main.js:85",
+      "error": "TypeError: document.querySelectorAll is not a function",
+      "observed_cause": "Harness document mock only implements getElementById; runtime import now queries navigation-count elements."
+    }
+  },
+  "flask_smoke": {
+    "isolation": "Fresh empty temporary database and storage; admin; workers disabled; no inference",
+    "login_status": 302,
+    "get_status": 200,
+    "routes": [
+      "/",
+      "/live-monitor",
+      "/violations",
+      "/analytics",
+      "/reports",
+      "/settings",
+      "/review-queue",
+      "/pickup-detail-review",
+      "/motorcycle-detail-review",
+      "/annotation-help",
+      "/about-developers",
+      "/api/navigation-counts",
+      "/api/processing-jobs",
+      "/api/zone-types",
+      "/api/videos",
+      "/api/plate-ocr/status"
+    ]
+  },
+  "targeted_triage": {
+    "command": "python -m pytest tests/test_plate_ocr.py::TestDisabledByDefault tests/test_annotation_editor_gate4.py::test_annotation_api_preserves_v2_ids_on_save_and_reload tests/test_migration_007_provenance.py::TestMigration007LegacySafety::test_migrations_idempotent_mixed_population tests/test_object_roster_v9_1_readiness.py::TestHelmetAndMirrorCapabilityGates::test_mirror_rule_enabled_with_side_mirror_class -q --tb=short",
+    "isolation": "Fresh temporary database/storage; OCR APP/DEMO/EVALUATION initially 0",
+    "passed": 9,
+    "failed": 3,
+    "duration_seconds": 4.05,
+    "findings": [
+      "All nine TestDisabledByDefault cases passed; four full-run failures in this class are environment-sensitive.",
+      "Annotation fixture creates an ownerless video; enforcer request returns 404.",
+      "Partial legacy migration fixture calls current finish_processing_run and lacks worker_id.",
+      "Mirror test expects automatic_evaluation=True without required mounting visibility context."
+    ],
+    "limit": "No second full-suite run; no runtime code or test corrections applied."
+  },
+  "documentation_checks": {
+    "local_links_checked_documents": 12,
+    "broken_local_links": 0,
+    "tracked_documentation_diff_check": "passed",
+    "new_document_checks": "UTF-8 readable; no conflict markers; links resolve",
+    "scope": "documentation and audit evidence only"
+  }
+}

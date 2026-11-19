@@ -1,5 +1,7 @@
 # First-Time Setup — TAVIDM
 
+> **Historical setup reference — reviewed 2026-10-25.** Use [README.md](README.md) as the sole current setup guide, including required credential configuration. The older instructions below are retained for history and must not be used as a current installation recipe. Use [project.md](project.md) for the current phase, local model state, and acceptance limits.
+
 **Traffic Violation Detection and Monitoring System**
 
 Use this guide after cloning the repository from GitHub for the first time on a new machine.

@@ -41,6 +41,13 @@ MOTORCYCLE_DETAIL_ENABLED = os.environ.get(
 PICKUP_DETAIL_REVIEW_ENABLED = os.environ.get(
     "TAVIDM_PICKUP_DETAIL_REVIEW_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
+# Third-stage pickup crop person detector. Blank weights use the configured
+# pretrained YOLOv8m checkpoint (COCO person class); operators may point this
+# at a pickup-specific fine-tuned person detector without changing main weights.
+PICKUP_PERSON_WEIGHTS = os.environ.get("TAVIDM_PICKUP_PERSON_WEIGHTS", "").strip()
+PICKUP_PERSON_ENABLED = os.environ.get(
+    "TAVIDM_PICKUP_PERSON_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
 
 DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower() or "sqlite"
 # DATABASE_URL is backend-agnostic. For sqlite, a local file path is also accepted.

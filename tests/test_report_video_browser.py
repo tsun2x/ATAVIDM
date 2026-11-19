@@ -53,6 +53,72 @@ def test_preview_paginates_cases_but_returns_complete_type_totals(auth_db):
     assert payload["result_state"] == "legacy_results_available"
 
 
+def test_video_groups_automatically_list_case_sources_with_owner_scope(auth_db):
+    import app as flask_app
+
+    owner_a = auth_db.get_user_by_username("enforcer")["id"]
+    auth_db.create_user("second_enforcer", "not-used", role="enforcer")
+    owner_b = auth_db.get_user_by_username("second_enforcer")["id"]
+    own_video = _video(auth_db, "my-traffic.mp4", owner_a)
+    other_video = _video(auth_db, "other-traffic.mp4", owner_b)
+    no_case_video = _video(auth_db, "no-cases.mp4", owner_a)
+    auth_db.insert_violation(own_video, 1, "Illegal Parking", 0.8, 10, 1.0)
+    auth_db.insert_violation(own_video, 2, "Obstruction", 0.7, 20, 2.0)
+    auth_db.insert_violation(other_video, 3, "Illegal Parking", 0.9, 30, 3.0)
+    auth_db.insert_violation(None, 4, "Obstruction", 0.8, 40, 4.0, reason_log="[camera:school-gate]")
+
+    client = flask_app.app.test_client()
+    _login(client, "enforcer", "enforcer123")
+    response = client.get("/api/reports/video-groups")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total"] == 2
+    live_group = next(group for group in payload["groups"] if group.get("source_type") == "live")
+    assert live_group["video_id"] is None
+    assert live_group["filename"] == "Live CCTV"
+    assert live_group["case_count"] == 1
+    group = next(group for group in payload["groups"] if group.get("source_type") == "video")
+    assert group["video_id"] == own_video
+    assert group["filename"] == "my-traffic.mp4"
+    assert group["case_count"] == 2
+    assert group["latest_case_at"]
+    assert set(group["violation_types"]) == {"Illegal Parking", "Obstruction"}
+    assert other_video != own_video and no_case_video != own_video
+
+
+def test_enforcer_can_export_shared_live_cctv_cases_without_uploads(auth_db):
+    from core import reports
+
+    owner = auth_db.get_user_by_username("enforcer")["id"]
+    own_video = _video(auth_db, "my-report.mp4", owner)
+    auth_db.insert_violation(own_video, 1, "Illegal Parking", 0.8, 10, 1.0)
+    auth_db.insert_violation(None, 2, "Obstruction", 0.8, 20, 2.0, reason_log="[camera:school-gate]")
+
+    rows = reports._fetch_rows({"source_type": "live"}, owner_user_id=owner)
+
+    assert {row["violation_type"] for row in rows} == {"Obstruction"}
+
+
+def test_live_cctv_preview_returns_only_source_less_cases_for_owner(auth_db):
+    import app as flask_app
+
+    owner = auth_db.get_user_by_username("enforcer")["id"]
+    own_video = _video(auth_db, "my-preview.mp4", owner)
+    auth_db.insert_violation(own_video, 1, "Illegal Parking", 0.8, 10, 1.0)
+    auth_db.insert_violation(None, 2, "Obstruction", 0.8, 20, 2.0, reason_log="[camera:school-gate]")
+
+    client = flask_app.app.test_client()
+    _login(client, "enforcer", "enforcer123")
+    response = client.get("/api/reports/preview?source_type=live")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["video"]["filename"] == "Live CCTV"
+    assert payload["total_cases"] == 1
+    assert payload["items"][0]["violation_type"] == "Obstruction"
+
+
 def test_preview_hides_another_enforcers_video_and_rejects_account_override(auth_db):
     """Preview scope must come from the signed-in account, not query arguments."""
     import app as flask_app

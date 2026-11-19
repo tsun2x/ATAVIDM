@@ -177,6 +177,22 @@ class TestAccessControl:
             "/api/motorcycle-detail-review?scan_state=bogus"
         ).status_code == 400
 
+    def test_enforcer_sees_shared_live_camera_candidate(self, detail_enforcer, test_db, seeded):
+        candidate_id = _seed(
+            test_db, None, run_key="camera_7_session_live", occurrence_key="live-track-7"
+        )
+
+        response = detail_enforcer.get("/api/motorcycle-detail-review")
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["total"] == 2
+        item = next(row for row in payload["items"] if row["id"] == candidate_id)
+        assert item["video_id"] is None
+        assert item["video_name"] == "Live Camera"
+        detail = detail_enforcer.get(f"/api/motorcycle-detail-review/{candidate_id}")
+        assert detail.status_code == 200
+
     def test_viewer_cannot_confirm_motorcycle_case(self, detail_viewer, seeded):
         _, candidate_id = seeded
         response = detail_viewer.post(

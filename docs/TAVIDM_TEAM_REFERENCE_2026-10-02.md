@@ -1,5 +1,7 @@
 # TAVIDM — Team Reference for the Project Progress Form
 
+> **Historical snapshot:** This reference describes 2026-10-02. For the 2026-10-25 phase assessment, installed model state, fresh test results, and remaining acceptance gates, use [project.md](../project.md). Do not reuse this snapshot's completion estimates or validation claims as current measurements.
+
 **Expanded report:** See [the detailed capstone report reference](TAVIDM_CAPSTONE_REPORT_REFERENCE_2026-10-02.md), revised using the supplied GURO report's section coverage. This file remains the shorter form-filling guide.
 
 **Audit date:** 2 October 2026  

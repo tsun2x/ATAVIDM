@@ -2,6 +2,8 @@
 
 Concise map of where authoritative TAVIDM knowledge lives. This file identifies sources; it does not duplicate their contents.
 
+**Current state reviewed 2026-10-25:** [project.md](../project.md) records the current phase, local checkpoint identities, fresh verification, and remaining validation gates. Phase assessment: **Phase 2 — model integration, evaluation, and system validation; pre-field-pilot**.
+
 ## Hierarchy
 
 ```text
@@ -31,9 +33,11 @@ When documentation and implementation conflict, **report and reconcile** the con
 
 - Current implemented schema **v1.3.0**: **10** vehicle detector classes (`autorickshaw`; single `van`; SUV/crossover consolidated into `car`; no canonical `uv_express_van` / `piaggio`); **15** object + **9** scene = **24** labels.
 - Legacy compatibility: `uv_express_van` normalizes to `van`; ambiguous `piaggio` stays UNCERTAIN until body-form review (`sidecar`→`tricycle`, `integrated`→`autorickshaw`). Migration manifest: `config/training/label_migration_1_1_to_1_2.json`.
-- Seven-class baseline **label set** (`bicycle`, `bus`, `car`, `jeepney`, `motorcycle`, `tricycle`, `truck`) is a valid subset of the 10-class roster; missing production classes `van`, `autorickshaw`, and `pickup_truck` must be reported and fail-closed where required. The trained seven-class `best.pt` remains in an **external** training output directory and is **not** integrated into `D:\tavidm\models` (do not claim `models/best.pt` exists).
+- Fresh local checkpoint inspection (2026-10-25): the resolver selects `models/tavidm_yolov8m.pt`, whose ordered **15-object** map matches schema v1.3.0. A lower-priority `models/best.pt` also exists and has the seven-class baseline label set (`bicycle`, `bus`, `car`, `jeepney`, `motorcycle`, `tricycle`, `truck`). The separate `models/motorcycle_detail_best.pt` has three attributes (`helmet_nut_shell`, `helmet_acceptable`, `side_mirror`). See `project.md` for hashes and limits. The weights are local, untracked artifacts; class-map loading does not prove field accuracy or operational activation of the separate detail model.
 - Fixed-camera pavement markings still use operator-saved templates in the design direction; scene marking YOLO classes remain in the pilot schema until a separate markings migration.
 - **12** canonical traffic violations (unchanged by the vehicle-class revision)
+- Current registry: **4 implemented / 8 partial**. Automatic No Helmet remains blocked pending an approved positive uncovered-head source; mirror and cargo absence claims remain gated by missing production visibility evidence. A registered rule is not a field-validated enforcement capability.
+- The recorded training entry gate still returns `ready=false`; legal mappings remain `unverified` / `flag_only` in checked-in configuration. See `project.md` for the distinction between local integration and acceptance readiness.
 - Violation-engine remediation (2026-08-24): dual confidence, state expiry, footprint membership, geometry profiles, temporal evidence, capability gate — see `docs/VIOLATION_ENGINE_SPECIFICATION.md` §43.
 
 Vehicle collision / incident classification is a separate future requirement and does not alter the frozen vehicle or violation rosters.

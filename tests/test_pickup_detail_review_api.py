@@ -75,6 +75,37 @@ def test_enforcer_page_and_api_show_review_lead(pickup_candidate):
     assert result["items"][0]["association"]["evidence_source"] == "main_detector_and_bytetrack"
 
 
+def test_enforcer_sees_shared_live_camera_pickup_lead(pickup_candidate):
+    client, db, _video_id, _candidate_id = pickup_candidate
+    candidate_id = db.upsert_pickup_detail_candidate(
+        video_id=None,
+        run_key="camera_3_session_abc",
+        processing_run_id=None,
+        pickup_track_id=17,
+        person_track_id=18,
+        pickup_identity_epoch=1,
+        person_identity_epoch=1,
+        occurrence_key="camera_3_pickup_17_person_18",
+        selector_version="pickup-review-1",
+        timestamp_sec=4.0,
+        episode_start_sec=1.0,
+        frame_number=40,
+        source_width=640,
+        source_height=480,
+        frame_count=3,
+        frames_json="[]",
+        association_json=json.dumps({"evidence_source": "main_detector_and_bytetrack"}),
+        size_bytes=0,
+    )
+
+    response = client.get("/api/pickup-detail-review")
+
+    assert response.status_code == 200
+    item = next(row for row in response.get_json()["items"] if row["id"] == candidate_id)
+    assert item["video_id"] is None
+    assert item["video_name"] == "Live Camera"
+
+
 def test_evidence_is_served_from_private_pickup_path_only(pickup_candidate):
     client, _db, _video_id, candidate_id = pickup_candidate
     response = client.get(

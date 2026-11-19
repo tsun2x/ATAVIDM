@@ -2,6 +2,8 @@
 
 TAVIDM is a local Flask application for reviewing traffic footage and possible traffic violations. It stores uploaded videos and evidence in the project data folders and uses SQLite for application records.
 
+For the current development phase, installed local model state, fresh verification, and remaining acceptance gates, see [Current project state](project.md) (reviewed 2026-10-25).
+
 ## Requirements
 
 - Windows, macOS, or Linux

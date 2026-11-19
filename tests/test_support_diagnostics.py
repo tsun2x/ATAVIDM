@@ -22,6 +22,7 @@ def test_support_export_is_admin_only_and_excludes_private_data(client, monkeypa
         "has_error": 1, "motorcycle_detail_count": 0, "pickup_detail_count": 0,
     }])
     support_diagnostics.record_request("api_process_video", 200)
+    support_diagnostics.record_request("api_confirm_review", 409, {"review_id": 23})
     support_diagnostics.record_request("rtsp://password-secret", 500)
     response = client.get(route)
     assert response.status_code == 200
@@ -32,6 +33,12 @@ def test_support_export_is_admin_only_and_excludes_private_data(client, monkeypa
     assert data["recent_processing_runs"][0]["class_counts"] == {"truck": 2}
     assert data["recent_processing_runs"][0]["model_classes"] == ["person", "motorcycle"]
     assert any(event["action"] == "api_process_video" for event in data["recent_activity"])
+    confirm = next(
+        event for event in data["recent_activity"]
+        if event["action"] == "api_confirm_review" and event.get("review_id") == 23
+    )
+    assert confirm["http_status"] == 409
+    assert confirm["review_id"] == 23
     assert len(response.data) < 200_000
 
 

@@ -96,6 +96,48 @@ def test_list_review_queue_filters_by_status(test_db):
     assert pending_items[0]["status"] == "pending"
 
 
+def test_list_review_queue_filters_by_video_before_pagination(test_db):
+    video_one = test_db.insert_video(filename="one.mp4", filepath="/tmp/one.mp4", status="processed")
+    video_two = test_db.insert_video(filename="two.mp4", filepath="/tmp/two.mp4", status="processed")
+    for video_id, track_id in ((video_one, 1), (video_two, 2)):
+        test_db.insert_review_queue(
+            video_id=video_id, track_id=track_id, violation_type="Illegal Parking",
+            confidence=0.9, frame_number=track_id, status="pending",
+        )
+
+    items, total = test_db.list_review_queue(
+        status="pending", page=1, per_page=1, video_id=video_two
+    )
+
+    assert total == 1
+    assert len(items) == 1
+    assert items[0]["video_id"] == video_two
+
+
+def test_review_queue_api_filters_to_accessible_video(enforcer_client, test_db):
+    owner_id = test_db.get_user_by_username("enforcer_test")["id"]
+    video_one = test_db.insert_video(
+        filename="owner-one.mp4", filepath="/tmp/owner-one.mp4", status="processed",
+        uploaded_by=owner_id,
+    )
+    video_two = test_db.insert_video(
+        filename="owner-two.mp4", filepath="/tmp/owner-two.mp4", status="processed",
+        uploaded_by=owner_id,
+    )
+    for video_id, track_id in ((video_one, 1), (video_two, 2)):
+        test_db.insert_review_queue(
+            video_id=video_id, track_id=track_id, violation_type="Illegal Parking",
+            confidence=0.9, frame_number=track_id, status="pending",
+        )
+
+    response = enforcer_client.get(f"/api/review-queue?video_id={video_two}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total"] == 1
+    assert [item["video_id"] for item in payload["items"]] == [video_two]
+
+
 def test_insert_review_queue_defaults_to_pending():
     """Review items should default to pending status."""
     # This is a unit test for the default parameter

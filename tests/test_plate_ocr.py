@@ -623,20 +623,44 @@ class TestConfigValidation:
 
 
 class TestArtifacts:
-    def test_evaluator_environment_overrides_inherited_manifest_root(self, tmp_path, monkeypatch):
-        import importlib.util
+    def test_evaluator_environment_overrides_inherited_manifest_root(self, tmp_path):
+        import subprocess
+        import sys
 
-        monkeypatch.setenv("TAVIDM_PLATE_OCR_EVIDENCE_ROOT", str(tmp_path / "inherited-external"))
-        path = Path(__file__).resolve().parents[1] / "scripts" / "plate_ocr_evaluate.py"
-        spec = importlib.util.spec_from_file_location("plate_evaluator_env_under_test", path)
-        evaluator = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(evaluator)
-        evidence = tmp_path / "isolated" / "evidence"
-        evaluator.configure_environment(
-            tmp_path / "isolated" / "database.sqlite", evidence, tmp_path / "config.json",
-            tmp_path / "isolated", create_roots=False,
+        root = tmp_path / "isolated"
+        evidence = root / "evidence"
+        script = r"""
+import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+import numpy as np
+import config
+import core.evidence as evidence_module
+from scripts.plate_ocr_evaluate import configure_environment
+root, evidence = Path(sys.argv[1]), Path(sys.argv[2])
+configure_environment(root / 'database.sqlite', evidence, root / 'config.json', root, create_roots=False)
+assert Path(os.environ['TAVIDM_PLATE_OCR_EVIDENCE_ROOT']).resolve() == (evidence / 'plate_ocr').resolve()
+assert Path(config.EVIDENCE_FOLDER).resolve() == evidence.resolve()
+assert Path(evidence_module.EVIDENCE_FOLDER).resolve() == evidence.resolve()
+assert os.environ['TAVIDM_PLATE_OCR_APP'] == '0'
+saved = evidence_module.save_detail_evidence(
+    np.zeros((24, 24, 3), dtype=np.uint8),
+    SimpleNamespace(x=2, y=2, w=16, h=16),
+    run_key='isolation_check', occurrence_key='sample', frame_index=1,
+)
+assert saved is not None
+for key in ('scene_path', 'crop_path'):
+    path = Path(saved[key]).resolve()
+    assert path.is_relative_to(evidence.resolve())
+    assert path.is_file()
+"""
+        subprocess.run(
+            [sys.executable, "-c", script, str(root), str(evidence)],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        assert Path(os.environ["TAVIDM_PLATE_OCR_EVIDENCE_ROOT"]).resolve() == (evidence / "plate_ocr").resolve()
 
     def test_demo_launcher_sets_child_manifest_root_without_mutating_parent(self, tmp_path, monkeypatch):
         import importlib.util

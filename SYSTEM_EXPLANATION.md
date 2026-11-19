@@ -1,5 +1,7 @@
 # SYSTEM_EXPLANATION.md
 
+> **Status review — 2026-10-25:** Use [project.md](project.md) for the current system assessment and fresh verification. Current phase: Phase 2 — model integration, evaluation, and system validation; pre-field-pilot. The local selected main weights match 15 object classes (10 vehicles); the registry has four implemented and eight partial rules. The explanation below is a historical thesis reference and contains older rule/model/readiness descriptions; those passages are not current acceptance evidence.
+
 ## TAVIDM: Traffic Violation Detection and Monitoring System Using Computer Vision and Deep Learning
 
 This document is a technical reference for BSIT students preparing for a thesis proposal defense.  

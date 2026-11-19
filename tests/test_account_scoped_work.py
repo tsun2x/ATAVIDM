@@ -100,6 +100,18 @@ def test_database_lists_scope_uploaded_and_video_derived_rows(auth_db):
     assert upload_metrics["unique_videos_uploaded"] == 1
 
 
+def test_live_motorcycle_review_candidates_are_shared_with_enforcers(auth_db):
+    owner_a, _owner_b = _users(auth_db)
+    candidate_id = _seed_candidate(auth_db, None, "camera-session-1")
+
+    rows, total = auth_db.list_motorcycle_detail_candidates(owner_user_id=owner_a)
+
+    assert total == 1
+    assert rows[0]["id"] == candidate_id
+    assert rows[0]["video_id"] is None
+    assert auth_db.count_motorcycle_detail_pending(owner_user_id=owner_a) == 1
+
+
 def test_report_row_selection_forces_video_owner_scope(auth_db):
     """A report builder must not be able to include another account's rows."""
     from core import reports

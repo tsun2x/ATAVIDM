@@ -1,5 +1,7 @@
 # CODEBASE EXPLAINED — TAVIDM
 
+For the current phase and source-backed system status (reviewed 2026-10-25), use [project.md](project.md). This walkthrough retains its historical prototype scope.
+
 **Traffic Violation Detection and Monitoring System**
 Line-by-line code walkthrough, architecture overview, and dependency map.
 

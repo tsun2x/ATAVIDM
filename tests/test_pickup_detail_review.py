@@ -101,3 +101,27 @@ def test_reentering_pickup_creates_a_distinct_review_episode():
     candidates = collector.candidates()
     assert len(candidates) == 2
     assert len({item["occurrence_key"] for item in candidates}) == 2
+
+
+def test_crop_submodel_person_above_vehicle_box_can_create_review_lead():
+    """The pickup crop pass can see riders whose body center is above the truck box."""
+    collector = _collector()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    for index in range(5):
+        x = 20 + index * 12
+        tracked = [
+            _det(10, "pickup_truck", x, 80, 100, 80),
+            {
+                **_det(-1, "person", x + 40, 50, 20, 40),
+                "source": "pickup_person_crop_submodel",
+                "source_pickup_track_id": 10,
+                "source_pickup_identity_epoch": 1,
+            },
+        ]
+        collector.observe(frame, tracked, frame_number=index * 10, timestamp_sec=index * 0.5)
+
+    candidates = collector.candidates()
+    assert len(candidates) == 1
+    assert json.loads(candidates[0]["association_json"])["evidence_source"] == (
+        "pickup_person_crop_submodel"
+    )

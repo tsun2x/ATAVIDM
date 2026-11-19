@@ -213,10 +213,15 @@ class PickupDetailCollector:
             for person in persons:
                 person_box = _box(person)
                 person_center = _center(person_box)
-                if not _center_inside(person_center, pbox):
-                    continue
                 person_id = int(person["track_id"])
                 person_epoch = int(person.get("track_identity_epoch") or 0)
+                is_crop_submodel_person = (
+                    str(person.get("source") or "") == "pickup_person_crop_submodel"
+                    and int(person.get("source_pickup_track_id") or -1) == pickup_id
+                    and int(person.get("source_pickup_identity_epoch") or 0) == pickup_epoch
+                )
+                if not is_crop_submodel_person and not _center_inside(person_center, pbox):
+                    continue
                 key = (pickup_id, pickup_epoch, person_id, person_epoch)
                 active.add(key)
                 episode = self._pairs.get(key)
@@ -233,6 +238,7 @@ class PickupDetailCollector:
                     "person_box": person_box,
                     "pickup_center": pc,
                     "person_center": person_center,
+                    "person_source": str(person.get("source") or "main_detector_and_bytetrack"),
                 })
                 if key in self._emitted:
                     continue
@@ -332,7 +338,11 @@ class PickupDetailCollector:
             "frames_json": json.dumps([frame]),
             "association_json": json.dumps({
                 "state": "shared_motion_candidate",
-                "evidence_source": "main_detector_and_bytetrack",
+                "evidence_source": (
+                    "pickup_person_crop_submodel"
+                    if any(item.get("person_source") == "pickup_person_crop_submodel" for item in episode.samples)
+                    else "main_detector_and_bytetrack"
+                ),
                 "observations": samples,
                 "motion": dict(motion),
                 "cargo_region_visible": None,

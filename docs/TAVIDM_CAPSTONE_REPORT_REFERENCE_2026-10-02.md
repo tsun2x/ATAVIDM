@@ -1,6 +1,8 @@
 # TAVIDM
 ## Capstone 2 Project Update / Report Reference
 
+> **Historical snapshot:** This report reference describes 2026-10-02. Use [project.md](../project.md) for the 2026-10-25 system phase, installed model state, fresh regression evidence, and remaining acceptance gates. Earlier completion estimates, model details, and test results are not current measurements.
+
 **Project title:** TAVIDM: Traffic Violation Detection and Monitoring System Using Computer Vision and Deep Learning  
 **Reference date:** 2 October 2026  
 **Prepared for:** The TAVIDM project team  
