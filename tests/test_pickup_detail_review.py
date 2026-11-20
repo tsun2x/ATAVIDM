@@ -125,3 +125,27 @@ def test_crop_submodel_person_above_vehicle_box_can_create_review_lead():
     assert json.loads(candidates[0]["association_json"])["evidence_source"] == (
         "pickup_person_crop_submodel"
     )
+
+
+def test_crop_submodel_positive_routes_to_review_on_first_scan_frame():
+    """A crop-person hit enters review immediately without a motion wait."""
+    collector = _collector()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    pickup = _det(10, "pickup_truck", 80, 80, 100, 80)
+    scanned_person = {
+        **_det(-1, "person", 112, 48, 24, 36),
+        "source": "pickup_person_crop_submodel",
+        "source_pickup_track_id": 10,
+        "source_pickup_identity_epoch": 1,
+    }
+
+    collector.observe(
+        frame, [pickup, scanned_person], frame_number=1, timestamp_sec=0.0
+    )
+
+    candidates = collector.candidates()
+    assert len(candidates) == 1
+    association = json.loads(candidates[0]["association_json"])
+    assert association["state"] == "crop_person_scan_positive"
+    assert association["evidence_source"] == "pickup_person_crop_submodel"
+    assert association["motion"] == {}

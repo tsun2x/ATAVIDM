@@ -242,6 +242,26 @@ class PickupDetailCollector:
                 })
                 if key in self._emitted:
                     continue
+                if is_crop_submodel_person:
+                    # The crop scan is already scoped to this exact pickup.
+                    # Send positive scan hits to human review immediately;
+                    # requiring another two seconds of shared-motion evidence
+                    # can discard the short or distant pickup appearances the
+                    # crop model is intended to recover.
+                    self._emit_candidate(
+                        episode,
+                        key,
+                        frame,
+                        int(frame_number),
+                        ts,
+                        person_box,
+                        pbox,
+                        {
+                            "state": "crop_person_scan_positive",
+                            "person_source": "pickup_person_crop_submodel",
+                        },
+                    )
+                    continue
                 if ts - episode.started_at < MIN_ASSOCIATION_SEC:
                     continue
                 motion = _shared_motion(tuple(episode.samples))
@@ -337,14 +357,17 @@ class PickupDetailCollector:
             "frame_count": len(samples),
             "frames_json": json.dumps([frame]),
             "association_json": json.dumps({
-                "state": "shared_motion_candidate",
+                "state": str(motion.get("state") or "shared_motion_candidate"),
                 "evidence_source": (
                     "pickup_person_crop_submodel"
                     if any(item.get("person_source") == "pickup_person_crop_submodel" for item in episode.samples)
                     else "main_detector_and_bytetrack"
                 ),
                 "observations": samples,
-                "motion": dict(motion),
+                "motion": {
+                    key: value for key, value in motion.items()
+                    if key not in {"state", "person_source"}
+                },
                 "cargo_region_visible": None,
                 "lower_body_visible": None,
             }),
