@@ -18,6 +18,7 @@ from core.detection_config import (
     YOLO_CLASS_PERSON,
     YOLO_CLASS_PICKUP_TRUCK,
 )
+from core.tracker import TRACK_EXPIRY_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,13 @@ class PickupPersonCropScanner:
 
     CAR_FALLBACK_INTERVAL_SEC = 0.5
     MAX_CAR_FALLBACK_CROPS = 3
+    # The tracker settles car/pickup identity only after one label holds for
+    # its motion window, so an approaching pickup whose label alternates with
+    # car stays "car" (or unresolved) for its whole pass. Raw pickup frames
+    # within one track identity epoch promote it to a full per-frame scan.
+    # Sensitivity: lower values scan more car tracks with spurious pickup
+    # frames; higher values delay or miss short pickup passes.
+    PICKUP_LABEL_MIN_FRAMES = 3
 
     def __init__(
         self,
@@ -83,6 +91,31 @@ class PickupPersonCropScanner:
         self._next_track_id = -1
         self._previous: dict[tuple[int, int], list[dict[str, Any]]] = {}
         self._last_car_fallback_scan_sec: float | None = None
+        # (track_id, identity_epoch) -> (raw pickup frame count, last seen sec)
+        self._pickup_label_votes: dict[tuple[int, int], tuple[int, float]] = {}
+
+    def _scan_class(self, det: Mapping[str, Any], timestamp_sec: float) -> str:
+        """Return the vehicle class used to route this track into the scan."""
+        raw = str(det.get("class_label") or "")
+        resolved = str(det.get("resolved_track_class") or raw)
+        if det.get("track_id") is None:
+            return resolved
+        key = (int(det["track_id"]), int(det.get("track_identity_epoch") or 0))
+        votes, _ = self._pickup_label_votes.get(key, (0, timestamp_sec))
+        if raw == YOLO_CLASS_PICKUP_TRUCK:
+            votes += 1
+        self._pickup_label_votes[key] = (votes, timestamp_sec)
+        if votes >= self.PICKUP_LABEL_MIN_FRAMES:
+            return YOLO_CLASS_PICKUP_TRUCK
+        return resolved
+
+    def _prune_label_votes(self, timestamp_sec: float) -> None:
+        stale = [
+            key for key, (_, last_seen) in self._pickup_label_votes.items()
+            if timestamp_sec - last_seen > TRACK_EXPIRY_SEC
+        ]
+        for key in stale:
+            self._pickup_label_votes.pop(key, None)
 
     @staticmethod
     def _load_yolo(path: str) -> Any:
@@ -146,8 +179,9 @@ class PickupPersonCropScanner:
                 ]
             ] = []
             car_fallbacks = []
+            self._prune_label_votes(float(timestamp_sec))
             for det in tracked:
-                label = str(det.get("resolved_track_class", det.get("class_label", "")))
+                label = self._scan_class(det, float(timestamp_sec))
                 is_pickup = label == YOLO_CLASS_PICKUP_TRUCK
                 is_car = label == YOLO_CLASS_CAR
                 if not (is_pickup or is_car) or det.get("track_id") is None:
@@ -239,8 +273,9 @@ class PickupPersonCropScanner:
                     center_x = mapped["bbox_x"] + mapped["bbox_w"] / 2.0
                     center_y = mapped["bbox_y"] + mapped["bbox_h"] / 2.0
                     vx, vy, vw, vh = vehicle_box
-                    horizontal_margin = vw * 0.05
-                    if not (vx - horizontal_margin <= center_x <= vx + vw + horizontal_margin):
+                    # A rider in the bed is horizontally over the vehicle; a
+                    # pedestrian beside a parked vehicle is centred past its side.
+                    if not (vx <= center_x <= vx + vw):
                         continue
                     if vehicle_class == YOLO_CLASS_CAR and center_y > vy + vh * 0.15:
                         continue

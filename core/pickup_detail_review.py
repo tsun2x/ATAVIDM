@@ -198,9 +198,9 @@ class PickupDetailCollector:
             label = str(det.get("class_label") or "")
             if label == YOLO_CLASS_PERSON and det.get("track_id") is not None:
                 persons.append(det)
-            resolved = det.get("resolved_track_class", label)
+            resolved = det.get("resolved_track_class") or label
             if (
-                str(resolved or "") in {YOLO_CLASS_PICKUP_TRUCK, "car"}
+                (str(resolved) in {YOLO_CLASS_PICKUP_TRUCK, "car"} or label == YOLO_CLASS_PICKUP_TRUCK)
                 and det.get("track_id") is not None
             ):
                 pickups.append(det)
@@ -220,7 +220,7 @@ class PickupDetailCollector:
             pickup_id = int(pickup["track_id"])
             pickup_epoch = int(pickup.get("track_identity_epoch") or 0)
             vehicle_class = str(
-                pickup.get("resolved_track_class", pickup.get("class_label", ""))
+                pickup.get("resolved_track_class") or pickup.get("class_label") or ""
             )
             for person in persons:
                 person_box = _box(person)

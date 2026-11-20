@@ -221,6 +221,30 @@ def test_crop_scan_car_fallback_requires_persistent_person_hit():
     assert association["vehicle_class_at_scan"] == "car"
 
 
+def test_unresolved_vehicle_track_still_links_crop_scan_person():
+    """Tracker output carries resolved_track_class=None before class settles."""
+    collector = _collector()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    pickup = {**_det(10, "pickup_truck", 80, 80, 100, 80), "resolved_track_class": None}
+    scanned_person = {
+        **_det(-1, "person", 112, 48, 24, 36),
+        "source": "pickup_person_crop_submodel",
+        "source_pickup_track_id": 10,
+        "source_pickup_identity_epoch": 1,
+        "source_vehicle_class": "pickup_truck",
+    }
+    for index in range(4):
+        collector.observe(
+            frame, [pickup, scanned_person], frame_number=index + 1,
+            timestamp_sec=index * 0.5,
+        )
+
+    candidates = collector.candidates()
+    assert len(candidates) == 1
+    assert candidates[0]["pickup_track_id"] == 10
+    assert json.loads(candidates[0]["association_json"])["vehicle_class_at_scan"] == "pickup_truck"
+
+
 def test_crop_review_evidence_uses_largest_vehicle_box_during_persistence():
     """Review evidence selects the largest pickup crop seen before confirmation."""
     written = []
