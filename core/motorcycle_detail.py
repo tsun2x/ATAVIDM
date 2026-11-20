@@ -90,6 +90,9 @@ SCORE_WEIGHTS: dict[str, float] = {
 RIDER_MIN_AREA_OVERLAP = 0.05
 RIDER_AMBIGUOUS_IOU = 0.25
 RIDER_HEAD_TOP_FRAC = 0.45
+HELMET_MAX_RIDER_WIDTH_RATIO = 0.9
+HELMET_MAX_RIDER_HEIGHT_RATIO = 0.6
+HELMET_MAX_CROP_AREA_RATIO = 0.75
 MIRROR_MOUNT_BAND_FRAC = 0.60
 MIRROR_MAX_WIDTH_RATIO = 0.75
 MOTORCYCLE_AMBIGUOUS_IOU = 0.20
@@ -515,6 +518,7 @@ class AttributeAssociation:
     state: str
     observations: tuple[AttributeObservation, ...] = ()
     reasons: tuple[str, ...] = ()
+    rejected_observations: tuple[AttributeObservation, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -588,6 +592,23 @@ def associate_rider(
         reasons=(),
     )
 
+def _implausible_helmet_size(box: Box, rider_box: Box | None, crop: CropRect | None) -> bool:
+    """Conservative geometry filter pending validation on labelled footage."""
+    if rider_box is not None:
+        if (
+            box[2] - box[0] > HELMET_MAX_RIDER_WIDTH_RATIO * (rider_box[2] - rider_box[0])
+            or box[3] - box[1] > HELMET_MAX_RIDER_HEIGHT_RATIO * (rider_box[3] - rider_box[1])
+        ):
+            return True
+    if crop is None:
+        return False
+    edges_touched = sum((
+        box[0] <= crop.x + 0.5,
+        box[1] <= crop.y + 0.5,
+        box[2] >= crop.x + crop.w - 0.5,
+        box[3] >= crop.y + crop.h - 0.5,
+    ))
+    return edges_touched >= 2 or box_area(box) >= HELMET_MAX_CROP_AREA_RATIO * crop.w * crop.h
 
 
 def associate_helmet(
@@ -597,12 +618,15 @@ def associate_helmet(
     *,
     other_riders: Sequence[Box] = (),
     other_riders_complete: bool = True,
+    crop: CropRect | None = None,
 ) -> AttributeAssociation:
     """Associate helmet labels with the associated rider's head region.
 
     Without an associated rider the helmet state is ``unknown``: an unassociated
     helmet must not be attributed to a motorcycle. Legacy generic ``helmet`` is
     never upgraded to acceptable shape — only ``helmet_acceptable`` sets that.
+    Implausible helmet boxes are rejected before attribution. Plausible
+    acceptable and nut-shell labels on the same head leave its class ambiguous.
 
     ``other_riders`` are *different* riders the main detector saw near the
     target. A helmet that also sits in one of their head regions is not
@@ -625,15 +649,19 @@ def associate_helmet(
         return AttributeAssociation(state=HELMET_UNKNOWN, reasons=(reason,))
     head = rider.head_region
     other_heads = [rider_head_region(box) for box in other_riders]
-    shared = 0
     head_height = max(1.0, head[3] - head[1])
     observations: list[AttributeObservation] = []
+    rejected: list[AttributeObservation] = []
     for det in helmets:
         label = str(det.get("class_label") or "").strip().lower()
         if label not in _HEAD_OBSERVATION_LABELS:
             continue
         hbox = box_of(det)
         if box_area(hbox) <= 0:
+            continue
+        confidence = float(det.get("confidence") or 0.0)
+        if label in _HELMET_CLASS_LABELS and _implausible_helmet_size(hbox, rider.rider_box, crop):
+            rejected.append(AttributeObservation(label, confidence, hbox, reasons=("implausible_helmet_size",)))
             continue
         centre = ((hbox[0] + hbox[2]) / 2.0, (hbox[1] + hbox[3]) / 2.0)
         area_overlap = intersection_area(head, hbox) / box_area(hbox)
@@ -644,70 +672,58 @@ def associate_helmet(
         )
         if _point_in_box(centre, head) or area_overlap >= 0.25 or sits_on_head:
             if any(_point_in_box(centre, other) for other in other_heads):
-                shared += 1
+                rejected.append(AttributeObservation(
+                    label, confidence, hbox, reasons=("helmet_in_other_rider_head_region_unattributed",)
+                ))
                 continue
             limited = bool(det.get("evidence_limited")) and label == DETAIL_CLASS_NO_HELMET
             observations.append(
                 AttributeObservation(
                     label=label,
-                    confidence=float(det.get("confidence") or 0.0),
+                    confidence=confidence,
                     box=hbox,
                     reasons=("box_clipped_or_unclear",) if limited else (),
                 )
             )
-    shared_reasons: tuple[str, ...] = (
-        ("helmet_in_other_rider_head_region_unattributed",) if shared else ()
-    )
+    rejection_reasons = tuple(dict.fromkeys(reason for obs in rejected for reason in obs.reasons))
+    shared = "helmet_in_other_rider_head_region_unattributed" in rejection_reasons
     if not other_riders_complete and (observations or shared):
         return AttributeAssociation(
             state=STATE_AMBIGUOUS,
-            reasons=("nearby_rider_context_incomplete_helmet_unattributed",) + shared_reasons,
+            reasons=("nearby_rider_context_incomplete_helmet_unattributed",) + rejection_reasons,
+            rejected_observations=tuple(rejected),
         )
     if not observations:
-        if shared:
-            return AttributeAssociation(state=STATE_AMBIGUOUS, reasons=shared_reasons)
-        # No head label in the head region: UNKNOWN, never an inferred uncovered head.
-        return AttributeAssociation(state=HELMET_UNKNOWN, reasons=("no_helmet_observation",))
+        return AttributeAssociation(
+            state=STATE_AMBIGUOUS if shared else HELMET_UNKNOWN,
+            reasons=rejection_reasons if shared else ("no_helmet_observation",) + rejection_reasons,
+            rejected_observations=tuple(rejected),
+        )
     labels = {o.label for o in observations}
-    helmet_labels = labels & _HELMET_CLASS_LABELS
     uncovered = [o for o in observations if o.label == DETAIL_CLASS_NO_HELMET]
-    if uncovered and helmet_labels:
-        # Keep every box. Do not pick the higher-confidence label.
-        return AttributeAssociation(
-            state=STATE_AMBIGUOUS,
-            observations=tuple(observations),
-            reasons=("contradictory_head_labels",) + shared_reasons,
-        )
-    clear_uncovered = [o for o in uncovered if "box_clipped_or_unclear" not in o.reasons]
-    if uncovered and not clear_uncovered:
-        return AttributeAssociation(
-            state=STATE_AMBIGUOUS,
-            observations=tuple(observations),
-            reasons=("uncovered_head_box_clipped_or_unclear",) + shared_reasons,
-        )
-    if YOLO_CLASS_HELMET_NUT_SHELL in labels:
-        return AttributeAssociation(
-            state=HELMET_NUT_SHELL, observations=tuple(observations), reasons=shared_reasons
-        )
-    if YOLO_CLASS_HELMET_ACCEPTABLE in labels:
-        return AttributeAssociation(
-            state=HELMET_ACCEPTABLE, observations=tuple(observations), reasons=shared_reasons
-        )
-    if clear_uncovered:
-        # A detail-model rider/person box is never the owner of this observation.
-        if rider.source != CONTEXT_SOURCE_MAIN:
-            return AttributeAssociation(
-                state=STATE_AMBIGUOUS,
-                observations=tuple(observations),
-                reasons=("uncovered_head_requires_main_detector_rider",) + shared_reasons,
-            )
-        return AttributeAssociation(
-            state=HELMET_UNCOVERED, observations=tuple(observations), reasons=shared_reasons
-        )
+    reasons: tuple[str, ...] = ()
+    if uncovered and labels & _HELMET_CLASS_LABELS:
+        state, reasons = STATE_AMBIGUOUS, ("contradictory_head_labels",)
+    elif {YOLO_CLASS_HELMET_ACCEPTABLE, YOLO_CLASS_HELMET_NUT_SHELL} <= labels:
+        state, reasons = STATE_AMBIGUOUS, ("conflicting_helmet_classes",)
+    elif YOLO_CLASS_HELMET_NUT_SHELL in labels:
+        state = HELMET_NUT_SHELL
+    elif YOLO_CLASS_HELMET_ACCEPTABLE in labels:
+        state = HELMET_ACCEPTABLE
+    elif uncovered:
+        if all("box_clipped_or_unclear" in obs.reasons for obs in uncovered):
+            state, reasons = STATE_AMBIGUOUS, ("uncovered_head_box_clipped_or_unclear",)
+        elif rider.source != CONTEXT_SOURCE_MAIN:
+            state, reasons = STATE_AMBIGUOUS, ("uncovered_head_requires_main_detector_rider",)
+        else:
+            state = HELMET_UNCOVERED
+    else:
+        state, reasons = HELMET_UNKNOWN, ("legacy_generic_helmet_label",)
     return AttributeAssociation(
-        state=HELMET_UNKNOWN,
+        state=state,
         observations=tuple(observations),
-        reasons=("legacy_generic_helmet_label",) + shared_reasons,
+        reasons=reasons + rejection_reasons,
+        rejected_observations=tuple(rejected),
     )
 
 
@@ -1384,6 +1400,9 @@ class _FrameSlot:
     size_bytes: int = 0
     main_context: MainDetectorContext | None = None
 
+    def rank(self) -> tuple[bool, float]:
+        return (self.rider_box is not None, self.score.total)
+
     def as_dict(self) -> dict[str, Any]:
         rider = self.rider_box
         out = {
@@ -1419,25 +1438,15 @@ class _OccurrenceSlots:
     def worst(self) -> _FrameSlot | None:
         if len(self.slots) < MAX_FRAMES_PER_OCCURRENCE:
             return None
-        return min(self.slots, key=lambda s: s.score.total)
+        return min(self.slots, key=_FrameSlot.rank)
 
     def best(self) -> _FrameSlot | None:
         if not self.slots:
             return None
-        return max(self.slots, key=lambda s: s.score.total)
+        return max(self.slots, key=_FrameSlot.rank)
 
     def ordered(self) -> list[_FrameSlot]:
         return sorted(self.slots, key=lambda s: s.timestamp_sec)
-
-    def separated_from(
-        self, timestamp_sec: float, *, min_gap: float, ignore: _FrameSlot | None = None
-    ) -> bool:
-        for slot in self.slots:
-            if slot is ignore:
-                continue
-            if abs(float(timestamp_sec) - float(slot.timestamp_sec)) < min_gap:
-                return False
-        return True
 
 
 class MotorcycleDetailCollector:
@@ -1593,32 +1602,26 @@ class MotorcycleDetailCollector:
         *,
         detections: Sequence[Mapping[str, Any]] = (),
     ) -> None:
-        target: _FrameSlot | None = None
-        replace = False
-        if len(occ.slots) < MAX_FRAMES_PER_OCCURRENCE:
-            if occ.separated_from(timestamp_sec, min_gap=self.min_separation_sec):
-                target = None
-            else:
-                nearest = min(occ.slots, key=lambda s: abs(s.timestamp_sec - timestamp_sec))
-                if score.total <= nearest.score.total + SCORE_REPLACEMENT_MARGIN:
-                    self.stats["frames_skipped_temporal_overlap"] += 1
-                    return
-                target, replace = nearest, True
-        else:
-            worst = occ.worst()
-            if worst is None or score.total <= worst.score.total + SCORE_REPLACEMENT_MARGIN:
-                self.stats["frames_skipped_score"] += 1
+        overlapping = [
+            slot for slot in occ.slots
+            if abs(slot.timestamp_sec - timestamp_sec) < self.min_separation_sec
+        ]
+        if len(overlapping) > 1:
+            self.stats["frames_skipped_temporal_overlap"] += 1
+            return
+        target = overlapping[0] if overlapping else occ.worst()
+        if target is not None:
+            # Apply the score margin only within the same rider-association tier.
+            incoming = (rider.state == STATE_ASSOCIATED, score.total)
+            incumbent = (target.rider_box is not None, target.score.total + SCORE_REPLACEMENT_MARGIN)
+            if incoming <= incumbent:
+                reason = "frames_skipped_temporal_overlap" if overlapping else "frames_skipped_score"
+                self.stats[reason] += 1
                 return
-            if not occ.separated_from(
-                timestamp_sec, min_gap=self.min_separation_sec, ignore=worst
-            ):
-                self.stats["frames_skipped_temporal_overlap"] += 1
-                return
-            target, replace = worst, True
 
         scale_x, scale_y = scan_scale_for(crop, min_side=self.scan_min_side)
         slot = _FrameSlot(
-            frame_index=target.frame_index if (replace and target is not None) else self._free_index(occ),
+            frame_index=target.frame_index if target is not None else self._free_index(occ),
             frame_number=frame_number,
             timestamp_sec=timestamp_sec,
             score=score,
@@ -1633,7 +1636,7 @@ class MotorcycleDetailCollector:
         if not self._write_evidence(occ, slot, frame):
             self.stats["evidence_write_failures"] += 1
             return
-        if replace and target is not None:
+        if target is not None:
             occ.slots[occ.slots.index(target)] = slot
         else:
             occ.slots.append(slot)

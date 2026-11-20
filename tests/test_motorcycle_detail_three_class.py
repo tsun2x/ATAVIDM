@@ -1489,6 +1489,7 @@ _DEFINITE = ("acceptable", "nut_shell", "uncovered_head")
 # Per-frame scenario -> (detail detections, per-frame main-context override).
 _FRAME_SPECS = {
     "unknown": ([], None),
+    "unknown_unlinked": ([], {"rider": {"state": "unassociated"}}),
     "acceptable": ([("helmet_acceptable", HELMET_SRC)], None),
     "nut_shell": ([("helmet_nut_shell", HELMET_SRC)], None),
     "uncovered_head": ([("no_helmet", HELMET_SRC)], None),
@@ -1618,10 +1619,12 @@ def _check_summary_against_frames(summary, frame_helmets, expected):
 
 class TestCrossFrameHelmetSummary:
     def test_unknown_primary_then_uncovered_head_reaches_saved_json_and_reviewer(
-        self, test_db, video_id, evidence_root, app_workers
+        self, test_db, evidence_root, app_workers, enforcer_client
     ):
+        owner = test_db.get_user_by_username("enforcer_test")
+        video_id = test_db.insert_video("owned.mp4", "/tmp/owned.mp4", status="processed", uploaded_by=owner["id"])
         candidate_id, row = _scan_frames(
-            test_db, video_id, ("unknown", "uncovered_head"), four_class=True
+            test_db, video_id, ("unknown_unlinked", "uncovered_head"), four_class=True
         )
         observations = json.loads(row["observations_json"])
         frames = observations["frames"]
@@ -1636,22 +1639,28 @@ class TestCrossFrameHelmetSummary:
         summary = json.loads(row["association_json"])
         assert summary == observations["association"]
         assert summary["helmet"]["state"] == "uncovered_head"
+        assert summary["rider"]["rider_track_id"] == 11
+        assert summary["reference_frame"] == {"index": 2, "frame_number": 20}
+        assert summary["helmet_evidence_frames"] == [
+            {"index": 2, "frame_number": 20, "rider_track_id": 11, "state": "uncovered_head"}
+        ]
         assert [o["label"] for o in summary["helmet"]["observations"]] == ["no_helmet"]
         assert summary["helmet"]["observations"][0]["box"] == [pytest.approx(v) for v in HELMET_SRC]
         assert "evidence_on_some_selected_frames_only" in summary["helmet"]["reasons"]
         uncertainty = json.loads(row["uncertainty_json"])
         assert "helmet:evidence_on_some_selected_frames_only" in uncertainty
-        assert "helmet:no_observation_does_not_prove_absence" in uncertainty
+        assert "helmet:rider_not_associated" in frames[0]["uncertainty"]
+        assert "helmet:rider_not_associated" not in uncertainty
 
-        client = _enforcer_client("md_xf_uncovered", "md-xf-uncovered-pass")
         item = next(
-            i for i in client.get("/api/motorcycle-detail-review?outcome=all").get_json()["items"]
+            i for i in enforcer_client.get("/api/motorcycle-detail-review?outcome=all").get_json()["items"]
             if i["id"] == candidate_id
         )
         assert item["association"]["helmet"]["state"] == "uncovered_head"
         assert item["can_confirm"] is False
-        body = client.get("/motorcycle-detail-review?outcome=all").get_data(as_text=True)
+        body = enforcer_client.get("/motorcycle-detail-review?outcome=all").get_data(as_text=True)
         assert _rendered_helmet(body) == "Uncovered head observed (review only)"
+        assert "Rider: associated" in body and "(frame 20)" in body and "(rider #11)" in body
         assert _protected_counts(test_db) == {t: 0 for t in _protected_counts(test_db)}
 
     @pytest.mark.parametrize(

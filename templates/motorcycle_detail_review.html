@@ -137,8 +137,15 @@
                             {% if item.scan_error %}<div class="small text-muted">{{ item.scan_error }}</div>{% endif %}
                             {% if item.scan_state == 'ready' and item.association.helmet is mapping %}
                             {% set helmet_state = item.association.helmet.state or 'unknown' %}
+                            {% set helmet_reasons = item.association.helmet.reasons or [] %}
+                            {% set reference = item.association.reference_frame or {} %}
+                            {% set legacy_summary = not reference and ('evidence_on_some_selected_frames_only' in helmet_reasons or 'contradictory_helmet_observations_across_frames' in helmet_reasons) %}
                             <div class="small text-muted">
-                                Rider: {{ (item.association.rider or {}).state or 'unknown' }} ·
+                                Rider: {{ 'see frame tabs' if legacy_summary else ((item.association.rider or {}).state or 'unknown') }}
+                                {% if reference.frame_number is defined and reference.frame_number is not none %}
+                                (frame {{ reference.frame_number }})
+                                {% endif %}
+                                ·
                                 Helmet:
                                 {% if helmet_state == 'uncovered_head' %}
                                 Uncovered head observed (review only)
@@ -149,6 +156,15 @@
                                 {% endif %}
                                 · Mirror: {{ (item.association.mirror or {}).state or 'unknown' }}
                             </div>
+                            {% if item.association.helmet_evidence_frames %}
+                            <div class="small text-muted">
+                                Helmet evidence:
+                                {% for evidence in item.association.helmet_evidence_frames %}
+                                frame {{ evidence.frame_number if evidence.frame_number is not none else evidence.index }}
+                                {% if evidence.rider_track_id is not none %}(rider #{{ evidence.rider_track_id }}){% endif %}{{ ',' if not loop.last else '' }}
+                                {% endfor %}
+                            </div>
+                            {% endif %}
                             {% endif %}
                         </td>
                         <td class="small">{{ '%.2f'|format(item.frame_score or 0) }}</td>

@@ -385,6 +385,27 @@ def _feed(collector, frame, dets, first_ts, step=1.0, count=6, frame_offset=0):
 
 
 class TestCollectorBounds:
+    @pytest.mark.parametrize("linked_time", [1.1, 2.0])
+    def test_linked_frame_displaces_sharper_unlinked_frame(self, linked_time):
+        collector = _collector()
+        collector._writer = _RecordingWriter()
+        for number, time in enumerate((0.0, 1.0, linked_time)):
+            detections = [_det(7, "motorcycle", ts=time)]
+            frame = _sharp_frame()
+            if number == 2:
+                frame = _blur_frame()
+                detections.append(_det(205, "rider", ts=time, x=312, y=165, w=30, h=75))
+            collector.observe(frame, detections, frame_number=number, timestamp_sec=time)
+        collector.wrap_up()
+        candidate = collector.candidates()[0]
+        frames = json.loads(candidate["frames_json"])
+        assert len(frames) == 2
+        assert candidate["frame_number"] == 2
+        selected_numbers = {frame["frame_number"] for frame in frames}
+        assert 2 in selected_numbers
+        if linked_time == 1.1:
+            assert selected_numbers == {0, 2}
+
     def test_at_most_two_frames_per_occurrence(self):
         collector = _collector()
         collector._writer = _RecordingWriter()

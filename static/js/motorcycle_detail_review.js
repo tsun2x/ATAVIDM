@@ -24,6 +24,7 @@ function describeHelmet(association) {
         case "unknown": return "helmet unknown — absence is not proven";
         case "ambiguous":
             if (reasons.indexOf("contradictory_head_labels") >= 0 ||
+                reasons.indexOf("conflicting_helmet_classes") >= 0 ||
                 reasons.indexOf("contradictory_helmet_observations_across_frames") >= 0) {
                 return "ambiguous: conflicting head observations; human verification required";
             }
@@ -111,17 +112,29 @@ function describeRider(association) {
     if (!association) return "not scanned yet";
     const fromMain = association.source === "main_detector" || association.source === "legacy_row";
     switch (association.state) {
-        case "associated": return "rider associated" + (fromMain ? " (main detector)" : "");
+        case "associated":
+            return "rider associated" +
+                (association.rider_track_id != null ? " (track #" + association.rider_track_id + ")" : "") +
+                (fromMain ? " (main detector)" : "");
         case "ambiguous": return "ambiguous: multiple riders overlap";
         default: return "no rider associated";
     }
 }
 
-function frameDetections(item, index) {
+function scanFrame(item, index) {
     const frames = ((item && item.observations) || {}).frames;
-    if (!Array.isArray(frames)) return [];
-    const match = frames.filter(function (entry) { return entry && Number(entry.index) === Number(index); })[0];
+    return Array.isArray(frames)
+        ? frames.find(function (entry) { return entry && Number(entry.index) === Number(index); })
+        : undefined;
+}
+
+function frameDetections(item, index) {
+    const match = scanFrame(item, index);
     return match && Array.isArray(match.detections) ? match.detections : [];
+}
+
+function formatUncertainty(reason) {
+    return String(reason || "").replace(/_/g, " ");
 }
 
 function uncertaintyList(item) {
@@ -156,6 +169,18 @@ function buildEvidenceMarkup(item) {
             ? '<img src="' + escapeHtml(frame.overlay_url) + '" alt="Mapped boxes ' + i + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4">Not scanned yet — mapped boxes appear after the crop pass.</div>';
         const detections = frameDetections(item, frame.index);
+        const scanned = scanFrame(item, frame.index) || {};
+        const frameAssociation = scanned.association;
+        const frameSummary = frameAssociation
+            ? '<p class="small mt-2 mb-1">Rider: ' + escapeHtml(describeRider(frameAssociation.rider)) +
+              ' · Helmet: ' + escapeHtml(describeHelmet(frameAssociation.helmet)) +
+              ' · Mirror: ' + escapeHtml(describeMirror(frameAssociation.mirror)) + '</p>'
+            : "";
+        const frameReasons = Array.isArray(scanned.uncertainty) && scanned.uncertainty.length
+            ? '<ul class="small text-muted mb-1">' + scanned.uncertainty.map(function (reason) {
+                return '<li>' + escapeHtml(formatUncertainty(reason)) + '</li>';
+            }).join("") + '</ul>'
+            : "";
         const detectionList = detections.length
             ? '<ul class="small mb-0 mt-2">' + detections.map(function (d) {
                 const conf = d.confidence != null ? " " + Math.round(Number(d.confidence) * 100) + "%" : "";
@@ -167,6 +192,10 @@ function buildEvidenceMarkup(item) {
                     text += " — Uncovered head observed (human verification only; not a confirmed violation)";
                 }
                 if (d.evidence_limited) text += " (clipped or unclear)";
+                if (typeof d.attributed === "boolean") {
+                    text += d.attributed ? " — Attributed" : " — Unattributed";
+                    if (d.attribution_reason) text += ": " + formatUncertainty(d.attribution_reason);
+                }
                 return "<li>" + escapeHtml(text) + "</li>";
             }).join("") + "</ul>"
             : (frame.overlay_url ? '<p class="small text-muted mb-0 mt-2">No detail detections in this crop (not proof of absence).</p>' : "");
@@ -177,7 +206,8 @@ function buildEvidenceMarkup(item) {
             "</ul>" + scene +
             '<div class="row g-3 mt-1"><div class="col-md-6"><p class="small text-muted mb-1">Padded motorcycle/rider crop</p>' + crop +
             "</div>" +
-            '<div class="col-md-6"><p class="small text-muted mb-1">Mapped detections (source space)</p>' + overlay + detectionList + "</div></div>" +
+            '<div class="col-md-6"><p class="small text-muted mb-1">Mapped detections (source space)</p>' +
+            overlay + frameSummary + frameReasons + detectionList + "</div></div>" +
             "</div>"
         );
     });
@@ -191,11 +221,23 @@ function buildEvidenceMarkup(item) {
     const reasons = uncertaintyList(item);
 
     const classMap = formatClassMap(scan.class_map || item.scan_class_map || scan.class_names || []);
+    const reference = association.reference_frame;
+    const helmetFrames = Array.isArray(association.helmet_evidence_frames) ? association.helmet_evidence_frames : [];
+    const legacySummary = !reference && frames.length > 1 && ((helmet.reasons || [])
+        .some(function (reason) {
+            return reason === "evidence_on_some_selected_frames_only" ||
+                reason === "contradictory_helmet_observations_across_frames";
+        }));
     const facts = [
-        ["Rider", describeRider(rider)],
+        ["Rider", legacySummary ? "See frame tabs" : describeRider(rider)],
         ["Helmet", describeHelmet(helmet)],
+        ...(reference ? [["Evidence frame", reference.frame_number ?? reference.index]] : []),
+        ...(helmetFrames.length ? [["Helmet evidence frames", helmetFrames.map(function (entry) {
+            return (entry.frame_number ?? entry.index) +
+                (entry.rider_track_id != null ? " (rider #" + entry.rider_track_id + ")" : "");
+        }).join(", ")]] : []),
         ["Side mirror", describeMirror(mirror)],
-        ["Attribution", describeAttribution(association)],
+        ["Attribution", legacySummary ? "See frame tabs" : describeAttribution(association)],
         ["Model", describeModel(scan, item)],
         ["Scan confidence", scan.conf != null ? Math.round(scan.conf * 100) + "%" : "—"],
         ["Class map", classMap || "—"]

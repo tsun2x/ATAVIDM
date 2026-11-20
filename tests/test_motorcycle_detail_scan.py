@@ -346,6 +346,49 @@ def _mock_scanner(predictor):
 
 
 class TestScanMapping:
+    @pytest.mark.parametrize(
+        "size,rider,boxes,state,attributed",
+        [
+            ((68, 97), (21, 35, 26, 50), [(25, 31, 42, 49), (0, 0, 68, 97)], "acceptable", [True, False]),
+            ((64, 77), (24, 15, 17, 32), [(4, 0, 59, 49), (8, 0, 63, 49)], "unknown", [False, False]),
+            ((68, 97), (21, 35, 26, 50), [(25, 31, 42, 49), (25, 31, 42, 49)], "ambiguous", [True, True]),
+        ],
+        ids=["1065-frame-1610", "1072-frame-194", "conflicting-plausible-labels"],
+    )
+    def test_only_plausible_helmet_boxes_count(self, tmp_path, monkeypatch, size, rider, boxes, state, attributed):
+        import config
+
+        root = tmp_path / "evidence"
+        monkeypatch.setattr(config, "EVIDENCE_FOLDER", str(root))
+        monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(root))
+        crop_path = _write_crop(root / "run_1" / "t7g1", "crop_f1.jpg", *size)
+        row = _row(crop_path, crop=dict(x=100, y=100, w=size[0], h=size[1]))
+        frames = json.loads(row["frames_json"])
+        x, y, w, h = rider
+        frames[0]["rider_bbox"] = dict(x=100 + x, y=100 + y, w=w, h=h)
+        frames[0]["main_context"] = {
+            "version": 1, "source": "main_detector", "target_track_id": 7,
+            "rider": {"state": "associated", "track_id": 205},
+            "motorcycles": [], "riders": [], "truncated": False,
+        }
+        row["frames_json"] = json.dumps(frames)
+        labels = ("helmet_nut_shell" if state == "unknown" else "helmet_acceptable", "helmet_nut_shell")
+        predictor = lambda image: [
+            {"class_label": label, "confidence": confidence, "bbox": box}
+            for label, confidence, box in zip(labels, (0.51, 0.33), boxes)
+        ]
+        scanner = _mock_scanner(predictor)
+        result = scanner._scan_candidate(row, scanner.checkpoint(), predictor)
+        helmet = json.loads(result["association_json"])["helmet"]
+        assert helmet["state"] == state
+        assert len(helmet["observations"]) == sum(attributed)
+        detections = json.loads(result["observations_json"])["frames"][0]["detections"]
+        assert [det["attributed"] for det in detections] == attributed
+        if not all(attributed):
+            assert detections[-1]["attribution_reason"] == "implausible_helmet_size"
+        else:
+            assert "conflicting_helmet_classes" in helmet["reasons"]
+
     def test_scan_boxes_are_mapped_into_source_coordinates(self, tmp_path, monkeypatch):
         import config
 
@@ -379,9 +422,12 @@ class TestScanMapping:
 
     def test_resized_scan_scale_is_divided_out(self, tmp_path, monkeypatch):
         import config
+        import cv2
+        from core.motorcycle_detail_scan import resolve_detail_evidence_path
 
         root = tmp_path / "evidence"
         monkeypatch.setattr(config, "EVIDENCE_FOLDER", str(root))
+        monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(root))
         crop_path = _write_crop(root / "run_1" / "t7g1", "crop_f1.jpg", 40, 40)
         crop = {"x": 10, "y": 20, "w": 40, "h": 40}
         row = _row(crop_path, crop=crop, scale_x=2.0, scale_y=2.0)
@@ -400,7 +446,13 @@ class TestScanMapping:
             row, scanner.checkpoint(), scanner._predictor(scanner.checkpoint())
         )
         assert seen["shape"][0] == 80 and seen["shape"][1] == 80
-        bbox = json.loads(result["observations_json"])["frames"][0]["detections"][0]["source_bbox"]
+        frame = json.loads(result["observations_json"])["frames"][0]
+        overlay_path = resolve_detail_evidence_path(frame["overlay_path"])
+        assert overlay_path is not None
+        overlay = cv2.imread(str(overlay_path))
+        assert overlay is not None
+        assert overlay.shape[:2] == (80, 80)
+        bbox = frame["detections"][0]["source_bbox"]
         # crop origin (10,20) + local (10/2,10/2)-(30/2,30/2)
         assert bbox[0] == pytest.approx(15.0)
         assert bbox[1] == pytest.approx(25.0)

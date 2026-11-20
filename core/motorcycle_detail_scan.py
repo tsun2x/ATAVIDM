@@ -69,6 +69,7 @@ from core.motorcycle_detail import (
     HELMET_UNKNOWN,
     MAX_FRAMES_PER_OCCURRENCE,
     STATE_AMBIGUOUS,
+    STATE_ASSOCIATED,
     AttributeAssociation,
     CropRect,
     MainDetectorContext,
@@ -481,17 +482,18 @@ def draw_mapped_boxes(
             text = f"{label} {float(confidences[index]) * 100:.0f}%"
         ty = max(12, y1 - 4)
         (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        tx = max(0, min(x1, width - tw - 4))
         cv2.rectangle(
             annotated,
-            (x1, max(0, ty - th - baseline)),
-            (min(width - 1, x1 + tw + 4), min(height - 1, ty + baseline)),
+            (tx, max(0, ty - th - baseline)),
+            (min(width - 1, tx + tw + 4), min(height - 1, ty + baseline)),
             (20, 20, 20),
             -1,
         )
         cv2.putText(
             annotated,
             text,
-            (x1 + 2, ty),
+            (tx + 2, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
@@ -531,6 +533,7 @@ def associate_scan_detections(
     frame_w: int,
     frame_h: int,
     main_context: MainDetectorContext | None = None,
+    crop: CropRect | None = None,
 ) -> ScanAssociations:
     """Associate scan detections from one frame into review observations.
 
@@ -548,7 +551,7 @@ def associate_scan_detections(
     del frame_w, frame_h  # reserved for future frame-edge reasoning
     if main_context is not None:
         return _associate_with_main_context(
-            detections, motorcycle_box=motorcycle_box, context=main_context
+            detections, motorcycle_box=motorcycle_box, context=main_context, crop=crop
         )
     primary = _primary_detection(_as_box(motorcycle_box))
     riders = [d for d in detections if d.get("class_label") == YOLO_CLASS_RIDER]
@@ -557,7 +560,7 @@ def associate_scan_detections(
     motorcycles = [d for d in detections if d.get("class_label") == YOLO_CLASS_MOTORCYCLE]
 
     rider = associate_rider(primary, riders)
-    helmet = associate_helmet(primary, rider, helmets)
+    helmet = associate_helmet(primary, rider, helmets, crop=crop)
     mirror = associate_mirrors(primary, mirrors, motorcycles_in_frame=motorcycles)
     return ScanAssociations(
         rider=rider,
@@ -603,6 +606,7 @@ def _associate_with_main_context(
     *,
     motorcycle_box: Sequence[float],
     context: MainDetectorContext,
+    crop: CropRect | None,
 ) -> ScanAssociations:
     box = _as_box(motorcycle_box)
     primary = _primary_detection(box)
@@ -617,6 +621,7 @@ def _associate_with_main_context(
         helmets,
         other_riders=[o.box for o in context.riders],
         other_riders_complete=context.riders_complete,
+        crop=crop,
     )
     mirror = associate_mirrors(
         primary,
@@ -642,6 +647,32 @@ def _associate_with_main_context(
         motorcycle_box=box,
         context=context,
     )
+
+
+def _detection_attribution(
+    label: str, confidence: float, box: Sequence[float], association: ScanAssociations
+) -> dict[str, Any]:
+    attribute = association.helmet if label in _HEAD_LABELS else association.mirror
+    coordinates = tuple(round(value, 2) for value in box)
+    for observation in (*attribute.observations, *attribute.rejected_observations):
+        if (
+            label == observation.label
+            and round(confidence, 4) == round(observation.confidence, 4)
+            and coordinates == tuple(round(value, 2) for value in observation.box)
+        ):
+            reason = next(iter(observation.reasons), None)
+            attributed = observation in attribute.observations and reason != "box_clipped_or_unclear"
+            if attributed and attribute.state == STATE_AMBIGUOUS:
+                reason = next(iter(attribute.reasons), reason)
+            return {"attributed": attributed, "attribution_reason": reason}
+
+    reason = "box_not_used_in_frame_association"
+    if label in _HEAD_LABELS:
+        if association.rider.state != STATE_ASSOCIATED:
+            reason = association.helmet.reasons[0]
+        elif "nearby_rider_context_incomplete_helmet_unattributed" in attribute.reasons:
+            reason = "nearby_rider_context_incomplete_helmet_unattributed"
+    return {"attributed": False, "attribution_reason": reason}
 
 
 HELMET_FRAMES_CONFLICT = "contradictory_helmet_observations_across_frames"
@@ -1160,8 +1191,7 @@ class MotorcycleDetailScanner:
         occurrence_key = str(row.get("occurrence_key") or "")
 
         frame_records: list[dict[str, Any]] = []
-        uncertainty: list[str] = []
-        primary_assoc: ScanAssociations | None = None
+        primary_index = 0
         frame_assocs: list[ScanAssociations] = []
         contract_meta = checkpoint.describe()
         for frame in frames:
@@ -1211,6 +1241,7 @@ class MotorcycleDetailScanner:
                 frame_w=source_w,
                 frame_h=source_h,
                 main_context=context,
+                crop=crop,
             )
             frame_uncertainty = list(association.uncertainty)
             if scale_x != 1.0 or scale_y != 1.0:
@@ -1222,10 +1253,11 @@ class MotorcycleDetailScanner:
                 or (crop.y + crop.h) >= source_h
             ):
                 frame_uncertainty.append("crop_clamped_at_frame_edge")
-            uncertainty.extend(frame_uncertainty)
-
             def _local(box: Sequence[float]) -> tuple[float, float, float, float]:
-                return (box[0] - crop.x, box[1] - crop.y, box[2] - crop.x, box[3] - crop.y)
+                return (
+                    (box[0] - crop.x) * scale_x, (box[1] - crop.y) * scale_y,
+                    (box[2] - crop.x) * scale_x, (box[3] - crop.y) * scale_y,
+                )
 
             main_boxes = [_local(motorcycle_box)]
             main_labels = ["main:motorcycle"]
@@ -1235,7 +1267,7 @@ class MotorcycleDetailScanner:
             for other in context.motorcycles:
                 main_boxes.append(_local(other.box))
                 main_labels.append("main:other_motorcycle")
-            overlay = draw_mapped_boxes(image, main_boxes, labels=main_labels)
+            overlay = draw_mapped_boxes(scan_image, main_boxes, labels=main_labels)
             overlay = draw_mapped_boxes(
                 overlay,
                 [_local(box) for _, box, _limited in mapped],
@@ -1271,6 +1303,7 @@ class MotorcycleDetailScanner:
                         "source_bbox": [round(float(v), 2) for v in box],
                         "contract": contract_meta.get("contract"),
                         "evidence_limited": limited,
+                        **_detection_attribution(str(det["class_label"]), float(det["confidence"]), box, association),
                     }
                     for det, box, limited in mapped
                 ],
@@ -1279,16 +1312,30 @@ class MotorcycleDetailScanner:
             }
             frame_records.append(frame_record)
             frame_assocs.append(association)
-            if primary_assoc is None or frame.get("frame_number") == primary_number:
-                primary_assoc = association
+            if frame.get("frame_number") == primary_number:
+                primary_index = len(frame_records) - 1
 
-        if primary_assoc is None:  # pragma: no cover - frames is non-empty
-            raise DetailScanError("candidate_association_failed")
-        reconciled, summary_reason = _reconcile_helmet_across_frames(frame_assocs)
+        contributing = [i for i, assoc in enumerate(frame_assocs) if assoc.helmet.state != HELMET_UNKNOWN]
+        reference_index = primary_index
+        if contributing and primary_index not in contributing:
+            reference_index = contributing[0]
+        reference = frame_records[reference_index]
+        summary = frame_assocs[reference_index].as_dict()
+        summary["reference_frame"] = {"index": reference["index"], "frame_number": reference["frame_number"]}
+        summary["helmet_evidence_frames"] = [
+            {
+                "index": frame_records[i]["index"],
+                "frame_number": frame_records[i]["frame_number"],
+                "rider_track_id": frame_assocs[i].rider.rider_track_id,
+                "state": frame_assocs[i].helmet.state,
+            }
+            for i in contributing
+        ]
+        uncertainty = list(reference["uncertainty"])
+        reconciled, _ = _reconcile_helmet_across_frames(frame_assocs)
         if reconciled is not None:
-            primary_assoc.helmet = reconciled
-            if summary_reason is not None:
-                uncertainty.append(f"helmet:{summary_reason}")
+            summary["helmet"] = reconciled.as_dict()
+            uncertainty.extend(f"helmet:{reason}" for reason in reconciled.reasons)
         uncertainty = list(dict.fromkeys(uncertainty))
         no_helmet_policy = (
             "positive_visible_uncovered_head_review_only"
@@ -1305,13 +1352,13 @@ class MotorcycleDetailScanner:
                 "no_helmet_policy": no_helmet_policy,
             },
             "frames": frame_records,
-            "association": primary_assoc.as_dict(),
+            "association": summary,
             "uncertainty": uncertainty,
         }
         scan_seconds = max(0.0, time.monotonic() - started)
         return {
             "observations_json": json.dumps(observations),
-            "association_json": json.dumps(primary_assoc.as_dict()),
+            "association_json": json.dumps(summary),
             "uncertainty_json": json.dumps(uncertainty),
             "scan_seconds": round(scan_seconds, 4),
         }

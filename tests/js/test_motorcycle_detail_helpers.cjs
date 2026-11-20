@@ -172,4 +172,22 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(detailUi.frameDetections({}, 1), []);
 
+const attributedMarkup = detailUi.buildEvidenceMarkup({
+    frames: [{ index: 1, frame_number: 10 }, { index: 2, frame_number: 20 }],
+    association: {
+        reference_frame: { index: 2, frame_number: 20 },
+        helmet_evidence_frames: [{ index: 2, frame_number: 20, rider_track_id: 205 }]
+    },
+    observations: { frames: [
+        { index: 1, association: { rider: { state: "unassociated" }, helmet: { state: "unknown" } } },
+        { index: 2, association: { rider: { state: "associated", rider_track_id: 205 }, helmet: { state: "acceptable" } },
+            detections: [{ class_label: "helmet_nut_shell", attributed: false, attribution_reason: "implausible_helmet_size" }] }
+    ] }
+});
+assert.match(attributedMarkup, /Evidence frame<\/dt><dd>20/);
+assert.match(attributedMarkup, /Helmet evidence frames<\/dt><dd>20 \(rider #205\)/);
+assert.match(attributedMarkup, /Rider: no rider associated/);
+assert.match(attributedMarkup, /Helmet: helmet detected \(acceptable shape\)/);
+assert.match(attributedMarkup, /Unattributed: implausible helmet size/);
+
 console.log("Motorcycle detail review helper tests passed");
