@@ -12,7 +12,12 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from core.detection_config import PRETRAINED_WEIGHTS, YOLO_CLASS_PERSON, YOLO_CLASS_PICKUP_TRUCK
+from core.detection_config import (
+    PRETRAINED_WEIGHTS,
+    YOLO_CLASS_CAR,
+    YOLO_CLASS_PERSON,
+    YOLO_CLASS_PICKUP_TRUCK,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +50,10 @@ def _weights_path() -> str:
 
 
 class PickupPersonCropScanner:
-    """Scan expanded crops for pickup tracks and return frame-coordinate people."""
+    """Scan pickup crops and bounded car fallbacks for frame-coordinate people."""
+
+    CAR_FALLBACK_INTERVAL_SEC = 0.5
+    MAX_CAR_FALLBACK_CROPS = 3
 
     def __init__(
         self,
@@ -66,6 +74,7 @@ class PickupPersonCropScanner:
         self._disabled_reason: str | None = None
         self._next_track_id = -1
         self._previous: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        self._last_car_fallback_scan_sec: float | None = None
 
     @staticmethod
     def _load_yolo(path: str) -> Any:
@@ -111,20 +120,29 @@ class PickupPersonCropScanner:
         *,
         timestamp_sec: float,
     ) -> list[dict[str, Any]]:
-        """Detect people on pickup crops, remapping boxes to the source frame.
+        """Detect people on pickup crops and selected car fallbacks.
 
         The crop extends above the vehicle detection to retain riders whose
-        upper bodies project beyond its roofline. If an auxiliary checkpoint
+        upper bodies project beyond its roofline. Car fallbacks are throttled
+        and accepted only above the vehicle body. If the auxiliary checkpoint
         cannot load or infer, the primary video pipeline continues unchanged.
         """
         if not self.enabled or not self._load():
             return []
         try:
             frame_h, frame_w = frame.shape[:2]
-            pickups: list[tuple[tuple[int, int], tuple[int, int, int, int], Any]] = []
+            pickups: list[
+                tuple[
+                    tuple[int, int], tuple[int, int, int, int], Any,
+                    tuple[float, float, float, float], str,
+                ]
+            ] = []
+            car_fallbacks = []
             for det in tracked:
                 label = str(det.get("resolved_track_class", det.get("class_label", "")))
-                if label != YOLO_CLASS_PICKUP_TRUCK or det.get("track_id") is None:
+                is_pickup = label == YOLO_CLASS_PICKUP_TRUCK
+                is_car = label == YOLO_CLASS_CAR
+                if not (is_pickup or is_car) or det.get("track_id") is None:
                     continue
                 x, y, w, h = _box(det)
                 if w <= 0 or h <= 0:
@@ -138,7 +156,36 @@ class PickupPersonCropScanner:
                 if right <= left or bottom <= top:
                     continue
                 key = (int(det["track_id"]), int(det.get("track_identity_epoch") or 0))
-                pickups.append((key, (left, top, right, bottom), frame[top:bottom, left:right]))
+                candidate = (
+                    key,
+                    (left, top, right, bottom),
+                    frame[top:bottom, left:right],
+                    (x, y, w, h),
+                    label,
+                )
+                if is_pickup:
+                    pickups.append(candidate)
+                else:
+                    car_fallbacks.append(candidate)
+
+            # Some pickups are classified as cars. Inspect only the three
+            # largest car crops twice per second; a person hit is accepted only
+            # above the vehicle's roofline and horizontally over that vehicle.
+            # This bounded fallback catches missed pickup labels without
+            # scanning every car crop on every frame.
+            if (
+                car_fallbacks
+                and (
+                    self._last_car_fallback_scan_sec is None
+                    or float(timestamp_sec) - self._last_car_fallback_scan_sec
+                    >= self.CAR_FALLBACK_INTERVAL_SEC
+                )
+            ):
+                car_fallbacks.sort(
+                    key=lambda item: item[3][2] * item[3][3], reverse=True
+                )
+                pickups.extend(car_fallbacks[:self.MAX_CAR_FALLBACK_CROPS])
+                self._last_car_fallback_scan_sec = float(timestamp_sec)
             if not pickups:
                 return []
 
@@ -151,7 +198,10 @@ class PickupPersonCropScanner:
             if len(results) != len(pickups):
                 raise RuntimeError("person submodel returned an incomplete crop batch")
             detections_by_pickup: dict[tuple[int, int], list[dict[str, Any]]] = {}
-            for (pickup_key, (left, top, _right, _bottom), _crop), result in zip(pickups, results):
+            for (
+                (pickup_key, (left, top, _right, _bottom), _crop, vehicle_box, vehicle_class),
+                result,
+            ) in zip(pickups, results):
                 detections: list[dict[str, Any]] = []
                 boxes = getattr(result, "boxes", None)
                 if boxes is None:
@@ -176,7 +226,16 @@ class PickupPersonCropScanner:
                         "bbox_w": x2 - x1,
                         "bbox_h": y2 - y1,
                         "source": "pickup_person_crop_submodel",
+                        "source_vehicle_class": vehicle_class,
                     }
+                    center_x = mapped["bbox_x"] + mapped["bbox_w"] / 2.0
+                    center_y = mapped["bbox_y"] + mapped["bbox_h"] / 2.0
+                    vx, vy, vw, vh = vehicle_box
+                    horizontal_margin = vw * 0.05
+                    if not (vx - horizontal_margin <= center_x <= vx + vw + horizontal_margin):
+                        continue
+                    if vehicle_class == YOLO_CLASS_CAR and center_y > vy + vh * 0.15:
+                        continue
                     # Avoid drawing/queuing the same person twice when the
                     # primary detector already found that person in-frame.
                     if any(

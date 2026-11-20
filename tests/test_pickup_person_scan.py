@@ -79,3 +79,37 @@ def test_pickup_crop_scan_skips_non_pickups_and_disabled_scanner():
 
     disabled = PickupPersonCropScanner(enabled=False, model_loader=lambda _path: Model())
     assert disabled.scan(frame, [], timestamp_sec=0.0) == []
+
+
+def test_car_fallback_accepts_person_over_vehicle_and_rejects_adjacent_person():
+    """A pickup labeled as car can be scanned without adopting nearby people."""
+    from core.pickup_person_scan import PickupPersonCropScanner
+
+    class Model:
+        names = {0: "person"}
+
+        def predict(self, source, **kwargs):
+            assert len(source) == 1
+            return [_Result([
+                _Box([30, 5, 50, 40]),
+                _Box([111, 5, 116, 40]),
+            ])]
+
+    scanner = PickupPersonCropScanner(enabled=True, model_loader=lambda _path: Model())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    car = {
+        "track_id": 12,
+        "track_identity_epoch": 1,
+        "class_label": "car",
+        "bbox_x": 100,
+        "bbox_y": 80,
+        "bbox_w": 100,
+        "bbox_h": 80,
+    }
+
+    detections = scanner.scan(frame, [car], timestamp_sec=1.0)
+
+    assert len(detections) == 1
+    assert detections[0]["source_vehicle_class"] == "car"
+    assert detections[0]["bbox_x"] == 122
+    assert detections[0]["bbox_y"] == 41

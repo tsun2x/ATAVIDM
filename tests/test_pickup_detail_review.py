@@ -149,3 +149,47 @@ def test_crop_submodel_positive_routes_to_review_on_first_scan_frame():
     assert association["state"] == "crop_person_scan_positive"
     assert association["evidence_source"] == "pickup_person_crop_submodel"
     assert association["motion"] == {}
+
+
+def test_crop_scan_hits_for_one_pickup_do_not_create_duplicate_review_leads():
+    """Changing synthetic person IDs do not duplicate one pickup's review item."""
+    collector = _collector()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    pickup = _det(10, "pickup_truck", 80, 80, 100, 80)
+
+    for index in range(5):
+        scanned_person = {
+            **_det(-1 - index, "person", 112, 48, 24, 36),
+            "source": "pickup_person_crop_submodel",
+            "source_pickup_track_id": 10,
+            "source_pickup_identity_epoch": 1,
+            "source_vehicle_class": "pickup_truck",
+        }
+        collector.observe(
+            frame, [pickup, scanned_person], frame_number=index + 1,
+            timestamp_sec=index * 0.1,
+        )
+
+    assert len(collector.candidates()) == 1
+
+
+def test_crop_scan_car_fallback_is_eligible_for_pickup_review():
+    """A crop hit can route when the primary detector labeled the vehicle car."""
+    collector = _collector()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    car = _det(12, "car", 80, 80, 100, 80)
+    scanned_person = {
+        **_det(-1, "person", 112, 48, 24, 36),
+        "source": "pickup_person_crop_submodel",
+        "source_pickup_track_id": 12,
+        "source_pickup_identity_epoch": 1,
+        "source_vehicle_class": "car",
+    }
+
+    collector.observe(
+        frame, [car, scanned_person], frame_number=1, timestamp_sec=0.0
+    )
+
+    assert len(collector.candidates()) == 1
+    association = json.loads(collector.candidates()[0]["association_json"])
+    assert association["vehicle_class_at_scan"] == "car"

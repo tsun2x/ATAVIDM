@@ -170,6 +170,7 @@ class PickupDetailCollector:
         self._candidates: list[dict[str, Any]] = []
         self._persisted_occurrences: set[str] = set()
         self._emitted: set[tuple[int, int, int, int]] = set()
+        self._crop_reviewed_pickups: set[tuple[int, int]] = set()
         self.budget_exhausted = False
 
     def observe(
@@ -191,7 +192,7 @@ class PickupDetailCollector:
                 persons.append(det)
             resolved = det.get("resolved_track_class", label)
             if (
-                str(resolved or "") == YOLO_CLASS_PICKUP_TRUCK
+                str(resolved or "") in {YOLO_CLASS_PICKUP_TRUCK, "car"}
                 and det.get("track_id") is not None
             ):
                 pickups.append(det)
@@ -210,6 +211,9 @@ class PickupDetailCollector:
             pc = _center(pbox)
             pickup_id = int(pickup["track_id"])
             pickup_epoch = int(pickup.get("track_identity_epoch") or 0)
+            vehicle_class = str(
+                pickup.get("resolved_track_class", pickup.get("class_label", ""))
+            )
             for person in persons:
                 person_box = _box(person)
                 person_center = _center(person_box)
@@ -220,6 +224,8 @@ class PickupDetailCollector:
                     and int(person.get("source_pickup_track_id") or -1) == pickup_id
                     and int(person.get("source_pickup_identity_epoch") or 0) == pickup_epoch
                 )
+                if vehicle_class != YOLO_CLASS_PICKUP_TRUCK and not is_crop_submodel_person:
+                    continue
                 if not is_crop_submodel_person and not _center_inside(person_center, pbox):
                     continue
                 key = (pickup_id, pickup_epoch, person_id, person_epoch)
@@ -239,16 +245,22 @@ class PickupDetailCollector:
                     "pickup_center": pc,
                     "person_center": person_center,
                     "person_source": str(person.get("source") or "main_detector_and_bytetrack"),
+                    "vehicle_class_at_scan": str(
+                        person.get("source_vehicle_class") or vehicle_class
+                    ),
                 })
                 if key in self._emitted:
                     continue
                 if is_crop_submodel_person:
+                    pickup_identity = (pickup_id, pickup_epoch)
+                    if pickup_identity in self._crop_reviewed_pickups:
+                        continue
                     # The crop scan is already scoped to this exact pickup.
                     # Send positive scan hits to human review immediately;
                     # requiring another two seconds of shared-motion evidence
                     # can discard the short or distant pickup appearances the
                     # crop model is intended to recover.
-                    self._emit_candidate(
+                    if self._emit_candidate(
                         episode,
                         key,
                         frame,
@@ -260,7 +272,8 @@ class PickupDetailCollector:
                             "state": "crop_person_scan_positive",
                             "person_source": "pickup_person_crop_submodel",
                         },
-                    )
+                    ):
+                        self._crop_reviewed_pickups.add(pickup_identity)
                     continue
                 if ts - episode.started_at < MIN_ASSOCIATION_SEC:
                     continue
@@ -302,8 +315,8 @@ class PickupDetailCollector:
         timestamp_sec: float,
         person_box: tuple[float, float, float, float],
         pickup_box: tuple[float, float, float, float],
-        motion: Mapping[str, float],
-    ) -> None:
+        motion: Mapping[str, Any],
+    ) -> bool:
         occurrence_key = episode.key
         rect = _crop_rect(pickup_box, person_box, self.frame_w, self.frame_h)
         try:
@@ -316,9 +329,9 @@ class PickupDetailCollector:
             )
         except Exception:
             logger.exception("pickup review evidence write failed for %s", occurrence_key)
-            return
+            return False
         if not saved or not saved.get("scene_path") or not saved.get("crop_path"):
-            return
+            return False
         samples = [
             {
                 "timestamp_sec": float(item["timestamp_sec"]),
@@ -364,6 +377,9 @@ class PickupDetailCollector:
                     else "main_detector_and_bytetrack"
                 ),
                 "observations": samples,
+                "vehicle_class_at_scan": str(
+                    episode.samples[-1].get("vehicle_class_at_scan") or YOLO_CLASS_PICKUP_TRUCK
+                ),
                 "motion": {
                     key: value for key, value in motion.items()
                     if key not in {"state", "person_source"}
@@ -376,6 +392,7 @@ class PickupDetailCollector:
         self._emitted.add(key)
         if len(self._candidates) >= self.max_candidates:
             self.budget_exhausted = True
+        return True
 
     def candidates(self) -> list[dict[str, Any]]:
         return list(self._candidates)

@@ -49,7 +49,8 @@
         <span class="badge bg-secondary" data-outcome>{{ item.human_outcome }}</span>
     </div>
     <div class="card-body">
-        <p class="mb-2">Pickup track <strong>#{{ item.pickup_track_id }}</strong> · Person track <strong>#{{ item.person_track_id }}</strong>
+        <p class="mb-2">Pickup candidate track <strong>#{{ item.pickup_track_id }}</strong> · Person track <strong>#{{ item.person_track_id }}</strong>
+            {% if item.association.vehicle_class_at_scan == 'car' %}<span class="text-muted">(main detector labeled this vehicle as car; pickup fallback scan)</span>{% endif %}
             · Run {{ item.processing_run_id or 'unattributed' }} · {{ item.frame_count }} tracked observations</p>
         {% if item.source_video_url %}
         <p><a href="{{ item.source_video_url }}#t={{ item.episode_start_sec or 0 }},{{ item.timestamp_sec or 0 }}" target="_blank" rel="noopener">Open source video at evidence interval</a></p>
