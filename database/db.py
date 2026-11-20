@@ -127,6 +127,7 @@ purge_motorcycle_detail_candidates_for_video = (
 )
 upsert_pickup_detail_candidate = _adapter.upsert_pickup_detail_candidate
 get_pickup_detail_candidate = _adapter.get_pickup_detail_candidate
+list_pickup_detail_handoffs = _adapter.list_pickup_detail_handoffs
 list_pickup_detail_candidates = _adapter.list_pickup_detail_candidates
 count_pickup_detail_pending = _adapter.count_pickup_detail_pending
 record_pickup_detail_review = _adapter.record_pickup_detail_review

@@ -607,6 +607,7 @@ def _violation_to_ui(row: dict, videos: dict[int, dict]) -> dict:
 def _review_to_ui(
     row: dict, videos: dict[int, dict], *, include_plate_details: bool = True
 ) -> dict:
+    from core.pickup_review_handoff import PICKUP_HANDOFF_MARKER
     from core.review_decision_service import disposition_label
     from core.violation_policy import (
         legal_status_for,
@@ -644,6 +645,20 @@ def _review_to_ui(
                 }
         except Exception:  # noqa: BLE001 - optional plate review must not break the queue
             app.logger.exception("pending plate choice unavailable for review %s", row.get("id"))
+    reason_log = row.get("reason_log") or ""
+    factors = _detail_json(row.get("contributing_factors_json"), {}) if reason_log.startswith(PICKUP_HANDOFF_MARKER) else {}
+    pickup = factors.get("pickup_review") if isinstance(factors, dict) else None
+    pickup_details = {}
+    if isinstance(pickup, dict):
+        video_id = row.get("video_id")
+        pickup_details = {
+            "pickup_provenance": pickup,
+            "source_video_url": url_for("api_video_media", video_id=video_id) if video_id in videos else None,
+        }
+        reason_log = reason_log.removeprefix(PICKUP_HANDOFF_MARKER).strip()
+    rule_score = row.get("violation_confidence")
+    if rule_score is None and not pickup_details:
+        rule_score = row.get("confidence")
     return {
         "id": row["id"],
         "display_id": f"RQ-{row['id']:05d}",
@@ -652,16 +667,8 @@ def _review_to_ui(
         "track_id": row.get("track_id"),
         "violation_type": row.get("violation_type"),
         "type_slug": _vtype_slug(row.get("violation_type") or ""),
-        "confidence": (
-            row.get("violation_confidence")
-            if row.get("violation_confidence") is not None
-            else row.get("confidence")
-        ),
-        "violation_confidence": (
-            row.get("violation_confidence")
-            if row.get("violation_confidence") is not None
-            else row.get("confidence")
-        ),
+        "confidence": rule_score,
+        "violation_confidence": rule_score,
         "detection_confidence": row.get("detection_confidence"),
         "frame_number": row.get("frame_number"),
         "vehicle_class": row.get("vehicle_class") or "—",
@@ -677,7 +684,7 @@ def _review_to_ui(
         ),
         "plate_text": row.get("plate_text") or None,
         "plate_status": row.get("plate_status") or "not_attempted",
-        "reason_log": row.get("reason_log") or "",
+        "reason_log": reason_log,
         "queued_at": row.get("queued_at"),
         "status": row.get("status"),
         "proposed_official_category": proposed_official_category_for(vtype),
@@ -699,6 +706,7 @@ def _review_to_ui(
         "plate_machine": plate_machine,
         "review_plate_choice": plate_choice,
         "plate_details_loaded": bool(include_plate_details),
+        **pickup_details,
     }
 
 
@@ -3564,7 +3572,11 @@ def _motorcycle_detail_page_context(rows: list[dict[str, Any]]) -> tuple[dict[in
     return review_links, current_runs
 
 
-def _pickup_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> dict[str, Any]:
+def _pickup_detail_to_ui(
+    row: dict[str, Any], videos: dict[int, dict], handoff: dict[str, Any] | None
+) -> dict[str, Any]:
+    from core.pickup_review_handoff import SENDABLE_OUTCOMES
+
     frames = _detail_json(row.get("frames_json"), [])
     association = _detail_json(row.get("association_json"), {})
     video_id = row.get("video_id")
@@ -3597,6 +3609,12 @@ def _pickup_detail_to_ui(row: dict[str, Any], videos: dict[int, dict]) -> dict[s
         "episode_start_sec": row.get("episode_start_sec"),
         "frame_count": row.get("frame_count"),
         "human_outcome": row.get("human_outcome"),
+        "sent_to_review": handoff,
+        "can_send": (
+            handoff is None and row.get("human_outcome") in SENDABLE_OUTCOMES
+            and video_id in videos and row.get("processing_run_id") is not None
+        ),
+        "violation_review_url": url_for("review_queue", video_id=video_id) if video_id in videos else None,
         "association": association if isinstance(association, dict) else {},
         "frames": out_frames,
         "reviewer_notes": row.get("reviewer_notes"),
@@ -3637,9 +3655,10 @@ def pickup_detail_review():
             **scope,
         )
     videos = _video_name_map(**scope)
+    handoffs = db.list_pickup_detail_handoffs([row["id"] for row in rows])
     return render_template(
         "pickup_detail_review.html",
-        pickup_items=[_pickup_detail_to_ui(row, videos) for row in rows],
+        pickup_items=[_pickup_detail_to_ui(row, videos, handoffs.get(row["id"])) for row in rows],
         pickup_total=total,
         pickup_page=page,
         pickup_per_page=per_page,
@@ -3672,9 +3691,10 @@ def api_pickup_detail_list():
         **scope,
     )
     videos = _video_name_map(**scope)
+    handoffs = db.list_pickup_detail_handoffs([row["id"] for row in rows])
     return jsonify({
         "success": True,
-        "items": [_pickup_detail_to_ui(row, videos) for row in rows],
+        "items": [_pickup_detail_to_ui(row, videos, handoffs.get(row["id"])) for row in rows],
         "total": total,
         "page": page,
         "per_page": per_page,
@@ -3711,6 +3731,38 @@ def api_pickup_detail_evidence(candidate_id: int, kind: str):
     if not path.is_file():
         return jsonify({"success": False, "error": "Evidence not found."}), 404
     return _evidence_media_response(str(path))
+
+
+@app.route("/api/pickup-detail-review/<int:candidate_id>/send", methods=["POST"])
+@auth.role_required("enforcer")
+def api_send_pickup_to_review(candidate_id: int):
+    from core.pickup_review_handoff import PickupHandoffConflict, PickupHandoffNotFound, send_pickup_to_review
+
+    origin = request.headers.get("Origin")
+    if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
+        return jsonify({"success": False, "error": "Send pickup evidence from the Pickup Review page."}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or payload.get("approved") is not True:
+        return jsonify({"success": False, "error": "Approve sending this lead to Violation Review."}), 400
+    expected_outcome = payload.get("expected_outcome")
+    expected_run_id = payload.get("expected_processing_run_id")
+    if not isinstance(expected_outcome, str) or type(expected_run_id) is not int or expected_run_id < 1:
+        return jsonify({"success": False, "error": "Reload this lead before sending it."}), 400
+    notes = payload.get("notes")
+    if notes is not None and (not isinstance(notes, str) or len(notes.strip()) > 2000):
+        return jsonify({"success": False, "error": "Reviewer notes must be at most 2000 characters."}), 400
+    try:
+        result = send_pickup_to_review(
+            db, candidate_id, int(auth.current_user()["id"]),
+            expected_outcome=expected_outcome, expected_processing_run_id=expected_run_id, notes=notes,
+        )
+    except PickupHandoffNotFound as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    except PermissionError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 403
+    except PickupHandoffConflict as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    return jsonify({"success": True, **result}), 200 if result["idempotent"] else 201
 
 
 @app.route("/api/pickup-detail-review/<int:candidate_id>/outcome", methods=["POST"])

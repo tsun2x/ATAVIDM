@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 PICKUP_REVIEW_SELECTOR_VERSION = "pickup-review-2"
 MIN_ASSOCIATION_SEC = 2.0
 MIN_CROP_ASSOCIATION_SEC = 1.1
+# A parked pickup gives no shared-motion evidence, so a crop rider on it must
+# persist longer before review.
+MIN_STATIONARY_CROP_SEC = 2.0
+MIN_ELEVATED_FRACTION = 0.5
+MAX_CROP_DECISIONS = 200
 MIN_SHARED_DISPLACEMENT_PX = 40.0
 MAX_RELATIVE_DRIFT = 0.22
 MAX_ACTIVE_PAIRS = 96
@@ -129,6 +134,45 @@ def _shared_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, float] | N
     }
 
 
+def _crop_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Classify how a crop-detected person moved relative to its pickup."""
+    first, last = samples[0], samples[-1]
+    v0, v1 = first["pickup_center"], last["pickup_center"]
+    p0, p1 = first["person_center"], last["person_center"]
+    vdx, vdy = float(v1[0]) - float(v0[0]), float(v1[1]) - float(v0[1])
+    pdx, pdy = float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1])
+    vdist, pdist = math.hypot(vdx, vdy), math.hypot(pdx, pdy)
+    rel_positions = []
+    for sample in samples:
+        vx, vy, vw, vh = sample["pickup_box"]
+        px, py = sample["person_center"]
+        if vw > 0 and vh > 0:
+            rel_positions.append(((px - vx) / vw, (py - vy) / vh))
+    drift = max(
+        max(p[0] for p in rel_positions) - min(p[0] for p in rel_positions),
+        max(p[1] for p in rel_positions) - min(p[1] for p in rel_positions),
+    ) if rel_positions else 1.0
+    if drift > MAX_RELATIVE_DRIFT:
+        state = "moved_independently"
+    elif vdist < MIN_SHARED_DISPLACEMENT_PX:
+        state = "moved_independently" if pdist >= MIN_SHARED_DISPLACEMENT_PX else "stationary"
+    else:
+        cosine = (vdx * pdx + vdy * pdy) / (vdist * pdist) if pdist > 0 else -1.0
+        vector_error = math.hypot(vdx - pdx, vdy - pdy)
+        state = (
+            "moving_with_pickup"
+            if cosine >= 0.8 and vector_error <= max(16.0, vdist * _MOTION_TOLERANCE)
+            else "moved_independently"
+        )
+    return {
+        "motion_state": state,
+        "duration_sec": float(last["timestamp_sec"]) - float(first["timestamp_sec"]),
+        "pickup_displacement_px": vdist,
+        "person_displacement_px": pdist,
+        "relative_position_drift": drift,
+    }
+
+
 def _crop_rect(
     pickup_box: tuple[float, float, float, float],
     person_box: tuple[float, float, float, float],
@@ -179,7 +223,25 @@ class PickupDetailCollector:
         self._persisted_occurrences: set[str] = set()
         self._emitted: set[tuple[int, int, int, int]] = set()
         self._crop_reviewed_pickups: set[tuple[int, int]] = set()
+        self._crop_decision_counts: Counter[str] = Counter()
+        self._crop_decisions: list[dict[str, Any]] = []
+        self._crop_decision_seen: set[tuple[int, int, str]] = set()
         self.budget_exhausted = False
+
+    def _record_crop_decision(
+        self, pickup_identity: tuple[int, int], timestamp_sec: float, decision: str
+    ) -> None:
+        self._crop_decision_counts[decision] += 1
+        seen_key = (*pickup_identity, decision)
+        if seen_key in self._crop_decision_seen or len(self._crop_decisions) >= MAX_CROP_DECISIONS:
+            return
+        self._crop_decision_seen.add(seen_key)
+        self._crop_decisions.append({
+            "pickup_track_id": pickup_identity[0],
+            "pickup_identity_epoch": pickup_identity[1],
+            "first_timestamp_sec": round(float(timestamp_sec), 3),
+            "decision": decision,
+        })
 
     def observe(
         self,
@@ -214,6 +276,18 @@ class PickupDetailCollector:
             int(det["track_id"]): int(det.get("track_identity_epoch") or 0)
             for det in persons
         }
+        # A main-detector person already linked through its pickup's crop scan
+        # must not also start a second, main-detector pair with that pickup.
+        crop_covered_primary = {
+            (
+                int(det.get("source_pickup_track_id") or -1),
+                int(det.get("source_pickup_identity_epoch") or 0),
+                int(det["overlaps_primary_track_id"]),
+            )
+            for det in persons
+            if str(det.get("source") or "") == "pickup_person_crop_submodel"
+            and det.get("overlaps_primary_track_id") is not None
+        }
         for pickup in pickups:
             pbox = _box(pickup)
             pc = _center(pbox)
@@ -234,7 +308,10 @@ class PickupDetailCollector:
                 )
                 if vehicle_class != YOLO_CLASS_PICKUP_TRUCK and not is_crop_submodel_person:
                     continue
-                if not is_crop_submodel_person and not _center_inside(person_center, pbox):
+                if not is_crop_submodel_person and (
+                    not _center_inside(person_center, pbox)
+                    or (pickup_id, pickup_epoch, person_id) in crop_covered_primary
+                ):
                     continue
                 key = (pickup_id, pickup_epoch, person_id, person_epoch)
                 active.add(key)
@@ -256,6 +333,7 @@ class PickupDetailCollector:
                     "vehicle_class_at_scan": str(
                         person.get("source_vehicle_class") or vehicle_class
                     ),
+                    "rider_geometry": person.get("rider_geometry"),
                 })
                 if is_crop_submodel_person and pbox[2] * pbox[3] >= episode.best_vehicle_area:
                     encoded_ok, encoded = cv2.imencode(
@@ -278,6 +356,24 @@ class PickupDetailCollector:
                     if pickup_identity in self._crop_reviewed_pickups:
                         continue
                     if ts - episode.started_at < MIN_CROP_ASSOCIATION_SEC:
+                        continue
+                    samples = tuple(episode.samples)
+                    elevated = sum(
+                        1 for item in samples
+                        if (item.get("rider_geometry") or {}).get("label") == "elevated"
+                    )
+                    elevated_fraction = elevated / len(samples)
+                    if elevated_fraction < MIN_ELEVATED_FRACTION:
+                        self._record_crop_decision(pickup_identity, ts, "rider_not_elevated")
+                        continue
+                    crop_motion = _crop_motion(samples)
+                    if crop_motion["motion_state"] == "moved_independently":
+                        self._record_crop_decision(pickup_identity, ts, "moved_independently")
+                        continue
+                    if (
+                        crop_motion["motion_state"] == "stationary"
+                        and ts - episode.started_at < MIN_STATIONARY_CROP_SEC
+                    ):
                         continue
                     evidence_frame = frame
                     evidence_frame_number = int(frame_number)
@@ -310,9 +406,18 @@ class PickupDetailCollector:
                             "person_source": "pickup_person_crop_submodel",
                             "minimum_persistence_sec": MIN_CROP_ASSOCIATION_SEC,
                             "evidence_vehicle_area": episode.best_vehicle_area,
+                            "rider_geometry": {
+                                "label": "elevated",
+                                "elevated_fraction": round(elevated_fraction, 3),
+                                "last": samples[-1].get("rider_geometry"),
+                            },
+                            **crop_motion,
                         },
                     ):
                         self._crop_reviewed_pickups.add(pickup_identity)
+                        self._record_crop_decision(
+                            pickup_identity, ts, f"lead_created_{crop_motion['motion_state']}"
+                        )
                     continue
                 if ts - episode.started_at < MIN_ASSOCIATION_SEC:
                     continue
@@ -377,6 +482,7 @@ class PickupDetailCollector:
                 "frame_number": int(item["frame_number"]),
                 "pickup_bbox": dict(zip(("x", "y", "w", "h"), item["pickup_box"])),
                 "person_bbox": dict(zip(("x", "y", "w", "h"), item["person_box"])),
+                "geometry_label": (item.get("rider_geometry") or {}).get("label"),
             }
             for item in episode.samples
         ]
@@ -425,11 +531,12 @@ class PickupDetailCollector:
                     "minimum_persistence_sec": motion.get("minimum_persistence_sec"),
                     "evidence_vehicle_area": motion.get("evidence_vehicle_area"),
                 } if motion.get("minimum_persistence_sec") is not None else {},
+                "rider_geometry": motion.get("rider_geometry"),
                 "motion": {
                     key: value for key, value in motion.items()
                     if key not in {
                         "state", "person_source", "minimum_persistence_sec",
-                        "evidence_vehicle_area",
+                        "evidence_vehicle_area", "rider_geometry",
                     }
                 },
                 "cargo_region_visible": None,
@@ -484,4 +591,6 @@ class PickupDetailCollector:
             "budget_exhausted": self.budget_exhausted,
             "active_pairs": len(self._pairs),
             "source": "main_detector_and_bytetrack",
+            "crop_decision_counts": dict(self._crop_decision_counts),
+            "crop_decisions": list(self._crop_decisions),
         }

@@ -3686,25 +3686,27 @@ def insert_review_queue(
         else float(confidence)
     )
     det_conf = detection_confidence
+    reason_text = str(reason_log or "")
+    is_pickup_handoff = reason_text.startswith("[pickup_detail_handoff]")
     with db_session() as conn:
         # A reprocess gets a new processing_run_id, but an identical source
         # observation from the same uploaded video is still the same review
         # item. Reuse its row so prior reviewer decisions and linked case
         # history remain intact. Frame and timestamp together distinguish
         # separate occurrences on the same track.
-        # Motorcycle Detail creates review items only after a separate human
-        # decision flow. Keep those marked rows distinct from automatic
-        # observations, even when the source-frame identity happens to match.
-        is_motorcycle_detail_decision = "[motorcycle_detail_candidate:" in str(reason_log or "")
+        # Keep approvals from the detail queues distinct from automatic rows,
+        # even when the source-frame identity happens to match.
+        is_detail_handoff = is_pickup_handoff or "[motorcycle_detail_candidate:" in reason_text
         if (
             video_id is not None
             and processing_run_id is not None
-            and not is_motorcycle_detail_decision
+            and not is_detail_handoff
         ):
             existing = conn.execute(
                 """SELECT id FROM review_queue
                    WHERE video_id = ? AND track_id = ? AND violation_type = ?
                      AND frame_number = ? AND timestamp_sec IS ?
+                     AND instr(COALESCE(reason_log, ''), '[pickup_detail_handoff]') = 0
                    ORDER BY id LIMIT 1""",
                 (
                     int(video_id), int(track_id), str(violation_type),
@@ -3749,7 +3751,7 @@ def insert_review_queue(
                 plate_text,
                 plate_status,
                 det_conf,
-                viol_conf,
+                None if is_pickup_handoff else viol_conf,
                 evidence_sufficiency,
                 evidence_clip_path,
                 evidence_sequence_dir,
@@ -7719,6 +7721,34 @@ def get_pickup_detail_candidate(candidate_id: int) -> dict[str, Any] | None:
             (int(candidate_id),),
         ).fetchone()
         return _row_to_dict(row)
+
+
+def list_pickup_detail_handoffs(candidate_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Resolve a pickup occurrence to its audited handoff, including retired reviews."""
+    if not candidate_ids:
+        return {}
+    placeholders = ",".join("?" for _ in candidate_ids)
+    with db_session() as conn:
+        rows = conn.execute(
+            f"""SELECT c.id AS candidate_id,
+                       json_extract(h.detail_json, '$.review_id') AS review_id,
+                       rq.status AS review_status
+                FROM pickup_detail_candidates c
+                JOIN video_history_events h ON h.video_id = c.video_id
+                  AND h.event_type = 'pickup_detail_sent_to_review'
+                  AND json_extract(h.detail_json, '$.occurrence_key') = c.occurrence_key
+                LEFT JOIN review_queue rq
+                  ON rq.id = json_extract(h.detail_json, '$.review_id') AND rq.video_id = c.video_id
+                WHERE c.id IN ({placeholders})
+                ORDER BY h.id DESC""",
+            tuple(candidate_ids),
+        ).fetchall()
+    handoffs = {}
+    for row in rows:
+        handoffs.setdefault(row["candidate_id"], {
+            "review_id": row["review_id"], "review_status": row["review_status"],
+        })
+    return handoffs
 
 
 def list_pickup_detail_candidates(

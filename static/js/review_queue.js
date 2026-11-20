@@ -137,8 +137,32 @@ if (typeof document !== "undefined") {
         window.__tavidmEvidenceItem = item;
         const body = document.getElementById("evidenceModalBody");
         if (!body) return;
+        const pickup = item.pickup_provenance;
+        let pickupDetails = "";
+        if (pickup) {
+            const association = pickup.association || {};
+            const observations = Array.isArray(association.observations) ? association.observations : [];
+            const videoUrl = item.source_video_url
+                ? item.source_video_url + "#t=" + Number(pickup.episode_start_sec ?? pickup.timestamp_sec)
+                : null;
+            pickupDetails = '<section class="mt-3 text-start"><h6>Pickup Review evidence</h6>' +
+                '<p class="small mb-1">PU-' + escapeHtml(String(pickup.candidate_id).padStart(5, "0")) +
+                ' · Run ' + escapeHtml(pickup.processing_run_id) + ' · Frame ' + escapeHtml(pickup.frame_number) +
+                ' at ' + escapeHtml(pickup.timestamp_sec) + ' s</p>' +
+                '<p class="small mb-1">Pickup track #' + escapeHtml(pickup.pickup_track_id) +
+                ' (identity ' + escapeHtml(pickup.pickup_identity_epoch) + ') · Person track #' +
+                escapeHtml(pickup.person_track_id) + ' (identity ' + escapeHtml(pickup.person_identity_epoch) + ')</p>' +
+                '<p class="small mb-1">Association: ' + escapeHtml(String(association.state || "unknown").replaceAll("_", " ")) +
+                ' · ' + escapeHtml(String(association.evidence_source || "unknown").replaceAll("_", " ")) +
+                ' · ' + observations.length + ' tracked observations</p>' +
+                (pickup.reviewer_notes ? '<p class="small mb-1">Pickup reviewer notes: ' + escapeHtml(pickup.reviewer_notes) + '</p>' : '') +
+                (videoUrl ? '<p class="small mb-1"><a href="' + escapeHtml(videoUrl) +
+                    '" target="_blank" rel="noopener">Open source video at the pickup interval</a></p>' : '') +
+                '</section>';
+        }
         const sceneImg = item.evidence_url
-            ? '<img src="' + escapeHtml(item.evidence_url) + '" alt="Annotated scene evidence" class="evidence-preview img-fluid rounded">'
+            ? '<img src="' + escapeHtml(item.evidence_url) + '" alt="' +
+                (pickup ? 'Pickup source scene evidence' : 'Annotated scene evidence') + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>No evidence snapshot available.</div>';
         const rawSceneImg = item.raw_evidence_url
             ? '<img src="' + escapeHtml(item.raw_evidence_url) + '" alt="Raw scene evidence" class="evidence-preview img-fluid rounded">'
@@ -149,7 +173,8 @@ if (typeof document !== "undefined") {
                 '<p class="small text-muted mt-1">' + escapeHtml(item.preferred_evidence_reason || "Selected from this event’s bounded temporal window.") +
                 ' The trigger snapshot and event clip remain the primary evidence record.</p></section>' : "";
         const vehicleImg = item.vehicle_evidence_url
-            ? '<img src="' + escapeHtml(item.vehicle_evidence_url) + '" alt="Vehicle" class="evidence-preview img-fluid rounded">'
+            ? '<img src="' + escapeHtml(item.vehicle_evidence_url) + '" alt="' +
+                (pickup ? 'Pickup and person context crop' : 'Vehicle') + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4"><i class="bi bi-car-front fs-1 d-block mb-2"></i>No vehicle crop captured.</div>';
         const clipPane = item.evidence_clip_url
             ? (item.annotated_evidence_clip_url
@@ -171,19 +196,22 @@ if (typeof document !== "undefined") {
             '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="reviewEvidenceScale">Evidence size</label>' +
             '<input id="reviewEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
             '<ul class="nav nav-tabs mb-3" role="tablist">' +
-            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">Annotated scene</button></li>' +
-            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqRawScene" type="button" role="tab">Raw scene</button></li>' +
-            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqVehicle" type="button" role="tab">Vehicle</button></li>' +
-            clipTab +
+            '<li class="nav-item" role="presentation"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#rqScene" type="button" role="tab">' +
+            (pickup ? 'Source scene' : 'Annotated scene') + '</button></li>' +
+            (pickup ? '' : '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqRawScene" type="button" role="tab">Raw scene</button></li>') +
+            '<li class="nav-item" role="presentation"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#rqVehicle" type="button" role="tab">' +
+            (pickup ? 'Context crop' : 'Vehicle') + '</button></li>' +
+            (pickup && !item.evidence_clip_url ? '' : clipTab) +
             "</ul>" +
             '<div class="tab-content">' +
             '<div class="tab-pane fade show active" id="rqScene" role="tabpanel"><div class="row g-3 align-items-start"><div class="col-lg-8">' + sceneImg +
-            '</div><div class="col-lg-4"><h6>Enlarged vehicle/object crop</h6>' + vehicleImg +
+            '</div><div class="col-lg-4"><h6>' + (pickup ? 'Pickup and person context crop' : 'Enlarged vehicle/object crop') + '</h6>' + vehicleImg +
             '<p class="small text-muted mt-2">Original crop pixels are shown at a larger screen size; no missing detail is reconstructed.</p>' + preferredScene + '</div></div></div>' +
-            '<div class="tab-pane fade" id="rqRawScene" role="tabpanel">' + rawSceneImg + '<p class="small text-muted mt-2">Browser zoom does not recover missing image detail.</p></div>' +
+            (pickup ? '' : '<div class="tab-pane fade" id="rqRawScene" role="tabpanel">' + rawSceneImg + '<p class="small text-muted mt-2">Browser zoom does not recover missing image detail.</p></div>') +
             '<div class="tab-pane fade" id="rqVehicle" role="tabpanel">' + vehicleImg + "</div>" +
-            '<div class="tab-pane fade" id="rqClip" role="tabpanel">' + clipPane + "</div>" +
+            (pickup && !item.evidence_clip_url ? '' : '<div class="tab-pane fade" id="rqClip" role="tabpanel">' + clipPane + "</div>") +
             "</div>" +
+            pickupDetails +
             "<p class=\"mt-3 text-muted\">" + escapeHtml(item.display_id) + " · " + escapeHtml(item.violation_type) + " · Track #" + escapeHtml(item.track_id) + "</p>" +
             "<p class=\"small text-muted\">" + escapeHtml(item.reason_log) + "</p>" +
             "<p class=\"small text-muted\">Rule evidence score: " + escapeHtml(fmtConfidence(item.violation_confidence !== undefined ? item.violation_confidence : item.confidence)) +

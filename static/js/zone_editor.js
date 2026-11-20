@@ -215,9 +215,10 @@
 
     ZoneEditor.prototype._toImageCoords = function (clientX, clientY) {
         var rect = this.canvas.getBoundingClientRect();
-        var x = (clientX - rect.left) / this.scale;
-        var y = (clientY - rect.top) / this.scale;
-        return [x, y];
+        if (!rect.width || !rect.height) return [0, 0];
+        var x = (clientX - rect.left) * (this.canvas.width / rect.width);
+        var y = (clientY - rect.top) * (this.canvas.height / rect.height);
+        return [x - this.offsetX, y - this.offsetY];
     };
 
     ZoneEditor.prototype._activePoints = function () {
@@ -236,7 +237,9 @@
     };
 
     ZoneEditor.prototype._hitPoint = function (x, y) {
-        var radius = HIT_RADIUS / this.scale;
+        var rect = this.canvas.getBoundingClientRect();
+        var scaleX = rect.width ? rect.width / this.canvas.width : this.scale;
+        var scaleY = rect.height ? rect.height / this.canvas.height : this.scale;
         var kinds = Object.keys(this.scene.objects);
         var k, j, i, arr, pts, dx, dy;
         if (this.scene.selectedId) {
@@ -244,9 +247,9 @@
             if (selected) {
                 pts = selected.object.points || [];
                 for (i = pts.length - 1; i >= 0; i--) {
-                    dx = pts[i][0] - x;
-                    dy = pts[i][1] - y;
-                    if (Math.sqrt(dx * dx + dy * dy) <= radius) {
+                    dx = (pts[i][0] - x) * scaleX;
+                    dy = (pts[i][1] - y) * scaleY;
+                    if (Math.sqrt(dx * dx + dy * dy) <= HIT_RADIUS) {
                         return { id: selected.object.id, kind: selected.kind, pointIndex: i };
                     }
                 }
@@ -257,9 +260,9 @@
             for (j = 0; j < arr.length; j++) {
                 pts = arr[j].points || [];
                 for (i = pts.length - 1; i >= 0; i--) {
-                    dx = pts[i][0] - x;
-                    dy = pts[i][1] - y;
-                    if (Math.sqrt(dx * dx + dy * dy) <= radius) {
+                    dx = (pts[i][0] - x) * scaleX;
+                    dy = (pts[i][1] - y) * scaleY;
+                    if (Math.sqrt(dx * dx + dy * dy) <= HIT_RADIUS) {
                         return { id: arr[j].id, kind: kinds[k], pointIndex: i };
                     }
                 }
@@ -325,8 +328,11 @@
     ZoneEditor.prototype._handleMouseMove = function (e) {
         if (!this.image) return;
         if (this.isPanning && this.panStart) {
-            this.offsetX = this.panStart.ox + (e.clientX - this.panStart.x);
-            this.offsetY = this.panStart.oy + (e.clientY - this.panStart.y);
+            var rect = this.canvas.getBoundingClientRect();
+            var scaleX = rect.width ? rect.width / this.canvas.width : this.scale;
+            var scaleY = rect.height ? rect.height / this.canvas.height : this.scale;
+            this.offsetX = this.panStart.ox + (e.clientX - this.panStart.x) / scaleX;
+            this.offsetY = this.panStart.oy + (e.clientY - this.panStart.y) / scaleY;
             this.draw();
             return;
         }

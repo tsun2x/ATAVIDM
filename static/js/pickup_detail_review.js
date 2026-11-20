@@ -62,42 +62,66 @@
     refreshBulkControls();
 
     document.addEventListener("click", async (event) => {
-        const button = event.target.closest("[data-pickup-outcome]");
+        const button = event.target.closest("[data-pickup-outcome], [data-pickup-send]");
         if (!button) return;
         const card = button.closest(".pickup-review-item");
         if (!card) return;
         const status = card.querySelector("[data-save-status]");
         const notes = card.querySelector("textarea");
         const outcome = button.dataset.pickupOutcome;
-        button.disabled = true;
-        if (status) status.textContent = "Saving review outcome…";
+        const sending = button.hasAttribute("data-pickup-send");
+        if (sending && !window.confirm("Send these images and notes to Violation Review as a pending item?")) return;
+        const actions = card.querySelectorAll("[data-pickup-outcome], [data-pickup-send]");
+        actions.forEach((action) => { action.disabled = true; });
+        if (status) status.textContent = sending ? "Sending evidence…" : "Saving review outcome…";
         try {
-            const response = await fetch(`/api/pickup-detail-review/${card.dataset.candidateId}/outcome`, {
+            const expectedOutcome = card.dataset.outcome || "pending";
+            const decision = sending
+                ? { approved: true, expected_processing_run_id: Number(card.dataset.processingRunId) }
+                : { outcome };
+            const endpoint = sending ? "send" : "outcome";
+            const response = await fetch(`/api/pickup-detail-review/${card.dataset.candidateId}/${endpoint}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    outcome,
+                    ...decision,
                     notes: notes ? notes.value : "",
-                    expected_outcome: card.dataset.outcome || "pending"
+                    expected_outcome: expectedOutcome
                 })
             });
-            const result = await response.json();
-            if (!response.ok || !result.success) throw new Error(result.error || "Could not save outcome.");
+            const result = await response.json().catch(() => null);
+            if (!response.ok || !result?.success) {
+                const message = sending ? "Could not send evidence. Reload the lead and try again." : "Could not save outcome.";
+                throw new Error(result?.error || message);
+            }
             card.dataset.outcome = result.outcome;
             const badge = card.querySelector("[data-outcome]");
             if (badge) badge.textContent = result.outcome;
+            if (sending) {
+                card.dataset.sent = "true";
+                card.querySelector("[data-handoff]").hidden = false;
+                const reference = "RQ-" + String(result.review_id).padStart(5, "0");
+                card.querySelector("[data-handoff-reference]").textContent =
+                    ` · ${reference} · ${result.review_status || "Review removed"}`;
+                const link = card.querySelector("[data-handoff-link]");
+                if (link) link.hidden = result.review_status !== "pending";
+            }
+            const sendButton = card.querySelector("[data-pickup-send]");
+            if (sendButton) sendButton.hidden = card.dataset.sent === "true" || !["pending", "reviewed"].includes(result.outcome);
             const selector = card.querySelector(".pickup-select-item");
-            if (selector && result.outcome !== "pending") {
+            if (selector && (sending || result.outcome !== "pending")) {
                 selector.checked = false;
                 selector.disabled = true;
                 refreshBulkControls();
             }
-            if (status) status.textContent = `Saved as ${result.outcome}. This does not create a violation case.`;
+            if (status) status.textContent = sending
+                ? (result.idempotent ? "This lead was already sent." : "Pending review item created.")
+                : `Saved as ${result.outcome}. This does not create a violation case.`;
             window.TAVIDMRefreshNavCounts?.(true);
         } catch (error) {
             if (status) status.textContent = error.message || "Could not save outcome.";
         } finally {
-            button.disabled = false;
+            actions.forEach((action) => { action.disabled = false; });
         }
     });
 })();

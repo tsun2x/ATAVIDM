@@ -49,9 +49,11 @@
 {% endif %}
 
 {% for item in pickup_items %}
-<article class="card card-panel mb-3 pickup-review-item" data-candidate-id="{{ item.id }}" data-outcome="{{ item.human_outcome }}">
+<article class="card card-panel mb-3 pickup-review-item" data-candidate-id="{{ item.id }}"
+         data-outcome="{{ item.human_outcome }}" data-processing-run-id="{{ item.processing_run_id or '' }}"
+         data-sent="{{ 'true' if item.sent_to_review else 'false' }}">
     <div class="card-header d-flex flex-wrap justify-content-between gap-2">
-        <div class="d-flex align-items-center gap-2"><input class="form-check-input pickup-select-item" type="checkbox" aria-label="Select {{ item.display_id }} for bulk dismissal" {% if item.human_outcome != 'pending' %}disabled{% endif %}><span><code>{{ item.display_id }}</code> · {{ item.video_name }}</span></div>
+        <div class="d-flex align-items-center gap-2"><input class="form-check-input pickup-select-item" type="checkbox" aria-label="Select {{ item.display_id }} for bulk dismissal" {% if item.human_outcome != 'pending' or item.sent_to_review %}disabled{% endif %}><span><code>{{ item.display_id }}</code> · {{ item.video_name }}</span></div>
         <span class="badge bg-secondary" data-outcome>{{ item.human_outcome }}</span>
     </div>
     <div class="card-body">
@@ -87,8 +89,21 @@
                 {% for state in ('reviewed', 'uncertain', 'dismissed') %}
                 <button type="button" class="btn btn-sm {% if state == 'reviewed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" data-pickup-outcome="{{ state }}">{{ state|capitalize }}</button>
                 {% endfor %}
+                {% if item.violation_review_url and item.processing_run_id %}
+                <button type="button" class="btn btn-sm btn-outline-primary" data-pickup-send
+                        {% if not item.can_send %}hidden{% endif %}>Send to Violation Review</button>
+                {% endif %}
             </div>
         </div>
+        <p class="small mt-2 mb-0" data-handoff {% if not item.sent_to_review %}hidden{% endif %}>
+            <strong>Sent to Violation Review</strong>
+            <span data-handoff-reference>
+            {%- if item.sent_to_review %} · RQ-{{ '%05d'|format(item.sent_to_review.review_id) }} · {{ item.sent_to_review.review_status or 'Review removed' }}{% endif -%}
+            </span>
+            {% if item.violation_review_url %}
+            <a data-handoff-link href="{{ item.violation_review_url }}" {% if not item.sent_to_review or item.sent_to_review.review_status != 'pending' %}hidden{% endif %}>Open Violation Review for this video</a>
+            {% endif %}
+        </p>
         <p class="small text-muted mt-2 mb-0" data-save-status aria-live="polite"></p>
     </div>
 </article>

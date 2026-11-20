@@ -88,7 +88,11 @@
                             <span class="vtype-badge vtype-{{ item.type_slug }}">{{ item.violation_type }}</span>
                             {% endif %}
                         </td>
-                        <td class="small">{{ item.video_name }}</td>
+                        <td class="small">{{ item.video_name }}
+                            {% if item.pickup_provenance %}
+                            <div class="text-muted">Pickup Review · PU-{{ '%05d'|format(item.pickup_provenance.candidate_id) }}</div>
+                            {% endif %}
+                        </td>
                         <td>#{{ item.track_id }}</td>
                         <td class="small">{{ item.vehicle_class }}</td>
                         <td>

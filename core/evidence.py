@@ -7,6 +7,8 @@ is stored with the violation record.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,8 @@ from typing import Any
 import cv2
 
 from config import EVIDENCE_FOLDER
+
+logger = logging.getLogger(__name__)
 
 _BOX_COLOR = (54, 57, 230)   # BGR red — offending object
 _TEXT_COLOR = (255, 255, 255)
@@ -368,6 +372,25 @@ def save_pickup_detail_evidence(
         "crop_path": _stored_path(crop_path),
         "size_bytes": int(scene_bytes + crop_bytes),
     }
+
+
+def save_pickup_detail_scan_log(run_key: str, rows: list[dict[str, Any]]) -> str | None:
+    """Write the run's pickup person-scan diagnostics as JSON lines."""
+    if not rows:
+        return None
+    root = Path(EVIDENCE_FOLDER) / "pickup_detail"
+    out_dir = root / _safe_detail_key(run_key, label="pickup run key")
+    try:
+        out_dir.resolve().relative_to(root.resolve())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "scan_log.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except (OSError, ValueError, TypeError):
+        logger.exception("pickup scan log write failed for %s", run_key)
+        return None
+    return _stored_path(path)
 
 
 def remove_pickup_detail_run(run_key: str) -> bool:

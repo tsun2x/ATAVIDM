@@ -28,7 +28,11 @@ from core.detector import (
     enforce_object_class_contract,
     resolve_weights_path,
 )
-from core.evidence import save_evidence_snapshot, save_vehicle_crop
+from core.evidence import (
+    save_evidence_snapshot,
+    save_pickup_detail_scan_log,
+    save_vehicle_crop,
+)
 from core.frame_annotate import TrajectoryOverlay, annotate_frame
 from core.geometry_profile import build_geometry_profile
 from core.motorcycle_detail import MotorcycleDetailCollector
@@ -664,7 +668,7 @@ def process_video(
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
             tracked = track_state.update(raw, now=timestamp_sec)
             pickup_person_detections = pickup_person_scanner.scan(
-                frame, tracked, timestamp_sec=timestamp_sec
+                frame, tracked, timestamp_sec=timestamp_sec, frame_number=frame_number
             )
             pickup_review_tracked = [*tracked, *pickup_person_detections]
             # End an old identity's review episode before a reused ByteTrack ID
@@ -885,6 +889,21 @@ def process_video(
                 run_id_int,
                 pickup_detail_summary,
             )
+        if pickup_person_scanner.enabled:
+            try:
+                pickup_scan_diagnostics = {
+                    **pickup_person_scanner.summary(),
+                    "collector": pickup_detail_summary,
+                    "scan_log_path": save_pickup_detail_scan_log(
+                        pickup_detail_collector.run_key,
+                        pickup_person_scanner.scan_log_rows(),
+                    ),
+                }
+                diagnostics_payload = json.loads(diagnostics_json)
+                diagnostics_payload["pickup_person_scan"] = pickup_scan_diagnostics
+                diagnostics_json = json.dumps(diagnostics_payload)
+            except Exception:  # noqa: BLE001 - diagnostics must not fail a run
+                logger.exception("pickup person scan diagnostics unavailable for run %s", run_id_int)
 
         db.mark_video_processed(video_id)
         result = ProcessVideoResult(
