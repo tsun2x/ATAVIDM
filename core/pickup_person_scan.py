@@ -39,6 +39,14 @@ def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
     return intersection / union if union > 0 else 0.0
 
 
+def _center_distance(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> float:
+    ax, ay = a[0] + a[2] / 2.0, a[1] + a[3] / 2.0
+    bx, by = b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
+    return math.hypot(ax - bx, ay - by)
+
+
 def _weights_path() -> str:
     try:
         import config
@@ -263,16 +271,28 @@ class PickupPersonCropScanner:
             available = set(range(len(prior)))
             for detection in detections:
                 detection_box = _box(detection)
-                best_index = max(
+                best_index = min(
                     available,
-                    key=lambda index: _iou(detection_box, _box(prior[index])),
+                    key=lambda index: (
+                        0 if _iou(detection_box, _box(prior[index])) >= self.minimum_iou else 1,
+                        -_iou(detection_box, _box(prior[index]))
+                        if _iou(detection_box, _box(prior[index])) >= self.minimum_iou
+                        else _center_distance(detection_box, _box(prior[index])),
+                    ),
                     default=None,
                 )
+                matched = False
                 if (
                     best_index is not None
                     and timestamp_sec - float(prior[best_index]["timestamp_sec"]) <= self.track_gap_sec
-                    and _iou(detection_box, _box(prior[best_index])) >= self.minimum_iou
                 ):
+                    prior_box = _box(prior[best_index])
+                    matched = (
+                        _iou(detection_box, prior_box) >= self.minimum_iou
+                        or _center_distance(detection_box, prior_box)
+                        <= max(8.0, min(detection_box[3], prior_box[3]) * 0.45)
+                    )
+                if matched and best_index is not None:
                     track_id = int(prior[best_index]["track_id"])
                     available.remove(best_index)
                 else:
@@ -290,6 +310,13 @@ class PickupPersonCropScanner:
                     **detection,
                     "timestamp_sec": timestamp_sec,
                 })
+            if pickup_key not in next_previous:
+                recent = [
+                    item for item in prior
+                    if timestamp_sec - float(item["timestamp_sec"]) <= self.track_gap_sec
+                ]
+                if recent:
+                    next_previous[pickup_key] = recent
         self._previous = next_previous
         return output
 

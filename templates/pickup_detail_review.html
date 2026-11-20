@@ -6,9 +6,10 @@
 
 {% block content %}
 <div class="alert alert-info" role="note">
-    <strong>Evidence leads only.</strong> A person detected by the pickup-crop scan can enter review immediately;
-    main-detector person tracks enter through persistent shared movement with a pickup. These signals do not prove
-    cargo-bed occupancy. Cargo-area and lower-body visibility remain unknown, and review leads do not create violations.
+    <strong>Evidence leads only.</strong> A crop-scan person must stay associated with the same vehicle for at least
+    1.1 seconds before entering review. The lead uses the largest vehicle crop observed during that interval.
+    Main-detector person tracks enter through persistent shared movement with a pickup. These signals do not prove
+    cargo-bed occupancy, and review leads do not create violations.
 </div>
 
 {% if uploader_accounts %}
@@ -38,7 +39,7 @@
 {% if not pickup_items %}
 <div class="card card-panel"><div class="card-body">
     <p class="mb-2"><strong>No pickup passenger review leads match this filter.</strong></p>
-    <p class="text-muted mb-0">This queue receives crop-scan person detections associated with a pickup, or main-detector person tracks that persist with shared pickup movement. A pickup detection by itself does not create a lead. Check the processed video’s scan results and the selected account/outcome filter; these leads are separate from vehicle-classification review and do not create violation cases.</p>
+    <p class="text-muted mb-0">This queue receives a crop-scan person hit that persists with a vehicle for at least 1.1 seconds, or main-detector person tracks that persist with shared pickup movement. A pickup detection or one-frame person hit by itself does not create a lead. Check the processed video’s scan results and the selected account/outcome filter; these leads are separate from vehicle-classification review and do not create violation cases.</p>
 </div></div>
 {% endif %}
 

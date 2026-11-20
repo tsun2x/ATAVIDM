@@ -127,8 +127,8 @@ def test_crop_submodel_person_above_vehicle_box_can_create_review_lead():
     )
 
 
-def test_crop_submodel_positive_routes_to_review_on_first_scan_frame():
-    """A crop-person hit enters review immediately without a motion wait."""
+def test_crop_submodel_requires_1_1_seconds_before_review():
+    """A one-frame pickup/person association cannot create a review lead."""
     collector = _collector()
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     pickup = _det(10, "pickup_truck", 80, 80, 100, 80)
@@ -139,16 +139,23 @@ def test_crop_submodel_positive_routes_to_review_on_first_scan_frame():
         "source_pickup_identity_epoch": 1,
     }
 
-    collector.observe(
-        frame, [pickup, scanned_person], frame_number=1, timestamp_sec=0.0
-    )
+    for index in range(3):
+        collector.observe(
+            frame, [pickup, scanned_person], frame_number=index + 1,
+            timestamp_sec=index * 0.5,
+        )
+        assert collector.candidates() == []
 
+    collector.observe(
+        frame, [pickup, scanned_person], frame_number=4, timestamp_sec=1.5
+    )
     candidates = collector.candidates()
     assert len(candidates) == 1
     association = json.loads(candidates[0]["association_json"])
     assert association["state"] == "crop_person_scan_positive"
     assert association["evidence_source"] == "pickup_person_crop_submodel"
     assert association["motion"] == {}
+    assert association["crop_scan"]["minimum_persistence_sec"] == 1.1
 
 
 def test_crop_scan_hits_for_one_pickup_do_not_create_duplicate_review_leads():
@@ -157,9 +164,9 @@ def test_crop_scan_hits_for_one_pickup_do_not_create_duplicate_review_leads():
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     pickup = _det(10, "pickup_truck", 80, 80, 100, 80)
 
-    for index in range(5):
+    for index in range(4):
         scanned_person = {
-            **_det(-1 - index, "person", 112, 48, 24, 36),
+            **_det(-1, "person", 112, 48, 24, 36),
             "source": "pickup_person_crop_submodel",
             "source_pickup_track_id": 10,
             "source_pickup_identity_epoch": 1,
@@ -167,14 +174,29 @@ def test_crop_scan_hits_for_one_pickup_do_not_create_duplicate_review_leads():
         }
         collector.observe(
             frame, [pickup, scanned_person], frame_number=index + 1,
-            timestamp_sec=index * 0.1,
+            timestamp_sec=index * 0.5,
+        )
+
+    # A later person-ID replacement for the same pickup must not create a
+    # second row after the first persistent crop hit was reviewed.
+    replacement = {
+        **_det(-2, "person", 112, 48, 24, 36),
+        "source": "pickup_person_crop_submodel",
+        "source_pickup_track_id": 10,
+        "source_pickup_identity_epoch": 1,
+        "source_vehicle_class": "pickup_truck",
+    }
+    for index in range(4, 8):
+        collector.observe(
+            frame, [pickup, replacement], frame_number=index + 1,
+            timestamp_sec=index * 0.5,
         )
 
     assert len(collector.candidates()) == 1
 
 
-def test_crop_scan_car_fallback_is_eligible_for_pickup_review():
-    """A crop hit can route when the primary detector labeled the vehicle car."""
+def test_crop_scan_car_fallback_requires_persistent_person_hit():
+    """A car-labeled candidate routes only after a sustained crop-person hit."""
     collector = _collector()
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     car = _det(12, "car", 80, 80, 100, 80)
@@ -186,10 +208,43 @@ def test_crop_scan_car_fallback_is_eligible_for_pickup_review():
         "source_vehicle_class": "car",
     }
 
-    collector.observe(
-        frame, [car, scanned_person], frame_number=1, timestamp_sec=0.0
-    )
+    for index in range(4):
+        collector.observe(
+            frame, [car, scanned_person], frame_number=index + 1,
+            timestamp_sec=index * 0.5,
+        )
+        if index < 3:
+            assert collector.candidates() == []
 
     assert len(collector.candidates()) == 1
     association = json.loads(collector.candidates()[0]["association_json"])
     assert association["vehicle_class_at_scan"] == "car"
+
+
+def test_crop_review_evidence_uses_largest_vehicle_box_during_persistence():
+    """Review evidence selects the largest pickup crop seen before confirmation."""
+    written = []
+
+    def writer(frame, rect, **_kwargs):
+        written.append((int(frame[0, 0, 0]), rect))
+        return {"scene_path": "scene.jpg", "crop_path": "crop.jpg", "size_bytes": 12}
+
+    collector = _collector(writer=writer)
+    pickup_sizes = [(80, 64), (90, 72), (110, 88), (100, 80)]
+    frame_markers = [20, 40, 80, 120]
+    for index, ((width, height), marker) in enumerate(zip(pickup_sizes, frame_markers)):
+        frame = np.full((240, 320, 3), marker, dtype=np.uint8)
+        pickup = _det(10, "pickup_truck", 80, 80, width, height)
+        person = {
+            **_det(-1, "person", 112, 48, 24, 36),
+            "source": "pickup_person_crop_submodel",
+            "source_pickup_track_id": 10,
+            "source_pickup_identity_epoch": 1,
+        }
+        collector.observe(
+            frame, [pickup, person], frame_number=index + 1,
+            timestamp_sec=index * 0.5,
+        )
+
+    assert len(collector.candidates()) == 1
+    assert written[0][0] == 80

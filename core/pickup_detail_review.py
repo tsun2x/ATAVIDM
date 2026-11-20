@@ -22,8 +22,9 @@ from core.tracker import TRACK_EXPIRY_SEC
 
 logger = logging.getLogger(__name__)
 
-PICKUP_REVIEW_SELECTOR_VERSION = "pickup-review-1"
+PICKUP_REVIEW_SELECTOR_VERSION = "pickup-review-2"
 MIN_ASSOCIATION_SEC = 2.0
+MIN_CROP_ASSOCIATION_SEC = 1.1
 MIN_SHARED_DISPLACEMENT_PX = 40.0
 MAX_RELATIVE_DRIFT = 0.22
 MAX_ACTIVE_PAIRS = 96
@@ -51,6 +52,13 @@ class _PairEpisode:
     samples: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=MAX_SAMPLES_PER_PAIR)
     )
+    best_frame_jpeg: Any | None = None
+    best_frame_number: int | None = None
+    best_timestamp_sec: float | None = None
+    best_person_box: tuple[float, float, float, float] | None = None
+    best_pickup_box: tuple[float, float, float, float] | None = None
+    best_vehicle_area: float = 0.0
+    best_vehicle_class: str | None = None
 
     @property
     def key(self) -> str:
@@ -249,28 +257,59 @@ class PickupDetailCollector:
                         person.get("source_vehicle_class") or vehicle_class
                     ),
                 })
+                if is_crop_submodel_person and pbox[2] * pbox[3] >= episode.best_vehicle_area:
+                    encoded_ok, encoded = cv2.imencode(
+                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82]
+                    )
+                    if encoded_ok:
+                        episode.best_frame_jpeg = encoded
+                        episode.best_frame_number = int(frame_number)
+                        episode.best_timestamp_sec = ts
+                        episode.best_person_box = person_box
+                        episode.best_pickup_box = pbox
+                        episode.best_vehicle_area = pbox[2] * pbox[3]
+                        episode.best_vehicle_class = str(
+                            person.get("source_vehicle_class") or vehicle_class
+                        )
                 if key in self._emitted:
                     continue
                 if is_crop_submodel_person:
                     pickup_identity = (pickup_id, pickup_epoch)
                     if pickup_identity in self._crop_reviewed_pickups:
                         continue
-                    # The crop scan is already scoped to this exact pickup.
-                    # Send positive scan hits to human review immediately;
-                    # requiring another two seconds of shared-motion evidence
-                    # can discard the short or distant pickup appearances the
-                    # crop model is intended to recover.
+                    if ts - episode.started_at < MIN_CROP_ASSOCIATION_SEC:
+                        continue
+                    evidence_frame = frame
+                    evidence_frame_number = int(frame_number)
+                    evidence_timestamp = ts
+                    evidence_person_box = person_box
+                    evidence_pickup_box = pbox
+                    if episode.best_frame_jpeg is not None:
+                        best = cv2.imdecode(episode.best_frame_jpeg, cv2.IMREAD_COLOR)
+                        if best is not None:
+                            evidence_frame = best
+                            evidence_frame_number = int(
+                                episode.best_frame_number or frame_number
+                            )
+                            evidence_timestamp = float(
+                                episode.best_timestamp_sec
+                                if episode.best_timestamp_sec is not None else ts
+                            )
+                            evidence_person_box = episode.best_person_box or person_box
+                            evidence_pickup_box = episode.best_pickup_box or pbox
                     if self._emit_candidate(
                         episode,
                         key,
-                        frame,
-                        int(frame_number),
-                        ts,
-                        person_box,
-                        pbox,
+                        evidence_frame,
+                        evidence_frame_number,
+                        evidence_timestamp,
+                        evidence_person_box,
+                        evidence_pickup_box,
                         {
                             "state": "crop_person_scan_positive",
                             "person_source": "pickup_person_crop_submodel",
+                            "minimum_persistence_sec": MIN_CROP_ASSOCIATION_SEC,
+                            "evidence_vehicle_area": episode.best_vehicle_area,
                         },
                     ):
                         self._crop_reviewed_pickups.add(pickup_identity)
@@ -378,11 +417,20 @@ class PickupDetailCollector:
                 ),
                 "observations": samples,
                 "vehicle_class_at_scan": str(
-                    episode.samples[-1].get("vehicle_class_at_scan") or YOLO_CLASS_PICKUP_TRUCK
+                    episode.best_vehicle_class
+                    or episode.samples[-1].get("vehicle_class_at_scan")
+                    or YOLO_CLASS_PICKUP_TRUCK
                 ),
+                "crop_scan": {
+                    "minimum_persistence_sec": motion.get("minimum_persistence_sec"),
+                    "evidence_vehicle_area": motion.get("evidence_vehicle_area"),
+                } if motion.get("minimum_persistence_sec") is not None else {},
                 "motion": {
                     key: value for key, value in motion.items()
-                    if key not in {"state", "person_source"}
+                    if key not in {
+                        "state", "person_source", "minimum_persistence_sec",
+                        "evidence_vehicle_area",
+                    }
                 },
                 "cargo_region_visible": None,
                 "lower_body_visible": None,

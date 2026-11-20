@@ -113,3 +113,38 @@ def test_car_fallback_accepts_person_over_vehicle_and_rejects_adjacent_person():
     assert detections[0]["source_vehicle_class"] == "car"
     assert detections[0]["bbox_x"] == 122
     assert detections[0]["bbox_y"] == 41
+
+
+def test_person_track_survives_box_jitter_and_vehicle_class_flapping():
+    """The same crop-person identity remains stable across small box jitter."""
+    from core.pickup_person_scan import PickupPersonCropScanner
+
+    class Model:
+        names = {0: "person"}
+
+        def __init__(self):
+            self.results = iter([
+                _Result([_Box([30, 0, 35, 30])]),
+                _Result([_Box([35, 0, 40, 30])]),
+            ])
+
+        def predict(self, *_args, **_kwargs):
+            return [next(self.results)]
+
+    scanner = PickupPersonCropScanner(enabled=True, model_loader=lambda _path: Model())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    vehicle = {
+        "track_id": 12,
+        "track_identity_epoch": 1,
+        "class_label": "pickup_truck",
+        "bbox_x": 100,
+        "bbox_y": 80,
+        "bbox_w": 100,
+        "bbox_h": 80,
+    }
+    first = scanner.scan(frame, [vehicle], timestamp_sec=0.0)
+    vehicle["class_label"] = "car"
+    second = scanner.scan(frame, [vehicle], timestamp_sec=0.5)
+
+    assert len(first) == len(second) == 1
+    assert first[0]["track_id"] == second[0]["track_id"]
