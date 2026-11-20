@@ -45,6 +45,31 @@ def test_pickup_candidates_deduplicate_and_review_outcome_is_persisted(test_db):
     assert updated["reviewer_notes"] == "visibility unclear"
 
 
+def test_same_video_pickup_occurrence_across_processing_runs_updates_one_candidate(test_db):
+    video_id = test_db.insert_video("pickup-rerun.mp4", "/tmp/pickup-rerun.mp4", status="processed")
+    first_payload = _payload(video_id)
+    first = test_db.upsert_pickup_detail_candidate(**first_payload)
+    from database.sqlite_adapter import db_session
+    with db_session() as conn:
+        conn.execute(
+            "UPDATE pickup_detail_candidates SET dedup_key = ? WHERE id = ?",
+            (f"5|{first_payload['occurrence_key']}|{first_payload['selector_version']}", first),
+        )
+    test_db.record_pickup_detail_review(
+        candidate_id=first, outcome="uncertain", reviewed_by=None, notes="keep reviewer decision"
+    )
+    rerun_payload = {**first_payload, "run_key": "run_6", "processing_run_id": 6}
+    second = test_db.upsert_pickup_detail_candidate(**rerun_payload)
+
+    assert second == first
+    _, total = test_db.list_pickup_detail_candidates(video_id=video_id)
+    assert total == 1
+    updated = test_db.get_pickup_detail_candidate(first)
+    assert updated["processing_run_id"] == 6
+    assert updated["human_outcome"] == "uncertain"
+    assert updated["dedup_key"] == f"video:{video_id}|{first_payload['occurrence_key']}|{first_payload['selector_version']}"
+
+
 def test_pickup_candidate_lists_follow_video_owner_scope(test_db):
     owner_a = test_db.create_user("pickup_owner_a", "hash", role="viewer")
     owner_b = test_db.create_user("pickup_owner_b", "hash", role="viewer")

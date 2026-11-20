@@ -279,6 +279,8 @@ CREATE TABLE IF NOT EXISTS processing_account_dispatch (
 CREATE INDEX IF NOT EXISTS idx_detections_run_id ON detections(processing_run_id);
 CREATE INDEX IF NOT EXISTS idx_detections_video_run ON detections(video_id, processing_run_id);
 CREATE INDEX IF NOT EXISTS idx_review_queue_run_id ON review_queue(processing_run_id);
+CREATE INDEX IF NOT EXISTS idx_review_queue_event_identity
+  ON review_queue(video_id, track_id, violation_type, frame_number, timestamp_sec);
 CREATE INDEX IF NOT EXISTS idx_violations_run_id ON violations(processing_run_id);
 
 -- Durable upload/processing history events (survives reloads; cascades with video).

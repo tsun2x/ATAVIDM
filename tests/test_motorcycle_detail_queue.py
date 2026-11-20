@@ -120,16 +120,29 @@ class TestDeduplication:
         _, total = test_db.list_motorcycle_detail_candidates()
         assert total == 2
 
-    def test_different_processing_run_is_a_separate_candidate(self, test_db, video_row):
+    def test_same_video_occurrence_across_processing_runs_updates_candidate(self, test_db, video_row):
         first = _seed_candidate(
             test_db, video_id=video_row, run_key="run_1", processing_run_id=1
+        )
+        from database.sqlite_adapter import db_session
+        with db_session() as conn:
+            conn.execute(
+                "UPDATE motorcycle_detail_candidates SET dedup_key = ? WHERE id = ?",
+                (f"run:1|t7g1|{DETAIL_SELECTOR_VERSION}", first),
+            )
+        test_db.record_motorcycle_detail_review(
+            candidate_id=first, outcome="uncertain", reviewed_by=None,
+            notes="preserve this review", expected_outcome="pending",
         )
         second = _seed_candidate(
             test_db, video_id=video_row, run_key="run_2", processing_run_id=2
         )
-        assert first != second
+        assert first == second
         _, total = test_db.list_motorcycle_detail_candidates()
-        assert total == 2
+        assert total == 1
+        updated = test_db.get_motorcycle_detail_candidate(first)
+        assert updated["human_outcome"] == "uncertain"
+        assert updated["dedup_key"] == f"video:{video_row}|t7g1|{DETAIL_SELECTOR_VERSION}"
 
     def test_same_run_with_a_new_run_key_stays_one_row(self, test_db, video_row):
         # Reprocessing the same run must update the candidate, not duplicate it.

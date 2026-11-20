@@ -276,6 +276,61 @@ def test_multiple_pending_reviews_can_be_created(test_db):
         assert item["status"] == "pending"
 
 
+def test_reprocessing_same_review_event_reuses_existing_queue_item(test_db):
+    video_id = test_db.insert_video("rerun.mp4", "/tmp/rerun.mp4", status="processed")
+    event = {
+        "video_id": video_id,
+        "track_id": 17,
+        "violation_type": "Illegal Parking",
+        "confidence": 0.9,
+        "frame_number": 120,
+        "timestamp_sec": 4.0,
+        "status": "pending",
+    }
+    first = test_db.insert_review_queue(**event, processing_run_id=41)
+    reviewer_id = test_db.create_user("rerun-reviewer", "hash", role="enforcer")
+    test_db.dismiss_review_item(first, reviewer_id)
+    second = test_db.insert_review_queue(**event, processing_run_id=42)
+
+    assert second == first
+    item = test_db.get_review_item(first)
+    assert item["status"] == "dismissed"
+    assert item["processing_run_id"] == 42
+
+    distinct = test_db.insert_review_queue(
+        **{**event, "frame_number": 150, "timestamp_sec": 5.0},
+        processing_run_id=43,
+    )
+    assert distinct != first
+    _, total = test_db.list_review_queue(status="dismissed", video_id=video_id)
+    assert total == 1
+    _, pending = test_db.list_review_queue(status="pending", video_id=video_id)
+    assert pending == 1
+
+
+def test_motorcycle_detail_decision_marker_is_not_merged_with_automatic_event(test_db):
+    video_id = test_db.insert_video("detail-decision.mp4", "/tmp/detail-decision.mp4", status="processed")
+    base = {
+        "video_id": video_id,
+        "track_id": 9,
+        "violation_type": "No Helmet",
+        "confidence": 0.8,
+        "frame_number": 30,
+        "timestamp_sec": 1.0,
+        "status": "pending",
+    }
+    automatic = test_db.insert_review_queue(
+        **base, processing_run_id=51, reason_log="[medium] automatic detector event"
+    )
+    human_decision = test_db.insert_review_queue(
+        **base,
+        processing_run_id=51,
+        reason_log="[motorcycle_detail_candidate:12] [human_review_choice]",
+    )
+
+    assert human_decision != automatic
+
+
 def test_timestamp_sec_preserved_in_review(test_db):
     """Timestamp should be preserved when moving from queue to violations."""
     video_id = test_db.insert_video(

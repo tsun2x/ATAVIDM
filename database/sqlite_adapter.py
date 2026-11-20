@@ -236,6 +236,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     _apply_migration_013(conn)
     _apply_migration_014(conn)
     _apply_migration_015(conn)
+    _apply_migration_016(conn)
 
     if _table_exists(conn, "users"):
         if not _users_table_allows_viewer(conn):
@@ -636,6 +637,13 @@ def _apply_migration_011(conn: sqlite3.Connection) -> None:
 def _apply_migration_015(conn: sqlite3.Connection) -> None:
     """Add the independent pickup review-lead table without altering tables."""
     migration = Path(__file__).parent / "migrations" / "015_pickup_detail_review.sql"
+    if migration.is_file():
+        conn.executescript(migration.read_text(encoding="utf-8"))
+
+
+def _apply_migration_016(conn: sqlite3.Connection) -> None:
+    """Index source-event identity lookups used to deduplicate review inserts."""
+    migration = Path(__file__).parent / "migrations" / "016_review_queue_event_identity.sql"
     if migration.is_file():
         conn.executescript(migration.read_text(encoding="utf-8"))
 
@@ -3679,6 +3687,38 @@ def insert_review_queue(
     )
     det_conf = detection_confidence
     with db_session() as conn:
+        # A reprocess gets a new processing_run_id, but an identical source
+        # observation from the same uploaded video is still the same review
+        # item. Reuse its row so prior reviewer decisions and linked case
+        # history remain intact. Frame and timestamp together distinguish
+        # separate occurrences on the same track.
+        # Motorcycle Detail creates review items only after a separate human
+        # decision flow. Keep those marked rows distinct from automatic
+        # observations, even when the source-frame identity happens to match.
+        is_motorcycle_detail_decision = "[motorcycle_detail_candidate:" in str(reason_log or "")
+        if (
+            video_id is not None
+            and processing_run_id is not None
+            and not is_motorcycle_detail_decision
+        ):
+            existing = conn.execute(
+                """SELECT id FROM review_queue
+                   WHERE video_id = ? AND track_id = ? AND violation_type = ?
+                     AND frame_number = ? AND timestamp_sec IS ?
+                   ORDER BY id LIMIT 1""",
+                (
+                    int(video_id), int(track_id), str(violation_type),
+                    int(frame_number), timestamp_sec,
+                ),
+            ).fetchone()
+            if existing is not None:
+                # Keep run-scoped result views attached to the latest pass,
+                # without replacing the human outcome or its evidence record.
+                conn.execute(
+                    "UPDATE review_queue SET processing_run_id = ? WHERE id = ?",
+                    (int(processing_run_id), int(existing["id"])),
+                )
+                return int(existing["id"])
         cursor = conn.execute(
             """
             INSERT INTO review_queue (
@@ -6922,23 +6962,23 @@ DETAIL_REVIEW_OUTCOMES = ("reviewed", "dismissed", "uncertain")
 
 
 def detail_dedup_key(run_scope: str, occurrence_key: str, selector_version: str) -> str:
-    """Encoded (processing run, track occurrence, selector version) identity."""
+    """Encoded (source scope, track occurrence, selector version) identity."""
     return f"{run_scope}|{occurrence_key}|{selector_version}"
 
 
 def _detail_run_scope(
     processing_run_id: int | None, video_id: int | None, run_key: str | None = None
 ) -> str:
-    """Run identity for dedup.
+    """Source identity for dedup.
 
-    Real processing runs dedup on the run row. Direct uploaded-video calls use
-    their video identity; live-camera calls use the unique source run key, so
-    repeated ByteTrack IDs from separate cameras or sessions cannot collapse.
+    Uploaded videos dedup across reprocessing runs by video identity. Live-camera
+    calls use their unique source run key, so repeated ByteTrack IDs from
+    separate cameras or sessions cannot collapse.
     """
-    if processing_run_id is not None:
-        return f"run:{int(processing_run_id)}"
     if video_id is not None:
         return f"video:{int(video_id)}"
+    if processing_run_id is not None:
+        return f"run:{int(processing_run_id)}"
     if run_key:
         return f"source:{str(run_key)}"
     raise ValueError("A source identity is required for run-less detail candidates.")
@@ -6999,6 +7039,25 @@ def upsert_motorcycle_detail_candidate(
         bbox_json = _detail_primary_bbox(frames_json, frame_number)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with db_session() as conn:
+        # Promote a matching row written by the former run-scoped scheme to
+        # the video-scoped key, so the first reprocess after upgrade also
+        # reuses the existing candidate instead of adding one more row.
+        if video_id is not None and conn.execute(
+            "SELECT 1 FROM motorcycle_detail_candidates WHERE dedup_key = ?", (dedup,)
+        ).fetchone() is None:
+            legacy = conn.execute(
+                """SELECT id, dedup_key FROM motorcycle_detail_candidates
+                   WHERE video_id = ? AND occurrence_key = ? AND selector_version = ?
+                   ORDER BY CASE WHEN human_outcome = 'pending' THEN 1 ELSE 0 END,
+                            COALESCE(reviewed_at, updated_at) DESC, id DESC
+                   LIMIT 1""",
+                (int(video_id), str(occurrence_key), str(selector_version)),
+            ).fetchone()
+            if legacy is not None:
+                conn.execute(
+                    "UPDATE motorcycle_detail_candidates SET dedup_key = ? WHERE id = ?",
+                    (dedup, int(legacy["id"])),
+                )
         conn.execute(
             """
             INSERT INTO motorcycle_detail_candidates (
@@ -7583,13 +7642,33 @@ def upsert_pickup_detail_candidate(
 ) -> int:
     """Idempotently persist one independent pickup/person review lead."""
     run_scope = (
-        str(processing_run_id) if processing_run_id is not None
-        else f"video:{int(video_id)}" if video_id is not None
+        f"video:{int(video_id)}" if video_id is not None
+        else str(processing_run_id) if processing_run_id is not None
         else f"source:{run_key}"
     )
     dedup_key = f"{run_scope}|{occurrence_key}|{selector_version}"
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with db_session() as conn:
+        # Re-key one matching row from the old per-run scheme on its first
+        # video reprocess. Prefer an already reviewed row; never discard its
+        # reviewer outcome or history.
+        if video_id is not None and conn.execute(
+            "SELECT 1 FROM pickup_detail_candidates WHERE dedup_key = ?",
+            (dedup_key,),
+        ).fetchone() is None:
+            legacy = conn.execute(
+                """SELECT id, dedup_key FROM pickup_detail_candidates
+                   WHERE video_id = ? AND occurrence_key = ? AND selector_version = ?
+                   ORDER BY CASE WHEN human_outcome = 'pending' THEN 1 ELSE 0 END,
+                            COALESCE(reviewed_at, updated_at) DESC, id DESC
+                   LIMIT 1""",
+                (int(video_id), str(occurrence_key), str(selector_version)),
+            ).fetchone()
+            if legacy is not None:
+                conn.execute(
+                    "UPDATE pickup_detail_candidates SET dedup_key = ? WHERE id = ?",
+                    (dedup_key, int(legacy["id"])),
+                )
         conn.execute(
             """INSERT INTO pickup_detail_candidates (
                 video_id, processing_run_id, run_key, pickup_track_id, person_track_id,

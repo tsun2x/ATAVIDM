@@ -274,7 +274,7 @@ class TestPipelineIntegration:
         _, total = test_db.list_motorcycle_detail_candidates(video_id=video_id)
         assert total == 0
 
-    def test_reprocessing_creates_a_new_run_scoped_candidate(
+    def test_reprocessing_reuses_video_scoped_candidate(
         self, test_db, tmp_path, monkeypatch, pipeline
     ):
         from core.video_processor import process_video
@@ -292,10 +292,10 @@ class TestPipelineIntegration:
         )
         process_video(video_id, enabled_violations=(), processing_run_id=second_run)
         rows, total = test_db.list_motorcycle_detail_candidates(video_id=video_id)
-        # One candidate per processing run, each with its own run-scoped evidence.
-        assert total == 2
-        assert {row["processing_run_id"] for row in rows} == {first_run, second_run}
-        assert len({row["run_key"] for row in rows}) == 2
+        # Reprocessing the same source reuses its candidate and tracks the latest run.
+        assert total == 1
+        assert rows[0]["processing_run_id"] == second_run
+        assert rows[0]["run_key"] == f"run_{second_run}"
 
     def test_remove_results_removes_candidates_and_evidence(
         self, test_db, tmp_path, monkeypatch, pipeline
