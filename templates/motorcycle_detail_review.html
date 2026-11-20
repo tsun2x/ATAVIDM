@@ -46,7 +46,12 @@
                href="{{ url_for('motorcycle_detail_review', outcome='all', uploader_id=selected_uploader_id) }}"
                aria-pressed="{{ 'true' if detail_outcome == 'all' else 'false' }}">All</a>
         </div>
+        <div class="d-flex align-items-center gap-2">
+            <label class="form-check mb-0"><input class="form-check-input" type="checkbox" id="detailSelectAll"> <span class="form-check-label small">Select pending on this page</span></label>
+            <button type="button" class="btn btn-sm btn-outline-danger" id="detailBulkDismiss" disabled>Dismiss selected (<span data-selected-count>0</span>)</button>
+        </div>
     </div>
+    <div class="card-footer py-2 small text-muted" id="detailBulkStatus" aria-live="polite">Bulk dismissal keeps the review records and marks selected pending items as dismissed.</div>
     <div class="card-footer py-2">
         <p class="small text-muted mb-1" id="detailQueueStatus" aria-live="polite">
             Showing {{ detail_items|length }} on this page of {{ detail_total }} {{ detail_outcome }} candidates.
@@ -107,6 +112,7 @@
             <table class="table table-hover mb-0 align-middle" id="detailTable">
                 <thead>
                     <tr>
+                        <th scope="col"><span class="visually-hidden">Select</span></th>
                         <th>ID</th>
                         <th>Source</th>
                         <th>Track / Occurrence</th>
@@ -120,6 +126,7 @@
                 <tbody id="detailBody">
                     {% for item in detail_items %}
                     <tr data-item='{{ item | tojson }}'>
+                        <td><input class="form-check-input detail-select-item" type="checkbox" aria-label="Select {{ item.display_id }} for bulk dismissal" {% if item.human_outcome != 'pending' %}disabled{% endif %}></td>
                         <td><code>{{ item.display_id }}</code></td>
                         <td class="small">{{ item.video_name }}</td>
                         <td class="small">#{{ item.track_id }} · occ {{ item.occurrence_index }}<br>
@@ -175,7 +182,7 @@
                     </tr>
                     {% else %}
                     <tr id="detailEmptyRow">
-                        <td colspan="8" class="text-center text-muted py-4">No motorcycle detail candidates match this filter. Processing must first save motorcycle evidence candidates; then a designated compatible detail checkpoint can scan them. The scan provides human-review evidence and does not automatically create or confirm a violation.</td>
+                        <td colspan="9" class="text-center text-muted py-4">No motorcycle detail candidates match this filter. Processing must first save motorcycle evidence candidates; then a designated compatible detail checkpoint can scan them. The scan provides human-review evidence and does not automatically create or confirm a violation.</td>
                     </tr>
                     {% endfor %}
                 </tbody>

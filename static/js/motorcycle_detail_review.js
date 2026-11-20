@@ -266,11 +266,75 @@ if (typeof module !== "undefined" && module.exports) {
     const pendingCount = document.getElementById("detailPendingCount");
     const queueStatus = document.getElementById("detailQueueStatus");
     const scanQueuedButton = document.getElementById("btnScanQueuedDetails");
+    const selectAll = document.getElementById("detailSelectAll");
+    const bulkDismissButton = document.getElementById("detailBulkDismiss");
+    const bulkStatus = document.getElementById("detailBulkStatus");
     let activeDecisionItem = null;
     let activeDecisionRow = null;
     const evidenceModal = modalEl && bootstrap && bootstrap.Modal
         ? new bootstrap.Modal(modalEl)
         : null;
+
+    function refreshBulkControls() {
+        if (!selectAll && !bulkDismissButton) return;
+        const eligible = Array.from(document.querySelectorAll("#detailBody .detail-select-item:not(:disabled)"));
+        const selected = eligible.filter(function (checkbox) { return checkbox.checked; });
+        if (bulkDismissButton) {
+            bulkDismissButton.disabled = selected.length === 0;
+            const count = bulkDismissButton.querySelector("[data-selected-count]");
+            if (count) count.textContent = String(selected.length);
+        }
+        if (selectAll) {
+            selectAll.disabled = eligible.length === 0;
+            selectAll.checked = eligible.length > 0 && selected.length === eligible.length;
+            selectAll.indeterminate = selected.length > 0 && selected.length < eligible.length;
+        }
+    }
+
+    document.addEventListener?.("change", function (event) {
+        if (event.target.matches(".detail-select-item")) refreshBulkControls();
+        if (event.target === selectAll) {
+            document.querySelectorAll("#detailBody .detail-select-item:not(:disabled)").forEach(function (checkbox) {
+                checkbox.checked = selectAll.checked;
+            });
+            refreshBulkControls();
+        }
+    });
+
+    bulkDismissButton?.addEventListener("click", async function () {
+        const checkboxes = Array.from(document.querySelectorAll("#detailBody .detail-select-item:checked:not(:disabled)"));
+        if (!checkboxes.length) return;
+        if (!window.confirm("Dismiss " + checkboxes.length + " selected pending motorcycle detail item(s)? The evidence records will be kept.")) return;
+        bulkDismissButton.disabled = true;
+        let dismissed = 0;
+        const failures = [];
+        for (const checkbox of checkboxes) {
+            const row = checkbox.closest("tr[data-item]");
+            let item;
+            try {
+                item = JSON.parse(row.dataset.item);
+                const response = await fetch("/api/motorcycle-detail-review/" + item.id + "/outcome", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(detailOutcomeRequestBody(item, "dismissed"))
+                });
+                const result = await response.json();
+                if (!response.ok || !result.success) throw new Error(result.error || "Could not dismiss item.");
+                dismissed += 1;
+            } catch (error) {
+                const displayId = item && item.display_id ? item.display_id : "candidate";
+                failures.push(displayId + ": " + (error.message || "Request failed."));
+            }
+        }
+        if (bulkStatus) {
+            bulkStatus.textContent = failures.length
+                ? "Dismissed " + dismissed + "; " + failures.length + " failed. Refreshing to show current outcomes. " + failures.join("; ")
+                : "Dismissed " + dismissed + " item(s). Refreshing the queue.";
+        }
+        window.TAVIDMRefreshNavCounts?.(true);
+        window.setTimeout(function () { window.location.reload(); }, 900);
+    });
+    refreshBulkControls();
 
     function showToast(title, message, tone) {
         if (window.TAVIDMMainUI && typeof window.TAVIDMMainUI.showToast === "function") {
@@ -421,6 +485,12 @@ if (typeof module !== "undefined" && module.exports) {
                     if (payload.reviewer_notes !== undefined) item.reviewer_notes = payload.reviewer_notes;
                     if (payload.review_revision) item.review_revision = payload.review_revision;
                     row.dataset.item = JSON.stringify(item);
+                    const selector = row.querySelector(".detail-select-item");
+                    if (selector && payload.outcome !== "pending") {
+                        selector.checked = false;
+                        selector.disabled = true;
+                        refreshBulkControls();
+                    }
                     const reviewMeta = row.querySelector("[data-review-meta]");
                     if (reviewMeta) {
                         const parts = [];

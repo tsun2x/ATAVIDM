@@ -33,7 +33,12 @@
                aria-pressed="{{ 'true' if pickup_outcome == state else 'false' }}">{{ state|capitalize }}</a>
             {% endfor %}
         </div>
+        <div class="d-flex align-items-center gap-2">
+            <label class="form-check mb-0"><input class="form-check-input" type="checkbox" id="pickupSelectAll"> <span class="form-check-label small">Select pending on this page</span></label>
+            <button type="button" class="btn btn-sm btn-outline-danger" id="pickupBulkDismiss" disabled>Dismiss selected (<span data-selected-count>0</span>)</button>
+        </div>
     </div>
+    <div class="card-footer py-2 small text-muted" id="pickupBulkStatus" aria-live="polite">Bulk dismissal keeps the review records and marks selected pending items as dismissed.</div>
 </div>
 
 {% if not pickup_items %}
@@ -46,7 +51,7 @@
 {% for item in pickup_items %}
 <article class="card card-panel mb-3 pickup-review-item" data-candidate-id="{{ item.id }}" data-outcome="{{ item.human_outcome }}">
     <div class="card-header d-flex flex-wrap justify-content-between gap-2">
-        <div><code>{{ item.display_id }}</code> · {{ item.video_name }}</div>
+        <div class="d-flex align-items-center gap-2"><input class="form-check-input pickup-select-item" type="checkbox" aria-label="Select {{ item.display_id }} for bulk dismissal" {% if item.human_outcome != 'pending' %}disabled{% endif %}><span><code>{{ item.display_id }}</code> · {{ item.video_name }}</span></div>
         <span class="badge bg-secondary" data-outcome>{{ item.human_outcome }}</span>
     </div>
     <div class="card-body">
