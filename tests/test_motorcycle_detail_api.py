@@ -285,6 +285,65 @@ def detail_env_path(test_db, candidate_id):
     row = test_db.get_motorcycle_detail_candidate(candidate_id)
     return json.loads(row["frames_json"])[0]["scene_path"]
 
+
+@pytest.mark.parametrize("scan_state,evidence_available,choice", [
+    ("ready", True, "no_side_mirror"), ("queued", True, "no_side_mirror"),
+    ("failed", True, "no_side_mirror"), ("scanning", True, "no_side_mirror"),
+    ("queued", False, "no_side_mirror"), ("queued", True, "no_violation"),
+])
+def test_manual_motorcycle_review_uses_saved_evidence(
+    detail_enforcer, seeded, test_db, monkeypatch, scan_state, evidence_available, choice,
+):
+    from database.review_revision import motorcycle_detail_review_revision
+
+    video_id, candidate_id = seeded
+    run_id = test_db.create_processing_run(video_id, json.dumps(["No Side Mirror"]))
+    test_db.start_processing_run(run_id)
+    test_db.finish_processing_run(run_id)
+    with test_db.db_session() as conn:
+        conn.execute(
+            "UPDATE motorcycle_detail_candidates SET processing_run_id = ?, scan_state = ? WHERE id = ?",
+            (run_id, scan_state, candidate_id),
+        )
+    row = test_db.get_motorcycle_detail_candidate(candidate_id)
+    if not evidence_available:
+        Path(json.loads(row["frames_json"])[0]["scene_path"]).unlink()
+    calls = []
+
+    def queue(adapter, review_id, lead, *, kind):
+        assert adapter.get_review_item(review_id)["status"] == "pending"
+        calls.append((review_id, lead["id"], kind))
+
+    monkeypatch.setattr("core.plate_runtime.queue_detail_review_ocr", queue)
+    url = f"/api/motorcycle-detail-review/{candidate_id}"
+    assert detail_enforcer.get(url).json["item"]["can_review_saved_evidence"] is evidence_available
+    payload = {
+        "choice": choice, "human_confirmed": True, "send_to_review": choice != "no_violation",
+        "expected_revision": motorcycle_detail_review_revision(row), "expected_outcome": "pending",
+    }
+    if scan_state != "ready" and payload["send_to_review"]:
+        direct_confirmation = detail_enforcer.post(f"{url}/decision", json={**payload, "send_to_review": False})
+        assert direct_confirmation.status_code == 409
+        assert test_db.list_review_items_for_video(video_id, status=None) == []
+    response = detail_enforcer.post(f"{url}/decision", json=payload)
+    if not evidence_available:
+        assert response.status_code == 409
+        assert "saved source frame" in response.json["error"]
+        assert calls == []
+        assert test_db.list_review_items_for_video(video_id, status=None) == []
+        return
+    assert response.status_code == 200, response.json
+    review_id = response.json["review_id"]
+    assert test_db.list_violation_rows_for_video(video_id) == []
+    if choice == "no_violation":
+        assert response.json["creates_case"] is False
+        assert test_db.get_review_item(review_id)["status"] != "pending"
+        assert calls == []
+        return
+    assert calls == [(review_id, candidate_id, "motorcycle")]
+    assert test_db.get_motorcycle_detail_no_helmet_review(candidate_id)["id"] == review_id
+    assert test_db.get_review_item(review_id)["violation_type"] == "No Side Mirror"
+
     def test_evidence_outside_the_private_root_is_refused(self, detail_enforcer, test_db, detail_env):
         owner = test_db.get_user_by_username("detail_enforcer")
         video_id = test_db.insert_video("leak.mp4", "/tmp/leak.mp4", status="processed", uploaded_by=owner["id"])

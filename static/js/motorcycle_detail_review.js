@@ -271,18 +271,23 @@ function buildEvidenceMarkup(item) {
         ["no_side_mirror", "No Side Mirror", "Sends evidence to Violation Review"],
         ["no_violation", "No Violation", "Closes this review without creating a case"]
     ];
+    const canReview = item.can_review_saved_evidence ?? (item.scan_state === "ready");
+    const disabled = canReview ? "" : " disabled";
     const choiceMarkup = choices.map(function (choice) {
-        return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="radio" name="detailDecisionChoice" value="' + choice[0] + '"' + (item.scan_state !== "ready" ? " disabled" : "") + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
+        return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="radio" name="detailDecisionChoice" value="' + choice[0] + '"' + disabled + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
     }).join("");
-    const scanGateMessage = item.scan_state === "ready" ? ""
-        : item.scan_state === "queued"
-            ? '<p class="small text-warning mt-2 mb-0" role="status">Decision choices unlock when this candidate\'s evidence scan is ready. Start queued work with “Scan queued evidence” when that button is available.</p>'
-            : item.scan_state === "scanning"
-                ? '<p class="small text-warning mt-2 mb-0" role="status">Decision choices unlock when the current evidence scan finishes.</p>'
-                : '<p class="small text-warning mt-2 mb-0" role="status">Decision choices are unavailable because this evidence scan did not finish successfully. Check the scan status and error before retrying.</p>';
+    let reviewMessage = "";
+    if (!canReview) {
+        const reason = item.linked_review_status && item.linked_review_status !== "pending"
+            ? "This linked review is already closed."
+            : "A saved source frame from the current completed run is required.";
+        reviewMessage = '<p class="small text-warning mt-2 mb-0" role="status">' + reason + '</p>';
+    } else if (item.scan_state !== "ready") {
+        reviewMessage = '<p class="small text-muted mt-2 mb-0" role="status">Review the saved evidence while the optional model scan is unavailable or incomplete.</p>';
+    }
     return '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="detailEvidenceScale">Evidence size</label><input id="detailEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
         videoMarkup + frameMarkup + '<dl class="row small mt-3 mb-0">' + facts + "</dl>" + reasonMarkup +
-        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + (item.scan_state !== "ready" ? " disabled" : "") + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span>' + scanGateMessage + "</section>";
+        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + disabled + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span>' + reviewMessage + "</section>";
 }
 
 if (typeof module !== "undefined" && module.exports) {

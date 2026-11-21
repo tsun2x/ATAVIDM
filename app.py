@@ -3504,6 +3504,27 @@ def _motorcycle_detail_can_confirm(
         return False
 
 
+def _motorcycle_saved_scene(row: dict[str, Any]) -> Path | None:
+    """Find the private scene that matches the candidate's selected source frame."""
+    frames = _detail_json(row.get("frames_json"), [])
+    if not isinstance(frames, list):
+        return None
+    root = Path(config.BASE_DIR) / config.EVIDENCE_FOLDER / "detail"
+    for frame in frames:
+        if not isinstance(frame, dict) or frame.get("frame_number") != row.get("frame_number"):
+            continue
+        stored = frame.get("scene_path")
+        if not isinstance(stored, str) or not stored:
+            continue
+        try:
+            scene = resolve_under_roots(Path(config.BASE_DIR) / stored, [root])
+            if scene.stat().st_size > 0:
+                return scene
+        except (MediaPathError, OSError, RuntimeError):
+            continue
+    return None
+
+
 def _motorcycle_detail_to_ui(
     row: dict[str, Any], videos: dict[int, dict], linked_review: dict[str, Any] | None = None,
     current_run: dict[str, Any] | None = None,
@@ -3521,6 +3542,11 @@ def _motorcycle_detail_to_ui(
         and int(run.get("id") or 0) == int(row["processing_run_id"])
         and run.get("annotated_video_ready")
         else None
+    )
+    can_review_saved_evidence = bool(
+        run and run["id"] == row.get("processing_run_id")
+        and (linked_review is None or linked_review.get("status") == "pending")
+        and _motorcycle_saved_scene(row) is not None
     )
     return {
         "id": row["id"],
@@ -3556,6 +3582,7 @@ def _motorcycle_detail_to_ui(
         "annotated_video_url": annotated_url,
         "linked_review_id": linked_review.get("id") if linked_review else None,
         "linked_review_status": linked_review.get("status") if linked_review else None,
+        "can_review_saved_evidence": can_review_saved_evidence,
         "can_confirm": _motorcycle_detail_can_confirm(row, linked_review, run),
         "case_action": "confirm_no_helmet" if _motorcycle_detail_can_confirm(row, linked_review, run) else None,
     }
@@ -4114,13 +4141,13 @@ def api_motorcycle_detail_decision(candidate_id: int):
     row = db.get_motorcycle_detail_candidate(candidate_id)
     if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
-    if row.get("scan_state") != "ready":
-        return jsonify({"success": False, "error": "Wait for the evidence scan to finish before deciding."}), 409
-
     reviewer_id = int(auth.current_user()["id"])
     label, selected_rule = choices[choice]
     send_to_review = payload.get("send_to_review") is True
-    if send_to_review:
+    review_saved_evidence = send_to_review or selected_rule is None
+    if not review_saved_evidence and row.get("scan_state") != "ready":
+        return jsonify({"success": False, "error": "Wait for the evidence scan before confirming a case."}), 409
+    if review_saved_evidence:
         origin = request.headers.get("Origin")
         if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
             return jsonify({"success": False, "error": "Send motorcycle evidence from Motorcycle Detail Review."}), 403
@@ -4133,17 +4160,22 @@ def api_motorcycle_detail_decision(candidate_id: int):
     frames = _detail_json(row.get("frames_json"), [])
     evidence_path = next((frame.get("scene_path") for frame in frames
                           if isinstance(frame, dict) and frame.get("scene_path")), None) if isinstance(frames, list) else None
-    if linked is None and (not evidence_path or row.get("video_id") is None or row.get("processing_run_id") is None):
+    if not review_saved_evidence and linked is None and (
+        not evidence_path or row.get("video_id") is None or row.get("processing_run_id") is None
+    ):
         return jsonify({"success": False, "error": "This candidate has no stored source-frame evidence."}), 409
     try:
         # Candidate outcome, linked queue item, and final case/no-case decision
         # share the SQLite write transaction; a failed decision rolls back all
         # three so the UI cannot say "reviewed" without recording the choice.
         with db.review_write_transaction():
-            if send_to_review:
+            if review_saved_evidence:
                 run = db.get_current_completed_result_run(row["video_id"]) if row.get("video_id") else None
                 if not run or run["id"] != row.get("processing_run_id"):
                     raise ReviewDecisionConflict("This observation needs evidence from the current completed run.")
+                evidence_path = _motorcycle_saved_scene(row)
+                if evidence_path is None:
+                    raise ReviewDecisionConflict("The saved source frame for this observation is unavailable.")
             snapshot = db.record_motorcycle_detail_review(
                 candidate_id=candidate_id,
                 outcome="reviewed",

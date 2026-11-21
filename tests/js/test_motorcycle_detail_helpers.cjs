@@ -158,6 +158,20 @@ assert.ok(summarizedMarkup.includes("Raw model predictions"));
 assert.ok(summarizedMarkup.includes("helmet_acceptable 81%"));
 assert.ok(summarizedMarkup.includes("helmet_nut_shell 69%"));
 
+const queuedManualReview = detailUi.buildEvidenceMarkup({
+    scan_state: "queued", can_review_saved_evidence: true,
+    frames: [{ index: 1, scene_url: "/scene.jpg" }]
+});
+assert.match(queuedManualReview, /name="detailDecisionChoice" value="no_helmet">/);
+assert.match(queuedManualReview, /data-detail-submit-choice>/);
+assert.match(queuedManualReview, /saved evidence/i);
+
+const missingEvidence = detailUi.buildEvidenceMarkup({
+    scan_state: "ready", can_review_saved_evidence: false, frames: []
+});
+assert.match(missingEvidence, /name="detailDecisionChoice" value="no_helmet" disabled>/);
+assert.match(missingEvidence, /data-detail-submit-choice disabled>/);
+
 // Attribution context: older rows say nearby motorcycles were not recorded.
 assert.ok(detailUi.describeAttribution({ context: { recorded: false } }).includes("not recorded"));
 assert.ok(detailUi.describeAttribution({

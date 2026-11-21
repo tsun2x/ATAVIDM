@@ -81,11 +81,12 @@
     <code>motorcycle_detail_weights</code> system setting) points to a separate three-class
     or four-class motorcycle detail checkpoint whose class map is exactly one of the contracts above.
     The main object checkpoint and any other ID order are rejected; class IDs are never relabeled.
+    Manual review is available when the current run has a saved source frame.
 </div>
 {% elif not detail_gate.exists %}
 <div class="alert alert-danger py-2 small" role="status">
     Detail checkpoint configured but missing on disk: <code>{{ detail_gate.path }}</code>.
-    Crop scans stay queued and fail closed.
+    Crop scans stay queued. Manual review is available when the current run has a saved source frame.
 </div>
 {% endif %}
 
