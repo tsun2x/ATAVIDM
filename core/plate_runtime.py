@@ -14,7 +14,9 @@ retained-crop reservation.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 import threading
 from importlib.util import find_spec
@@ -38,6 +40,7 @@ from core.plate_settings import (
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
+_DETAIL_SUBMISSION_LOCK = threading.Lock()
 _RUNTIME: "PlateRuntime | None" = None
 _RUNTIME_BUILT = False
 _LAST_ERROR: str | None = None
@@ -331,3 +334,81 @@ def worker_state_for(review_id: int | None) -> str | None:
     if runtime is None or review_id is None:
         return None
     return runtime.worker.state_for(review_id)
+
+
+def queue_detail_review_ocr(adapter: Any, review_id: int, lead: dict[str, Any], *, kind: str) -> None:
+    """Offer stored vehicle evidence to OCR after the review transaction commits."""
+    try:
+        runtime = get_runtime()
+        if runtime is None:
+            return
+        with _DETAIL_SUBMISSION_LOCK:
+            if runtime.worker.state_for(review_id) or manifests.attempts_for_review(review_id):
+                return
+            _submit_detail_evidence(runtime, adapter, review_id, lead, kind)
+    except Exception:
+        logger.exception("Plate OCR could not be prepared for detail review %s", review_id)
+
+
+def _submit_detail_evidence(
+    runtime: PlateRuntime, adapter: Any, review_id: int, lead: dict[str, Any], kind: str,
+) -> None:
+    import cv2
+    import config
+    from core.detection_config import VEHICLE_CLASSES
+    from core.media_serve import resolve_under_roots
+
+    pickup = kind == "pickup"
+    track_id = lead["pickup_track_id" if pickup else "track_id"]
+    review = adapter.get_review_item(review_id)
+    if not review or not lead.get("processing_run_id") or (
+        review.get("video_id"), review.get("processing_run_id"), review.get("track_id")
+    ) != (lead.get("video_id"), lead["processing_run_id"], track_id):
+        return
+
+    directory = Path(config.BASE_DIR) / config.EVIDENCE_FOLDER / ("pickup_detail" if pickup else "detail")
+    occurrence_root = resolve_under_roots(
+        directory / lead["run_key"] / lead["occurrence_key"], [directory], must_exist=False,
+    )
+    frames = json.loads(lead.get("frames_json") or "[]")
+    if not isinstance(frames, list):
+        frames = []
+    ordered = sorted(
+        (frame for frame in frames if isinstance(frame, dict) and type(frame.get("frame_number")) is int),
+        key=lambda frame: frame["frame_number"],
+    )
+    collector = runtime.new_collector(source="video", run_key=f"run_{lead['processing_run_id']}")
+    epoch = lead.get("pickup_identity_epoch") if pickup else None
+    collector.register(
+        review_id=review_id, track_id=track_id, identity_epoch=epoch,
+        violation_type=review["violation_type"], frame_number=review["frame_number"],
+        timestamp_sec=review["timestamp_sec"],
+    )
+    offered = False
+    try:
+        for frame in ordered[:int(runtime.settings.bounds["max_crops_per_observation"])]:
+            try:
+                stored_box = frame["pickup_bbox" if pickup else "detection_bbox"]
+                box = {f"bbox_{axis}": float(stored_box[axis]) for axis in ("x", "y", "w", "h")}
+                timestamp = float(frame["timestamp_sec"])
+                if not all(math.isfinite(number) for number in (*box.values(), timestamp)):
+                    continue
+                if box["bbox_w"] <= 0 or box["bbox_h"] <= 0:
+                    continue
+                path = resolve_under_roots(Path(config.BASE_DIR) / frame["scene_path"], [occurrence_root])
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
+            image = cv2.imread(str(path))
+            if image is None or image.shape[:2] != (lead.get("source_height"), lead.get("source_width")):
+                continue
+            frame_number = frame["frame_number"]
+            neighbors = adapter.get_detections_by_video(
+                lead["video_id"], frame_number, frame_number, processing_run_id=lead["processing_run_id"],
+            )
+            target = {"track_id": track_id, "track_identity_epoch": epoch, **box}
+            vehicles = [row for row in neighbors if row.get("class_label") in VEHICLE_CLASSES
+                        and row.get("track_id") != track_id]
+            collector.observe(image, frame_number, timestamp, [target, *vehicles])
+            offered = True
+    finally:
+        collector.flush("stored_detail_evidence" if offered else "no_attributable_detail_frame")

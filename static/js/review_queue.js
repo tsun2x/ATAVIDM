@@ -121,7 +121,11 @@ if (typeof document !== "undefined") {
     "use strict";
 
     const tbody = document.getElementById("reviewBody");
-    const evidenceModal = new bootstrap.Modal(document.getElementById("evidenceModal"));
+    const evidenceModalElement = document.getElementById("evidenceModal");
+    const evidenceModal = new bootstrap.Modal(evidenceModalElement);
+    evidenceModalElement?.addEventListener("hidden.bs.modal", function () {
+        window.__tavidmEvidenceItem = null;
+    });
     const decisionModalEl = document.getElementById("decisionModal");
     const decisionModal = decisionModalEl ? new bootstrap.Modal(decisionModalEl) : null;
     const pendingCount = document.getElementById("pendingCount");
@@ -275,7 +279,7 @@ if (typeof document !== "undefined") {
         body.textContent = "Loading optional plate evidence…";
     }
 
-    function loadPlateDetails(item) {
+    function loadPlateDetails(item, pollsRemaining = 20) {
         const cached = plateDetailsCache.get(String(item.id));
         if (cached) {
             Object.assign(item, cached, { plate_details_loaded: true });
@@ -296,9 +300,18 @@ if (typeof document !== "undefined") {
                 review_plate_choice: payload.review_plate_choice || null,
                 plate_details_loaded: true,
             };
-            plateDetailsCache.set(String(item.id), details);
+            const running = ["queued", "processing"].includes(details.plate_machine?.state);
+            if (!running && details.plate_machine?.state !== "none") {
+                plateDetailsCache.set(String(item.id), details);
+            }
             Object.assign(item, details);
-            if (String(window.__tavidmEvidenceItem?.id) === String(item.id)) renderPlateOcr(item);
+            if (window.__tavidmEvidenceItem !== item) return;
+            renderPlateOcr(item);
+            if (running && pollsRemaining > 0) {
+                window.setTimeout(function () {
+                    if (window.__tavidmEvidenceItem === item) loadPlateDetails(item, pollsRemaining - 1);
+                }, 1500);
+            }
         }).catch(function () {
             if (String(window.__tavidmEvidenceItem?.id) !== String(item.id)) return;
             const badge = document.getElementById("plateOcrStateBadge");

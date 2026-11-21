@@ -60,8 +60,13 @@
         <p class="mb-2">Pickup candidate track <strong>#{{ item.pickup_track_id }}</strong> · Person track <strong>#{{ item.person_track_id }}</strong>
             {% if item.association.vehicle_class_at_scan == 'car' %}<span class="text-muted">(main detector labeled this vehicle as car; pickup fallback scan)</span>{% endif %}
             · Run {{ item.processing_run_id or 'unattributed' }} · {{ item.frame_count }} tracked observations</p>
+        {% if item.association.state == 'moving_with_pickup_bed_uncertain' %}
+        <p class="mb-2"><span class="badge text-bg-warning">Person moving with pickup · bed location uncertain</span></p>
+        {% endif %}
         {% if item.source_video_url %}
-        <p><a href="{{ item.source_video_url }}#t={{ item.episode_start_sec or 0 }},{{ item.timestamp_sec or 0 }}" target="_blank" rel="noopener">Open source video at evidence interval</a></p>
+        {% set observations = item.association.observations or [] %}
+        {% set evidence_end = observations[-1].timestamp_sec if observations else item.timestamp_sec %}
+        <p><a href="{{ item.source_video_url }}#t={{ item.episode_start_sec or 0 }},{{ evidence_end or 0 }}" target="_blank" rel="noopener">Open source video at evidence interval</a></p>
         {% endif %}
         {% for frame in item.frames %}
         <div class="row g-3 mb-3">

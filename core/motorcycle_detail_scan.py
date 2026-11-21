@@ -1107,7 +1107,7 @@ class MotorcycleDetailScanner:
                     no_helmet_review = _no_helmet_review_payload(
                         row, result, checkpoint, confidence_floor=self.conf
                     )
-                    self.adapter.finish_motorcycle_detail_scan(
+                    review_id = self.adapter.finish_motorcycle_detail_scan(
                         candidate_id=candidate_id,
                         observations_json=result["observations_json"],
                         association_json=result["association_json"],
@@ -1117,6 +1117,10 @@ class MotorcycleDetailScanner:
                         scan_seconds=result["scan_seconds"],
                         no_helmet_review_candidate=no_helmet_review,
                     )
+                    if review_id is not None:
+                        from core.plate_runtime import queue_detail_review_ocr
+
+                        queue_detail_review_ocr(self.adapter, review_id, row, kind="motorcycle")
                     report["ready"] += 1
                     self.stats["ready"] += 1
                 except Exception as exc:

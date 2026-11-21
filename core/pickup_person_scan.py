@@ -25,7 +25,7 @@ from core.tracker import TRACK_EXPIRY_SEC
 
 logger = logging.getLogger(__name__)
 
-SCANNER_VERSION = "pickup-person-scan-3"
+SCANNER_VERSION = "pickup-person-scan-4"
 # Raw person boxes down to this score are logged for missed-rider diagnosis;
 # only boxes at or above the scanner confidence can become review evidence.
 DIAGNOSTIC_CONFIDENCE = 0.10
@@ -44,6 +44,7 @@ GROUND_MIN_HEIGHT_RATIO = 0.80
 # Overlapping pickup crops can see the same person; it is linked only to the
 # best-matching pickup at or above this frame-space IoU.
 EXCLUSIVE_ASSIGNMENT_IOU = 0.50
+EXCLUSIVE_ASSIGNMENT_MIN_COVERAGE = 0.75
 
 
 def _box(det: Mapping[str, Any]) -> tuple[float, float, float, float]:
@@ -53,14 +54,32 @@ def _box(det: Mapping[str, Any]) -> tuple[float, float, float, float]:
     )
 
 
-def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+def _intersection_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     ax1, ay1, aw, ah = a
     bx1, by1, bw, bh = b
     iw = max(0.0, min(ax1 + aw, bx1 + bw) - max(ax1, bx1))
     ih = max(0.0, min(ay1 + ah, by1 + bh) - max(ay1, by1))
-    intersection = iw * ih
-    union = aw * ah + bw * bh - intersection
+    return iw * ih
+
+
+def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    intersection = _intersection_area(a, b)
+    union = a[2] * a[3] + b[2] * b[3] - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def _same_person_across_crops(
+    first: Mapping[str, Any], second: Mapping[str, Any],
+) -> bool:
+    a, b = _box(first), _box(second)
+    intersection = _intersection_area(a, b)
+    area_a, area_b = a[2] * a[3], b[2] * b[3]
+    # A crop can truncate the detection, lowering IoU even when the smaller
+    # box is mostly contained in the larger one.
+    return (
+        intersection >= EXCLUSIVE_ASSIGNMENT_IOU * (area_a + area_b - intersection)
+        or intersection >= EXCLUSIVE_ASSIGNMENT_MIN_COVERAGE * min(area_a, area_b)
+    )
 
 
 def _center_distance(
@@ -449,8 +468,8 @@ class PickupPersonCropScanner:
                         "persons": persons_log,
                     })
 
-            # Link each person to exactly one pickup: an elevated, centred,
-            # confident match wins over other pickups whose crops overlap it.
+            # Retain one box for annotation, but withhold review credit when
+            # another pickup's crop also contains that person.
             kept.sort(
                 key=lambda item: (
                     item[1]["rider_geometry"]["label"] == "elevated",
@@ -462,16 +481,25 @@ class PickupPersonCropScanner:
             detections_by_pickup: dict[tuple[int, int], list[dict[str, Any]]] = {
                 candidate["key"]: [] for candidate in pickups
             }
-            accepted: list[tuple[tuple[int, int], dict[str, Any]]] = []
+            accepted: list[tuple[tuple[int, int], dict[str, Any], dict[str, Any]]] = []
             for candidate, mapped, entry in kept:
-                if any(
-                    other_key != candidate["key"]
-                    and _iou(_box(mapped), _box(other)) >= EXCLUSIVE_ASSIGNMENT_IOU
-                    for other_key, other in accepted
-                ):
+                duplicate = next(
+                    (
+                        (other, other_entry)
+                        for other_key, other, other_entry in accepted
+                        if other_key != candidate["key"] and _same_person_across_crops(mapped, other)
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    other, other_entry = duplicate
+                    other["pickup_ownership_contested"] = True
+                    other_entry["pickup_ownership_contested"] = True
+                    if "overlaps_primary_track_id" in mapped:
+                        other.setdefault("overlaps_primary_track_id", mapped["overlaps_primary_track_id"])
                     entry["decision"] = "assigned_to_other_pickup"
                     continue
-                accepted.append((candidate["key"], mapped))
+                accepted.append((candidate["key"], mapped, entry))
                 detections_by_pickup[candidate["key"]].append(mapped)
             output = self._assign_tracks(detections_by_pickup, ts)
             for _candidate, mapped, entry in kept:

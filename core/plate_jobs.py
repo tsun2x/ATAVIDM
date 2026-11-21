@@ -360,8 +360,14 @@ class PlateInferenceWorker:
             reserved_bytes=reserved,
             enqueued_monotonic=time.monotonic(),
         )
+        if observation.association_uncertain:
+            self._release(job)
+            self._write_terminal(attempt_id, observation, PlateAttemptOutcome.ASSOCIATION_UNCERTAIN)
+            return True
         try:
-            self._queue.put_nowait(job)
+            with self._lock:
+                self._queue.put_nowait(job)
+                self._states[int(observation.review_id)] = PlateAttemptOutcome.QUEUED.value
         except queue.Full:
             with self._lock:
                 self.rejected_saturated += 1
@@ -373,7 +379,6 @@ class PlateInferenceWorker:
                 extra={"reason": "queue_saturated", "queued": False},
             )
             return False
-        self._set_state(observation.review_id, PlateAttemptOutcome.QUEUED.value)
         return True
 
     def _release(self, job: _Job) -> None:

@@ -3471,6 +3471,7 @@ def _motorcycle_detail_can_confirm(
     current_run: dict[str, Any] | None = None,
 ) -> bool:
     if (not linked_review or linked_review.get("status") != "pending"
+            or linked_review.get("violation_type") != "No Helmet"
             or row.get("scan_state") != "ready"
             or row.get("human_outcome") not in ("pending", "reviewed")
             or row.get("processing_run_id") is None):
@@ -3737,6 +3738,7 @@ def api_pickup_detail_evidence(candidate_id: int, kind: str):
 @auth.role_required("enforcer")
 def api_send_pickup_to_review(candidate_id: int):
     from core.pickup_review_handoff import PickupHandoffConflict, PickupHandoffNotFound, send_pickup_to_review
+    from core.plate_runtime import queue_detail_review_ocr
 
     origin = request.headers.get("Origin")
     if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
@@ -3762,6 +3764,8 @@ def api_send_pickup_to_review(candidate_id: int):
         return jsonify({"success": False, "error": str(exc)}), 403
     except PickupHandoffConflict as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
+    if result["review_status"] == "pending":
+        queue_detail_review_ocr(db, result["review_id"], db.get_pickup_detail_candidate(candidate_id), kind="pickup")
     return jsonify({"success": True, **result}), 200 if result["idempotent"] else 201
 
 
@@ -3985,6 +3989,7 @@ def api_motorcycle_detail_outcome(candidate_id: int):
 def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
     """Create a No Helmet case only after an explicit human evidence decision."""
     from core.case_review_service import CaseReviewError
+    from core.plate_runtime import queue_detail_review_ocr
     from core.review_decision_service import (
         DECISION_CONFIRM, ReviewDecisionConflict, ReviewDecisionError, apply_review_decision,
     )
@@ -4043,6 +4048,8 @@ def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
             return jsonify({"success": False, "error": f"Could not create the linked review record: {exc}"}), 409
     if not linked or linked.get("status") != "pending":
         return jsonify({"success": False, "error": "The linked review item is no longer pending."}), 409
+    if linked.get("violation_type") != "No Helmet":
+        return jsonify({"success": False, "error": "Resolve the linked proposal in Violation Review."}), 409
     try:
         result = apply_review_decision(
             db,
@@ -4052,6 +4059,7 @@ def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
             reason=reason,
             idempotency_key=f"motorcycle-detail:{candidate_id}:confirm-no-helmet",
         )
+        queue_detail_review_ocr(db, linked["id"], row, kind="motorcycle")
         return jsonify({"success": True, "review_id": linked["id"], **result})
     except TemporalEvidenceNotReady as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
@@ -4070,6 +4078,7 @@ def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
 def api_motorcycle_detail_decision(candidate_id: int):
     """Record a human-selected motorcycle disposition through the review queue."""
     from core.case_review_service import CaseReviewError
+    from core.plate_runtime import queue_detail_review_ocr
     from core.detection_config import (
         VIOLATION_NO_HELMET,
         VIOLATION_NO_SIDE_MIRROR,
@@ -4110,6 +4119,13 @@ def api_motorcycle_detail_decision(candidate_id: int):
 
     reviewer_id = int(auth.current_user()["id"])
     label, selected_rule = choices[choice]
+    send_to_review = payload.get("send_to_review") is True
+    if send_to_review:
+        origin = request.headers.get("Origin")
+        if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify({"success": False, "error": "Send motorcycle evidence from Motorcycle Detail Review."}), 403
+    if send_to_review and selected_rule is None:
+        return jsonify({"success": False, "error": "Choose a proposed violation to send to Violation Review."}), 400
     if selected_rule is not None and not db.can_confirm_case(reviewer_id):
         return jsonify({"success": False, "error": "Your account does not have case-confirmation authority."}), 403
     note = "Reviewer selected: " + label
@@ -4124,6 +4140,10 @@ def api_motorcycle_detail_decision(candidate_id: int):
         # share the SQLite write transaction; a failed decision rolls back all
         # three so the UI cannot say "reviewed" without recording the choice.
         with db.review_write_transaction():
+            if send_to_review:
+                run = db.get_current_completed_result_run(row["video_id"]) if row.get("video_id") else None
+                if not run or run["id"] != row.get("processing_run_id"):
+                    raise ReviewDecisionConflict("This observation needs evidence from the current completed run.")
             snapshot = db.record_motorcycle_detail_review(
                 candidate_id=candidate_id,
                 outcome="reviewed",
@@ -4143,7 +4163,7 @@ def api_motorcycle_detail_decision(candidate_id: int):
                 review_id = db.insert_review_queue(
                     video_id=int(row["video_id"]),
                     track_id=int(row["track_id"]),
-                    violation_type=VIOLATION_NO_HELMET,
+                    violation_type=selected_rule if send_to_review else VIOLATION_NO_HELMET,
                     confidence=score,
                     frame_number=int(row.get("frame_number") or 0),
                     timestamp_sec=float(row.get("timestamp_sec") or 0.0),
@@ -4156,18 +4176,28 @@ def api_motorcycle_detail_decision(candidate_id: int):
             if not linked or linked.get("status") != "pending":
                 raise ReviewDecisionConflict("The linked review item is already closed.")
 
-            decision = DECISION_NO_VIOLATION if choice == "no_violation" else (
-                DECISION_CONFIRM if selected_rule == linked.get("violation_type") else DECISION_CORRECT
-            )
-            result = apply_review_decision(
-                db,
-                int(linked["id"]),
-                reviewer_id,
-                decision=decision,
-                reason=f"Motorcycle Detail Review: reviewer inspected the evidence and selected {label}.",
-                selected_canonical_rule=selected_rule if decision == DECISION_CORRECT else None,
-                idempotency_key=f"motorcycle-detail:{candidate_id}:{motorcycle_detail_review_revision(snapshot)}:{choice}",
-            )
+            result = {}
+            if not send_to_review:
+                decision = DECISION_NO_VIOLATION if choice == "no_violation" else (
+                    DECISION_CONFIRM if selected_rule == linked.get("violation_type") else DECISION_CORRECT
+                )
+                result = apply_review_decision(
+                    db,
+                    int(linked["id"]),
+                    reviewer_id,
+                    decision=decision,
+                    reason=f"Motorcycle Detail Review: reviewer inspected the evidence and selected {label}.",
+                    selected_canonical_rule=selected_rule if decision == DECISION_CORRECT else None,
+                    idempotency_key=f"motorcycle-detail:{candidate_id}:{motorcycle_detail_review_revision(snapshot)}:{choice}",
+                )
+        if selected_rule is not None:
+            queue_detail_review_ocr(db, linked["id"], row, kind="motorcycle")
+        if send_to_review:
+            return jsonify({
+                "success": True, "review_id": linked["id"], "review_status": "pending",
+                "review_url": url_for("review_queue", video_id=row["video_id"]),
+                "proposed_rule": linked["violation_type"], "creates_case": False,
+            })
         return jsonify({"success": True, "choice": choice, "label": label,
                         "creates_case": choice != "no_violation", "review_id": linked["id"], **result})
     except TemporalEvidenceNotReady as exc:

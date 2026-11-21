@@ -4696,7 +4696,7 @@ def get_review_item(review_id: int) -> dict[str, Any] | None:
 
 
 def get_motorcycle_detail_no_helmet_review(candidate_id: int) -> dict[str, Any] | None:
-    """Find only the pending No Helmet row issued for this exact detail candidate."""
+    """Find the review row linked to this exact motorcycle detail candidate."""
     return list_motorcycle_detail_no_helmet_reviews([candidate_id]).get(int(candidate_id))
 
 
@@ -4712,7 +4712,6 @@ def list_motorcycle_detail_no_helmet_reviews(candidate_ids: list[int]) -> dict[i
                JOIN review_queue rq ON rq.video_id = mdc.video_id
                  AND rq.processing_run_id = mdc.processing_run_id
                  AND rq.track_id = mdc.track_id
-                 AND rq.violation_type = 'No Helmet'
                  AND instr(COALESCE(rq.reason_log, ''), '[motorcycle_detail_candidate:' || mdc.id || ']') > 0
                WHERE mdc.id IN ({placeholders})
                ORDER BY rq.id DESC""",
@@ -7269,7 +7268,7 @@ def finish_motorcycle_detail_scan(
     scan_class_map_json: str,
     scan_seconds: float | None = None,
     no_helmet_review_candidate: dict[str, Any] | None = None,
-) -> None:
+) -> int | None:
     """Atomically finish a detail scan and optionally queue positive evidence.
 
     The optional No Helmet row is still an ordinary pending review item. It is
@@ -7330,15 +7329,15 @@ def finish_motorcycle_detail_scan(
         marker = f"[motorcycle_detail_candidate:{int(candidate_id)}]"
         existing = conn.execute(
             """SELECT id FROM review_queue
-               WHERE processing_run_id = ? AND track_id = ? AND violation_type = ?
+               WHERE processing_run_id = ? AND track_id = ?
                  AND instr(COALESCE(reason_log, ''), ?) > 0
                ORDER BY id LIMIT 1""",
-            (run_id, int(source["track_id"]), "No Helmet", marker),
+            (run_id, int(source["track_id"]), marker),
         ).fetchone()
         if existing is not None:
             return
         values = dict(no_helmet_review_candidate)
-        insert_review_queue(
+        return insert_review_queue(
             video_id=video_id,
             track_id=int(source["track_id"]),
             violation_type="No Helmet",

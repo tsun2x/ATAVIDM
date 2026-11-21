@@ -263,9 +263,9 @@ function buildEvidenceMarkup(item) {
         ? '<ul class="nav nav-tabs mb-3" role="tablist">' + tabs.join("") + "</ul><div class='tab-content'>" + panes.join("") + "</div>"
         : '<p class="text-muted py-3 mb-0">No stored detail-frame images for this candidate. Source video playback is still available when present.</p>';
     const choices = [
-        ["no_helmet", "No Helmet", "Creates a No Helmet case"],
-        ["nut_shell_helmet", "Nut-shell helmet", "Creates a Substandard / Nut-Shell Helmet case"],
-        ["no_side_mirror", "No Side Mirror", "Creates a No Side Mirror case"],
+        ["no_helmet", "No Helmet", "Sends evidence to Violation Review"],
+        ["nut_shell_helmet", "Nut-shell helmet", "Sends evidence to Violation Review"],
+        ["no_side_mirror", "No Side Mirror", "Sends evidence to Violation Review"],
         ["no_violation", "No Violation", "Closes this review without creating a case"]
     ];
     const choiceMarkup = choices.map(function (choice) {
@@ -431,13 +431,17 @@ if (typeof module !== "undefined" && module.exports) {
             return;
         }
         const labels = {
-            no_helmet: "No Helmet case",
-            nut_shell_helmet: "Substandard / Nut-Shell Helmet case",
-            no_side_mirror: "No Side Mirror case",
+            no_helmet: "No Helmet",
+            nut_shell_helmet: "Substandard / Nut-Shell Helmet",
+            no_side_mirror: "No Side Mirror",
             no_violation: "No Violation (no case)"
         };
         const label = labels[selected.value];
-        if (!window.confirm("Are you sure? Save this human-reviewed decision as: " + label + "?")) return;
+        const sendToReview = selected.value !== "no_violation";
+        const confirmText = sendToReview
+            ? "Send this evidence to Violation Review with the proposed classification " + label + "?"
+            : "Close this observation as No Violation?";
+        if (!window.confirm(confirmText)) return;
         const item = activeDecisionItem;
         const row = activeDecisionRow;
         setRowBusy(row, true, "Saving decision…");
@@ -447,6 +451,7 @@ if (typeof module !== "undefined" && module.exports) {
             body: JSON.stringify({
                 choice: selected.value,
                 human_confirmed: true,
+                send_to_review: sendToReview,
                 expected_revision: item.review_revision || null,
                 expected_outcome: item.human_outcome || "pending"
             })
@@ -460,6 +465,10 @@ if (typeof module !== "undefined" && module.exports) {
             }
             if (evidenceModal) evidenceModal.hide();
             if (item.human_outcome === "pending") updateCounts();
+            if (result.payload.review_status === "pending") {
+                window.location.href = result.payload.review_url;
+                return;
+            }
             if (result.payload.creates_case) {
                 showToast("Violation case created", label + " is now available in Violations.", "success");
                 window.location.href = "/violations";

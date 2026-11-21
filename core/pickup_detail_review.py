@@ -11,7 +11,7 @@ import json
 import logging
 import math
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 import cv2
@@ -29,12 +29,16 @@ MIN_CROP_ASSOCIATION_SEC = 1.1
 # persist longer before review.
 MIN_STATIONARY_CROP_SEC = 2.0
 MIN_ELEVATED_FRACTION = 0.5
+MIN_AMBIGUOUS_SAMPLES = 4
+MAX_AMBIGUOUS_GAP_SEC = 0.6
+MAX_AMBIGUOUS_WINDOW_SEC = 2.5
 MAX_CROP_DECISIONS = 200
 MIN_SHARED_DISPLACEMENT_PX = 40.0
 MAX_RELATIVE_DRIFT = 0.22
 MAX_ACTIVE_PAIRS = 96
 MAX_CANDIDATES_PER_RUN = 120
 MAX_SAMPLES_PER_PAIR = 48
+MAX_CROP_SAMPLES_PER_PAIR = 120
 _MOTION_TOLERANCE = 0.4
 
 
@@ -54,16 +58,10 @@ class _PairEpisode:
     person_epoch: int
     started_at: float
     last_seen: float
-    samples: deque[dict[str, Any]] = field(
-        default_factory=lambda: deque(maxlen=MAX_SAMPLES_PER_PAIR)
-    )
+    samples: deque[dict[str, Any]]
     best_frame_jpeg: Any | None = None
-    best_frame_number: int | None = None
-    best_timestamp_sec: float | None = None
-    best_person_box: tuple[float, float, float, float] | None = None
-    best_pickup_box: tuple[float, float, float, float] | None = None
-    best_vehicle_area: float = 0.0
-    best_vehicle_class: str | None = None
+    best_sample: dict[str, Any] | None = None
+    best_frame_score: tuple[bool, float] = (False, 0.0)
 
     @property
     def key(self) -> str:
@@ -134,7 +132,11 @@ def _shared_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, float] | N
     }
 
 
-def _crop_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _crop_motion(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    minimum_displacement: float = MIN_SHARED_DISPLACEMENT_PX,
+) -> dict[str, Any]:
     """Classify how a crop-detected person moved relative to its pickup."""
     first, last = samples[0], samples[-1]
     v0, v1 = first["pickup_center"], last["pickup_center"]
@@ -154,8 +156,8 @@ def _crop_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ) if rel_positions else 1.0
     if drift > MAX_RELATIVE_DRIFT:
         state = "moved_independently"
-    elif vdist < MIN_SHARED_DISPLACEMENT_PX:
-        state = "moved_independently" if pdist >= MIN_SHARED_DISPLACEMENT_PX else "stationary"
+    elif vdist < minimum_displacement:
+        state = "moved_independently" if pdist >= minimum_displacement else "stationary"
     else:
         cosine = (vdx * pdx + vdy * pdy) / (vdist * pdist) if pdist > 0 else -1.0
         vector_error = math.hypot(vdx - pdx, vdy - pdy)
@@ -171,6 +173,36 @@ def _crop_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "person_displacement_px": pdist,
         "relative_position_drift": drift,
     }
+
+
+def _ambiguous_motion(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    if len(samples) < MIN_AMBIGUOUS_SAMPLES:
+        return None
+    start, end = samples[0]["timestamp_sec"], samples[-1]["timestamp_sec"]
+    if end - start < MIN_CROP_ASSOCIATION_SEC:
+        return None
+    if any(
+        current["timestamp_sec"] - previous["timestamp_sec"] > MAX_AMBIGUOUS_GAP_SEC
+        for previous, current in zip(samples, samples[1:])
+    ):
+        return None
+    if any(sample["vehicle_class_at_scan"] != YOLO_CLASS_PICKUP_TRUCK for sample in samples):
+        return None
+    motion = _crop_motion(samples)
+    if motion["motion_state"] != "moving_with_pickup":
+        return None
+    midpoint = (start + end) / 2.0
+    split = min(
+        range(1, len(samples) - 1),
+        key=lambda i: abs(samples[i]["timestamp_sec"] - midpoint),
+    )
+    for segment in (samples[:split + 1], samples[split:]):
+        segment_duration = segment[-1]["timestamp_sec"] - segment[0]["timestamp_sec"]
+        minimum_displacement = MIN_SHARED_DISPLACEMENT_PX * segment_duration / (end - start)
+        segment_motion = _crop_motion(segment, minimum_displacement=minimum_displacement)
+        if segment_motion["motion_state"] != "moving_with_pickup":
+            return None
+    return motion
 
 
 def _crop_rect(
@@ -221,8 +253,7 @@ class PickupDetailCollector:
         self._pairs: dict[tuple[int, int, int, int], _PairEpisode] = {}
         self._candidates: list[dict[str, Any]] = []
         self._persisted_occurrences: set[str] = set()
-        self._emitted: set[tuple[int, int, int, int]] = set()
-        self._crop_reviewed_pickups: set[tuple[int, int]] = set()
+        self._reviewed_pickups: set[tuple[int, int]] = set()
         self._crop_decision_counts: Counter[str] = Counter()
         self._crop_decisions: list[dict[str, Any]] = []
         self._crop_decision_seen: set[tuple[int, int, str]] = set()
@@ -276,23 +307,28 @@ class PickupDetailCollector:
             int(det["track_id"]): int(det.get("track_identity_epoch") or 0)
             for det in persons
         }
-        # A main-detector person already linked through its pickup's crop scan
-        # must not also start a second, main-detector pair with that pickup.
+        # A main-detector person linked to a crop must not bypass the crop's
+        # ownership checks or start another pair under a different pickup.
         crop_covered_primary = {
-            (
-                int(det.get("source_pickup_track_id") or -1),
-                int(det.get("source_pickup_identity_epoch") or 0),
-                int(det["overlaps_primary_track_id"]),
-            )
+            int(det["overlaps_primary_track_id"])
             for det in persons
             if str(det.get("source") or "") == "pickup_person_crop_submodel"
             and det.get("overlaps_primary_track_id") is not None
         }
+        pickup_boxes = [
+            _box(det) for det in pickups
+            if (det.get("resolved_track_class") or det.get("class_label")) == YOLO_CLASS_PICKUP_TRUCK
+        ]
         for pickup in pickups:
+            if self.budget_exhausted:
+                break
             pbox = _box(pickup)
             pc = _center(pbox)
             pickup_id = int(pickup["track_id"])
             pickup_epoch = int(pickup.get("track_identity_epoch") or 0)
+            pickup_identity = (pickup_id, pickup_epoch)
+            if pickup_identity in self._reviewed_pickups:
+                continue
             vehicle_class = str(
                 pickup.get("resolved_track_class") or pickup.get("class_label") or ""
             )
@@ -301,16 +337,22 @@ class PickupDetailCollector:
                 person_center = _center(person_box)
                 person_id = int(person["track_id"])
                 person_epoch = int(person.get("track_identity_epoch") or 0)
-                is_crop_submodel_person = (
-                    str(person.get("source") or "") == "pickup_person_crop_submodel"
-                    and int(person.get("source_pickup_track_id") or -1) == pickup_id
-                    and int(person.get("source_pickup_identity_epoch") or 0) == pickup_epoch
-                )
-                if vehicle_class != YOLO_CLASS_PICKUP_TRUCK and not is_crop_submodel_person:
-                    continue
-                if not is_crop_submodel_person and (
-                    not _center_inside(person_center, pbox)
-                    or (pickup_id, pickup_epoch, person_id) in crop_covered_primary
+                is_crop_submodel_person = person.get("source") == "pickup_person_crop_submodel"
+                if is_crop_submodel_person:
+                    source_pickup = (
+                        person.get("source_pickup_track_id"),
+                        person.get("source_pickup_identity_epoch"),
+                    )
+                    if source_pickup != pickup_identity:
+                        continue
+                    if person.get("pickup_ownership_contested"):
+                        self._record_crop_decision(pickup_identity, ts, "pickup_ownership_contested")
+                        continue
+                elif (
+                    vehicle_class != YOLO_CLASS_PICKUP_TRUCK
+                    or person_id in crop_covered_primary
+                    or not _center_inside(person_center, pbox)
+                    or sum(_center_inside(person_center, box) for box in pickup_boxes) > 1
                 ):
                     continue
                 key = (pickup_id, pickup_epoch, person_id, person_epoch)
@@ -318,11 +360,13 @@ class PickupDetailCollector:
                 episode = self._pairs.get(key)
                 if episode is None or ts <= episode.last_seen or ts - episode.last_seen > self.expiry_sec:
                     episode = _PairEpisode(
-                        pickup_id, person_id, pickup_epoch, person_epoch, ts, ts
+                        pickup_id, person_id, pickup_epoch, person_epoch, ts, ts,
+                        deque(maxlen=MAX_CROP_SAMPLES_PER_PAIR if is_crop_submodel_person
+                              else MAX_SAMPLES_PER_PAIR),
                     )
                     self._pairs[key] = episode
                 episode.last_seen = ts
-                episode.samples.append({
+                sample = {
                     "timestamp_sec": ts,
                     "frame_number": int(frame_number),
                     "pickup_box": pbox,
@@ -334,39 +378,48 @@ class PickupDetailCollector:
                         person.get("source_vehicle_class") or vehicle_class
                     ),
                     "rider_geometry": person.get("rider_geometry"),
-                })
-                if is_crop_submodel_person and pbox[2] * pbox[3] >= episode.best_vehicle_area:
-                    encoded_ok, encoded = cv2.imencode(
-                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82]
-                    )
-                    if encoded_ok:
-                        episode.best_frame_jpeg = encoded
-                        episode.best_frame_number = int(frame_number)
-                        episode.best_timestamp_sec = ts
-                        episode.best_person_box = person_box
-                        episode.best_pickup_box = pbox
-                        episode.best_vehicle_area = pbox[2] * pbox[3]
-                        episode.best_vehicle_class = str(
-                            person.get("source_vehicle_class") or vehicle_class
-                        )
-                if key in self._emitted:
-                    continue
+                }
+                episode.samples.append(sample)
                 if is_crop_submodel_person:
-                    pickup_identity = (pickup_id, pickup_epoch)
-                    if pickup_identity in self._crop_reviewed_pickups:
-                        continue
+                    elevated_now = (sample["rider_geometry"] or {}).get("label") == "elevated"
+                    evidence_score = (
+                        elevated_now,
+                        pbox[2] * pbox[3] if elevated_now else
+                        person_box[2] * person_box[3] * float(person.get("confidence") or 0.0),
+                    )
+                    if (
+                        episode.best_sample is None
+                        or episode.best_sample["timestamp_sec"] < episode.samples[0]["timestamp_sec"]
+                        or evidence_score >= episode.best_frame_score
+                    ):
+                        encoded_ok, encoded = cv2.imencode(
+                            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82]
+                        )
+                        if encoded_ok:
+                            episode.best_frame_jpeg = encoded
+                            episode.best_sample = sample
+                            episode.best_frame_score = evidence_score
                     if ts - episode.started_at < MIN_CROP_ASSOCIATION_SEC:
                         continue
-                    samples = tuple(episode.samples)
+                    all_samples = tuple(episode.samples)
+                    samples = all_samples[-MAX_SAMPLES_PER_PAIR:]
                     elevated = sum(
                         1 for item in samples
                         if (item.get("rider_geometry") or {}).get("label") == "elevated"
                     )
                     elevated_fraction = elevated / len(samples)
-                    if elevated_fraction < MIN_ELEVATED_FRACTION:
-                        self._record_crop_decision(pickup_identity, ts, "rider_not_elevated")
-                        continue
-                    crop_motion = _crop_motion(samples)
+                    bed_uncertain = elevated_fraction < MIN_ELEVATED_FRACTION
+                    if bed_uncertain:
+                        samples = tuple(
+                            sample for sample in all_samples
+                            if ts - sample["timestamp_sec"] <= MAX_AMBIGUOUS_WINDOW_SEC
+                        )
+                        crop_motion = _ambiguous_motion(samples)
+                        if crop_motion is None:
+                            self._record_crop_decision(pickup_identity, ts, "ambiguous_motion_unproven")
+                            continue
+                    else:
+                        crop_motion = _crop_motion(samples)
                     if crop_motion["motion_state"] == "moved_independently":
                         self._record_crop_decision(pickup_identity, ts, "moved_independently")
                         continue
@@ -376,64 +429,52 @@ class PickupDetailCollector:
                     ):
                         continue
                     evidence_frame = frame
-                    evidence_frame_number = int(frame_number)
-                    evidence_timestamp = ts
-                    evidence_person_box = person_box
-                    evidence_pickup_box = pbox
-                    if episode.best_frame_jpeg is not None:
+                    evidence_sample = sample
+                    if (
+                        episode.best_sample is not None
+                        and episode.best_sample["timestamp_sec"] >= samples[0]["timestamp_sec"]
+                    ):
                         best = cv2.imdecode(episode.best_frame_jpeg, cv2.IMREAD_COLOR)
                         if best is not None:
                             evidence_frame = best
-                            evidence_frame_number = int(
-                                episode.best_frame_number or frame_number
-                            )
-                            evidence_timestamp = float(
-                                episode.best_timestamp_sec
-                                if episode.best_timestamp_sec is not None else ts
-                            )
-                            evidence_person_box = episode.best_person_box or person_box
-                            evidence_pickup_box = episode.best_pickup_box or pbox
+                            evidence_sample = episode.best_sample
+                    evidence_box = evidence_sample["pickup_box"]
                     if self._emit_candidate(
                         episode,
-                        key,
                         evidence_frame,
-                        evidence_frame_number,
-                        evidence_timestamp,
-                        evidence_person_box,
-                        evidence_pickup_box,
+                        evidence_sample,
                         {
-                            "state": "crop_person_scan_positive",
+                            "state": "moving_with_pickup_bed_uncertain" if bed_uncertain else "crop_person_scan_positive",
                             "person_source": "pickup_person_crop_submodel",
                             "minimum_persistence_sec": MIN_CROP_ASSOCIATION_SEC,
-                            "evidence_vehicle_area": episode.best_vehicle_area,
+                            "evidence_vehicle_area": evidence_box[2] * evidence_box[3],
                             "rider_geometry": {
-                                "label": "elevated",
+                                "label": "ambiguous" if bed_uncertain else "elevated",
                                 "elevated_fraction": round(elevated_fraction, 3),
                                 "last": samples[-1].get("rider_geometry"),
                             },
                             **crop_motion,
                         },
+                        samples=samples,
                     ):
-                        self._crop_reviewed_pickups.add(pickup_identity)
                         self._record_crop_decision(
                             pickup_identity, ts, f"lead_created_{crop_motion['motion_state']}"
                         )
+                        break
                     continue
                 if ts - episode.started_at < MIN_ASSOCIATION_SEC:
                     continue
                 motion = _shared_motion(tuple(episode.samples))
                 if motion is None:
                     continue
-                self._emit_candidate(
+                if self._emit_candidate(
                     episode,
-                    key,
                     frame,
-                    int(frame_number),
-                    ts,
-                    person_box,
-                    pbox,
+                    sample,
                     motion,
-                )
+                    samples=tuple(episode.samples),
+                ):
+                    break
         for key, episode in list(self._pairs.items()):
             pickup_seen = observed_pickups.get(episode.pickup_id) == episode.pickup_epoch
             person_seen = observed_persons.get(episode.person_id) == episode.person_epoch
@@ -441,7 +482,6 @@ class PickupDetailCollector:
                 # Both tracks were present but the person left the pickup box;
                 # do not bridge two separate overlap episodes.
                 self._pairs.pop(key, None)
-                self._emitted.discard(key)
                 continue
             if key not in active and ts - episode.last_seen > self.expiry_sec:
                 self._pairs.pop(key, None)
@@ -453,14 +493,16 @@ class PickupDetailCollector:
     def _emit_candidate(
         self,
         episode: _PairEpisode,
-        key: tuple[int, int, int, int],
         frame: Any,
-        frame_number: int,
-        timestamp_sec: float,
-        person_box: tuple[float, float, float, float],
-        pickup_box: tuple[float, float, float, float],
+        evidence_sample: Mapping[str, Any],
         motion: Mapping[str, Any],
+        *,
+        samples: Sequence[Mapping[str, Any]],
     ) -> bool:
+        frame_number = evidence_sample["frame_number"]
+        timestamp_sec = evidence_sample["timestamp_sec"]
+        pickup_box = evidence_sample["pickup_box"]
+        person_box = evidence_sample["person_box"]
         occurrence_key = episode.key
         rect = _crop_rect(pickup_box, person_box, self.frame_w, self.frame_h)
         try:
@@ -473,10 +515,12 @@ class PickupDetailCollector:
             )
         except Exception:
             logger.exception("pickup review evidence write failed for %s", occurrence_key)
+            self._record_crop_decision((episode.pickup_id, episode.pickup_epoch), timestamp_sec, "evidence_write_failed")
             return False
         if not saved or not saved.get("scene_path") or not saved.get("crop_path"):
+            self._record_crop_decision((episode.pickup_id, episode.pickup_epoch), timestamp_sec, "evidence_write_failed")
             return False
-        samples = [
+        observations = [
             {
                 "timestamp_sec": float(item["timestamp_sec"]),
                 "frame_number": int(item["frame_number"]),
@@ -484,7 +528,7 @@ class PickupDetailCollector:
                 "person_bbox": dict(zip(("x", "y", "w", "h"), item["person_box"])),
                 "geometry_label": (item.get("rider_geometry") or {}).get("label"),
             }
-            for item in episode.samples
+            for item in samples
         ]
         frame = {
             "index": 1,
@@ -508,11 +552,11 @@ class PickupDetailCollector:
             "occurrence_key": occurrence_key,
             "selector_version": PICKUP_REVIEW_SELECTOR_VERSION,
             "timestamp_sec": timestamp_sec,
-            "episode_start_sec": episode.started_at,
+            "episode_start_sec": samples[0]["timestamp_sec"],
             "frame_number": frame_number,
             "source_width": self.frame_w,
             "source_height": self.frame_h,
-            "frame_count": len(samples),
+            "frame_count": len(observations),
             "frames_json": json.dumps([frame]),
             "association_json": json.dumps({
                 "state": str(motion.get("state") or "shared_motion_candidate"),
@@ -521,12 +565,8 @@ class PickupDetailCollector:
                     if any(item.get("person_source") == "pickup_person_crop_submodel" for item in episode.samples)
                     else "main_detector_and_bytetrack"
                 ),
-                "observations": samples,
-                "vehicle_class_at_scan": str(
-                    episode.best_vehicle_class
-                    or episode.samples[-1].get("vehicle_class_at_scan")
-                    or YOLO_CLASS_PICKUP_TRUCK
-                ),
+                "observations": observations,
+                "vehicle_class_at_scan": evidence_sample["vehicle_class_at_scan"],
                 "crop_scan": {
                     "minimum_persistence_sec": motion.get("minimum_persistence_sec"),
                     "evidence_vehicle_area": motion.get("evidence_vehicle_area"),
@@ -544,7 +584,7 @@ class PickupDetailCollector:
             }),
             "size_bytes": int(saved.get("size_bytes") or 0),
         })
-        self._emitted.add(key)
+        self._reviewed_pickups.add((episode.pickup_id, episode.pickup_epoch))
         if len(self._candidates) >= self.max_candidates:
             self.budget_exhausted = True
         return True

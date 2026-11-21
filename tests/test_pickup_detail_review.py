@@ -87,7 +87,7 @@ def test_person_leaving_pickup_box_resets_the_candidate_episode():
     assert len(collector.candidates()) == 1
 
 
-def test_reentering_pickup_creates_a_distinct_review_episode():
+def test_person_reentering_same_pickup_passage_does_not_duplicate_lead():
     collector = _collector()
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     for index in range(12):
@@ -99,8 +99,7 @@ def test_reentering_pickup_creates_a_distinct_review_episode():
         ]
         collector.observe(frame, tracked, frame_number=index * 10, timestamp_sec=index * 0.5)
     candidates = collector.candidates()
-    assert len(candidates) == 2
-    assert len({item["occurrence_key"] for item in candidates}) == 2
+    assert len(candidates) == 1
 
 
 def test_crop_submodel_person_above_vehicle_box_can_create_review_lead():
