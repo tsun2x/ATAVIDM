@@ -52,12 +52,16 @@ def _snapshot(lead: dict[str, Any], notes: str | None) -> tuple[dict[str, Any], 
         "video_id", "processing_run_id", "run_key", "occurrence_key", "selector_version",
         "pickup_track_id", "person_track_id", "pickup_identity_epoch", "person_identity_epoch",
         "frame_number", "timestamp_sec", "episode_start_sec", "source_width", "source_height",
+        "frame_count",
     )}
     provenance.update({
         "candidate_id": lead["id"],
         "reviewer_notes": notes,
         "association": association,
-        "frame": {key: frame[key] for key in ("index", "crop", "pickup_bbox", "person_bbox") if key in frame},
+        "frame": {key: frame[key] for key in (
+            "index", "crop", "pickup_bbox", "person_bbox", "pickup_detector_class",
+            "pickup_detector_score", "person_detector_score",
+        ) if key in frame},
     })
     return provenance, scene, crop
 

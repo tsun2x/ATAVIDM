@@ -146,6 +146,8 @@ if (typeof document !== "undefined") {
         if (pickup) {
             const association = pickup.association || {};
             const observations = Array.isArray(association.observations) ? association.observations : [];
+            const frame = pickup.frame || {};
+            const duration = association.motion?.duration_sec;
             const videoUrl = item.source_video_url
                 ? item.source_video_url + "#t=" + Number(pickup.episode_start_sec ?? pickup.timestamp_sec)
                 : null;
@@ -156,9 +158,17 @@ if (typeof document !== "undefined") {
                 '<p class="small mb-1">Pickup track #' + escapeHtml(pickup.pickup_track_id) +
                 ' (identity ' + escapeHtml(pickup.pickup_identity_epoch) + ') · Person track #' +
                 escapeHtml(pickup.person_track_id) + ' (identity ' + escapeHtml(pickup.person_identity_epoch) + ')</p>' +
-                '<p class="small mb-1">Association: ' + escapeHtml(String(association.state || "unknown").replaceAll("_", " ")) +
+                '<p class="small mb-1">Association: ' + escapeHtml(association.state === "moving_with_pickup_bed_uncertain"
+                    ? "Person moving with pickup · bed location uncertain"
+                    : String(association.state || "unknown").replaceAll("_", " ")) +
                 ' · ' + escapeHtml(String(association.evidence_source || "unknown").replaceAll("_", " ")) +
-                ' · ' + observations.length + ' tracked observations</p>' +
+                ' · ' + escapeHtml(pickup.frame_count ?? observations.length) + ' tracked observations' +
+                (typeof duration === "number" && Number.isFinite(duration) && duration >= 0
+                    ? ' over ' + duration.toFixed(2) + ' s' : '') + '</p>' +
+                '<p class="small mb-1">Vehicle detector' +
+                (frame.pickup_detector_class ? ' (' + escapeHtml(frame.pickup_detector_class.replaceAll("_", " ")) + ')' : '') +
+                ' score: ' + escapeHtml(fmtConfidence(frame.pickup_detector_score)) +
+                ' · Person detector score: ' + escapeHtml(fmtConfidence(frame.person_detector_score)) + '</p>' +
                 (pickup.reviewer_notes ? '<p class="small mb-1">Pickup reviewer notes: ' + escapeHtml(pickup.reviewer_notes) + '</p>' : '') +
                 (videoUrl ? '<p class="small mb-1"><a href="' + escapeHtml(videoUrl) +
                     '" target="_blank" rel="noopener">Open source video at the pickup interval</a></p>' : '') +
@@ -219,7 +229,7 @@ if (typeof document !== "undefined") {
             "<p class=\"mt-3 text-muted\">" + escapeHtml(item.display_id) + " · " + escapeHtml(item.violation_type) + " · Track #" + escapeHtml(item.track_id) + "</p>" +
             "<p class=\"small text-muted\">" + escapeHtml(item.reason_log) + "</p>" +
             "<p class=\"small text-muted\">Rule evidence score: " + escapeHtml(fmtConfidence(item.violation_confidence !== undefined ? item.violation_confidence : item.confidence)) +
-            " (not a probability of guilt) · Detector model score: " + escapeHtml(fmtConfidence(item.detection_confidence)) + "</p>" +
+            (pickup ? "" : " (not a probability of guilt) · Detector model score: " + escapeHtml(fmtConfidence(item.detection_confidence))) + "</p>" +
             "<p class=\"small text-muted\">" + escapeHtml(plateLine) + "</p>" +
             "<p class=\"small\">Legal status: <strong>" + escapeHtml(item.legal_status || "—") + "</strong>" +
             (item.flag_only ? " · <span class=\"badge bg-warning text-dark\">flag_only review material</span>" : "") + "</p>" +

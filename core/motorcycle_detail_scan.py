@@ -80,6 +80,7 @@ from core.motorcycle_detail import (
     box_from_dict,
     map_box_from_crop,
     padded_crop_rect,
+    rider_head_region,
 )
 from core.motorcycle_detail_contract import (
     DETAIL_CLASS_NO_HELMET,
@@ -481,7 +482,11 @@ def draw_mapped_boxes(
         if confidences and index < len(confidences):
             text = f"{label} {float(confidences[index]) * 100:.0f}%"
         ty = max(12, y1 - 4)
-        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        font_scale = 0.45
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        if tw > width - 4:
+            font_scale *= max(1, width - 4) / tw
+            (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
         tx = max(0, min(x1, width - tw - 4))
         cv2.rectangle(
             annotated,
@@ -495,7 +500,7 @@ def draw_mapped_boxes(
             text,
             (tx + 2, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            font_scale,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
@@ -673,6 +678,54 @@ def _detection_attribution(
         elif "nearby_rider_context_incomplete_helmet_unattributed" in attribute.reasons:
             reason = "nearby_rider_context_incomplete_helmet_unattributed"
     return {"attributed": False, "attribution_reason": reason}
+
+
+def _helmet_overlay_marks(
+    association: ScanAssociations,
+    detections: Sequence[Mapping[str, Any]],
+    motorcycle_box: Sequence[float],
+    context: MainDetectorContext,
+    crop: CropRect,
+) -> list[tuple[Sequence[float], str]]:
+    """Summarize each visible rider's head evidence without changing attribution."""
+    helmets = [det for det in detections if det.get("class_label") in _HEAD_LABELS]
+    riders = [(association.rider, association.helmet)]
+    for index, other in enumerate(context.riders):
+        rider = RiderAssociation(
+            state=STATE_ASSOCIATED, rider_track_id=other.track_id,
+            rider_box=other.box, head_region=rider_head_region(other.box), source=context.source,
+        )
+        other_boxes = [nearby.box for offset, nearby in enumerate(context.riders) if offset != index]
+        if context.rider_box is not None:
+            other_boxes.append(context.rider_box)
+        helmet = associate_helmet(
+            _primary_detection(_as_box(motorcycle_box)), rider, helmets,
+            other_riders=other_boxes, other_riders_complete=context.riders_complete, crop=crop,
+        )
+        riders.append((rider, helmet))
+
+    labels = {
+        HELMET_ACCEPTABLE: ("Helmet", YOLO_CLASS_HELMET_ACCEPTABLE),
+        HELMET_NUT_SHELL: ("Nut-shell helmet", YOLO_CLASS_HELMET_NUT_SHELL),
+        HELMET_UNCOVERED: ("Uncovered head", DETAIL_CLASS_NO_HELMET),
+    }
+    marks = []
+    for rider, helmet in riders:
+        if rider.head_region is None:
+            continue
+        if helmet.state == STATE_AMBIGUOUS:
+            conflict = {"contradictory_head_labels", "conflicting_helmet_classes"}
+            text = "Helmet conflict" if conflict.intersection(helmet.reasons) else "Helmet uncertain"
+            marks.append((rider.head_region, text))
+        elif helmet.state in labels:
+            text, label = labels[helmet.state]
+            observation = max(
+                (obs for obs in helmet.observations if obs.label == label and not obs.reasons),
+                key=lambda obs: obs.confidence, default=None,
+            )
+            if observation is not None:
+                marks.append((observation.box, text))
+    return marks
 
 
 HELMET_FRAMES_CONFLICT = "contradictory_helmet_observations_across_frames"
@@ -1272,12 +1325,21 @@ class MotorcycleDetailScanner:
                 main_boxes.append(_local(other.box))
                 main_labels.append("main:other_motorcycle")
             overlay = draw_mapped_boxes(scan_image, main_boxes, labels=main_labels)
+            other_detections = [
+                (det, box) for det, box, _ in mapped if det["class_label"] not in _HEAD_LABELS
+            ]
             overlay = draw_mapped_boxes(
                 overlay,
-                [_local(box) for _, box, _limited in mapped],
-                labels=[str(det["class_label"]) for det, _box, _limited in mapped],
-                confidences=[float(det["confidence"]) for det, _box, _limited in mapped],
+                [_local(box) for _, box in other_detections],
+                labels=[str(det["class_label"]) for det, _ in other_detections],
+                confidences=[float(det["confidence"]) for det, _ in other_detections],
             )
+            helmet_marks = _helmet_overlay_marks(association, detections, motorcycle_box, context, crop)
+            if helmet_marks:
+                overlay = draw_mapped_boxes(
+                    overlay, [_local(box) for box, _ in helmet_marks],
+                    labels=[label for _, label in helmet_marks],
+                )
             from core.evidence import save_detail_overlay
 
             overlay_path = save_detail_overlay(
@@ -1293,6 +1355,7 @@ class MotorcycleDetailScanner:
                 "scan_scale_y": scale_y,
                 "crop": crop.as_dict(),
                 "overlay_path": overlay_path,
+                "helmet_overlay_summarized": True,
                 "contract": contract_meta.get("contract"),
                 "class_map": contract_meta.get("class_map"),
                 "detections": [

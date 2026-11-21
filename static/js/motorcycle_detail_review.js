@@ -165,11 +165,14 @@ function buildEvidenceMarkup(item) {
         const crop = frame.crop_url
             ? '<img src="' + escapeHtml(frame.crop_url) + '" alt="Padded crop ' + i + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4">No padded crop.</div>';
-        const overlay = frame.overlay_url
+        const overlayImage = frame.overlay_url
             ? '<img src="' + escapeHtml(frame.overlay_url) + '" alt="Mapped boxes ' + i + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4">Not scanned yet — mapped boxes appear after the crop pass.</div>';
         const detections = frameDetections(item, frame.index);
         const scanned = scanFrame(item, frame.index) || {};
+        const overlay = frame.overlay_url && !scanned.helmet_overlay_summarized
+            ? '<details><summary class="small">Original detection overlay</summary>' + overlayImage + '</details>'
+            : overlayImage;
         const frameAssociation = scanned.association;
         const frameSummary = frameAssociation
             ? '<p class="small mt-2 mb-1">Rider: ' + escapeHtml(describeRider(frameAssociation.rider)) +
@@ -182,7 +185,7 @@ function buildEvidenceMarkup(item) {
             }).join("") + '</ul>'
             : "";
         const detectionList = detections.length
-            ? '<ul class="small mb-0 mt-2">' + detections.map(function (d) {
+            ? '<details class="mt-2"><summary class="small">Raw model predictions</summary><ul class="small mb-0">' + detections.map(function (d) {
                 const conf = d.confidence != null ? " " + Math.round(Number(d.confidence) * 100) + "%" : "";
                 const bbox = Array.isArray(d.source_bbox)
                     ? " at [" + d.source_bbox.map(function (v) { return Math.round(Number(v)); }).join(", ") + "]"
@@ -197,7 +200,7 @@ function buildEvidenceMarkup(item) {
                     if (d.attribution_reason) text += ": " + formatUncertainty(d.attribution_reason);
                 }
                 return "<li>" + escapeHtml(text) + "</li>";
-            }).join("") + "</ul>"
+            }).join("") + "</ul></details>"
             : (frame.overlay_url ? '<p class="small text-muted mb-0 mt-2">No detail detections in this crop (not proof of absence).</p>' : "");
         panes.push(
             '<div class="tab-pane fade' + (i === 0 ? " show active" : "") + '" id="detailFrame' + i + '" role="tabpanel">' +
@@ -206,7 +209,7 @@ function buildEvidenceMarkup(item) {
             "</ul>" + scene +
             '<div class="row g-3 mt-1"><div class="col-md-6"><p class="small text-muted mb-1">Padded motorcycle/rider crop</p>' + crop +
             "</div>" +
-            '<div class="col-md-6"><p class="small text-muted mb-1">Mapped detections (source space)</p>' +
+            '<div class="col-md-6"><p class="small text-muted mb-1">Review overlay</p>' +
             overlay + frameSummary + frameReasons + detectionList + "</div></div>" +
             "</div>"
         );

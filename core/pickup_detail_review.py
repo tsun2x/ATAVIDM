@@ -371,6 +371,9 @@ class PickupDetailCollector:
                     "frame_number": int(frame_number),
                     "pickup_box": pbox,
                     "person_box": person_box,
+                    "pickup_detector_class": str(pickup.get("class_label") or vehicle_class),
+                    "pickup_detector_score": pickup.get("confidence"),
+                    "person_detector_score": person.get("confidence"),
                     "pickup_center": pc,
                     "person_center": person_center,
                     "person_source": str(person.get("source") or "main_detector_and_bytetrack"),
@@ -539,6 +542,9 @@ class PickupDetailCollector:
             "crop": {"x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h},
             "pickup_bbox": dict(zip(("x", "y", "w", "h"), pickup_box)),
             "person_bbox": dict(zip(("x", "y", "w", "h"), person_box)),
+            "pickup_detector_class": evidence_sample["pickup_detector_class"],
+            "pickup_detector_score": evidence_sample["pickup_detector_score"],
+            "person_detector_score": evidence_sample["person_detector_score"],
             "size_bytes": int(saved.get("size_bytes") or 0),
         }
         self._candidates.append({

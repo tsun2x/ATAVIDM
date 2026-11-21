@@ -271,3 +271,54 @@ def test_crop_review_evidence_uses_largest_vehicle_box_during_persistence():
 
     assert len(collector.candidates()) == 1
     assert written[0][0] == 80
+
+
+def _crop_person(track_id, pickup, x, y, w, h, *, source_vehicle_class=None):
+    from core.pickup_person_scan import rider_geometry
+
+    person = {
+        **_det(track_id, "person", x, y, w, h),
+        "source": "pickup_person_crop_submodel",
+        "source_pickup_track_id": pickup["track_id"],
+        "source_pickup_identity_epoch": pickup["track_identity_epoch"],
+        "rider_geometry": rider_geometry(
+            (float(x), float(y), float(w), float(h)),
+            (pickup["bbox_x"], pickup["bbox_y"], pickup["bbox_w"], pickup["bbox_h"]),
+        ),
+    }
+    if source_vehicle_class is not None:
+        person["source_vehicle_class"] = source_vehicle_class
+    return person
+
+
+def test_evidence_uses_matching_frame_and_boxes_from_the_qualified_passage():
+    written = []
+
+    def writer(frame, rect, **_kwargs):
+        written.append((int(frame[0, 0, 0]), rect))
+        return {"scene_path": "scene.jpg", "crop_path": "crop.jpg", "size_bytes": 12}
+
+    collector = _collector(writer=writer)
+    for epoch in (1, 2):
+        for index, confidence in enumerate((0.97, 0.92, 0.88, 0.90)):
+            x = 20 + index * 16
+            pickup = _det(10, "pickup_truck", x, 80, 100, 80, epoch=epoch)
+            pickup["confidence"] = 0.74 + index * 0.03
+            person = _crop_person(-1, pickup, x + 30, 100, 20, 25)
+            person["confidence"] = confidence
+            frame = np.full((240, 320, 3), 60 * epoch + index, dtype=np.uint8)
+            collector.observe(
+                frame, [pickup, person], frame_number=(epoch - 1) * 10 + index,
+                timestamp_sec=(epoch - 1) * 5 + index * 0.5,
+            )
+
+    first, second = collector.candidates()
+    assert [marker for marker, _ in written] == [60, 120]
+    for item, number, (_, rect) in zip((first, second), (0, 10), written):
+        evidence, = json.loads(item["frames_json"])
+        assert evidence["frame_number"] == item["frame_number"] == number
+        assert evidence["pickup_bbox"] == {"x": 20, "y": 80, "w": 100, "h": 80}
+        assert evidence["person_bbox"] == {"x": 50, "y": 100, "w": 20, "h": 25}
+        assert evidence["pickup_detector_score"] == 0.74
+        assert evidence["person_detector_score"] == 0.97
+        assert (rect.x, rect.y, rect.w, rect.h) == (5, 68, 130, 104)

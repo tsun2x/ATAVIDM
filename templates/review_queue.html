@@ -66,7 +66,7 @@
                         <th>Source</th>
                         <th>Track</th>
                         <th>Vehicle Class</th>
-                        <th title="Rule evidence score; not a probability of guilt">Rule Evidence Score</th>
+                        <th title="Rule evidence and detector scores">Evidence Scores</th>
                         <th>Evidence</th>
                         <th>Queued At</th>
                         <th>Actions</th>
@@ -96,9 +96,23 @@
                         <td>#{{ item.track_id }}</td>
                         <td class="small">{{ item.vehicle_class }}</td>
                         <td>
-                            <span class="confidence-badge confidence-{% if item.confidence is not none and item.confidence >= 0.95 %}high{% elif item.confidence is not none and item.confidence >= 0.80 %}medium{% else %}low{% endif %}" title="Rule engine evidence score; not a probability of guilt">
-                                {% if item.confidence is none %}Unavailable{% else %}{{ (item.confidence * 100)|int }}%{% endif %}
+                            {% if item.confidence is none %}
+                            <span class="small text-muted">Rule score unavailable</span>
+                            {% else %}
+                            <span class="confidence-badge confidence-{% if item.confidence >= 0.95 %}high{% elif item.confidence >= 0.80 %}medium{% else %}low{% endif %}" title="Rule evidence score">
+                                {{ (item.confidence * 100)|int }}%
                             </span>
+                            {% endif %}
+                            {% if item.pickup_provenance %}
+                            {% set frame_scores = item.pickup_provenance.get('frame') or {} %}
+                            <div class="small text-muted">
+                                Vehicle detector{% if frame_scores.get('pickup_detector_class') %} ({{ frame_scores.pickup_detector_class|replace('_', ' ') }}){% endif %}
+                                {% if frame_scores.get('pickup_detector_score') is number %}{{ '%.0f'|format(frame_scores.pickup_detector_score * 100) }}%{% else %}unavailable{% endif %}
+                            </div>
+                            <div class="small text-muted">
+                                Person detector {% if frame_scores.get('person_detector_score') is number %}{{ '%.0f'|format(frame_scores.person_detector_score * 100) }}%{% else %}unavailable{% endif %}
+                            </div>
+                            {% endif %}
                         </td>
                         <td>
                             <button class="btn btn-sm btn-outline-secondary btn-view-evidence" title="View Evidence"

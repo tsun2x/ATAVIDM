@@ -357,6 +357,7 @@ class TestScanMapping:
     )
     def test_only_plausible_helmet_boxes_count(self, tmp_path, monkeypatch, size, rider, boxes, state, attributed):
         import config
+        from core import motorcycle_detail_scan
 
         root = tmp_path / "evidence"
         monkeypatch.setattr(config, "EVIDENCE_FOLDER", str(root))
@@ -378,6 +379,14 @@ class TestScanMapping:
             for label, confidence, box in zip(labels, (0.51, 0.33), boxes)
         ]
         scanner = _mock_scanner(predictor)
+        drawn_labels = []
+        draw = motorcycle_detail_scan.draw_mapped_boxes
+
+        def capture_labels(image, boxes, *, labels=None, confidences=None):
+            drawn_labels.extend(labels or [])
+            return draw(image, boxes, labels=labels, confidences=confidences)
+
+        monkeypatch.setattr(motorcycle_detail_scan, "draw_mapped_boxes", capture_labels)
         result = scanner._scan_candidate(row, scanner.checkpoint(), predictor)
         helmet = json.loads(result["association_json"])["helmet"]
         assert helmet["state"] == state
@@ -388,6 +397,8 @@ class TestScanMapping:
             assert detections[-1]["attribution_reason"] == "implausible_helmet_size"
         else:
             assert "conflicting_helmet_classes" in helmet["reasons"]
+            assert len(detections) == 2
+            assert [label for label in drawn_labels if not label.startswith("main:")] == ["Helmet conflict"]
 
     def test_scan_boxes_are_mapped_into_source_coordinates(self, tmp_path, monkeypatch):
         import config
@@ -419,6 +430,49 @@ class TestScanMapping:
         assert detection["source_bbox"][2] == pytest.approx(220.0)
         assert detection["source_bbox"][3] == pytest.approx(120.0)
         assert observations["frames"][0]["overlay_path"] is not None
+
+    def test_overlay_separates_riders_and_collapses_duplicate_helmet_boxes(self, tmp_path, monkeypatch):
+        from core import motorcycle_detail_scan
+
+        root = tmp_path / "evidence"
+        monkeypatch.setattr("config.EVIDENCE_FOLDER", str(root))
+        monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(root))
+        crop_path = _write_crop(root / "run_1" / "t7g1", "crop_f1.jpg", 160, 100)
+        row = _row(crop_path, crop=dict(x=100, y=100, w=160, h=100))
+        frames = json.loads(row["frames_json"])
+        frames[0]["rider_bbox"] = dict(x=121, y=135, w=26, h=50)
+        frames[0]["main_context"] = {
+            "version": 1, "source": "main_detector", "target_track_id": 7,
+            "rider": {"state": "associated", "track_id": 205},
+            "motorcycles": [], "truncated": False,
+            "riders": [{"track_id": 206, "bbox": dict(x=193, y=135, w=26, h=50)}],
+        }
+        row["frames_json"] = json.dumps(frames)
+
+        def predictor(_image):
+            return [
+                {"class_label": "helmet_acceptable", "confidence": 0.51, "bbox": (25, 31, 42, 49)},
+                {"class_label": "helmet_acceptable", "confidence": 0.65, "bbox": (26, 31, 43, 49)},
+                {"class_label": "helmet_nut_shell", "confidence": 0.72, "bbox": (97, 31, 114, 49)},
+            ]
+
+        drawn = {}
+        draw = motorcycle_detail_scan.draw_mapped_boxes
+
+        def capture(image, boxes, *, labels=None, confidences=None):
+            drawn.update(zip(labels or [], boxes))
+            if labels and "Helmet" in labels:
+                assert labels == ["Helmet", "Nut-shell helmet"]
+            return draw(image, boxes, labels=labels, confidences=confidences)
+
+        monkeypatch.setattr(motorcycle_detail_scan, "draw_mapped_boxes", capture)
+        scanner = _mock_scanner(predictor)
+        result = scanner._scan_candidate(row, scanner.checkpoint(), predictor)
+        frame = json.loads(result["observations_json"])["frames"][0]
+        assert len(frame["detections"]) == 3
+        assert drawn["Helmet"] == (26, 31, 43, 49)
+        assert drawn["Nut-shell helmet"] == (97, 31, 114, 49)
+        assert frame["association"]["helmet"]["state"] == "acceptable"
 
     def test_resized_scan_scale_is_divided_out(self, tmp_path, monkeypatch):
         import config

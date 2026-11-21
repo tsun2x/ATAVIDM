@@ -139,6 +139,24 @@ assert.ok(evidenceMarkup.includes("Annotated video"));
 assert.ok(evidenceMarkup.includes("/api/videos/1/annotated/2"));
 assert.ok(evidenceMarkup.includes('id="detailEvidenceScale"'));
 assert.ok(evidenceMarkup.includes("12.5"));
+assert.ok(evidenceMarkup.includes("Original detection overlay"));
+
+const summarizedMarkup = detailUi.buildEvidenceMarkup({
+    frames: [{ index: 1, overlay_url: "/summary.jpg" }],
+    observations: { frames: [{
+        index: 1,
+        helmet_overlay_summarized: true,
+        detections: [
+            { class_label: "helmet_acceptable", confidence: 0.81 },
+            { class_label: "helmet_nut_shell", confidence: 0.69 }
+        ]
+    }] }
+});
+assert.ok(summarizedMarkup.includes("/summary.jpg"));
+assert.ok(!summarizedMarkup.includes("Original detection overlay"));
+assert.ok(summarizedMarkup.includes("Raw model predictions"));
+assert.ok(summarizedMarkup.includes("helmet_acceptable 81%"));
+assert.ok(summarizedMarkup.includes("helmet_nut_shell 69%"));
 
 // Attribution context: older rows say nearby motorcycles were not recorded.
 assert.ok(detailUi.describeAttribution({ context: { recorded: false } }).includes("not recorded"));

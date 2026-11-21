@@ -22,12 +22,19 @@ def pickup_candidate(test_db, enforcer_client, tmp_path, monkeypatch):
     evidence_root = tmp_path / "evidence"
     monkeypatch.setattr(config, "EVIDENCE_FOLDER", str(evidence_root))
     monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(evidence_root))
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    source = uploads / "pickup-review-api.mp4"
+    source.write_bytes(b"test source video")
+    monkeypatch.setattr(config, "UPLOAD_FOLDER", str(uploads))
     user = test_db.get_user_by_username("enforcer_test")
     video_id = test_db.insert_video(
-        "pickup-review-api.mp4", "/tmp/pickup-review-api.mp4", status="processed",
+        source.name, str(source), status="processed",
         uploaded_by=user["id"],
     )
-    run_dir = evidence_root / "pickup_detail" / "run_8" / "pickup_1_g1_person_2_g1"
+    run_id = test_db.create_processing_run(video_id, "[]")
+    test_db.finish_processing_run(run_id)
+    run_dir = evidence_root / "pickup_detail" / f"run_{run_id}" / "pickup_1_g1_person_2_g1"
     run_dir.mkdir(parents=True)
     scene = run_dir / "scene_f1.jpg"
     crop = run_dir / "crop_f1.jpg"
@@ -35,8 +42,8 @@ def pickup_candidate(test_db, enforcer_client, tmp_path, monkeypatch):
     assert cv2.imwrite(str(crop), np.zeros((32, 32, 3), dtype=np.uint8))
     payload = {
         "video_id": video_id,
-        "run_key": "run_8",
-        "processing_run_id": 8,
+        "run_key": f"run_{run_id}",
+        "processing_run_id": run_id,
         "pickup_track_id": 1,
         "person_track_id": 2,
         "pickup_identity_epoch": 1,
@@ -175,3 +182,37 @@ def test_invalid_outcome_and_viewer_are_rejected(pickup_candidate, test_db):
     viewer = app.test_client()
     viewer.post("/login", data={"username": "pickup_viewer", "password": password})
     assert viewer.get("/pickup-detail-review").status_code in (302, 403)
+
+
+def _send_pickup(client, db, candidate_id, **overrides):
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    return client.post(f"/api/pickup-detail-review/{candidate_id}/send", json={
+        "approved": True, "expected_outcome": "pending",
+        "expected_processing_run_id": lead["processing_run_id"],
+        "notes": "Check the passenger position against the source video.",
+        **overrides,
+    })
+
+
+def test_pickup_promotion_preserves_detector_scores_separate_from_rule_score(pickup_candidate):
+    client, db, video_id, candidate_id = pickup_candidate
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    frames = json.loads(lead["frames_json"])
+    frames[0].update(
+        pickup_detector_class="pickup_truck", pickup_detector_score=0.74, person_detector_score=0.97,
+    )
+    with db.db_session() as conn:
+        conn.execute(
+            "UPDATE pickup_detail_candidates SET frames_json = ? WHERE id = ?",
+            (json.dumps(frames), candidate_id),
+        )
+    response = _send_pickup(client, db, candidate_id)
+    assert response.status_code == 201
+    [item] = client.get(f"/api/review-queue?video_id={video_id}").json["items"]
+    assert item["violation_confidence"] is None
+    assert item["pickup_provenance"]["frame_count"] == 5
+    assert item["pickup_provenance"]["frame"]["pickup_detector_score"] == 0.74
+    assert item["pickup_provenance"]["frame"]["person_detector_score"] == 0.97
+    page = client.get(f"/review-queue?video_id={video_id}").get_data(as_text=True)
+    assert "74%" in page
+    assert "Person detector 97%" in page
