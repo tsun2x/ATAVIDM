@@ -3351,18 +3351,73 @@ def api_review_queue():
     })
 
 
-@app.route("/api/review-queue/<int:review_id>/plate-details", methods=["GET"])
+def _pending_detail_plate_source(row: dict) -> tuple[str, int] | None:
+    from core.pickup_review_handoff import PICKUP_HANDOFF_MARKER
+
+    if row.get("status") != "pending":
+        return None
+    reason = row.get("reason_log") or ""
+    if reason.startswith(PICKUP_HANDOFF_MARKER):
+        factors = _detail_json(row.get("contributing_factors_json"), {})
+        pickup = factors.get("pickup_review") if isinstance(factors, dict) else None
+        candidate_id = pickup.get("candidate_id") if isinstance(pickup, dict) else None
+        if type(candidate_id) is int and candidate_id > 0:
+            return "pickup", candidate_id
+    match = re.search(r"\[motorcycle_detail_candidate:([0-9]+)\]", reason)
+    if match:
+        return "motorcycle", int(match[1])
+    return None
+
+
+@app.route("/api/review-queue/<int:review_id>/plate-details", methods=["GET", "POST"])
 @auth.role_required("enforcer")
 def api_review_plate_details(review_id: int):
-    """Load optional OCR evidence only when a reviewer opens its detail panel."""
+    """Load OCR evidence or submit a missing detail attempt from saved frames."""
+    if request.method == "POST":
+        origin = request.headers.get("Origin")
+        if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify({"success": False, "error": "Cross-site request refused."}), 403
     row = db.get_review_item(review_id)
     if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Review item not found."}), 404
     try:
         from core.plate_review import machine_result_for_review
+        from core.plate_runtime import LEGACY_DETAIL_FRAME_SKIP, get_runtime, queue_detail_review_ocr
 
         machine = machine_result_for_review(review_id)
+        source = _pending_detail_plate_source(row)
+        runtime = get_runtime() if source else None
+        can_queue = source is not None and (
+            machine["state"] == "none"
+            or (
+                machine["state"] == "no_candidate_detected"
+                and LEGACY_DETAIL_FRAME_SKIP in machine["quality_rejections"]
+            )
+        )
+        payload = request.get_json(silent=True) if request.method == "POST" else None
+        manual = isinstance(payload, dict) and "rescan_from" in payload
+        rescan_from = payload["rescan_from"] if manual else None
+        if source and request.method == "POST" and (
+            (not manual and can_queue)
+            or (
+                manual and runtime is not None and rescan_from == machine["attempt_id"]
+                and machine["state"] not in ("queued", "processing")
+            )
+        ):
+            kind, candidate_id = source
+            getter = db.get_pickup_detail_candidate if kind == "pickup" else db.get_motorcycle_detail_candidate
+            lead = getter(candidate_id)
+            if lead:
+                queue_detail_review_ocr(db, review_id, lead, kind=kind, rescan_from=rescan_from)
+                machine = machine_result_for_review(review_id)
+            else:
+                source = None
+            if machine["state"] == "none":
+                machine["state"] = "disabled" if runtime is None else "unavailable"
+        can_rescan = bool(source and runtime is not None and machine["state"] not in ("queued", "processing"))
     except Exception:  # noqa: BLE001 - optional OCR must not block core review
+        can_queue = False
+        can_rescan = False
         app.logger.exception("plate machine payload unavailable for review %s", review_id)
         machine = {
             "experimental": True,
@@ -3386,6 +3441,8 @@ def api_review_plate_details(review_id: int):
     return jsonify({
         "success": True,
         "plate_machine": machine,
+        "plate_ocr_can_queue": can_queue and request.method == "GET",
+        "plate_ocr_can_rescan": can_rescan,
         "review_plate_choice": choice,
     })
 

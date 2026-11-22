@@ -194,6 +194,59 @@ def _send_pickup(client, db, candidate_id, **overrides):
     })
 
 
+@pytest.mark.parametrize("kind", ["pickup", "motorcycle"])
+def test_pending_detail_review_can_queue_and_rescan_ocr_from_its_saved_lead(
+    pickup_candidate, monkeypatch, tmp_path, kind,
+):
+    client, db, video_id, candidate_id = pickup_candidate
+    monkeypatch.setenv("TAVIDM_PLATE_OCR_EVIDENCE_ROOT", str(tmp_path / "plate"))
+    submissions = []
+    monkeypatch.setattr("core.plate_runtime.queue_detail_review_ocr", lambda *args, **kwargs: None)
+    if kind == "pickup":
+        sent = _send_pickup(client, db, candidate_id)
+        assert sent.status_code == 201
+        review_id = sent.json["review_id"]
+    else:
+        candidate_id = db.upsert_motorcycle_detail_candidate(
+            video_id=video_id, processing_run_id=9, run_key="run_9", track_id=7,
+            occurrence_index=1, occurrence_key="t7g1", selector_version="test",
+            frame_number=10, timestamp_sec=1.0, frame_score=0.5,
+            score_breakdown_json="{}", frame_count=1, frames_json="[]",
+            source_width=640, source_height=480,
+        )
+        review_id = db.insert_review_queue(
+            video_id=video_id, track_id=7, frame_number=10, timestamp_sec=1.0,
+            violation_type="No Side Mirror", vehicle_class="motorcycle", confidence=0.0,
+            reason_log=f"[motorcycle_detail_candidate:{candidate_id}] Evidence sent for review.",
+            processing_run_id=9,
+        )
+
+    def submit(adapter, queued_review_id, lead, *, kind, rescan_from=None):
+        submissions.append((queued_review_id, lead["id"], kind, rescan_from))
+
+    monkeypatch.setattr("core.plate_runtime.queue_detail_review_ocr", submit)
+    monkeypatch.setattr("core.plate_runtime.get_runtime", lambda: None)
+    url = f"/api/review-queue/{review_id}/plate-details"
+    response = client.get(url)
+    assert response.json["plate_ocr_can_queue"] is True, response.json
+    assert submissions == []
+    assert client.post(url, headers={"Origin": "https://other.example"}).status_code == 403
+    assert submissions == []
+    response = client.post(url, json={"candidate_id": candidate_id + 1})
+    assert response.status_code == 200
+    assert submissions == [(review_id, candidate_id, kind, None)]
+
+    monkeypatch.setattr("core.plate_runtime.get_runtime", lambda: object())
+    monkeypatch.setattr("core.plate_review.machine_result_for_review", lambda _id: {
+        "state": "candidate_found", "attempt_id": "current-attempt", "quality_rejections": [],
+    })
+    assert client.get(url).json["plate_ocr_can_rescan"] is True
+    assert client.post(url, json={"rescan_from": "stale-attempt"}).status_code == 200
+    assert submissions == [(review_id, candidate_id, kind, None)]
+    assert client.post(url, json={"rescan_from": "current-attempt"}).status_code == 200
+    assert submissions[-1] == (review_id, candidate_id, kind, "current-attempt")
+
+
 def test_pickup_promotion_preserves_detector_scores_separate_from_rule_score(pickup_candidate):
     client, db, video_id, candidate_id = pickup_candidate
     lead = db.get_pickup_detail_candidate(candidate_id)

@@ -44,6 +44,7 @@ _DETAIL_SUBMISSION_LOCK = threading.Lock()
 _RUNTIME: "PlateRuntime | None" = None
 _RUNTIME_BUILT = False
 _LAST_ERROR: str | None = None
+LEGACY_DETAIL_FRAME_SKIP = "collection_ended:no_attributable_detail_frame"
 
 
 def _validated_manifest_root(
@@ -336,14 +337,29 @@ def worker_state_for(review_id: int | None) -> str | None:
     return runtime.worker.state_for(review_id)
 
 
-def queue_detail_review_ocr(adapter: Any, review_id: int, lead: dict[str, Any], *, kind: str) -> None:
-    """Offer stored vehicle evidence to OCR after the review transaction commits."""
+def queue_detail_review_ocr(
+    adapter: Any, review_id: int, lead: dict[str, Any], *,
+    kind: str, rescan_from: str | None = None,
+) -> None:
+    """Offer stored vehicle evidence or rescan the latest completed attempt."""
     try:
         runtime = get_runtime()
         if runtime is None:
             return
         with _DETAIL_SUBMISSION_LOCK:
-            if runtime.worker.state_for(review_id) or manifests.attempts_for_review(review_id):
+            if runtime.worker.state_for(review_id):
+                return
+            attempts = manifests.attempts_for_review(review_id)
+            latest_attempt = attempts[0] if attempts else None
+            latest = (latest_attempt.data or {}) if latest_attempt else {}
+            legacy_skip = latest and (
+                latest.get("outcome") == "no_candidate_detected"
+                and LEGACY_DETAIL_FRAME_SKIP in (latest.get("quality_rejections") or [])
+            )
+            if rescan_from is not None:
+                if latest_attempt is None or latest_attempt.attempt_id != rescan_from:
+                    return
+            elif latest and not legacy_skip:
                 return
             _submit_detail_evidence(runtime, adapter, review_id, lead, kind)
     except Exception:
@@ -356,6 +372,7 @@ def _submit_detail_evidence(
     import cv2
     import config
     from core.detection_config import VEHICLE_CLASSES
+    from core.evidence import detail_occurrence_dir, pickup_detail_occurrence_dir
     from core.media_serve import resolve_under_roots
 
     pickup = kind == "pickup"
@@ -366,9 +383,11 @@ def _submit_detail_evidence(
     ) != (lead.get("video_id"), lead["processing_run_id"], track_id):
         return
 
-    directory = Path(config.BASE_DIR) / config.EVIDENCE_FOLDER / ("pickup_detail" if pickup else "detail")
+    occurrence_dir = pickup_detail_occurrence_dir if pickup else detail_occurrence_dir
+    evidence_dir = Path(config.BASE_DIR) / config.EVIDENCE_FOLDER / ("pickup_detail" if pickup else "detail")
     occurrence_root = resolve_under_roots(
-        directory / lead["run_key"] / lead["occurrence_key"], [directory], must_exist=False,
+        Path(config.BASE_DIR) / occurrence_dir(lead["run_key"], lead["occurrence_key"]),
+        [evidence_dir], must_exist=False,
     )
     frames = json.loads(lead.get("frames_json") or "[]")
     if not isinstance(frames, list):
@@ -411,4 +430,4 @@ def _submit_detail_evidence(
             collector.observe(image, frame_number, timestamp, [target, *vehicles])
             offered = True
     finally:
-        collector.flush("stored_detail_evidence" if offered else "no_attributable_detail_frame")
+        collector.flush("stored_detail_evidence" if offered else "detail_evidence_unavailable")

@@ -128,6 +128,91 @@ def _replace(settings: PlateOcrSettings, **overrides: Any) -> PlateOcrSettings:
     return replace(settings, **overrides)
 
 
+@pytest.mark.parametrize("kind,overlap", [("pickup", False), ("motorcycle", False), ("pickup", True)])
+def test_detail_handoff_ocr_crops_only_attributed_vehicle(plate_root_env, tmp_path, monkeypatch, kind, overlap):
+    import cv2
+    from types import SimpleNamespace
+    from core.plate_runtime import queue_detail_review_ocr
+
+    settings = enabled_settings(tmp_path)
+    backend = FakeBackend(settings)
+    worker, _memory = build_worker(settings, backend)
+    runtime = SimpleNamespace(
+        settings=settings, worker=worker,
+        new_collector=lambda **kwargs: PlateObservationCollector(settings, backend, worker, **kwargs),
+    )
+    monkeypatch.setattr("core.plate_runtime.get_runtime", lambda: runtime)
+    evidence = tmp_path / "evidence"
+    monkeypatch.setattr("config.EVIDENCE_FOLDER", str(evidence))
+    monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(evidence))
+    directory = "pickup_detail" if kind == "pickup" else "detail"
+    # The evidence writer strips the minus sign from crop-assigned person IDs.
+    occurrence_key = "pickup_7_g1_person_-8_g1" if kind == "pickup" else "passage"
+    stored_directory = "pickup_7_g1_person_8_g1" if kind == "pickup" else "passage"
+    scene = evidence / directory / "run_9" / stored_directory / "scene_f1.jpg"
+    scene.parent.mkdir(parents=True)
+    assert cv2.imwrite(str(scene), make_vehicle_frame())
+    adapter = SimpleNamespace(
+        get_review_item=lambda _id: dict(
+            video_id=2, processing_run_id=9, track_id=7, frame_number=11,
+            timestamp_sec=1.0, violation_type="test proposal",
+        ),
+        get_detections_by_video=lambda _video, start, _end, **kwargs: [
+            dict(track_id=8, class_label="car", bbox_x=80, bbox_y=100, bbox_w=160, bbox_h=100)
+        ] if overlap and start == 12 else [],
+    )
+    box_field = "pickup_bbox" if kind == "pickup" else "detection_bbox"
+    first_frame = dict(
+        frame_number=11, timestamp_sec=1.0, scene_path=str(scene),
+        **{box_field: dict(x=80, y=100, w=160, h=100)},
+    )
+    frames = [first_frame]
+    if overlap:
+        second_scene = scene.with_name("scene_f2.jpg")
+        assert cv2.imwrite(str(second_scene), make_vehicle_frame())
+        frames.append(dict(first_frame, frame_number=12, timestamp_sec=2.0, scene_path=str(second_scene)))
+    lead = dict(
+        video_id=2, processing_run_id=9, track_id=7, pickup_track_id=7,
+        pickup_identity_epoch=1, run_key="run_9", occurrence_key=occurrence_key,
+        source_width=320, source_height=240,
+        frames_json=json.dumps(frames),
+    )
+    retry_legacy_skip = kind == "pickup" and not overlap
+    if retry_legacy_skip:
+        legacy = runtime.new_collector(source="video", run_key="run_9")
+        legacy.register(
+            review_id=1, track_id=7, identity_epoch=1,
+            violation_type="test proposal", frame_number=11, timestamp_sec=1.0,
+        )
+        legacy.flush("no_attributable_detail_frame")
+        assert current_attempt_for_review(1).data["calls"]["detector"] == 0
+    try:
+        queue_detail_review_ocr(adapter, 1, lead, kind=kind)
+        assert drain(worker)
+        queue_detail_review_ocr(adapter, 1, lead, kind=kind)
+        assert drain(worker)
+        loaded = current_attempt_for_review(1)
+        assert len(manifests.attempts_for_review(1)) == (2 if retry_legacy_skip else 1)
+        if overlap:
+            assert loaded.data["outcome"] == "association_uncertain"
+            assert backend.detector_calls == 0
+        else:
+            assert loaded.data["samples"][0]["vehicle_box_frame_px"] == [80, 100, 240, 200]
+            assert backend.detect_shapes == [(100, 160, 3)]
+            assert loaded.data["outcome"] == "candidate_found"
+        queue_detail_review_ocr(adapter, 1, lead, kind=kind, rescan_from=loaded.attempt_id)
+        assert drain(worker)
+        rescanned = current_attempt_for_review(1)
+        assert rescanned.attempt_id != loaded.attempt_id
+        assert rescanned.data["outcome"] == loaded.data["outcome"]
+        queue_detail_review_ocr(adapter, 1, lead, kind=kind, rescan_from=loaded.attempt_id)
+        assert drain(worker)
+        assert current_attempt_for_review(1).attempt_id == rescanned.attempt_id
+        assert len(manifests.attempts_for_review(1)) == (3 if retry_legacy_skip else 2)
+    finally:
+        worker.stop()
+
+
 #: Fake detector box in vehicle-crop coordinates (see make_vehicle_frame).
 FAKE_PLATE_BOX = (20, 10, 120, 40)
 

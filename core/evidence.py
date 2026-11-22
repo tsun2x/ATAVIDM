@@ -326,7 +326,8 @@ def remove_detail_run(run_key: str) -> bool:
     return True
 
 
-def _pickup_detail_occurrence_dir(run_key: str, occurrence_key: str) -> Path:
+def pickup_detail_occurrence_dir(run_key: str, occurrence_key: str) -> Path:
+    """Resolve the private directory used for one pickup observation."""
     root = Path(EVIDENCE_FOLDER) / "pickup_detail"
     run_dir = root / _safe_detail_key(run_key, label="pickup run key")
     out_dir = run_dir / _safe_detail_key(occurrence_key, label="pickup occurrence key")
@@ -346,7 +347,7 @@ def save_pickup_detail_evidence(
     frame_index: int,
 ) -> dict[str, Any] | None:
     """Save a private pickup-review scene and crop in a separate evidence tree."""
-    out_dir = _pickup_detail_occurrence_dir(run_key, occurrence_key)
+    out_dir = pickup_detail_occurrence_dir(run_key, occurrence_key)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError:

@@ -123,6 +123,14 @@ if (typeof document !== "undefined") {
     const tbody = document.getElementById("reviewBody");
     const evidenceModalElement = document.getElementById("evidenceModal");
     const evidenceModal = new bootstrap.Modal(evidenceModalElement);
+    const plateRescanButton = document.getElementById("plateOcrRescan");
+    plateRescanButton?.addEventListener("click", function () {
+        const item = window.__tavidmEvidenceItem;
+        if (!item?.plate_ocr_can_rescan) return;
+        plateDetailsCache.delete(String(item.id));
+        renderPlateOcrLoading();
+        loadPlateDetails(item, 20, { rescan_from: item.plate_machine?.attempt_id || null });
+    });
     evidenceModalElement?.addEventListener("hidden.bs.modal", function () {
         window.__tavidmEvidenceItem = null;
     });
@@ -269,16 +277,13 @@ if (typeof document !== "undefined") {
                 });
             });
         });
-        if (item.plate_details_loaded) {
-            renderPlateOcr(item);
-        } else {
-            renderPlateOcrLoading();
-            loadPlateDetails(item);
-        }
+        renderPlateOcrLoading();
+        loadPlateDetails(item);
         evidenceModal.show();
     }
 
     function renderPlateOcrLoading() {
+        if (plateRescanButton) plateRescanButton.hidden = true;
         const panel = document.getElementById("plateOcrPanel");
         const body = document.getElementById("plateOcrBody");
         const badge = document.getElementById("plateOcrStateBadge");
@@ -289,26 +294,41 @@ if (typeof document !== "undefined") {
         body.textContent = "Loading optional plate evidence…";
     }
 
-    function loadPlateDetails(item, pollsRemaining = 20) {
+    function loadPlateDetails(item, pollsRemaining = 20, rescanRequest = null) {
         const cached = plateDetailsCache.get(String(item.id));
         if (cached) {
-            Object.assign(item, cached, { plate_details_loaded: true });
+            Object.assign(item, cached);
             renderPlateOcr(item);
             return;
         }
-        fetch("/api/review-queue/" + encodeURIComponent(item.id) + "/plate-details", {
+        const url = "/api/review-queue/" + encodeURIComponent(item.id) + "/plate-details";
+        const options = {
             credentials: "same-origin",
             cache: "no-store",
             headers: { "Accept": "application/json" },
-        }).then(function (response) {
+        };
+        function readResponse(response) {
             if (!response.ok) throw new Error("Optional plate evidence is unavailable.");
             return response.json();
+        }
+        const request = rescanRequest ? {
+            ...options,
+            method: "POST",
+            headers: { ...options.headers, "Content-Type": "application/json" },
+            body: JSON.stringify(rescanRequest),
+        } : options;
+        fetch(url, request).then(readResponse).then(function (payload) {
+            if (!rescanRequest && payload.success === true && payload.plate_ocr_can_queue === true &&
+                window.__tavidmEvidenceItem === item) {
+                return fetch(url, { ...options, method: "POST" }).then(readResponse);
+            }
+            return payload;
         }).then(function (payload) {
             if (!payload || payload.success !== true) throw new Error("Optional plate evidence is unavailable.");
             const details = {
                 plate_machine: payload.plate_machine || null,
+                plate_ocr_can_rescan: payload.plate_ocr_can_rescan === true,
                 review_plate_choice: payload.review_plate_choice || null,
-                plate_details_loaded: true,
             };
             const running = ["queued", "processing"].includes(details.plate_machine?.state);
             if (!running && details.plate_machine?.state !== "none") {
@@ -324,6 +344,7 @@ if (typeof document !== "undefined") {
             }
         }).catch(function () {
             if (String(window.__tavidmEvidenceItem?.id) !== String(item.id)) return;
+            if (plateRescanButton) plateRescanButton.hidden = !item.plate_ocr_can_rescan;
             const badge = document.getElementById("plateOcrStateBadge");
             const body = document.getElementById("plateOcrBody");
             if (badge) {
@@ -407,10 +428,17 @@ if (typeof document !== "undefined") {
 
         const machine = item.plate_machine || {};
         const state = machine.state || "none";
-        const copy = plateState(state);
+        const noUsableFrame = state === "no_candidate_detected" &&
+            machine.quality_rejections?.includes("collection_ended:detail_evidence_unavailable");
+        const copy = noUsableFrame ? {
+            label: "No usable frame",
+            css: "text-bg-secondary",
+            text: "No saved evidence frame could be matched to the reviewed vehicle for OCR.",
+        } : plateState(state);
         panel.hidden = false;
         badge.className = "badge " + copy.css;
         badge.textContent = copy.label;
+        if (plateRescanButton) plateRescanButton.hidden = !item.plate_ocr_can_rescan;
 
         let html = '<p class="small mb-2">' + escapeHtml(copy.text) + "</p>";
         if (item.review_plate_choice && item.review_plate_choice.accepted_plate_text) {
@@ -487,11 +515,10 @@ if (typeof document !== "undefined") {
             }
             showToast("Plate verified", "The admin-verified plate will be attached to the case when you confirm this review.", "success");
             item.review_plate_choice = { accepted_plate_text: accepted };
-            item.plate_details_loaded = true;
             plateDetailsCache.set(String(item.id), {
                 plate_machine: item.plate_machine || null,
+                plate_ocr_can_rescan: item.plate_ocr_can_rescan,
                 review_plate_choice: item.review_plate_choice,
-                plate_details_loaded: true,
             });
             const confirmation = button.closest(".border")?.querySelector(".small.text-muted.mt-1");
             if (confirmation) confirmation.textContent = "Admin-verified plate saved. It will be attached to the case and report if this review is confirmed.";
