@@ -18,7 +18,10 @@ def test_support_export_is_admin_only_and_excludes_private_data(client, monkeypa
         "id": 7, "video_id": 4, "status": "completed", "stage": "password-secret",
         "class_counts_json": json.dumps({"truck": 2, "rtsp://password-secret": 1}),
         "diagnostics_json": json.dumps({"model_classes": ["person", "motorcycle", "password-secret"],
-                                        "notes": ["password-secret"]}),
+                                        "notes": ["password-secret"],
+                                        "frame_coverage": {"decoded_frames": 8, "inference_frames": 4,
+                                                           "advertised_frames": "password-secret",
+                                                           "private": "password-secret"}}),
         "has_error": 1, "motorcycle_detail_count": 0, "pickup_detail_count": 0,
     }])
     support_diagnostics.record_request("api_process_video", 200)
@@ -31,6 +34,7 @@ def test_support_export_is_admin_only_and_excludes_private_data(client, monkeypa
     assert b"password-secret" not in response.data
     data = response.get_json()
     assert data["recent_processing_runs"][0]["class_counts"] == {"truck": 2}
+    assert data["recent_processing_runs"][0]["frame_coverage"] == {"decoded_frames": 8, "inference_frames": 4}
     assert data["recent_processing_runs"][0]["model_classes"] == ["person", "motorcycle"]
     assert any(event["action"] == "api_process_video" for event in data["recent_activity"])
     confirm = next(

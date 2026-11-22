@@ -7,6 +7,64 @@ from tests.test_scene_annotation_gate2 import _v2_doc
 from core.zone_config import dumps_zones
 
 
+def test_camera_connection_url_only_reaches_admin_editor(client, test_db, monkeypatch):
+    import app as application
+
+    url = "rtsp://operator:synthetic-password@example.invalid/camera"
+    camera_id = test_db.create_camera("gate", url)
+    for role in ("viewer", "enforcer", "admin"):
+        actor = {"id": 1, "role": role, "username": "camera-test", "full_name": "Camera Test"}
+        monkeypatch.setattr(application.auth, "current_user", lambda: actor)
+        response = client.get("/api/cameras")
+        assert response.status_code == 200
+        camera = next(c for c in response.get_json()["cameras"] if c["id"] == camera_id)
+        assert camera["rtsp_url"] == (url if role == "admin" else "")
+        if role != "admin":
+            assert b"synthetic-password" not in response.data
+            monitor = client.get("/live-monitor")
+            assert monitor.status_code == 200
+            assert b"synthetic-password" not in monitor.data
+    response = client.put(f"/api/cameras/{camera_id}", json={"name": "renamed"})
+    assert response.status_code == 200
+    assert response.get_json()["camera"]["rtsp_url"] == url
+    assert test_db.get_camera(camera_id)["rtsp_url"] == url
+
+
+def test_stream_status_redacts_rtsp_userinfo_for_non_admin_roles(client, test_db, monkeypatch):
+    import app as application
+
+    url = "rtsp://operator:synthetic-password@example.invalid/camera"
+    camera_id = test_db.create_camera("gate", url)
+    monkeypatch.setattr(
+        application.stream_manager,
+        "status",
+        lambda _camera_id: {
+            "running": False,
+            "status": "error",
+            "error": f"Cannot open {url}",
+            "diagnostics": [f"source={url}"],
+        },
+    )
+    for role in ("viewer", "enforcer", "admin"):
+        actor = {"id": 1, "role": role, "username": "camera-test", "full_name": "Camera Test"}
+        monkeypatch.setattr(application.auth, "current_user", lambda: actor)
+        response = client.get(f"/api/cameras/{camera_id}/stream-status")
+        assert response.status_code == 200
+        camera_list = client.get("/api/cameras").get_json()["cameras"]
+        listed = next(c for c in camera_list if c["id"] == camera_id)
+        monitor = client.get("/live-monitor")
+        if role == "admin":
+            assert b"synthetic-password" in response.data
+            assert listed["stream_status"]["error"].find("synthetic-password") >= 0
+            assert b"synthetic-password" in monitor.data
+        else:
+            assert b"synthetic-password" not in response.data
+            assert b"[redacted]@example.invalid" in response.data
+            assert "synthetic-password" not in listed["stream_status"]["error"]
+            assert "[redacted]@example.invalid" in listed["stream_status"]["error"]
+            assert b"synthetic-password" not in monitor.data
+
+
 def test_live_snapshot_requires_login_and_a_processed_frame(client, test_db, monkeypatch):
     import app as application
     camera_id = test_db.create_camera("test", "rtsp://example/stream")

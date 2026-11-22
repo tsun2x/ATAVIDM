@@ -53,6 +53,9 @@ class WorkerFactory:
             def latest_jpeg(self):
                 return b"test-frame"
 
+            def frame_activity(self):
+                return {}
+
         return Worker
 
     def thread_factory(self, *, target, args, name, daemon):

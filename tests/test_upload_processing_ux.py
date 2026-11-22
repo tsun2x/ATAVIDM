@@ -537,7 +537,10 @@ class TestAnalyticsBoundaries:
 
 
 class TestProcessVideoIntegration:
-    def test_synthetic_process_produces_annotated_mp4(self, test_db, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("reported_frames", [10, 24])
+    @pytest.mark.parametrize("managed", [False, True])
+    def test_synthetic_process_produces_annotated_mp4(self, test_db, tmp_path, monkeypatch, reported_frames, managed):
+        from unittest.mock import Mock
         import config
 
         monkeypatch.setattr(config, "ANNOTATED_FOLDER", str(tmp_path / "ann"))
@@ -568,9 +571,26 @@ class TestProcessVideoIntegration:
             "core.video_processor.extract_model_class_names",
             lambda det: {"car", "motorcycle", "bus", "truck", "bicycle", "person"},
         )
-        monkeypatch.setattr("core.video_processor.evaluate_detection_rules", lambda *a, **k: [])
+        midrun = {}
+        def evaluate(*args, **kwargs):
+            if not midrun:
+                time.sleep(0.05)
+            midrun.update(tracker.snapshot())
+            return []
+        monkeypatch.setattr("core.video_processor.evaluate_detection_rules", evaluate)
 
         vid, _path = _ready_video(test_db, tmp_path, "proc.mp4", frames=10)
+        open_capture = cv2.VideoCapture
+
+        def capture_with_reported_length(path):
+            cap = open_capture(path)
+            if Path(path) != _path:
+                return cap
+            wrapped = Mock(wraps=cap)
+            wrapped.get.side_effect = lambda prop: reported_frames if prop == cv2.CAP_PROP_FRAME_COUNT else cap.get(prop)
+            return wrapped
+
+        monkeypatch.setattr(cv2, "VideoCapture", capture_with_reported_length)
         tracker = ProgressTracker(run_id=1, video_id=vid, viewer_mode="watch_live")
         run_id = test_db.create_processing_run(vid, "[]")
         result = process_video(
@@ -578,8 +598,34 @@ class TestProcessVideoIntegration:
             enabled_violations=(),
             processing_run_id=run_id,
             progress_tracker=tracker,
+            defer_video_status=managed,
         )
+        assert midrun["total_frames"] == reported_frames
+        assert midrun["source_duration_sec"] == pytest.approx(reported_frames / 10.0)
+        assert 0 < midrun["progress_percent"] < 100
+        assert midrun["eta_sec"] is not None
+        if managed:
+            assert tracker.snapshot()["stage"] != "completed"
+            assert tracker.snapshot()["annotated_video_url"] is None
+            durable_progress = tracker.snapshot()
+            durable_progress.update({
+                "stage": "completed",
+                "annotated_video_path": result.annotated_video_path,
+                "annotated_video_ready": result.annotated_video_ready,
+                "frames_processed": result.frames_processed,
+                "total_frames": result.total_frames,
+                "source_duration_sec": result.source_duration_sec,
+            })
+            test_db.finish_processing_run(run_id, status="completed", progress=durable_progress)
+            tracker.mark_completed(
+                annotated_ready=result.annotated_video_ready,
+                annotated_url=f"/api/videos/{vid}/annotated/{run_id}",
+            )
+        assert tracker.snapshot()["stage"] == "completed"
         assert result.annotated_video_ready is True
+        assert json.loads(result.diagnostics_json)["frame_coverage"] == {
+            "advertised_frames": reported_frames, "decoded_frames": 10, "inference_frames": 5,
+        }
         assert result.annotated_video_path
         out = Path(result.annotated_video_path)
         assert out.is_file()

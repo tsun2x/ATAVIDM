@@ -260,6 +260,7 @@ class EvidenceEpisode:
     spool_dir: str | None = None
     run_id: str = "direct"
     track_identity_epoch: int | None = None
+    protect_reused_review_evidence: bool = False
 
 
 @dataclass
@@ -441,6 +442,7 @@ class TemporalEvidenceBuffer:
         vehicle_crop_path: str | None = None,
         review_id: int | None = None,
         track_identity_epoch: int | None = None,
+        protect_reused_review_evidence: bool = False,
     ) -> EvidenceEpisode:
         key = (violation_type, int(track_id))
         prior = self._open_episodes.pop(key, None)
@@ -474,6 +476,7 @@ class TemporalEvidenceBuffer:
             track_identity_epoch=(
                 int(track_identity_epoch) if track_identity_epoch is not None else None
             ),
+            protect_reused_review_evidence=bool(protect_reused_review_evidence),
         )
         window_start = self._window_start(ep)
         for bf in self._frames:

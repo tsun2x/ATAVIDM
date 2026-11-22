@@ -11,6 +11,19 @@ from core.live_stream import (
 from core.violation_engine import RuleEngineState, ViolationEvent, evaluate_detection_rules
 
 
+def test_reading_cached_jpeg_does_not_refresh_publish_time(monkeypatch):
+    import numpy as np
+    from core import live_stream
+
+    worker = LiveStreamWorker({"id": 7})
+    assert worker.frame_activity()["last_published_age_sec"] is None
+    monkeypatch.setattr(live_stream.time, "monotonic", lambda: 10.0)
+    worker._publish(np.zeros((8, 8, 3), dtype=np.uint8))
+    monkeypatch.setattr(live_stream.time, "monotonic", lambda: 15.0)
+    assert worker.latest_jpeg()
+    assert worker.frame_activity()["last_published_age_sec"] == 5.0
+
+
 def test_live_unknown_prerequisites_are_exposed_as_actionable_diagnostics():
     zone = [[0, 0], [300, 0], [300, 300], [0, 300]]
     state = RuleEngineState()
@@ -143,6 +156,9 @@ def test_stream_manager_never_replaces_a_worker_while_it_is_stopping(monkeypatch
 
         def is_alive(self):
             return self.alive
+
+        def frame_activity(self):
+            return {}
 
         def stop(self):
             self.stop_requested = True

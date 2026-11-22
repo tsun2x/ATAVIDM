@@ -132,6 +132,116 @@ class TestPlateStatusDefault:
         assert vrow["plate_status"] == "not_attempted"
         assert vrow["plate_text"] is None
 
+    def test_temporal_finalization_writes_first_clip_but_keeps_existing_evidence(self, test_db):
+        vid = test_db.insert_video(filename="temporal-rerun.mp4", filepath="/tmp/temporal-rerun.mp4", status="processed")
+        rid = test_db.insert_review_queue(
+            video_id=vid, track_id=4, violation_type="Counterflow", confidence=0.8,
+            frame_number=12, evidence_pre_sec=2.0, evidence_post_sec=3.0,
+        )
+
+        test_db.update_review_temporal_evidence(
+            rid, evidence_clip_path="run-1.mp4", evidence_sequence_dir="run-1-seq",
+            episode_start_sec=1.0, episode_end_sec=4.0, only_if_unfinalized=True,
+        )
+        test_db.update_review_temporal_evidence(
+            rid, evidence_clip_path="run-2.mp4", evidence_sequence_dir="run-2-seq",
+            episode_start_sec=8.0, episode_end_sec=12.0, only_if_unfinalized=True,
+        )
+
+        item = test_db.get_review_item(rid)
+        assert item["evidence_clip_path"] == "run-1.mp4"
+        assert item["evidence_sequence_dir"] == "run-1-seq"
+        assert item["episode_start_sec"] == 1.0
+        assert item["episode_end_sec"] == 4.0
+
+    def test_reused_pending_episode_preserves_any_existing_temporal_evidence(self, test_db):
+        vid = test_db.insert_video(filename="partial-temporal.mp4", filepath="/tmp/partial-temporal.mp4", status="processed")
+        rid = test_db.insert_review_queue(
+            video_id=vid, track_id=8, violation_type="Counterflow", confidence=0.8,
+            frame_number=16, evidence_clip_path="partial.mp4",
+        )
+
+        test_db.update_review_temporal_evidence(
+            rid, evidence_clip_path="recovered.mp4", evidence_sequence_dir="recovered-seq",
+            only_if_unfinalized=True,
+        )
+        item = test_db.get_review_item(rid)
+        assert item["evidence_clip_path"] == "partial.mp4"
+        assert item["evidence_sequence_dir"] is None
+
+    def test_temporal_finalization_does_not_replace_confirmed_review_evidence(self, test_db):
+        vid = test_db.insert_video(filename="confirmed-temporal.mp4", filepath="/tmp/confirmed-temporal.mp4", status="processed")
+        rid = test_db.insert_review_queue(
+            video_id=vid, track_id=5, violation_type="Counterflow", confidence=0.8,
+            frame_number=13, evidence_pre_sec=2.0, evidence_post_sec=3.0,
+            evidence_clip_path="reviewed.mp4", evidence_sequence_dir="reviewed-seq",
+            episode_start_sec=1.0, episode_end_sec=4.0,
+        )
+        reviewer = test_db.create_user("temporal-reviewer", "hash", role="enforcer")
+        violation_id = test_db.confirm_review_item(rid, reviewed_by=reviewer)
+
+        test_db.update_review_temporal_evidence(
+            rid, evidence_clip_path="rerun.mp4", evidence_sequence_dir="rerun-seq",
+            episode_start_sec=8.0, episode_end_sec=12.0, only_if_unfinalized=True,
+        )
+
+        item = test_db.get_review_item(rid)
+        violation = test_db.get_violation(violation_id)
+        assert item["evidence_clip_path"] == "reviewed.mp4"
+        assert item["evidence_sequence_dir"] == "reviewed-seq"
+        assert violation["evidence_clip_path"] == "reviewed.mp4"
+        assert violation["evidence_sequence_dir"] == "reviewed-seq"
+
+    def test_reused_episode_guard_preserves_closed_row_and_allows_first_finalize(self, test_db):
+        from core import video_processor
+        from core.temporal_evidence import TemporalEvidenceBuffer
+        from core.violation_engine import ViolationEvent
+
+        from core.video_processor import _apply_finalized_episode
+        from core.temporal_evidence import EvidenceEpisode
+
+        vid = test_db.insert_video(filename="reused-temporal.mp4", filepath="/tmp/reused-temporal.mp4", status="processed")
+        reviewed = test_db.insert_review_queue(
+            video_id=vid, track_id=6, violation_type="Counterflow", confidence=0.8,
+            frame_number=14, timestamp_sec=1.0,
+            evidence_pre_sec=2.0, evidence_post_sec=3.0,
+            evidence_clip_path="reviewed-only-clip.mp4", evidence_sequence_dir="reviewed-seq",
+            episode_start_sec=1.0, episode_end_sec=4.0,
+        )
+        reviewer = test_db.create_user("reused-reviewer", "hash", role="enforcer")
+        test_db.confirm_review_item(reviewed, reviewed_by=reviewer)
+
+        buffer = TemporalEvidenceBuffer(source_key=f"video_{vid}", run_id=2)
+        event = ViolationEvent(
+            violation_type="Counterflow", track_id=6, confidence=0.8,
+            frame_number=14, timestamp_sec=1.0, reason_log="Opposing flow",
+            vehicle_class="car", detection_confidence=0.9,
+            violation_confidence=0.8, evidence_sufficiency=0.7,
+        )
+        assert video_processor._persist_event(event, None, None, vid, buffer, processing_run_id=2) == reviewed
+        rerun_episode = buffer._open_episodes[("Counterflow", 6)]
+        assert rerun_episode.review_id is None
+
+        _apply_finalized_episode(EvidenceEpisode(
+            violation_type="Counterflow", track_id=6, confirmed_at_sec=1.0,
+            episode_start_sec=1.0, episode_end_sec=4.0, clip_path="rerun.mp4",
+            sequence_dir="rerun-seq", review_id=reviewed,
+            protect_reused_review_evidence=True,
+        ))
+        assert test_db.get_review_item(reviewed)["evidence_clip_path"] == "reviewed-only-clip.mp4"
+
+        pending = test_db.insert_review_queue(
+            video_id=vid, track_id=7, violation_type="Counterflow", confidence=0.8,
+            frame_number=15, evidence_pre_sec=2.0, evidence_post_sec=3.0,
+        )
+        _apply_finalized_episode(EvidenceEpisode(
+            violation_type="Counterflow", track_id=7, confirmed_at_sec=2.0,
+            episode_start_sec=2.0, episode_end_sec=5.0, clip_path="first-run.mp4",
+            sequence_dir="first-run-seq", review_id=pending,
+            protect_reused_review_evidence=True,
+        ))
+        assert test_db.get_review_item(pending)["evidence_clip_path"] == "first-run.mp4"
+
 
 def test_raw_scene_endpoint_is_authenticated_and_pairs_with_annotated_snapshot(
     evidence_dir, client, test_db, monkeypatch

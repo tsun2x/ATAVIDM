@@ -8,7 +8,10 @@ started twice (Flask development reloader) or never started after a restart.
 
 from __future__ import annotations
 
+import gc
 import json
+import logging
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -25,6 +28,8 @@ from core.gpu_inference_slot import (
     PRIORITY_VIDEO_JOB,
     gpu_inference_slot,
 )
+from core.processing_preview import preview_hub
+from core.processing_progress import ProgressTracker
 
 ZONES = json.dumps({"z": [[0, 0], [1, 0], [1, 1], [0, 1]]})
 
@@ -71,7 +76,13 @@ def _reset_workers(test_db_path):
         app_module.stop_detail_scanner()
         app_module._process_queue.clear()
         app_module._processing_jobs.clear()
+        app_module._processing_cancel_events.clear()
+        app_module._running_video_ids.clear()
+        app_module._local_attempt_tokens.clear()
         app_module._running_video_id = None
+        # Windows keeps a just-closed SQLite handle until the connection is
+        # collected. Do that before the temporary database directory is removed.
+        gc.collect()
 
     _cleanup()
     yield
@@ -179,13 +190,21 @@ class TestVideoJobHoldsTheReservation:
         run_id = test_db.enqueue_processing_run(video_id, "[]")
         with app_module._queue_cv:
             app_module._process_queue.append((video_id, (), run_id))
+        app_module._worker_shutdown.clear()
         thread = threading.Thread(target=app_module._processing_worker, daemon=True)
         thread.start()
         try:
             # The run remains queued and can be claimed again.
-            assert _wait_until(
-                lambda: test_db.get_processing_run(run_id)["status"] == "queued"
-            )
+            assert _wait_until(lambda: (
+                (job := app_module._processing_jobs.get(video_id)) is not None
+                and job.get("run_id") == run_id
+                and job.get("tracker") is not None
+                and job["tracker"].snapshot()["queued"] is True
+                and test_db.get_processing_run(run_id)["status"] == "queued"
+            ))
+            assert app_module._processing_jobs[video_id]["run_id"] == run_id
+            assert app_module._processing_jobs[video_id]["tracker"].snapshot()["queued"] is True
+            assert run_id not in app_module._processing_cancel_events
         finally:
             for blocker in blockers:
                 gpu_inference_slot().release(blocker)
@@ -195,6 +214,604 @@ class TestVideoJobHoldsTheReservation:
             thread.join(10.0)
         assert not thread.is_alive()
         app_module._worker_shutdown.clear()
+
+    def test_cancel_during_gpu_timeout_finishes_durable_and_cached_state(self, test_db, monkeypatch):
+        monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 5.0)
+        monkeypatch.setattr(
+            app_module,
+            "_call_process_video",
+            lambda *a, **k: pytest.fail("cancelled job must not infer"),
+        )
+        blockers = [gpu_inference_slot().acquire(
+            f"video-job:cancel-blocker-{index}", timeout=0.0, priority=PRIORITY_VIDEO_JOB
+        ) for index in (1, 2)]
+        assert all(blocker is not None for blocker in blockers)
+        owner = test_db.create_user("cancel-slot-owner", "test-hash", role="enforcer")
+        video_id = test_db.insert_video(
+            filename="cancel-slot.mp4", filepath="/tmp/cancel-slot.mp4", status="ready", uploaded_by=owner
+        )
+        run_id = test_db.enqueue_processing_run(video_id, "[]")
+        with app_module._queue_cv:
+            app_module._process_queue.append((video_id, (), run_id))
+        app_module._worker_shutdown.clear()
+        thread = threading.Thread(target=app_module._processing_worker, daemon=True)
+        thread.start()
+        try:
+            assert _wait_until(lambda: gpu_inference_slot().waiter_count() > 0, timeout=10.0)
+            assert test_db.request_processing_cancel(run_id) == "stopping"
+            app_module._processing_cancel_events.setdefault(run_id, threading.Event()).set()
+            assert _wait_until(lambda: test_db.get_processing_run(run_id)["status"] == "cancelled")
+            assert app_module._processing_jobs[video_id]["state"] == "cancelled"
+            assert run_id not in app_module._processing_cancel_events
+        finally:
+            for blocker in blockers:
+                gpu_inference_slot().release(blocker)
+            app_module._worker_shutdown.set()
+            with app_module._queue_cv:
+                app_module._queue_cv.notify_all()
+            thread.join(10.0)
+        assert not thread.is_alive()
+        app_module._worker_shutdown.clear()
+
+    def test_release_failure_stops_attempt_and_other_job_can_run(self, test_db, monkeypatch):
+        monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 0.05)
+        blockers = [gpu_inference_slot().acquire(
+            f"video-job:release-failure-blocker-{index}", timeout=0.0,
+            priority=PRIORITY_VIDEO_JOB,
+        ) for index in (1, 2)]
+        assert all(blocker is not None for blocker in blockers)
+        owner_a = test_db.create_user("release-owner-a", "test-hash", role="enforcer")
+        owner_b = test_db.create_user("release-owner-b", "test-hash", role="enforcer")
+        first = test_db.insert_video(
+            filename="release-failure.mp4", filepath="/tmp/release-failure.mp4",
+            status="ready", uploaded_by=owner_a,
+        )
+        second = test_db.insert_video(
+            filename="after-release-failure.mp4", filepath="/tmp/after-release-failure.mp4",
+            status="ready", uploaded_by=owner_b,
+        )
+        first_run = test_db.enqueue_processing_run(first, "[]")
+        second_run = test_db.enqueue_processing_run(second, "[]")
+        original_release = test_db.release_processing_claim
+        failed_release = threading.Event()
+        lease_threads = []
+        real_thread = threading.Thread
+
+        def track_lease_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            if str(kwargs.get("name") or "").startswith("lease-"):
+                lease_threads.append(thread)
+            return thread
+
+        def release(run_id, worker_id):
+            if run_id == first_run:
+                failed_release.set()
+                raise OSError("synthetic release outage")
+            return original_release(run_id, worker_id)
+
+        monkeypatch.setattr(app_module.db, "release_processing_claim", release)
+        monkeypatch.setattr(app_module, "_call_process_video", lambda *_a, **_k: app_module.ProcessVideoResult())
+        monkeypatch.setattr(app_module.threading, "Thread", track_lease_thread)
+        app_module._worker_shutdown.clear()
+        worker = threading.Thread(target=app_module._processing_worker, daemon=True)
+        worker.start()
+        try:
+            assert failed_release.wait(5)
+            assert test_db.get_processing_run(first_run)["status"] == "running"
+            assert _wait_until(lambda: bool(lease_threads) and not lease_threads[0].is_alive())
+            for blocker in blockers:
+                gpu_inference_slot().release(blocker)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and test_db.get_processing_run(second_run)["status"] != "completed":
+                time.sleep(0.01)
+            assert test_db.get_processing_run(second_run)["status"] == "completed"
+            assert second_run not in app_module._processing_cancel_events
+        finally:
+            for blocker in blockers:
+                gpu_inference_slot().release(blocker)
+            app_module._worker_shutdown.set()
+            with app_module._queue_cv:
+                app_module._queue_cv.notify_all()
+            worker.join(10.0)
+            app_module._worker_shutdown.clear()
+        assert not worker.is_alive()
+
+
+def _expire_lease(db_path: str, run_id: int) -> None:
+    """Backdate a live claim so the real expiry path can recover it immediately."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE processing_runs SET lease_expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000+00:00", int(run_id)),
+        )
+
+
+def _release_gpu_blockers(blockers) -> None:
+    slot = gpu_inference_slot()
+    for blocker in blockers:
+        slot.release(blocker)
+
+
+class TestSameVideoRetryAfterWorkerCleanup:
+    """Same-video retry must survive a failed GPU acquire and a rejected claim release."""
+
+    def test_gpu_acquisition_exception_allows_retry_after_lease_recovery(
+        self, test_db, test_db_path, enforcer_client, monkeypatch
+    ):
+        raised = {"done": False}
+        slot = gpu_inference_slot()
+        real_acquire = slot.acquire
+
+        def acquire(owner, *, timeout, priority=PRIORITY_VIDEO_JOB):
+            if str(owner).startswith("video-job:") and not raised["done"]:
+                raised["done"] = True
+                raise RuntimeError("synthetic GPU acquisition failure")
+            return real_acquire(owner, timeout=timeout, priority=priority)
+
+        monkeypatch.setattr(slot, "acquire", acquire)
+        monkeypatch.setattr(
+            app_module, "process_video", lambda *_a, **_k: app_module.ProcessVideoResult()
+        )
+        owner = test_db.get_user_by_username("enforcer_test")
+        video_id = test_db.insert_video(
+            filename="retry-after-gpu-exception.mp4",
+            filepath="/tmp/retry-after-gpu-exception.mp4",
+            status="ready",
+            uploaded_by=owner["id"],
+        )
+        test_db.upsert_annotation(video_id, ZONES)
+        started = enforcer_client.post(
+            f"/api/videos/{video_id}/process",
+            json={"enabled_violations": []},
+            content_type="application/json",
+        )
+        assert started.status_code == 200, started.get_json()
+        run_id = int(started.get_json()["run_id"])
+
+        def attempt_cleared() -> bool:
+            run = test_db.get_processing_run(run_id)
+            return bool(
+                raised["done"]
+                and run
+                and run["status"] == "running"
+                and video_id not in app_module._running_video_ids
+                and app_module._processing_jobs.get(video_id) is None
+            )
+
+        assert _wait_until(attempt_cleared)
+        # The shared marker must follow the running set. SQLite, not a stale
+        # marker, is what still blocks a duplicate while the lease is live.
+        assert app_module._running_video_id != video_id
+        assert test_db.processing_queue_position(video_id) == 0
+        assert app_module._is_processing_or_queued(video_id) is True
+        duplicate = enforcer_client.post(
+            f"/api/videos/{video_id}/process",
+            json={"enabled_violations": []},
+            content_type="application/json",
+        )
+        assert duplicate.status_code == 409, duplicate.get_json()
+        assert test_db.get_processing_run(run_id)["status"] == "running"
+
+        _expire_lease(test_db_path, run_id)
+        test_db.recover_orphaned_processing()
+        assert _wait_until(
+            lambda: (
+                (recovered := test_db.get_processing_run(run_id)) is not None
+                and recovered["status"] == "failed"
+                and recovered["error_message"] == "Worker lease expired."
+            )
+        )
+        assert test_db.processing_queue_position(video_id) is None
+        assert app_module._processing_jobs.get(video_id) is None
+        assert app_module._is_processing_or_queued(video_id) is False
+
+        retried = enforcer_client.post(
+            f"/api/videos/{video_id}/process",
+            json={"enabled_violations": []},
+            content_type="application/json",
+        )
+        assert retried.status_code == 200, retried.get_json()
+        retry_run = int(retried.get_json()["run_id"])
+        assert retry_run != run_id
+        assert _wait_until(
+            lambda: test_db.get_processing_run(retry_run)["status"] == "completed"
+        )
+        app_module.stop_processing_worker(timeout=5)
+
+    def test_rejected_claim_release_cannot_block_resubmission_after_durable_clear(
+        self, test_db, test_db_path, enforcer_client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 0.05)
+        monkeypatch.setattr(
+            app_module, "process_video", lambda *_a, **_k: app_module.ProcessVideoResult()
+        )
+        blockers = [
+            gpu_inference_slot().acquire(
+                f"video-job:rejected-release-blocker-{index}",
+                timeout=0.0,
+                priority=PRIORITY_VIDEO_JOB,
+            )
+            for index in (1, 2)
+        ]
+        assert all(blocker is not None for blocker in blockers)
+        original_release = test_db.release_processing_claim
+        released = {"count": 0}
+
+        def release(run_id, worker_id):
+            released["count"] += 1
+            if released["count"] == 1:
+                return False
+            return original_release(run_id, worker_id)
+
+        monkeypatch.setattr(app_module.db, "release_processing_claim", release)
+        owner = test_db.get_user_by_username("enforcer_test")
+        video_id = test_db.insert_video(
+            filename="rejected-release.mp4",
+            filepath="/tmp/rejected-release.mp4",
+            status="ready",
+            uploaded_by=owner["id"],
+        )
+        test_db.upsert_annotation(video_id, ZONES)
+        try:
+            started = enforcer_client.post(
+                f"/api/videos/{video_id}/process",
+                json={"enabled_violations": []},
+                content_type="application/json",
+            )
+            assert started.status_code == 200, started.get_json()
+            run_id = int(started.get_json()["run_id"])
+            assert _wait_until(lambda: released["count"] >= 1)
+            assert _wait_until(
+                lambda: app_module._processing_jobs.get(video_id, {}).get("state") != "processing"
+            )
+            assert test_db.get_processing_run(run_id)["status"] == "running"
+            blocked = enforcer_client.post(
+                f"/api/videos/{video_id}/process",
+                json={"enabled_violations": []},
+                content_type="application/json",
+            )
+            assert blocked.status_code == 409, blocked.get_json()
+
+            _expire_lease(test_db_path, run_id)
+            test_db.recover_orphaned_processing()
+            assert _wait_until(
+                lambda: test_db.get_processing_run(run_id)["status"] == "failed"
+                and test_db.get_processing_run(run_id)["error_message"] == "Worker lease expired."
+            )
+            assert app_module._processing_jobs.get(video_id, {}).get("state") != "processing"
+            assert app_module._is_processing_or_queued(video_id) is False
+
+            _release_gpu_blockers(blockers)
+            blockers.clear()
+            retried = enforcer_client.post(
+                f"/api/videos/{video_id}/process",
+                json={"enabled_violations": []},
+                content_type="application/json",
+            )
+            assert retried.status_code == 200, retried.get_json()
+            retry_run = int(retried.get_json()["run_id"])
+            assert _wait_until(
+                lambda: test_db.get_processing_run(retry_run)["status"] == "completed"
+            )
+            app_module.stop_processing_worker(timeout=5)
+        finally:
+            _release_gpu_blockers(blockers)
+            app_module.stop_processing_worker(timeout=5)
+
+    def test_replacement_attempt_survives_rejected_release_cleanup(
+        self, test_db, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 0.05)
+        monkeypatch.setattr(
+            app_module,
+            "_call_process_video",
+            lambda *_a, **_k: pytest.fail("replacement cleanup must not infer"),
+        )
+        blockers = [
+            gpu_inference_slot().acquire(
+                f"video-job:replacement-blocker-{index}",
+                timeout=0.0,
+                priority=PRIORITY_VIDEO_JOB,
+            )
+            for index in (1, 2)
+        ]
+        assert all(blocker is not None for blocker in blockers)
+        owner = test_db.create_user("replacement-owner", "test-hash", role="enforcer")
+        video_id = test_db.insert_video(
+            filename="replacement.mp4",
+            filepath="/tmp/replacement.mp4",
+            status="ready",
+            uploaded_by=owner,
+        )
+        other_id = test_db.insert_video(
+            filename="other-active.mp4",
+            filepath="/tmp/other-active.mp4",
+            status="ready",
+            uploaded_by=owner,
+        )
+        run_id = test_db.enqueue_processing_run(video_id, "[]")
+        with app_module._queue_cv:
+            app_module._process_queue.append((video_id, (), run_id))
+        original_release = test_db.release_processing_claim
+        original_claim = test_db.claim_next_processing_run
+        reached = threading.Event()
+        gate = threading.Event()
+        claims = {"count": 0}
+
+        def claim(worker_id, *args, **kwargs):
+            claims["count"] += 1
+            return original_claim(worker_id, *args, **kwargs)
+
+        def release(run_id_arg, worker_id):
+            if int(run_id_arg) == int(run_id):
+                reached.set()
+                assert gate.wait(5.0)
+                return False
+            return original_release(run_id_arg, worker_id)
+
+        monkeypatch.setattr(app_module.db, "claim_next_processing_run", claim)
+        monkeypatch.setattr(app_module.db, "release_processing_claim", release)
+        app_module._worker_shutdown.clear()
+        worker = threading.Thread(target=app_module._processing_worker, daemon=True)
+        worker.start()
+        try:
+            assert reached.wait(10.0)
+            shared_event = app_module._processing_cancel_events[run_id]
+            replacement_tracker = ProgressTracker(
+                run_id=run_id, video_id=video_id, viewer_mode="watch_live"
+            )
+            replacement_tracker.set_stage("loading_model")
+            app_module._processing_jobs[video_id] = {
+                "state": "processing",
+                "error": None,
+                "run_id": run_id,
+                "tracker": replacement_tracker,
+                "viewer_mode": "watch_live",
+            }
+            app_module._processing_cancel_events[run_id] = shared_event
+            preview_hub.publish(video_id, b"replacement-preview")
+            app_module._adopt_running_attempt(video_id, object())
+            with app_module._queue_cv:
+                app_module._running_video_ids.add(other_id)
+                app_module._running_video_id = other_id
+            claims_before = claims["count"]
+            gate.set()
+            assert _wait_until(lambda: claims["count"] > claims_before)
+            assert app_module._processing_jobs[video_id]["tracker"] is replacement_tracker
+            replacement_tracker.set_stage("processing")
+            assert replacement_tracker.snapshot()["stage"] == "processing"
+            assert app_module._processing_cancel_events[run_id] is shared_event
+            shared_event.set()
+            assert shared_event.is_set() is True
+            assert preview_hub.latest(video_id) == b"replacement-preview"
+            assert video_id in app_module._running_video_ids
+            assert other_id in app_module._running_video_ids
+            assert app_module._running_video_id == other_id
+            assert app_module._running_video_id in app_module._running_video_ids
+        finally:
+            gate.set()
+            _release_gpu_blockers(blockers)
+            preview_hub.clear(video_id)
+            app_module._worker_shutdown.set()
+            with app_module._queue_cv:
+                app_module._queue_cv.notify_all()
+            worker.join(10.0)
+            app_module._worker_shutdown.clear()
+        assert not worker.is_alive()
+
+
+class TestPostReleaseReadCleanup:
+    """Local cleanup after a successful GPU-timeout release must survive a bad read."""
+
+    def test_status_read_failure_after_release_still_clears_local_attempt(
+        self, test_db, enforcer_client, monkeypatch, caplog
+    ):
+        _assert_post_release_read_is_best_effort(
+            test_db,
+            enforcer_client,
+            monkeypatch,
+            caplog,
+            failing_read="get_processing_run",
+        )
+
+    def test_queue_position_read_failure_after_release_still_clears_local_attempt(
+        self, test_db, enforcer_client, monkeypatch, caplog
+    ):
+        _assert_post_release_read_is_best_effort(
+            test_db,
+            enforcer_client,
+            monkeypatch,
+            caplog,
+            failing_read="processing_queue_position",
+        )
+
+
+def _assert_post_release_read_is_best_effort(
+    test_db,
+    enforcer_client,
+    monkeypatch,
+    caplog,
+    *,
+    failing_read: str,
+) -> None:
+    """One failed post-release read must not pin the video or kill the worker.
+
+    The injected failure is one-shot and happens only on the worker thread after
+    ``release_processing_claim`` has already returned true. Later status reads
+    use the real SQLite functions.
+    """
+    monkeypatch.setattr(app_module, "_VIDEO_JOB_GPU_WAIT_SEC", 0.05)
+    monkeypatch.setattr(app_module, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(app_module, "bootstrap_detail_queue", lambda: None)
+    monkeypatch.setattr(
+        app_module, "process_video", lambda *_a, **_k: app_module.ProcessVideoResult()
+    )
+    blockers = [
+        gpu_inference_slot().acquire(
+            f"video-job:post-release-{failing_read}-{index}",
+            timeout=0.0,
+            priority=PRIORITY_VIDEO_JOB,
+        )
+        for index in (1, 2)
+    ]
+    assert all(blocker is not None for blocker in blockers)
+    owner = test_db.get_user_by_username("enforcer_test")
+    video_id = test_db.insert_video(
+        filename=f"{failing_read}.mp4",
+        filepath=f"/tmp/{failing_read}.mp4",
+        status="ready",
+        uploaded_by=owner["id"],
+    )
+    other_id = test_db.insert_video(
+        filename=f"other-{failing_read}.mp4",
+        filepath=f"/tmp/other-{failing_read}.mp4",
+        status="ready",
+        uploaded_by=owner["id"],
+    )
+    next_id = test_db.insert_video(
+        filename=f"next-{failing_read}.mp4",
+        filepath=f"/tmp/next-{failing_read}.mp4",
+        status="ready",
+        uploaded_by=owner["id"],
+    )
+    test_db.upsert_annotation(video_id, ZONES)
+    run_id = test_db.enqueue_processing_run(video_id, "[]")
+    next_run = test_db.enqueue_processing_run(next_id, "[]")
+    with app_module._queue_cv:
+        app_module._running_video_ids.add(other_id)
+        app_module._running_video_id = other_id
+
+    original_release = app_module.db.release_processing_claim
+    original_get = app_module.db.get_processing_run
+    original_position = app_module.db.processing_queue_position
+    original_claim = app_module.db.claim_next_processing_run
+    original_finish = app_module._finish_local_attempt
+    released = threading.Event()
+    read_failed = threading.Event()
+    claim_gate = threading.Event()
+    claims = {"count": 0}
+    finishes = {"count": 0}
+    consumed = {"done": False}
+
+    def release(released_run_id, worker_id):
+        result = original_release(released_run_id, worker_id)
+        if (
+            threading.current_thread() is worker
+            and int(released_run_id) == int(run_id)
+            and result is True
+        ):
+            released.set()
+        return result
+
+    def fail_once():
+        if (
+            threading.current_thread() is worker
+            and released.is_set()
+            and not consumed["done"]
+        ):
+            consumed["done"] = True
+            read_failed.set()
+            raise sqlite3.OperationalError(f"synthetic {failing_read} outage")
+
+    def get_processing_run(read_run_id):
+        if failing_read == "get_processing_run" and int(read_run_id) == int(run_id):
+            fail_once()
+        return original_get(read_run_id)
+
+    def processing_queue_position(read_video_id):
+        if (
+            failing_read == "processing_queue_position"
+            and int(read_video_id) == int(video_id)
+        ):
+            fail_once()
+        return original_position(read_video_id)
+
+    def claim(worker_id, *args, **kwargs):
+        if threading.current_thread() is worker:
+            claims["count"] += 1
+            if claims["count"] == 2 and not claim_gate.wait(10):
+                raise TimeoutError("second claim was not released")
+        return original_claim(worker_id, *args, **kwargs)
+
+    def finish(*args, **kwargs):
+        if threading.current_thread() is worker:
+            finishes["count"] += 1
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.db, "release_processing_claim", release)
+    monkeypatch.setattr(app_module.db, "get_processing_run", get_processing_run)
+    monkeypatch.setattr(app_module.db, "processing_queue_position", processing_queue_position)
+    monkeypatch.setattr(app_module.db, "claim_next_processing_run", claim)
+    monkeypatch.setattr(app_module, "_finish_local_attempt", finish)
+    caplog.set_level(logging.ERROR, logger="app")
+    app_module._worker_shutdown.clear()
+    worker = threading.Thread(
+        target=app_module._processing_worker,
+        args=("post-release-read-worker",),
+        daemon=True,
+        name="post-release-read-worker",
+    )
+    worker.start()
+    try:
+        assert released.wait(10)
+        assert read_failed.wait(10)
+        assert _wait_until(
+            lambda: (
+                app_module._processing_jobs.get(video_id) is None
+                and video_id not in app_module._running_video_ids
+                and other_id in app_module._running_video_ids
+                and app_module._running_video_id == other_id
+                and finishes["count"] == 1
+                and worker.is_alive()
+            ),
+            timeout=2.0,
+        )
+        assert str(run_id) in caplog.text
+        assert test_db.get_processing_run(run_id)["status"] == "queued"
+        assert test_db.get_processing_run(run_id)["worker_id"] in (None, "")
+        blocked = enforcer_client.post(
+            f"/api/videos/{video_id}/process",
+            json={"enabled_violations": []},
+            content_type="application/json",
+        )
+        assert blocked.status_code == 409, blocked.get_json()
+        assert test_db.get_processing_run(run_id)["status"] == "queued"
+        assert finishes["count"] == 1
+
+        assert test_db.request_processing_cancel(run_id) == "cancelled"
+        assert test_db.get_processing_run(run_id)["status"] == "cancelled"
+        assert test_db.processing_queue_position(video_id) is None
+        assert app_module._is_processing_or_queued(video_id) is False
+        retried = enforcer_client.post(
+            f"/api/videos/{video_id}/process",
+            json={"enabled_violations": []},
+            content_type="application/json",
+        )
+        assert retried.status_code == 200, retried.get_json()
+        retry_run = int(retried.get_json()["run_id"])
+        assert retry_run != run_id
+
+        _release_gpu_blockers(blockers)
+        blockers.clear()
+        claim_gate.set()
+        assert _wait_until(
+            lambda: test_db.get_processing_run(next_run)["status"] == "completed"
+            and test_db.get_processing_run(retry_run)["status"] == "completed"
+        )
+        assert worker.is_alive()
+        assert worker.ident is not None
+        assert claims["count"] >= 2
+        assert not app_module._worker_threads
+        assert other_id in app_module._running_video_ids
+    finally:
+        claim_gate.set()
+        _release_gpu_blockers(blockers)
+        app_module._worker_shutdown.set()
+        with app_module._queue_cv:
+            app_module._queue_cv.notify_all()
+        worker.join(10.0)
+        app_module._worker_shutdown.clear()
+    assert not worker.is_alive()
 
 
 class TestDetailScannerLifecycle:
@@ -504,6 +1121,21 @@ def _stub_live_pipeline(monkeypatch, live, detector_cls, capture):
 
 
 class TestLiveStreamFrameReservation:
+    def test_camera_open_error_omits_connection_details(self, monkeypatch):
+        from unittest.mock import Mock
+        from core import live_stream as live
+
+        worker = live.LiveStreamWorker({"id": 3, "rtsp_url": "rtsp://user:synthetic-secret@camera/stream"})
+        capture = Mock()
+        capture.isOpened.return_value = False
+        _stub_live_pipeline(monkeypatch, live, Mock, capture)
+        worker.run()
+        manager = live.StreamManager()
+        manager._workers[3] = worker
+        status = manager.status(3)
+        assert status["status"] == "error"
+        assert status["error"] == "Cannot open stream for camera 3."
+
     def test_frame_is_dropped_instead_of_inferring_twice(self, monkeypatch):
         from core import live_stream as live
 
@@ -534,6 +1166,11 @@ class TestLiveStreamFrameReservation:
             for token in tokens:
                 slot.release(token)
         assert calls == []
+        activity = worker.frame_activity()
+        assert activity["gpu_skipped_frames"] == 2
+        assert activity["last_decoded_age_sec"] is not None
+        assert activity["last_inferred_age_sec"] is None
+        assert activity["last_published_age_sec"] is None
         assert capture.released is True
         assert worker.status == "stopped"
         assert slot.is_free()

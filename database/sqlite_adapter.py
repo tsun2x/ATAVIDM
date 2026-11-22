@@ -1463,6 +1463,15 @@ def get_video(video_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
+def video_filepath_is_registered(filepath: str) -> bool:
+    """Check exact upload-path registration after an uncertain write failure."""
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM videos WHERE filepath = ? LIMIT 1", (filepath,)
+        ).fetchone()
+        return row is not None
+
+
 def list_videos(
     processed: bool | None = None,
     *,
@@ -1780,23 +1789,35 @@ def release_processing_claim(run_id: int, worker_id: str) -> bool:
     """Return a live claim to the durable queue when its worker cannot run it."""
     with immediate_db_session() as conn:
         row = conn.execute(
-            "SELECT video_id FROM processing_runs WHERE id = ? AND worker_id = ? AND status = 'running'",
+            "SELECT video_id, cancel_requested_at FROM processing_runs WHERE id = ? AND worker_id = ? AND status = 'running'",
             (int(run_id), str(worker_id)),
         ).fetchone()
         if row is None:
             return False
+        cancelled = bool(row["cancel_requested_at"])
         updated = conn.execute(
-            """UPDATE processing_runs SET status = 'queued', stage = 'queued',
-               started_at = NULL, worker_id = NULL, heartbeat_at = NULL,
-               lease_expires_at = NULL
+            """UPDATE processing_runs SET status = ?, stage = ?,
+               started_at = CASE WHEN ? THEN started_at ELSE NULL END,
+               finished_at = CASE WHEN ? THEN ? ELSE NULL END,
+               error_message = NULL, worker_id = NULL, heartbeat_at = NULL,
+               lease_expires_at = NULL, cancel_requested_at = NULL
                WHERE id = ? AND worker_id = ? AND status = 'running'""",
-            (int(run_id), str(worker_id)),
+            (
+                "cancelled" if cancelled else "queued",
+                "cancelled" if cancelled else "queued",
+                int(cancelled), int(cancelled), datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                int(run_id), str(worker_id),
+            ),
         )
         if updated.rowcount != 1:
             return False
-        conn.execute(
-            "UPDATE videos SET status = 'ready' WHERE id = ? AND status = 'processing'",
+        completed = conn.execute(
+            "SELECT 1 FROM processing_runs WHERE video_id = ? AND status = 'completed' LIMIT 1",
             (int(row["video_id"]),),
+        ).fetchone()
+        conn.execute(
+            "UPDATE videos SET status = ? WHERE id = ? AND status = 'processing'",
+            ("processed" if completed else "ready", int(row["video_id"])),
         )
         return True
 
@@ -1890,7 +1911,9 @@ def start_processing_run(run_id: int) -> None:
         )
 
 
-def update_processing_run_progress(run_id: int, progress: dict[str, Any]) -> None:
+def update_processing_run_progress(
+    run_id: int, progress: dict[str, Any], *, worker_id: str | None = None
+) -> None:
     """Persist a progress snapshot (called periodically from the worker)."""
     fields = []
     params: list[Any] = []
@@ -1929,10 +1952,14 @@ def update_processing_run_progress(run_id: int, progress: dict[str, Any]) -> Non
         params.append(int(progress["vehicles_crossed"]))
     if not fields:
         return
+    where = "id = ? AND status = 'running'"
     params.append(run_id)
+    if worker_id is not None:
+        where += " AND worker_id = ?"
+        params.append(str(worker_id))
     with db_session() as conn:
         conn.execute(
-            f"UPDATE processing_runs SET {', '.join(fields)} WHERE id = ?",
+            f"UPDATE processing_runs SET {', '.join(fields)} WHERE {where}",
             params,
         )
 
@@ -1945,8 +1972,9 @@ def finish_processing_run(
     diagnostics_json: str | None = None,
     geometry_snapshot_json: str | None = None,
     progress: dict[str, Any] | None = None,
-) -> None:
-    with db_session() as conn:
+    worker_id: str | None = None,
+) -> bool:
+    with immediate_db_session() as conn:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         stage = "completed" if status == "completed" else "failed"
         ann_path = None
@@ -1992,7 +2020,15 @@ def finish_processing_run(
             extra_sets += ", annotated_video_ready = ?"
             extra_params.append(ann_ready)
 
-        conn.execute(
+        where = "id = ?"
+        finish_params = [
+            status, error_message, now, stage, diagnostics_json,
+            geometry_snapshot_json, *extra_params, run_id,
+        ]
+        if worker_id is not None:
+            where += " AND worker_id = ? AND status = 'running'"
+            finish_params.append(str(worker_id))
+        updated = conn.execute(
             f"""
             UPDATE processing_runs
             SET status = ?, error_message = ?, finished_at = ?, stage = ?,
@@ -2000,19 +2036,33 @@ def finish_processing_run(
                 geometry_snapshot_json = COALESCE(?, geometry_snapshot_json),
                 worker_id = NULL, heartbeat_at = NULL, lease_expires_at = NULL
                 {extra_sets}
-            WHERE id = ?
+            WHERE {where}
             """,
-            (
-                status,
-                error_message,
-                now,
-                stage,
-                diagnostics_json,
-                geometry_snapshot_json,
-                *extra_params,
-                run_id,
-            ),
+            finish_params,
         )
+        if updated.rowcount != 1:
+            return False
+        if worker_id is not None:
+            run = conn.execute(
+                "SELECT video_id FROM processing_runs WHERE id = ?", (int(run_id),)
+            ).fetchone()
+            if run:
+                video_id = int(run["video_id"])
+                if status == "completed":
+                    conn.execute(
+                        "UPDATE videos SET processed = 1, status = 'processed' WHERE id = ?",
+                        (video_id,),
+                    )
+                else:
+                    prior = conn.execute(
+                        "SELECT 1 FROM processing_runs WHERE video_id = ? AND status = 'completed' LIMIT 1",
+                        (video_id,),
+                    ).fetchone()
+                    conn.execute(
+                        "UPDATE videos SET status = ? WHERE id = ?",
+                        ("processed" if prior else "ready", video_id),
+                    )
+        return True
 
 
 def support_processing_summary(limit: int = 50) -> list[dict[str, Any]]:
@@ -2139,7 +2189,8 @@ def list_processing_runs(video_id: int) -> list[dict[str, Any]]:
 
 
 def list_processing_jobs(
-    *, recent_limit: int = 20, video_id: int | None = None
+    *, recent_limit: int = 20, video_id: int | None = None,
+    owner_user_id: int | None = None, uploader_id: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return active and bounded terminal processing runs across videos.
 
@@ -2149,6 +2200,16 @@ def list_processing_jobs(
     limit = max(1, min(int(recent_limit), 100))
     filter_sql = "AND pr.video_id = ?" if video_id is not None else ""
     filter_params: tuple[Any, ...] = (int(video_id),) if video_id is not None else ()
+    scope_user_id = owner_user_id if owner_user_id is not None else uploader_id
+    ownership_sql = "AND v.uploaded_by = ?" if scope_user_id is not None else ""
+    recent_scope_sql = """AND EXISTS (
+                      SELECT 1 FROM videos scoped_v
+                      WHERE scoped_v.id = pr.video_id
+                        AND scoped_v.uploaded_by = ?
+                  )""" if scope_user_id is not None else ""
+    ownership_params: tuple[Any, ...] = (
+        (int(scope_user_id),) if scope_user_id is not None else ()
+    )
     with db_session() as conn:
         rows = conn.execute(
             f"""
@@ -2156,6 +2217,7 @@ def list_processing_jobs(
                 SELECT pr.id
                 FROM processing_runs pr
                 WHERE pr.status IN ('completed', 'failed', 'cancelled')
+                  {recent_scope_sql}
                   {filter_sql}
                 ORDER BY COALESCE(pr.finished_at, pr.started_at, pr.queued_at) DESC,
                          pr.id DESC
@@ -2207,12 +2269,13 @@ def list_processing_jobs(
                      THEN 1 ELSE 0 END AS is_current_result
             FROM processing_runs pr
             JOIN videos v ON v.id = pr.video_id
-            WHERE ((pr.status IN ('queued', 'running') {filter_sql})
+            WHERE ((pr.status IN ('queued', 'running') {filter_sql} {ownership_sql})
                    OR pr.id IN (SELECT id FROM recent_ids))
             ORDER BY COALESCE(pr.finished_at, pr.started_at, pr.queued_at) DESC,
                      pr.id DESC
             """,
-            (*filter_params, limit, *filter_params),
+            (*ownership_params, *filter_params, limit,
+             *filter_params, *ownership_params),
         ).fetchall()
 
     active: list[dict[str, Any]] = []
@@ -3678,7 +3741,8 @@ def insert_review_queue(
     contributing_factors_json: str | None = None,
     unavailable_factors_json: str | None = None,
     processing_run_id: int | None = None,
-) -> int:
+    _return_reused: bool = False,
+) -> int | tuple[int, bool]:
     # Compatibility: legacy ``confidence`` stores violation_confidence when provided.
     viol_conf = (
         float(violation_confidence)
@@ -3688,6 +3752,7 @@ def insert_review_queue(
     det_conf = detection_confidence
     reason_text = str(reason_log or "")
     is_pickup_handoff = reason_text.startswith("[pickup_detail_handoff]")
+    is_detail_handoff = is_pickup_handoff or "[motorcycle_detail_candidate:" in reason_text
     with db_session() as conn:
         # A reprocess gets a new processing_run_id, but an identical source
         # observation from the same uploaded video is still the same review
@@ -3696,17 +3761,13 @@ def insert_review_queue(
         # separate occurrences on the same track.
         # Keep approvals from the detail queues distinct from automatic rows,
         # even when the source-frame identity happens to match.
-        is_detail_handoff = is_pickup_handoff or "[motorcycle_detail_candidate:" in reason_text
-        if (
-            video_id is not None
-            and processing_run_id is not None
-            and not is_detail_handoff
-        ):
+        if video_id is not None and processing_run_id is not None and not is_detail_handoff:
             existing = conn.execute(
                 """SELECT id FROM review_queue
                    WHERE video_id = ? AND track_id = ? AND violation_type = ?
                      AND frame_number = ? AND timestamp_sec IS ?
                      AND instr(COALESCE(reason_log, ''), '[pickup_detail_handoff]') = 0
+                     AND instr(COALESCE(reason_log, ''), '[motorcycle_detail_candidate:') = 0
                    ORDER BY id LIMIT 1""",
                 (
                     int(video_id), int(track_id), str(violation_type),
@@ -3720,7 +3781,8 @@ def insert_review_queue(
                     "UPDATE review_queue SET processing_run_id = ? WHERE id = ?",
                     (int(processing_run_id), int(existing["id"])),
                 )
-                return int(existing["id"])
+                review_id = int(existing["id"])
+                return (review_id, True) if _return_reused else review_id
         cursor = conn.execute(
             """
             INSERT INTO review_queue (
@@ -3764,7 +3826,8 @@ def insert_review_queue(
                 processing_run_id,
             ),
         )
-        return cursor.lastrowid
+        review_id = int(cursor.lastrowid)
+        return (review_id, False) if _return_reused else review_id
 
 
 def list_review_queue(
@@ -4615,6 +4678,7 @@ def update_review_temporal_evidence(
     episode_end_sec: float | None = None,
     evidence_pre_sec: float | None = None,
     evidence_post_sec: float | None = None,
+    only_if_unfinalized: bool = False,
 ) -> None:
     """Write finalized temporal evidence paths/timing back onto a review row."""
     fields: list[str] = []
@@ -4641,10 +4705,16 @@ def update_review_temporal_evidence(
         return
     params.append(review_id)
     with db_session() as conn:
-        conn.execute(
-            f"UPDATE review_queue SET {', '.join(fields)} WHERE id = ?",
-            params,
+        condition = ""
+        if only_if_unfinalized:
+            # Existing UI readiness accepts either artifact, so preserve the
+            # row once either evidence reference has been written.
+            condition = " AND status = 'pending' AND evidence_clip_path IS NULL AND evidence_sequence_dir IS NULL"
+        updated = conn.execute(
+            f"UPDATE review_queue SET {', '.join(fields)} WHERE id = ?{condition}", params
         )
+        if updated.rowcount == 0:
+            return
         review = conn.execute(
             "SELECT * FROM review_queue WHERE id = ?",
             (review_id,),

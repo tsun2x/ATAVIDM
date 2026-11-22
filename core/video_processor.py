@@ -304,6 +304,7 @@ def _apply_finalized_episode(ep: EvidenceEpisode) -> None:
         episode_end_sec=ep.episode_end_sec,
         evidence_pre_sec=EVIDENCE_PRE_SEC,
         evidence_post_sec=EVIDENCE_POST_SEC,
+        only_if_unfinalized=ep.protect_reused_review_evidence,
     )
 
 
@@ -347,7 +348,7 @@ def _persist_event(
     band = confidence_band(event.violation_confidence)
     factors_json = json.dumps(event.contributing_factors)
     unavailable_json = json.dumps(list(event.unavailable_factors))
-    review_id = db.insert_review_queue(
+    review_id, reused_review = db.insert_review_queue(
         video_id=video_id,
         track_id=event.track_id,
         violation_type=event.violation_type,
@@ -369,7 +370,14 @@ def _persist_event(
         contributing_factors_json=factors_json,
         unavailable_factors_json=unavailable_json,
         processing_run_id=processing_run_id,
+        _return_reused=True,
     )
+    existing_review = db.get_review_item(review_id) if reused_review else None
+    finalized_review_id = review_id
+    if reused_review and existing_review and existing_review.get("status") != "pending":
+        # Keep a closed human decision and its violation evidence detached from
+        # the new run's finalizer. The source event still reuses the review row.
+        finalized_review_id = None
 
     if plate_collector is not None and detection is not None:
         plate_collector.register(
@@ -388,10 +396,11 @@ def _persist_event(
         episode_start_sec=float(event.timestamp_sec),
         still_path=evidence_path,
         vehicle_crop_path=vehicle_evidence_path,
-        review_id=review_id,
+        review_id=finalized_review_id,
         track_identity_epoch=(
             detection.get("track_identity_epoch") if detection is not None else None
         ),
+        protect_reused_review_evidence=reused_review,
     )
     event.evidence_timing = evidence_timing_dict(episode)
     return int(review_id)
@@ -404,6 +413,7 @@ def process_video(
     processing_run_id: int | str | None = None,
     progress_tracker: ProgressTracker | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    defer_video_status: bool = False,
 ) -> ProcessVideoResult:
     """
     Run the full YOLOv8m -> ByteTrack -> rule engine pipeline on one video.
@@ -449,7 +459,7 @@ def process_video(
                 logger.exception("progress_callback failed")
 
     try:
-        if progress_tracker:
+        if progress_tracker and not defer_video_status:
             progress_tracker.set_stage("opening_video")
 
         cap = cv2.VideoCapture(ctx["video_path"])
@@ -597,6 +607,7 @@ def process_video(
         events: list[ViolationEvent] = []
         detection_batch: list[dict[str, Any]] = []
         frame_number = -1
+        inference_frames = 0
         last_ts = 0.0
         run_id_int = int(processing_run_id) if processing_run_id is not None else None
 
@@ -666,6 +677,7 @@ def process_video(
             evidence_buf.push(frame, frame_number, timestamp_sec, finalize_due=False)
 
             raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
+            inference_frames += 1
             tracked = track_state.update(raw, now=timestamp_sec)
             pickup_person_detections = pickup_person_scanner.scan(
                 frame, tracked, timestamp_sec=timestamp_sec, frame_number=frame_number
@@ -825,6 +837,14 @@ def process_video(
                 )
             _legacy_progress(frames_done, total_frames or frames_done)
 
+        diagnostics_payload = diagnostics.as_dict()
+        diagnostics_payload["frame_coverage"] = {
+            "advertised_frames": total_frames if total_frames > 0 else None,
+            "decoded_frames": frame_number + 1,
+            "inference_frames": inference_frames,
+        }
+        diagnostics_json = json.dumps(diagnostics_payload)
+
         if detection_batch:
             db.bulk_insert_detections(detection_batch)
 
@@ -905,7 +925,8 @@ def process_video(
             except Exception:  # noqa: BLE001 - diagnostics must not fail a run
                 logger.exception("pickup person scan diagnostics unavailable for run %s", run_id_int)
 
-        db.mark_video_processed(video_id)
+        if not defer_video_status:
+            db.mark_video_processed(video_id)
         result = ProcessVideoResult(
             events=events,
             diagnostics_json=diagnostics_json,
@@ -928,7 +949,7 @@ def process_video(
             pickup_detail_candidates=int(pickup_detail_summary.get("persisted") or 0),
             pickup_detail_summary=pickup_detail_summary,
         )
-        if progress_tracker:
+        if progress_tracker and not defer_video_status:
             url = (
                 f"/api/videos/{video_id}/annotated/{processing_run_id}"
                 if annotated_ready and processing_run_id is not None

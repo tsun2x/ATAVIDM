@@ -56,10 +56,14 @@ def _present(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_processing_jobs_snapshot(
-    *, recent_limit: int = 20, video_id: int | None = None
+    *, recent_limit: int = 20, video_id: int | None = None,
+    owner_user_id: int | None = None, uploader_id: int | None = None,
 ) -> dict[str, Any]:
     limit = max(1, min(int(recent_limit), MAX_RECENT))
-    grouped = db.list_processing_jobs(recent_limit=limit, video_id=video_id)
+    grouped = db.list_processing_jobs(
+        recent_limit=limit, video_id=video_id,
+        owner_user_id=owner_user_id, uploader_id=uploader_id,
+    )
     active = [_present(item) for item in grouped["active"]]
     recent = [_present(item) for item in grouped["recent"]]
     return {

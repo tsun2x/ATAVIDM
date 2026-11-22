@@ -519,6 +519,60 @@ class TestUploadRecordedAtRoute:
 # ---------------------------------------------------------------------------
 
 class TestTemporalEvidenceProcessVideoLifecycle:
+    def test_managed_pipeline_defers_completion_tracker_until_owner_commit(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        from core.processing_progress import ProgressTracker
+
+        video_path = tmp_path / "deferred.mp4"
+        _write_tiny_mp4(video_path, frames=3, fps=5.0)
+        video_id = test_db.insert_video(
+            filename="deferred.mp4", filepath=str(video_path), status="ready"
+        )
+        test_db.upsert_annotation(video_id, json.dumps({}))
+        run_id = test_db.enqueue_processing_run(video_id, "[]")
+        assert test_db.claim_next_processing_run("lease-owner")["id"] == run_id
+
+        class StubDetector:
+            def load(self):
+                return None
+
+            @property
+            def class_names(self):
+                return {"car"}
+
+            def track_frame(self, frame, conf=0.6, timestamp_sec=0.0):
+                return []
+
+        monkeypatch.setattr("core.video_processor.Detector", StubDetector)
+        tracker = ProgressTracker(run_id=run_id, video_id=video_id)
+        result = process_video(
+            video_id, enabled_violations=(), processing_run_id=run_id,
+            progress_tracker=tracker, defer_video_status=True,
+        )
+
+        status = tracker.snapshot()
+        assert status["stage"] == "finalizing"
+        assert status["state"] == "processing"
+        assert status["annotated_video_ready"] is False
+        assert status["annotated_video_url"] is None
+        assert test_db.get_video(video_id)["status"] != "processed"
+        # A stale owner cannot publish completion; the current owner can commit.
+        assert test_db.finish_processing_run(
+            run_id, status="completed", progress=result.progress_snapshot,
+            worker_id="stale-owner",
+        ) is False
+        assert tracker.snapshot()["state"] == "processing"
+        assert test_db.finish_processing_run(
+            run_id, status="completed", progress=result.progress_snapshot,
+            worker_id="lease-owner",
+        ) is True
+        tracker.mark_completed(
+            annotated_ready=result.annotated_video_ready,
+            annotated_url=None,
+        )
+        assert tracker.snapshot()["state"] == "done"
+
     def test_long_episode_spill_survives_ring_rotation(self, tmp_path, monkeypatch):
         monkeypatch.setattr("core.temporal_evidence.EVIDENCE_FOLDER", str(tmp_path / "evidence"))
         buf = TemporalEvidenceBuffer(source_key="video_spill", fps=5.0, max_frames=8)

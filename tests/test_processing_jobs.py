@@ -75,6 +75,36 @@ def test_list_processing_jobs_filters_and_removed_result_disables_preview(test_d
     assert "annotated_video_path" not in rows["recent"][0]
 
 
+def test_processing_job_recent_limit_is_applied_after_account_scope(test_db):
+    """A newer foreign account run must not consume this account's recent slot."""
+    import bcrypt
+
+    owner_a = test_db.create_user(
+        "jobs_owner_a", bcrypt.hashpw(b"pw", bcrypt.gensalt()).decode(),
+        role="enforcer", full_name="Owner A",
+    )
+    owner_b = test_db.create_user(
+        "jobs_other_owner", bcrypt.hashpw(b"pw", bcrypt.gensalt()).decode(),
+        role="enforcer", full_name="Other Owner",
+    )
+    video_a = test_db.insert_video(
+        "owned.mp4", "/tmp/owned.mp4", status="ready", uploaded_by=owner_a
+    )
+    video_b = test_db.insert_video(
+        "foreign.mp4", "/tmp/foreign.mp4", status="ready", uploaded_by=owner_b
+    )
+    own_run = test_db.create_processing_run(video_a, "[]")
+    test_db.finish_processing_run(own_run, status="failed")
+    foreign_run = test_db.create_processing_run(video_b, "[]")
+    test_db.finish_processing_run(foreign_run, status="failed")
+
+    rows = test_db.list_processing_jobs(
+        recent_limit=1, owner_user_id=owner_a
+    )
+
+    assert [row["id"] for row in rows["recent"]] == [own_run]
+
+
 def test_processing_jobs_api_requires_auth_and_validates_bounds(client, enforcer_client):
     """Catches an unauthenticated or unbounded cross-video history endpoint."""
     client.get("/logout")

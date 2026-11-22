@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from urllib.parse import urljoin, urlparse
@@ -125,6 +126,13 @@ def api_support_diagnostics():
         except (TypeError, ValueError):
             diagnostics = {}
         if isinstance(diagnostics, dict):
+            coverage = diagnostics.get("frame_coverage")
+            if isinstance(coverage, dict):
+                run["frame_coverage"] = {
+                    key: coverage[key]
+                    for key in ("advertised_frames", "decoded_frames", "inference_frames")
+                    if type(coverage.get(key)) is int and 0 <= coverage[key] <= 2**53 - 1
+                }
             classes = diagnostics.get("model_classes")
             run["model_classes"] = [c for c in classes if isinstance(c, str) and c in allowed_classes][:30] if isinstance(classes, list) else None
             capabilities = diagnostics.get("rule_capabilities")
@@ -183,6 +191,9 @@ _queue_cv = threading.Condition(_queue_lock)
 # _running_video_ids is the authoritative set of active local videos.
 _running_video_id: int | None = None
 _running_video_ids: set[int] = set()
+# Per-video token for the worker attempt that added the id to _running_video_ids.
+# Stale cleanup may change the legacy marker only while its token is still current.
+_local_attempt_tokens: dict[int, object] = {}
 _worker_shutdown = threading.Event()
 _worker_thread: threading.Thread | None = None
 _worker_threads: list[threading.Thread] = []
@@ -821,18 +832,43 @@ def _case_actions_for_user(user: dict) -> dict[str, bool]:
     }
 
 
-def _camera_to_ui(row: dict) -> dict:
+def _camera_to_ui(row: dict, *, include_connection_url: bool = False) -> dict:
     return {
         "id": row["id"],
         "name": row["name"],
         "location": row.get("location") or "",
-        "rtsp_url": row["rtsp_url"],
+        "rtsp_url": row["rtsp_url"] if include_connection_url else "",
         "zones_json": row.get("zones_json") or "{}",
         "is_active": bool(row.get("is_active", 1)),
         "created_at": row.get("created_at"),
         "stream_url": f"/api/cameras/{row['id']}/stream",
         "stream_status": stream_manager.status(row["id"]),
     }
+
+
+def _redact_camera_status(status: dict) -> dict:
+    """Hide RTSP userinfo from camera status text shown to non-admin roles."""
+    safe = dict(status)
+    pattern = re.compile(r"(?i)(rtsps?://)[^/@\s'\"]+@")
+
+    def redact(value):
+        if isinstance(value, str):
+            return pattern.sub(r"\1[redacted]@", value)
+        return value
+
+    safe["error"] = redact(safe.get("error"))
+    diagnostics = safe.get("diagnostics")
+    if isinstance(diagnostics, list):
+        safe["diagnostics"] = [redact(item) for item in diagnostics]
+    return safe
+
+
+def _camera_status_to_ui(camera_id: int) -> dict:
+    """Serialize stream status consistently for every authenticated surface."""
+    status = stream_manager.status(camera_id)
+    if not _is_admin_actor():
+        status = _redact_camera_status(status)
+    return status
 
 
 def _system_status(actor: dict[str, Any] | None = None, *, uploader_id: int | None = None) -> dict:
@@ -1017,7 +1053,11 @@ def live_monitor():
         return filter_error, filter_status
     scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     videos = [_db_video_to_ui(row) for row in db.list_videos(**scope)]
-    cameras = [_camera_to_ui(row) for row in db.list_cameras()]
+    cameras = [
+        {**_camera_to_ui(row, include_connection_url=_is_admin_actor()),
+         "stream_status": _camera_status_to_ui(row["id"])}
+        for row in db.list_cameras()
+    ]
     return render_template(
         "live_monitor.html",
         videos=videos,
@@ -1391,7 +1431,7 @@ def settings():
         violation_catalog=violation_catalog_for_ui(),
         violation_groups=violation_groups_for_ui(),
         enabled_violations=list(load_enabled_violations()),
-        cameras=[_camera_to_ui(c) for c in db.list_cameras()],
+        cameras=[_camera_to_ui(c, include_connection_url=True) for c in db.list_cameras()],
         roles=auth.ROLE_LABELS,
         zone_types=zones_for_api(),
         zone_templates=[_template_to_ui(t) for t in db.list_zone_templates()],
@@ -1747,6 +1787,8 @@ def api_upload_video():
                 "error": "Recording date and time cannot be in the future.",
             }), 400
 
+    filepath = None
+    video_registered = False
     try:
         validate_upload(file, request.content_length)
         filename, filepath = save_video_file(file)
@@ -1769,6 +1811,7 @@ def api_upload_video():
             file_size_bytes=file_size or None,
             uploaded_by=user["id"] if user else None,
         )
+        video_registered = True
         try:
             db.insert_video_history_event(
                 video_id,
@@ -1830,6 +1873,14 @@ def api_upload_video():
     except UploadError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
     except Exception as exc:
+        if filepath and not video_registered:
+            try:
+                if not db.video_filepath_is_registered(filepath):
+                    os.remove(filepath)
+            except OSError:
+                logger.exception("Could not remove unregistered upload %s", filepath)
+            except Exception:
+                logger.exception("Could not verify whether failed upload was registered")
         logger.exception("Upload failed: %s", exc)
         return jsonify({"success": False, "error": "Upload failed. Please try again."}), 500
 
@@ -1863,29 +1914,26 @@ def _queue_position(video_id: int) -> int | None:
     return None
 
 
-def _fail_processing_run(run_id: int, exc: BaseException) -> None:
+def _fail_processing_run(
+    run_id: int, exc: BaseException, *, worker_id: str | None = None
+) -> bool | None:
     progress = getattr(exc, "progress_snapshot", None)
     try:
-        db.finish_processing_run(
+        return db.finish_processing_run(
             run_id,
             status="failed",
             error_message=str(exc),
             diagnostics_json=getattr(exc, "diagnostics_json", None),
             geometry_snapshot_json=getattr(exc, "geometry_snapshot_json", None),
             progress=progress,
+            worker_id=worker_id,
         )
     except Exception:
         logger.exception("Failed to mark processing run %d as failed", run_id)
+        return None
 
 
-def _reset_video_ready(video_id: int) -> None:
-    try:
-        db.update_video(video_id, status="ready")
-    except Exception:
-        logger.exception("Failed to reset video %d to ready after pipeline error", video_id)
-
-
-def _call_process_video(video_id, *, enabled_violations, processing_run_id, progress_tracker=None):
+def _call_process_video(video_id, *, enabled_violations, processing_run_id, progress_tracker=None, worker_id=None):
     """Invoke process_video, passing optional kwargs only when supported."""
     kwargs = {"enabled_violations": enabled_violations}
     try:
@@ -1906,6 +1954,10 @@ def _call_process_video(video_id, *, enabled_violations, processing_run_id, prog
     ):
         event = _processing_cancel_events.setdefault(processing_run_id, threading.Event())
         kwargs["cancel_requested"] = event.is_set
+    if "defer_video_status" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        kwargs["defer_video_status"] = True
 
     def _persist_progress(cur: int, tot: int) -> None:
         # Throttled DB write via progress_tracker snapshot when available.
@@ -1917,7 +1969,10 @@ def _call_process_video(video_id, *, enabled_violations, processing_run_id, prog
         # Persist every ~30 frames to keep status recoverable across refresh.
         if cur == 1 or cur % 30 == 0 or (tot and cur >= tot):
             try:
-                db.update_processing_run_progress(processing_run_id, snap)
+                if worker_id is None:
+                    db.update_processing_run_progress(processing_run_id, snap)
+                else:
+                    db.update_processing_run_progress(processing_run_id, snap, worker_id=worker_id)
             except Exception:
                 logger.exception("Failed to persist progress for run %s", processing_run_id)
 
@@ -1926,6 +1981,55 @@ def _call_process_video(video_id, *, enabled_violations, processing_run_id, prog
     ):
         kwargs["progress_callback"] = _persist_progress
     return process_video(video_id, **kwargs)
+
+
+def _adopt_running_attempt(video_id: int, attempt_token: object) -> None:
+    """Record ``attempt_token`` as the local owner of ``video_id`` under the queue lock."""
+    global _running_video_id
+    with _queue_cv:
+        _running_video_ids.add(int(video_id))
+        _local_attempt_tokens[int(video_id)] = attempt_token
+        _running_video_id = next(iter(_running_video_ids), None)
+        _queue_cv.notify_all()
+
+
+def _finish_local_attempt(
+    video_id: int,
+    run_id: int,
+    attempt_token: object,
+    attempt_job: dict,
+    cancel_event: threading.Event,
+    *,
+    drop_job: bool = False,
+    replacement_job: dict | None = None,
+) -> bool:
+    """Retire this attempt's in-memory mirrors when it still owns the video.
+
+    The legacy ``_running_video_id`` assignment lives in this module-level
+    function, under ``_queue_cv``, so a nested worker helper cannot bind a
+    local name and leave the shared marker stale. A replacement attempt that
+    already stored a different token keeps its job, cancellation event,
+    running-set membership, preview, and the marker.
+    """
+    global _running_video_id
+    preview_generation = preview_hub.generation(video_id)
+    with _queue_cv:
+        if _local_attempt_tokens.get(video_id) is not attempt_token:
+            return False
+        current = _processing_jobs.get(video_id)
+        if current is attempt_job:
+            if replacement_job is not None:
+                _processing_jobs[video_id] = replacement_job
+            elif drop_job:
+                _processing_jobs.pop(video_id, None)
+        if _processing_cancel_events.get(run_id) is cancel_event:
+            _processing_cancel_events.pop(run_id, None)
+        _running_video_ids.discard(video_id)
+        _local_attempt_tokens.pop(video_id, None)
+        _running_video_id = next(iter(_running_video_ids), None)
+        _queue_cv.notify_all()
+    preview_hub.clear_if_generation(video_id, preview_generation)
+    return True
 
 
 def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
@@ -1953,10 +2057,14 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.exception("Invalid violation snapshot in processing run %d", run_id)
-            db.finish_processing_run(run_id, status="failed", error_message=str(exc))
+            db.finish_processing_run(
+                run_id, status="failed", error_message=str(exc), worker_id=worker_id
+            )
             continue
+        attempt_token = object()
         with _queue_cv:
             _running_video_ids.add(video_id)
+            _local_attempt_tokens[video_id] = attempt_token
             _running_video_id = next(iter(_running_video_ids), None)
             _process_queue[:] = [entry for entry in _process_queue if entry[2] != run_id]
             _queue_cv.notify_all()
@@ -1973,11 +2081,17 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
             "tracker": tracker,
             "viewer_mode": job.get("viewer_mode") or "background",
         }
+        attempt_job = _processing_jobs[video_id]
         # Reserved immediately before the first GPU inference call and released
         # in the finally below, so cancellation, failure, and shutdown all free
         # the device. No queue mutex is held while waiting or while inferring.
         lease_stop = threading.Event()
         cancel_event = _processing_cancel_events.setdefault(run_id, threading.Event())
+
+        def _evict_attempt_state() -> None:
+            """Drop only this attempt's cache entry; SQLite lease remains authoritative."""
+            if _processing_jobs.get(video_id) is attempt_job:
+                _processing_jobs.pop(video_id, None)
 
         def _maintain_claim() -> None:
             while not lease_stop.wait(10.0):
@@ -1994,12 +2108,37 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
         lease_thread = threading.Thread(
             target=_maintain_claim, daemon=True, name=f"lease-{run_id}"
         )
-        lease_thread.start()
-        gpu_token = _gpu_slot.acquire(
-            f"video-job:{video_id}:{run_id}",
-            timeout=_VIDEO_JOB_GPU_WAIT_SEC,
-            priority=PRIORITY_VIDEO_JOB,
-        )
+        gpu_token = None
+
+        def _stop_lease_thread() -> None:
+            lease_stop.set()
+            if lease_thread.ident is not None:
+                lease_thread.join(timeout=1.0)
+
+        def _cleanup_unstarted_attempt() -> None:
+            # The SQLite lease stays active. Duplicate enqueue stays blocked
+            # until claim recovery; only this attempt's local mirrors are dropped.
+            _stop_lease_thread()
+            _finish_local_attempt(
+                video_id,
+                run_id,
+                attempt_token,
+                attempt_job,
+                cancel_event,
+                drop_job=True,
+            )
+
+        try:
+            lease_thread.start()
+            gpu_token = _gpu_slot.acquire(
+                f"video-job:{video_id}:{run_id}",
+                timeout=_VIDEO_JOB_GPU_WAIT_SEC,
+                priority=PRIORITY_VIDEO_JOB,
+            )
+        except Exception:
+            logger.exception("Worker %s could not acquire GPU reservation for run %d", worker_id, run_id)
+            _cleanup_unstarted_attempt()
+            continue
         if gpu_token is None:
             # Bounded wait elapsed: put the job back at the head of the queue
             # and retry shortly rather than inferring without the reservation.
@@ -2009,13 +2148,102 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
                 video_id,
                 run_id,
             )
-            db.release_processing_claim(run_id, worker_id)
-            lease_stop.set()
-            lease_thread.join(timeout=1.0)
-            with _queue_cv:
-                _running_video_ids.discard(video_id)
-                _running_video_id = next(iter(_running_video_ids), None)
-                _queue_cv.notify_all()
+            try:
+                released = db.release_processing_claim(run_id, worker_id)
+            except Exception:
+                logger.exception("Worker %s could not release timed-out claim %d", worker_id, run_id)
+                _cleanup_unstarted_attempt()
+                continue
+            _stop_lease_thread()
+            if released is False:
+                # This worker no longer owns the claim. Drop only its mirrors
+                # when a replacement has not already adopted the video or run.
+                _finish_local_attempt(
+                    video_id,
+                    run_id,
+                    attempt_token,
+                    attempt_job,
+                    cancel_event,
+                    drop_job=True,
+                )
+                continue
+            # Both reads are best-effort. A failure is logged and must not
+            # escape the worker loop: ``finally`` still retires this attempt,
+            # and the handlers below swallow the error so the loop can claim
+            # the next job. Publish a queued or cancelled cache entry only
+            # after that state is known, and do it before the cancellation
+            # history write. Otherwise drop this attempt's job and leave the
+            # durable row untouched for the next status request.
+            replacement_job = None
+            record_cancellation = False
+            try:
+                try:
+                    current_run = db.get_processing_run(run_id)
+                except Exception:
+                    logger.exception(
+                        "Could not inspect released processing run %d", run_id
+                    )
+                    current_run = None
+                else:
+                    status = current_run.get("status") if current_run else None
+                    if status == "cancelled":
+                        tracker.mark_cancelled()
+                        replacement_job = {
+                            "state": "cancelled",
+                            "error": None,
+                            "run_id": run_id,
+                            "tracker": tracker,
+                            "viewer_mode": job.get("viewer_mode") or "background",
+                        }
+                        record_cancellation = True
+                    elif status == "queued":
+                        try:
+                            position = db.processing_queue_position(video_id)
+                        except Exception:
+                            logger.exception(
+                                "Could not read queue position for released processing run %d",
+                                run_id,
+                            )
+                        else:
+                            tracker.set_queued(True, position=position)
+                            replacement_job = {
+                                "state": "processing",
+                                "error": None,
+                                "run_id": run_id,
+                                "tracker": tracker,
+                                "viewer_mode": job.get("viewer_mode") or "background",
+                            }
+            except Exception:
+                logger.exception(
+                    "Could not refresh local state after releasing processing run %d",
+                    run_id,
+                )
+                record_cancellation = False
+            finally:
+                try:
+                    _finish_local_attempt(
+                        video_id,
+                        run_id,
+                        attempt_token,
+                        attempt_job,
+                        cancel_event,
+                        drop_job=replacement_job is None,
+                        replacement_job=replacement_job,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not finish local cleanup for released processing run %d",
+                        run_id,
+                    )
+            if record_cancellation:
+                try:
+                    db.insert_video_history_event(
+                        video_id, "processing_cancelled", run_id=run_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to write cancellation history for run %d", run_id
+                    )
             continue
         pipeline_ok = False
         result = None
@@ -2026,63 +2254,71 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
                     enabled_violations=enabled_violations,
                     processing_run_id=run_id,
                     progress_tracker=tracker,
+                    worker_id=worker_id,
                 )
                 if not isinstance(result, ProcessVideoResult):
                     result = ProcessVideoResult(events=list(result or []))
                 pipeline_ok = True
-                _processing_jobs[video_id] = {
-                    "state": "done",
-                    "error": None,
-                    "run_id": run_id,
-                    "tracker": tracker,
-                    "viewer_mode": job.get("viewer_mode") or "background",
-                    "result": result,
-                }
             except ProcessVideoError as exc:
                 if isinstance(exc, ProcessVideoCancelled):
-                    tracker.mark_cancelled()
+                    cancellation_progress = tracker.snapshot()
+                    cancellation_progress["stage"] = "cancelled"
+                    try:
+                        accepted = db.finish_processing_run(
+                            run_id, status="cancelled", progress=cancellation_progress, worker_id=worker_id
+                        )
+                    except Exception:
+                        logger.exception("Could not durably cancel processing run %d", run_id)
+                        accepted = None
+                    if accepted is True:
+                        tracker.mark_cancelled()
+                        _processing_jobs[video_id] = {
+                            "state": "cancelled", "error": None, "run_id": run_id,
+                            "tracker": tracker, "viewer_mode": job.get("viewer_mode") or "background",
+                        }
+                        try:
+                            db.insert_video_history_event(video_id, "processing_cancelled", run_id=run_id)
+                        except Exception:
+                            logger.exception("Failed to write cancellation history for run %d", run_id)
+                    else:
+                        logger.error("Could not durably cancel processing run %d; preserving current status", run_id)
+                        _evict_attempt_state()
+                    continue
+                accepted = _fail_processing_run(run_id, exc, worker_id=worker_id)
+                if accepted is True:
+                    tracker.set_error(str(exc))
                     _processing_jobs[video_id] = {
-                        "state": "cancelled", "error": None, "run_id": run_id,
+                        "state": "error", "error": str(exc), "run_id": run_id,
                         "tracker": tracker, "viewer_mode": job.get("viewer_mode") or "background",
                     }
-                    db.finish_processing_run(run_id, status="cancelled", progress=tracker.snapshot())
-                    previous = db.get_current_completed_result_run(video_id)
-                    db.update_video(video_id, status="processed" if previous else "ready")
-                    db.insert_video_history_event(video_id, "processing_cancelled", run_id=run_id)
-                    continue
-                tracker.set_error(str(exc))
-                _processing_jobs[video_id] = {
-                    "state": "error",
-                    "error": str(exc),
-                    "run_id": run_id,
-                    "tracker": tracker,
-                    "viewer_mode": job.get("viewer_mode") or "background",
-                }
-                _fail_processing_run(run_id, exc)
-                _reset_video_ready(video_id)
-                db.insert_video_history_event(
-                    video_id,
-                    "processing_failed",
-                    run_id=run_id,
-                    detail={"error": str(exc)},
-                )
+                    try:
+                        db.insert_video_history_event(
+                            video_id, "processing_failed", run_id=run_id,
+                            detail={"error": str(exc)},
+                        )
+                    except Exception:
+                        logger.exception("Failed to write failure history for run %d", run_id)
+                else:
+                    logger.error("Could not durably fail processing run %d; preserving current status", run_id)
+                    _evict_attempt_state()
             except Exception as exc:
-                tracker.set_error(str(exc))
-                _processing_jobs[video_id] = {
-                    "state": "error",
-                    "error": str(exc),
-                    "run_id": run_id,
-                    "tracker": tracker,
-                    "viewer_mode": job.get("viewer_mode") or "background",
-                }
-                _fail_processing_run(run_id, exc)
-                _reset_video_ready(video_id)
-                db.insert_video_history_event(
-                    video_id,
-                    "processing_failed",
-                    run_id=run_id,
-                    detail={"error": str(exc)},
-                )
+                accepted = _fail_processing_run(run_id, exc, worker_id=worker_id)
+                if accepted is True:
+                    tracker.set_error(str(exc))
+                    _processing_jobs[video_id] = {
+                        "state": "error", "error": str(exc), "run_id": run_id,
+                        "tracker": tracker, "viewer_mode": job.get("viewer_mode") or "background",
+                    }
+                    try:
+                        db.insert_video_history_event(
+                            video_id, "processing_failed", run_id=run_id,
+                            detail={"error": str(exc)},
+                        )
+                    except Exception:
+                        logger.exception("Failed to write failure history for run %d", run_id)
+                else:
+                    logger.error("Could not durably fail processing run %d; preserving current status", run_id)
+                    _evict_attempt_state()
 
             if pipeline_ok and result is not None:
                 progress = result.progress_snapshot or tracker.snapshot()
@@ -2105,53 +2341,93 @@ def _processing_worker(worker_id: str = "tavidm-process-worker") -> None:
                     }
                 )
                 try:
-                    db.finish_processing_run(
+                    accepted = db.finish_processing_run(
                         run_id,
                         status="completed",
                         diagnostics_json=result.diagnostics_json,
                         geometry_snapshot_json=result.geometry_snapshot_json,
                         progress=progress,
+                        worker_id=worker_id,
                     )
-                    db.insert_video_history_event(
-                        video_id,
-                        "processing_completed",
-                        run_id=run_id,
-                        detail={
-                            "detection_records": result.detection_records,
-                            "violation_candidates": result.violation_candidates,
-                            "annotated_video_ready": result.annotated_video_ready,
-                            "model_identifier": result.model_identifier,
-                        },
-                    )
+                    if accepted is not True:
+                        logger.error("Worker %s lost claim before finishing run %d", worker_id, run_id)
+                        _evict_attempt_state()
+                    else:
+                        annotated_url = (
+                            f"/api/videos/{video_id}/annotated/{run_id}"
+                            if result.annotated_video_ready else None
+                        )
+                        tracker.mark_completed(
+                            annotated_ready=result.annotated_video_ready,
+                            annotated_url=annotated_url,
+                        )
+                        _processing_jobs[video_id] = {
+                            "state": "done", "error": None, "run_id": run_id,
+                            "tracker": tracker, "viewer_mode": job.get("viewer_mode") or "background",
+                            "result": result,
+                        }
+                        try:
+                            db.insert_video_history_event(
+                                video_id,
+                                "processing_completed",
+                                run_id=run_id,
+                                detail={
+                                    "detection_records": result.detection_records,
+                                    "violation_candidates": result.violation_candidates,
+                                    "annotated_video_ready": result.annotated_video_ready,
+                                    "model_identifier": result.model_identifier,
+                                },
+                            )
+                        except Exception:
+                            logger.exception("Failed to write completion history for run %d", run_id)
                 except Exception:
                     logger.exception(
                         "Processing run %d row write failed after a successful pipeline; "
-                        "video %d stays processed.",
+                        "video %d terminal write failed.",
                         run_id,
                         video_id,
                     )
                     try:
-                        db.finish_processing_run(
+                        failed_write = db.finish_processing_run(
                             run_id,
                             status="failed",
-                            error_message="Failed to write processing run row after successful pipeline.",
+                            error_message="Failed to write completed processing result.",
                             diagnostics_json=result.diagnostics_json,
                             geometry_snapshot_json=result.geometry_snapshot_json,
-                            progress=progress,
+                            worker_id=worker_id,
                         )
+                        if failed_write is True:
+                            tracker.set_error("Failed to write completed processing result.")
+                            _processing_jobs[video_id] = {
+                                "state": "error", "error": tracker.snapshot().get("error"),
+                                "run_id": run_id, "tracker": tracker,
+                                "viewer_mode": job.get("viewer_mode") or "background",
+                            }
+                        else:
+                            _evict_attempt_state()
                     except Exception:
-                        pass
+                        logger.exception("Failed to record terminal write failure for run %d", run_id)
+                        try:
+                            current = db.get_processing_run(run_id)
+                        except Exception:
+                            current = None
+                        # A history or terminal write exception is not proof of
+                        # durable failure. Leave the current status recoverable.
+                        _evict_attempt_state()
         finally:
-            lease_stop.set()
-            lease_thread.join(timeout=1.0)
-            _processing_cancel_events.pop(run_id, None)
-            preview_hub.clear(video_id)
-            # Always release the device, including on cancellation/failure.
-            _gpu_slot.release(gpu_token)
-            with _queue_cv:
-                _running_video_ids.discard(video_id)
-                _running_video_id = next(iter(_running_video_ids), None)
-                _queue_cv.notify_all()
+            _stop_lease_thread()
+            try:
+                _finish_local_attempt(
+                    video_id,
+                    run_id,
+                    attempt_token,
+                    attempt_job,
+                    cancel_event,
+                    drop_job=False,
+                )
+            finally:
+                # Always release the device, including on cancellation/failure.
+                _gpu_slot.release(gpu_token)
 
 
 # ---------------------------------------------------------------------------
@@ -2332,6 +2608,7 @@ def stop_processing_worker(timeout: float = 3.0) -> None:
         _worker_threads = []
     _running_video_id = None
     _running_video_ids.clear()
+    _local_attempt_tokens.clear()
     stop_detail_scanner(timeout=timeout)
 
 
@@ -2819,35 +3096,12 @@ def api_processing_jobs():
         return jsonify({"success": False, "error": error}), status
     if video_id is not None and _accessible_video(video_id, actor) is None:
         return jsonify({"success": False, "error": "Video not found."}), 404
+    scope = _account_video_scope(actor, uploader_id=selected_uploader_id)
     snapshot = build_processing_jobs_snapshot(
-        recent_limit=min(recent_limit, 100), video_id=video_id
+        recent_limit=min(recent_limit, 100), video_id=video_id, **scope
     )
-    if actor and actor.get("role") == "enforcer":
-        visible_video_ids = {
-            int(row["id"])
-            for row in db.list_videos(**_account_video_scope(actor))
-        }
-        snapshot["active"] = [
-            job for job in snapshot.get("active", [])
-            if int(job.get("video_id") or -1) in visible_video_ids
-        ]
-        snapshot["recent"] = [
-            job for job in snapshot.get("recent", [])
-            if int(job.get("video_id") or -1) in visible_video_ids
-        ]
-    elif _is_admin_actor(actor) and selected_uploader_id is not None:
-        selected_video_ids = {
-            int(row["id"])
-            for row in db.list_videos(uploader_id=selected_uploader_id)
-        }
-        snapshot["active"] = [
-            job for job in snapshot.get("active", [])
-            if int(job.get("video_id") or -1) in selected_video_ids
-        ]
-        snapshot["recent"] = [
-            job for job in snapshot.get("recent", [])
-            if int(job.get("video_id") or -1) in selected_video_ids
-        ]
+    # Ownership is applied in the SQL query before LIMIT. Do not enumerate all
+    # account videos here: that defeats the bounded recent-history query.
     can_stop = (actor or {}).get("role") in ("admin", "enforcer")
     for job in snapshot["active"]:
         job["can_stop"] = can_stop
@@ -4982,7 +5236,13 @@ def api_update_user_access(user_id: int):
 @app.route("/api/cameras", methods=["GET"])
 @auth.login_required
 def api_list_cameras():
-    return jsonify({"success": True, "cameras": [_camera_to_ui(c) for c in db.list_cameras()]})
+    include_url = _is_admin_actor()
+    cameras = [
+        {**_camera_to_ui(c, include_connection_url=include_url),
+         "stream_status": _camera_status_to_ui(c["id"])}
+        for c in db.list_cameras()
+    ]
+    return jsonify({"success": True, "cameras": cameras})
 
 
 @app.route("/api/cameras", methods=["POST"])
@@ -5003,7 +5263,7 @@ def api_create_camera():
         location=(payload.get("location") or "").strip() or None,
         zones_json=zones_json,
     )
-    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id), include_connection_url=True)})
 
 
 @app.route("/api/cameras/<int:camera_id>", methods=["PUT"])
@@ -5039,7 +5299,7 @@ def api_update_camera(camera_id: int):
             return jsonify({"success": False, "error": "Camera not found."}), 404
         return jsonify({"success": False, "error": "Camera scene changed since this editor opened. Reload it and review the current scene before saving."}), 409
     stream_manager.restart(camera_id)  # active workers pick up the new configuration
-    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id))})
+    return jsonify({"success": True, "camera": _camera_to_ui(db.get_camera(camera_id), include_connection_url=True)})
 
 
 @app.route("/api/cameras/<int:camera_id>", methods=["DELETE"])
@@ -5068,7 +5328,8 @@ def api_camera_stream(camera_id: int):
 @app.route("/api/cameras/<int:camera_id>/stream-status")
 @auth.login_required
 def api_camera_stream_status(camera_id: int):
-    return jsonify({"success": True, **stream_manager.status(camera_id)})
+    status = _camera_status_to_ui(camera_id)
+    return jsonify({"success": True, **status})
 
 
 @app.route("/api/cameras/<int:camera_id>/annotation-frame")

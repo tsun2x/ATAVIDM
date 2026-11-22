@@ -99,6 +99,10 @@ class LiveStreamWorker(threading.Thread):
         self._frame_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
         self._latest_raw_jpeg: bytes | None = None
+        self._last_decoded_at: float | None = None
+        self._last_inferred_at: float | None = None
+        self._last_published_at: float | None = None
+        self._gpu_skipped_frames = 0
         self.status = "starting"
         self.error: str | None = None
         self.diagnostics: list[str] = []
@@ -142,6 +146,21 @@ class LiveStreamWorker(threading.Thread):
         if ok:
             with self._frame_lock:
                 self._latest_jpeg = buffer.tobytes()
+                self._last_published_at = time.monotonic()
+
+    def frame_activity(self) -> dict[str, float | int | None]:
+        """Ages use the worker's monotonic clock and count only newly published images."""
+        with self._frame_lock:
+            now = time.monotonic()
+            def age(timestamp: float | None) -> float | None:
+                return None if timestamp is None else round(now - timestamp, 2)
+
+            return {
+                "last_decoded_age_sec": age(self._last_decoded_at),
+                "last_inferred_age_sec": age(self._last_inferred_at),
+                "last_published_age_sec": age(self._last_published_at),
+                "gpu_skipped_frames": self._gpu_skipped_frames,
+            }
 
     def run(self) -> None:  # noqa: C901 — single sequential pipeline loop
         params = load_rule_parameters()
@@ -195,7 +214,7 @@ class LiveStreamWorker(threading.Thread):
                 plate_collector.flush("stream_start_failed")
             cap.release()
             self.status = "error"
-            self.error = f"Cannot open stream: {self.camera['rtsp_url']}"
+            self.error = f"Cannot open stream for camera {self.camera['id']}."
             return
 
         self.status = "live"
@@ -205,7 +224,6 @@ class LiveStreamWorker(threading.Thread):
         frame_skip = max(int(params["frame_skip"]), 1)
         conf_threshold = float(params["confidence_threshold"])
         frame_number = -1
-        skipped_frames = 0
         last_raw_snapshot = 0.0
         motorcycle_collector = None
         pickup_collector = None
@@ -240,6 +258,8 @@ class LiveStreamWorker(threading.Thread):
                         self.status = "live"
                     continue
 
+                with self._frame_lock:
+                    self._last_decoded_at = time.monotonic()
                 frame_number += 1
                 if frame_number % frame_skip != 0:
                     continue
@@ -279,9 +299,12 @@ class LiveStreamWorker(threading.Thread):
                     priority=PRIORITY_LIVE_FRAME,
                 ) as acquired:
                     if not acquired:
-                        skipped_frames += 1
+                        with self._frame_lock:
+                            self._gpu_skipped_frames += 1
                         continue
                     raw = detector.track_frame(frame, conf=conf_threshold, timestamp_sec=timestamp_sec)
+                    with self._frame_lock:
+                        self._last_inferred_at = time.monotonic()
                     tracked = track_state.update(raw, now=timestamp_sec)
                     pickup_person_detections = pickup_person_scanner.scan(
                         frame, tracked, timestamp_sec=timestamp_sec
@@ -392,11 +415,11 @@ class LiveStreamWorker(threading.Thread):
             if plate_collector is not None:
                 plate_collector.flush("stream_stopped")
             cap.release()
-            if skipped_frames:
+            if self._gpu_skipped_frames:
                 logger.info(
                     "camera %s skipped %d frame(s) while the GPU was reserved",
                     self.camera["id"],
-                    skipped_frames,
+                    self._gpu_skipped_frames,
                 )
             self.status = "stopped"
 
@@ -568,6 +591,7 @@ class StreamManager:
             "status": "stopping" if worker.is_alive() and worker.stop_requested else worker.status,
             "error": worker.error,
             "diagnostics": list(worker.diagnostics),
+            "frame_activity": worker.frame_activity(),
         }
 
 

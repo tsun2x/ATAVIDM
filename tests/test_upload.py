@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import namedtuple
 
 import pytest
@@ -85,6 +87,101 @@ class TestSaveAndPersist:
         import os
 
         assert os.path.getsize(path) == len(data)
+
+    def test_concurrent_colliding_names_allocate_distinct_files_without_overwriting(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(upload_mod, "check_disk_space", lambda *a, **k: None)
+        monkeypatch.setattr(upload_mod.config, "UPLOAD_FOLDER", str(tmp_path))
+        save_barrier = threading.Barrier(2)
+
+        class BarrierStorage:
+            def __init__(self, data):
+                self.filename = "same.mp4"
+                self.content_length = len(data)
+                self.stream = io.BytesIO(data)
+
+            def save(self, target):
+                # Both requests reach the write together. Before exclusive
+                # allocation, both had already selected the same free path.
+                save_barrier.wait(timeout=5)
+                if hasattr(target, "write"):
+                    target.write(self.stream.read())
+                else:
+                    with open(target, "wb") as handle:
+                        handle.write(self.stream.read())
+
+        first = BarrierStorage(b"first-bytes")
+        second = BarrierStorage(b"second-bytes")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(upload_mod.save_video_file, (first, second)))
+
+        by_bytes = {open(path, "rb").read(): name for name, path in results}
+        assert len({path for _name, path in results}) == 2
+        assert set(by_bytes) == {b"first-bytes", b"second-bytes"}
+        assert len({name for name, _path in results}) == 2
+
+    def test_failed_save_removes_partial_exclusive_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(upload_mod, "check_disk_space", lambda *a, **k: None)
+        monkeypatch.setattr(upload_mod.config, "UPLOAD_FOLDER", str(tmp_path))
+
+        class BrokenStorage:
+            filename = "broken.mp4"
+            content_length = 10
+
+            @staticmethod
+            def save(target):
+                target.write(b"partial")
+                raise OSError("write failed")
+
+        with pytest.raises(OSError):
+            upload_mod.save_video_file(BrokenStorage())
+        assert list(tmp_path.iterdir()) == []
+
+    def test_database_rollback_removes_unregistered_upload(
+        self, enforcer_client, monkeypatch, tmp_path
+    ):
+        import app as flask_app
+
+        monkeypatch.setattr(upload_mod, "check_disk_space", lambda *a, **k: None)
+        monkeypatch.setattr(upload_mod.config, "UPLOAD_FOLDER", str(tmp_path))
+
+        def fail_insert(**_kwargs):
+            raise RuntimeError("database transaction rolled back")
+
+        monkeypatch.setattr(flask_app.db, "insert_video", fail_insert)
+        response = enforcer_client.post(
+            "/api/upload-video",
+            data={"video": (io.BytesIO(b"video-bytes"), "rollback.mp4")},
+            content_type="multipart/form-data",
+        )
+
+        assert response.status_code == 500
+        assert list(tmp_path.iterdir()) == []
+
+    def test_ambiguous_committed_upload_keeps_registered_file(
+        self, enforcer_client, test_db, monkeypatch, tmp_path
+    ):
+        import app as flask_app
+
+        monkeypatch.setattr(upload_mod, "check_disk_space", lambda *a, **k: None)
+        monkeypatch.setattr(upload_mod.config, "UPLOAD_FOLDER", str(tmp_path))
+        insert_video = flask_app.db.insert_video
+
+        def commit_then_raise(**kwargs):
+            insert_video(**kwargs)
+            raise RuntimeError("connection dropped after commit")
+
+        monkeypatch.setattr(flask_app.db, "insert_video", commit_then_raise)
+        response = enforcer_client.post(
+            "/api/upload-video",
+            data={"video": (io.BytesIO(b"committed-video"), "committed.mp4")},
+            content_type="multipart/form-data",
+        )
+
+        assert response.status_code == 500
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == b"committed-video"
+        assert test_db.video_filepath_is_registered(str(saved[0].resolve())) is True
 
     def test_insert_video_persists_file_size(self, test_db):
         vid = test_db.insert_video(

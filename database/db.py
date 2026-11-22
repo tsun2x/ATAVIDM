@@ -37,6 +37,7 @@ update_user = _adapter.update_user
 insert_video = _adapter.insert_video
 update_video = _adapter.update_video
 get_video = _adapter.get_video
+video_filepath_is_registered = _adapter.video_filepath_is_registered
 list_videos = _adapter.list_videos
 _video_owner_scope_sql = _adapter._video_owner_scope_sql
 mark_video_processed = _adapter.mark_video_processed

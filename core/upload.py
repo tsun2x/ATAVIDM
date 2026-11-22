@@ -86,15 +86,30 @@ def save_video_file(file: FileStorage) -> tuple[str, str]:
     stem = Path(original).stem
     suffix = Path(original).suffix.lower()
     candidate = original
-    dest = upload_dir / candidate
-    counter = 1
-    while dest.exists():
-        candidate = f"{stem}_{int(time.time())}_{counter}{suffix}"
+    counter = 0
+    while True:
+        if counter:
+            candidate = f"{stem}_{int(time.time())}_{counter}{suffix}"
         dest = upload_dir / candidate
-        counter += 1
-
-    file.save(dest)
-    return candidate, str(dest.resolve())
+        try:
+            # Exclusive creation prevents concurrent uploads from replacing a
+            # file after both callers observed that the name was available.
+            target = dest.open("xb")
+        except FileExistsError:
+            counter += 1
+            continue
+        try:
+            with target:
+                file.save(target)
+            return candidate, str(dest.resolve())
+        except Exception:
+            # This path was created by this call with O_EXCL, so it is safe to
+            # remove even when save or close/flush failed partway through.
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def format_file_size(num_bytes: int) -> str:

@@ -331,6 +331,68 @@ def test_motorcycle_detail_decision_marker_is_not_merged_with_automatic_event(te
     assert human_decision != automatic
 
 
+@pytest.mark.parametrize("marker", [
+    "[pickup_detail_handoff]",
+    "[motorcycle_detail_candidate:12]",
+])
+def test_detail_handoff_keeps_separate_source_provenance(test_db, marker):
+    video_id = test_db.insert_video("detail-rerun.mp4", "/tmp/detail-rerun.mp4", status="processed")
+    event = dict(
+        video_id=video_id, track_id=19, violation_type="No Helmet",
+        confidence=0.8, frame_number=70, timestamp_sec=2.5,
+        reason_log=f"{marker} selected evidence", evidence_path="first-scene.jpg",
+    )
+
+    first = test_db.insert_review_queue(**event, processing_run_id=71)
+    second = test_db.insert_review_queue(
+        **{**event, "reason_log": f"{marker} rerun evidence", "evidence_path": "new-scene.jpg"},
+        processing_run_id=72,
+    )
+
+    assert second != first
+    item = test_db.get_review_item(first)
+    assert item["evidence_path"] == "first-scene.jpg"
+
+
+def test_insert_review_queue_can_report_reuse_to_temporal_finalizer(test_db):
+    video_id = test_db.insert_video("reuse-state.mp4", "/tmp/reuse-state.mp4", status="processed")
+    source = dict(
+        video_id=video_id, track_id=23, violation_type="Counterflow", confidence=0.8,
+        frame_number=81, timestamp_sec=3.0, processing_run_id=80,
+    )
+    first_id, first_reused = test_db.insert_review_queue(**source, _return_reused=True)
+    reused_id, was_reused = test_db.insert_review_queue(
+        **{**source, "processing_run_id": 81}, _return_reused=True
+    )
+    assert first_id == reused_id
+    assert first_reused is False
+    assert was_reused is True
+
+
+@pytest.mark.parametrize("marker", [
+    "[pickup_detail_handoff]",
+    "[motorcycle_detail_candidate:12]",
+])
+def test_automatic_event_reprocess_does_not_reuse_detail_handoff(test_db, marker):
+    video_id = test_db.insert_video("detail-boundary.mp4", "/tmp/detail-boundary.mp4", status="processed")
+    base = dict(
+        video_id=video_id, track_id=25, violation_type="No Helmet", confidence=0.8,
+        frame_number=90, timestamp_sec=3.5,
+    )
+    detail_id = test_db.insert_review_queue(
+        **base, reason_log=f"{marker} source observation", processing_run_id=90
+    )
+    automatic_id = test_db.insert_review_queue(
+        **base, reason_log="[medium] automatic observation", processing_run_id=91
+    )
+    automatic_rerun_id = test_db.insert_review_queue(
+        **base, reason_log="[medium] automatic rerun", processing_run_id=92
+    )
+
+    assert automatic_id != detail_id
+    assert automatic_rerun_id == automatic_id
+
+
 def test_timestamp_sec_preserved_in_review(test_db):
     """Timestamp should be preserved when moving from queue to violations."""
     video_id = test_db.insert_video(

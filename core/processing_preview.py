@@ -74,12 +74,28 @@ class ProcessingPreviewHub:
         with self._lock:
             return self._frames.get(int(video_id))
 
+    def generation(self, video_id: int) -> int:
+        """Current publish count for ``video_id`` (0 when nothing was published)."""
+        with self._lock:
+            return int(self._generations.get(int(video_id), 0))
+
     def clear(self, video_id: int) -> None:
         with self._lock:
             vid = int(video_id)
             self._frames.pop(vid, None)
             self._generations.pop(vid, None)
             self._last_encode_mono.pop(vid, None)
+
+    def clear_if_generation(self, video_id: int, generation: int) -> bool:
+        """Drop the preview only when no newer frame has been published."""
+        with self._lock:
+            vid = int(video_id)
+            if int(self._generations.get(vid, 0)) != int(generation):
+                return False
+            self._frames.pop(vid, None)
+            self._generations.pop(vid, None)
+            self._last_encode_mono.pop(vid, None)
+            return True
 
     def register_viewer(self, video_id: int) -> None:
         with self._lock:

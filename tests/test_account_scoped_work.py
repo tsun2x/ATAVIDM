@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def _users(test_db):
     import bcrypt
@@ -237,29 +239,24 @@ def test_bulk_processing_rejects_other_account_video_before_enqueue(
 
 
 def test_processing_job_drawer_hides_other_account_jobs(auth_db, monkeypatch):
-    """The shared processing-job endpoint currently exposes every account's runs."""
+    """The processing-job endpoint does not return another account's work."""
     _set_test_admin_bootstrap(monkeypatch)
     import app as flask_app
-
     owner_a, owner_b = _users(auth_db)
     video_a = _video(auth_db, "jobs-a.mp4", owner_a)
     video_b = _video(auth_db, "jobs-b.mp4", owner_b)
 
-    monkeypatch.setattr(
-        flask_app,
-        "build_processing_jobs_snapshot",
-        lambda **_kwargs: {
-            "success": True,
-            "server_time": "test",
-            "poll_after_ms": 1000,
-            "active": [{"video_id": video_a}, {"video_id": video_b}],
-            "recent": [{"video_id": video_b}],
-        },
-    )
+    own_run = auth_db.enqueue_processing_run(video_a, "[]")
+    foreign_run = auth_db.enqueue_processing_run(video_b, "[]")
+    auth_db.start_processing_run(foreign_run)
+    auth_db.finish_processing_run(foreign_run, status="failed", error_message="fixture")
+    # The API relies on SQL scope-before-LIMIT rather than loading every video
+    # for a second Python-side filtering pass.
+    monkeypatch.setattr(flask_app.db, "list_videos", lambda **_kwargs: pytest.fail("unbounded video enumeration"))
     client_a = _logged_in_client("enforcer", "enforcer123")
-    response = client_a.get("/api/processing-jobs")
+    response = client_a.get("/api/processing-jobs?recent_limit=1")
 
-    assert [job["video_id"] for job in response.get_json()["active"]] == [video_a]
+    assert [job["id"] for job in response.get_json()["active"]] == [own_run]
     assert response.get_json()["recent"] == []
     assert client_a.get(f"/api/processing-jobs?video_id={video_b}").status_code == 404
 
