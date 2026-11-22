@@ -286,6 +286,73 @@ def detail_env_path(test_db, candidate_id):
     return json.loads(row["frames_json"])[0]["scene_path"]
 
 
+def test_multiple_motorcycle_proposals_are_independent_and_no_violation_is_exclusive(
+    detail_enforcer, seeded, test_db, monkeypatch,
+):
+    from database.review_revision import motorcycle_detail_review_revision
+
+    video_id, candidate_id = seeded
+    run_id = test_db.create_processing_run(video_id, "[]")
+    test_db.start_processing_run(run_id)
+    test_db.finish_processing_run(run_id)
+    with test_db.db_session() as conn:
+        conn.execute(
+            "UPDATE motorcycle_detail_candidates SET processing_run_id = ? WHERE id = ?",
+            (run_id, candidate_id),
+        )
+
+    attempted = []
+    monkeypatch.setattr(
+        "core.plate_runtime.queue_detail_review_ocr",
+        lambda _adapter, review_id, _row, *, kind: attempted.append(review_id),
+    )
+    url = f"/api/motorcycle-detail-review/{candidate_id}/decision"
+
+    def submit(choices, *, send):
+        row = test_db.get_motorcycle_detail_candidate(candidate_id)
+        return detail_enforcer.post(url, json={
+            "choices": choices, "human_confirmed": True, "send_to_review": send,
+            "expected_outcome": row["human_outcome"],
+            "expected_revision": motorcycle_detail_review_revision(row),
+        })
+
+    mixed = submit(["no_violation", "no_helmet"], send=True)
+    assert mixed.status_code == 400
+    assert test_db.list_review_items_for_video(video_id, status=None) == []
+
+    from database import db
+    insert = db.insert_review_queue
+
+    def reject_mirror(**kwargs):
+        if kwargs["violation_type"] == "No Side Mirror":
+            raise ValueError("Test failure while inserting the second proposal")
+        return insert(**kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(db, "insert_review_queue", reject_mirror)
+        assert submit(["no_helmet", "no_side_mirror"], send=True).status_code == 404
+    assert attempted == []
+    assert test_db.get_motorcycle_detail_candidate(candidate_id)["human_outcome"] == "pending"
+    assert test_db.list_review_items_for_video(video_id, status=None) == []
+
+    proposed = submit(["no_helmet", "no_side_mirror"], send=True)
+    assert proposed.status_code == 200, proposed.json
+    review_ids = proposed.json["review_ids"]
+    assert len(review_ids) == len(set(review_ids)) == 2
+    assert attempted == review_ids
+    assert {test_db.get_review_item(rid)["violation_type"] for rid in review_ids} == {
+        "No Helmet", "No Side Mirror",
+    }
+    assert all(test_db.get_review_item(rid)["status"] == "pending" for rid in review_ids)
+    assert submit(["no_helmet", "no_side_mirror"], send=True).json["review_ids"] == review_ids
+    assert len(test_db.list_review_items_for_video(video_id, status="pending")) == 2
+
+    closed = submit(["no_violation"], send=False)
+    assert closed.status_code == 200, closed.json
+    assert test_db.list_review_items_for_video(video_id, status="pending") == []
+    assert test_db.list_violation_rows_for_video(video_id) == []
+
+
 @pytest.mark.parametrize("scan_state,evidence_available,choice", [
     ("ready", True, "no_side_mirror"), ("queued", True, "no_side_mirror"),
     ("failed", True, "no_side_mirror"), ("scanning", True, "no_side_mirror"),

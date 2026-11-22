@@ -147,6 +147,15 @@ function uncertaintyList(item) {
     });
 }
 
+function enforceExclusiveMotorcycleChoice(checkboxes, changed) {
+    if (!changed.checked) return;
+    for (const checkbox of checkboxes) {
+        if ((checkbox.value === "no_violation") !== (changed.value === "no_violation")) {
+            checkbox.checked = false;
+        }
+    }
+}
+
 function buildEvidenceMarkup(item) {
     const frames = Array.isArray(item.frames) ? item.frames : [];
     const tabs = [];
@@ -274,7 +283,7 @@ function buildEvidenceMarkup(item) {
     const canReview = item.can_review_saved_evidence ?? (item.scan_state === "ready");
     const disabled = canReview ? "" : " disabled";
     const choiceMarkup = choices.map(function (choice) {
-        return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="radio" name="detailDecisionChoice" value="' + choice[0] + '"' + disabled + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
+        return '<label class="list-group-item d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="detailDecisionChoice" value="' + choice[0] + '"' + disabled + '><span><strong>' + escapeHtml(choice[1]) + '</strong><span class="d-block small text-muted">' + escapeHtml(choice[2]) + "</span></span></label>";
     }).join("");
     let reviewMessage = "";
     if (!canReview) {
@@ -287,7 +296,7 @@ function buildEvidenceMarkup(item) {
     }
     return '<div class="d-flex align-items-center gap-2 mb-3"><label class="small mb-0" for="detailEvidenceScale">Evidence size</label><input id="detailEvidenceScale" class="form-control form-control-sm" type="number" min="50" max="100" step="5" value="100" style="width:90px"><span class="small">%</span></div>' +
         videoMarkup + frameMarkup + '<dl class="row small mt-3 mb-0">' + facts + "</dl>" + reasonMarkup +
-        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Choose what the evidence shows. The model suggestion does not make this decision.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + disabled + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span>' + reviewMessage + "</section>";
+        '<section class="border-top mt-4 pt-3" aria-labelledby="detailDecisionHeading"><h6 id="detailDecisionHeading">Reviewer decision</h6><p class="small text-muted">Select all violations you see, or choose No Violation by itself.</p><div class="list-group mb-3">' + choiceMarkup + '</div><button type="button" class="btn btn-primary" data-detail-submit-choice' + disabled + '>Confirm selection</button><span class="small text-muted ms-2">You will be asked to confirm before saving.</span>' + reviewMessage + "</section>";
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -302,7 +311,8 @@ if (typeof module !== "undefined" && module.exports) {
         uncertaintyList: uncertaintyList,
         detailOutcomeRequestBody: detailOutcomeRequestBody,
         isStaleDetailReviewResponse: isStaleDetailReviewResponse,
-        buildEvidenceMarkup: buildEvidenceMarkup
+        buildEvidenceMarkup: buildEvidenceMarkup,
+        enforceExclusiveMotorcycleChoice: enforceExclusiveMotorcycleChoice
     };
 }
 
@@ -433,8 +443,11 @@ if (typeof module !== "undefined" && module.exports) {
 
     function submitSelectedDecision() {
         if (!activeDecisionItem || !activeDecisionRow) return;
-        const selected = modalBody.querySelector("input[name='detailDecisionChoice']:checked");
-        if (!selected) {
+        const submit = modalBody.querySelector("[data-detail-submit-choice]");
+        if (!submit || submit.disabled) return;
+        const selected = Array.from(modalBody.querySelectorAll("input[name='detailDecisionChoice']:checked"),
+            function (input) { return input.value; });
+        if (!selected.length) {
             showToast("Choose an outcome", "Select what the evidence shows before continuing.", "warning");
             return;
         }
@@ -444,20 +457,21 @@ if (typeof module !== "undefined" && module.exports) {
             no_side_mirror: "No Side Mirror",
             no_violation: "No Violation (no case)"
         };
-        const label = labels[selected.value];
-        const sendToReview = selected.value !== "no_violation";
+        const label = selected.map(function (choice) { return labels[choice]; }).join(", ");
+        const sendToReview = !selected.includes("no_violation");
         const confirmText = sendToReview
-            ? "Send this evidence to Violation Review with the proposed classification " + label + "?"
+            ? "Send these proposed violations to Violation Review?\n\n" + label
             : "Close this observation as No Violation?";
         if (!window.confirm(confirmText)) return;
         const item = activeDecisionItem;
         const row = activeDecisionRow;
+        submit.disabled = true;
         setRowBusy(row, true, "Saving decision…");
         fetch("/api/motorcycle-detail-review/" + item.id + "/decision", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                choice: selected.value,
+                choices: selected,
                 human_confirmed: true,
                 send_to_review: sendToReview,
                 expected_revision: item.review_revision || null,
@@ -466,6 +480,7 @@ if (typeof module !== "undefined" && module.exports) {
         }).then(function (response) {
             return response.json().then(function (payload) { return { ok: response.ok, payload: payload }; });
         }).then(function (result) {
+            submit.disabled = false;
             setRowBusy(row, false);
             if (!result.ok || !result.payload.success) {
                 showToast("Decision not saved", result.payload.error || "The review decision could not be saved.", "danger");
@@ -485,6 +500,7 @@ if (typeof module !== "undefined" && module.exports) {
             showToast("No violation recorded", "The review is closed and no violation case was created.", "success");
             window.setTimeout(function () { window.location.reload(); }, 800);
         }).catch(function () {
+            submit.disabled = false;
             setRowBusy(row, false);
             showToast("Decision status unknown", "Reload Motorcycle Detail Review before retrying.", "danger");
         });
@@ -595,6 +611,12 @@ if (typeof module !== "undefined" && module.exports) {
             }
             postOutcome(item, outcome, row, outcomeButton);
             return;
+        }
+    });
+
+    modalBody?.addEventListener("change", function (e) {
+        if (e.target.matches("input[name='detailDecisionChoice']")) {
+            enforceExclusiveMotorcycleChoice(modalBody.querySelectorAll("input[name='detailDecisionChoice']"), e.target);
         }
     });
 

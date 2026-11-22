@@ -3526,13 +3526,20 @@ def _motorcycle_saved_scene(row: dict[str, Any]) -> Path | None:
 
 
 def _motorcycle_detail_to_ui(
-    row: dict[str, Any], videos: dict[int, dict], linked_review: dict[str, Any] | None = None,
+    row: dict[str, Any], videos: dict[int, dict], linked_reviews: list[dict[str, Any]] | None = None,
     current_run: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     observations = _detail_json(row.get("observations_json"), {})
     association = _detail_json(row.get("association_json"), {})
     uncertainty = _detail_json(row.get("uncertainty_json"), [])
     video_id = row.get("video_id")
+    linked_reviews = linked_reviews or []
+    linked_review = next((review for review in linked_reviews if review["status"] == "pending"), None)
+    if linked_review is None and linked_reviews:
+        linked_review = linked_reviews[0]
+    no_helmet_review = next(
+        (review for review in linked_reviews if review["violation_type"] == "No Helmet"), None
+    )
     run = current_run
     if run is None and video_id and hasattr(db, "get_current_completed_result_run"):
         run = db.get_current_completed_result_run(int(video_id))
@@ -3583,14 +3590,14 @@ def _motorcycle_detail_to_ui(
         "linked_review_id": linked_review.get("id") if linked_review else None,
         "linked_review_status": linked_review.get("status") if linked_review else None,
         "can_review_saved_evidence": can_review_saved_evidence,
-        "can_confirm": _motorcycle_detail_can_confirm(row, linked_review, run),
-        "case_action": "confirm_no_helmet" if _motorcycle_detail_can_confirm(row, linked_review, run) else None,
+        "can_confirm": _motorcycle_detail_can_confirm(row, no_helmet_review, run),
+        "case_action": "confirm_no_helmet" if _motorcycle_detail_can_confirm(row, no_helmet_review, run) else None,
     }
 
 
-def _motorcycle_detail_page_context(rows: list[dict[str, Any]]) -> tuple[dict[int, dict], dict[int, dict]]:
+def _motorcycle_detail_page_context(rows: list[dict[str, Any]]) -> tuple[dict[int, list[dict]], dict[int, dict]]:
     candidate_ids = [int(row["id"]) for row in rows]
-    review_links = db.list_motorcycle_detail_no_helmet_reviews(candidate_ids)
+    review_links = db.list_motorcycle_detail_linked_reviews(candidate_ids)
     video_ids = sorted({int(row["video_id"]) for row in rows if row.get("video_id") is not None})
     current_runs = {
         video_id: db.get_current_completed_result_run(video_id)
@@ -3905,7 +3912,10 @@ def api_motorcycle_detail_list():
     return jsonify(
         {
             "success": True,
-            "items": [_motorcycle_detail_to_ui(r, videos, db.get_motorcycle_detail_no_helmet_review(r["id"])) for r in rows],
+            "items": [
+                _motorcycle_detail_to_ui(r, videos, review_links.get(r["id"]), current_runs.get(r.get("video_id")))
+                for r in rows
+            ],
             "total": total,
             "page": page,
             "per_page": per_page,
@@ -3930,7 +3940,7 @@ def api_motorcycle_detail_candidate(candidate_id: int):
     return jsonify({
         "success": True,
         "item": _motorcycle_detail_to_ui(
-            row, videos, db.get_motorcycle_detail_no_helmet_review(candidate_id), current_run
+            row, videos, db.list_motorcycle_detail_linked_reviews([candidate_id]).get(candidate_id), current_run
         ),
     })
 
@@ -4024,7 +4034,11 @@ def api_motorcycle_detail_confirm_no_helmet(candidate_id: int):
     row = db.get_motorcycle_detail_candidate(candidate_id)
     if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
-    linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
+    linked_reviews = db.list_motorcycle_detail_linked_reviews([candidate_id]).get(candidate_id, [])
+    linked = next(
+        (review for review in linked_reviews if review["violation_type"] == "No Helmet"),
+        linked_reviews[0] if linked_reviews else None,
+    )
     payload = request.get_json(silent=True) or {}
     reason = payload.get("reason")
     if payload.get("human_confirmed") is not True:
@@ -4126,10 +4140,17 @@ def api_motorcycle_detail_decision(candidate_id: int):
         "nut_shell_helmet": ("Substandard / Nut-Shell Helmet", VIOLATION_SUBSTANDARD_HELMET),
         "no_violation": ("No Violation", None),
     }
-    payload = request.get_json(silent=True) or {}
-    choice = str(payload.get("choice") or "").strip()
-    if choice not in choices or payload.get("human_confirmed") is not True:
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
         return jsonify({"success": False, "error": "Choose an outcome and explicitly confirm the evidence decision."}), 400
+    submitted = payload.get("choices", [str(payload.get("choice") or "").strip()])
+    if (not isinstance(submitted, list) or not submitted or len(submitted) > len(choices)
+            or any(not isinstance(choice, str) or choice not in choices for choice in submitted)
+            or payload.get("human_confirmed") is not True):
+        return jsonify({"success": False, "error": "Choose an outcome and explicitly confirm the evidence decision."}), 400
+    selected_choices = list(dict.fromkeys(submitted))
+    if "no_violation" in selected_choices and len(selected_choices) > 1:
+        return jsonify({"success": False, "error": "Choose No Violation by itself."}), 400
     expected_outcome = payload.get("expected_outcome")
     expected_revision = payload.get("expected_revision")
     if expected_outcome not in ("pending", "reviewed", "dismissed", "uncertain"):
@@ -4142,8 +4163,13 @@ def api_motorcycle_detail_decision(candidate_id: int):
     if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Detail candidate not found."}), 404
     reviewer_id = int(auth.current_user()["id"])
-    label, selected_rule = choices[choice]
+    choice = selected_choices[0]
+    label = ", ".join(choices[key][0] for key in selected_choices)
+    selected_rules = [choices[key][1] for key in selected_choices if choices[key][1] is not None]
+    selected_rule = choices[choice][1]
     send_to_review = payload.get("send_to_review") is True
+    if len(selected_choices) > 1 and not send_to_review:
+        return jsonify({"success": False, "error": "Send multiple proposed violations to Violation Review."}), 400
     review_saved_evidence = send_to_review or selected_rule is None
     if not review_saved_evidence and row.get("scan_state") != "ready":
         return jsonify({"success": False, "error": "Wait for the evidence scan before confirming a case."}), 409
@@ -4156,14 +4182,9 @@ def api_motorcycle_detail_decision(candidate_id: int):
     if selected_rule is not None and not db.can_confirm_case(reviewer_id):
         return jsonify({"success": False, "error": "Your account does not have case-confirmation authority."}), 403
     note = "Reviewer selected: " + label
-    linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
     frames = _detail_json(row.get("frames_json"), [])
     evidence_path = next((frame.get("scene_path") for frame in frames
                           if isinstance(frame, dict) and frame.get("scene_path")), None) if isinstance(frames, list) else None
-    if not review_saved_evidence and linked is None and (
-        not evidence_path or row.get("video_id") is None or row.get("processing_run_id") is None
-    ):
-        return jsonify({"success": False, "error": "This candidate has no stored source-frame evidence."}), 409
     try:
         # Candidate outcome, linked queue item, and final case/no-case decision
         # share the SQLite write transaction; a failed decision rolls back all
@@ -4187,15 +4208,34 @@ def api_motorcycle_detail_decision(candidate_id: int):
             )
             if snapshot is False:
                 raise ReviewDecisionConflict("This observation changed in another review. Reload it before deciding.")
-            linked = db.get_motorcycle_detail_no_helmet_review(candidate_id)
-            if linked is None:
-                if not evidence_path:
+            linked_reviews = db.list_motorcycle_detail_linked_reviews([candidate_id]).get(candidate_id, [])
+            if linked_reviews and all(review["status"] != "pending" for review in linked_reviews):
+                raise ReviewDecisionConflict("The linked reviews are already closed.")
+            by_rule = {}
+            for linked in linked_reviews:
+                by_rule.setdefault(linked["violation_type"], linked)
+            targets = []
+            insert_rules = []
+            if send_to_review:
+                insert_rules = selected_rules
+            elif not linked_reviews:
+                insert_rules = [VIOLATION_NO_HELMET]
+            elif selected_rule is None:
+                targets = linked_reviews
+            else:
+                targets = [by_rule.get(selected_rule, linked_reviews[0])]
+
+            for rule in insert_rules:
+                if rule in by_rule:
+                    targets.append(by_rule[rule])
+                    continue
+                if not evidence_path or row.get("video_id") is None or row.get("processing_run_id") is None:
                     raise ReviewDecisionConflict("This candidate has no stored source-frame evidence.")
                 score = min(1.0, max(0.0, float(row.get("frame_score") or 0.5)))
                 review_id = db.insert_review_queue(
                     video_id=int(row["video_id"]),
                     track_id=int(row["track_id"]),
-                    violation_type=selected_rule if send_to_review else VIOLATION_NO_HELMET,
+                    violation_type=rule,
                     confidence=score,
                     frame_number=int(row.get("frame_number") or 0),
                     timestamp_sec=float(row.get("timestamp_sec") or 0.0),
@@ -4204,34 +4244,37 @@ def api_motorcycle_detail_decision(candidate_id: int):
                     vehicle_class="motorcycle",
                     processing_run_id=int(row["processing_run_id"]),
                 )
-                linked = db.get_review_item(review_id)
-            if not linked or linked.get("status") != "pending":
-                raise ReviewDecisionConflict("The linked review item is already closed.")
+                targets.append(db.get_review_item(review_id))
+            if any(not linked or linked["status"] != "pending" for linked in targets):
+                raise ReviewDecisionConflict("At least one linked review is already closed. Check Violation Review.")
 
             result = {}
             if not send_to_review:
-                decision = DECISION_NO_VIOLATION if choice == "no_violation" else (
-                    DECISION_CONFIRM if selected_rule == linked.get("violation_type") else DECISION_CORRECT
-                )
-                result = apply_review_decision(
-                    db,
-                    int(linked["id"]),
-                    reviewer_id,
-                    decision=decision,
-                    reason=f"Motorcycle Detail Review: reviewer inspected the evidence and selected {label}.",
-                    selected_canonical_rule=selected_rule if decision == DECISION_CORRECT else None,
-                    idempotency_key=f"motorcycle-detail:{candidate_id}:{motorcycle_detail_review_revision(snapshot)}:{choice}",
-                )
+                revision = motorcycle_detail_review_revision(snapshot)
+                for linked in targets:
+                    decision = DECISION_NO_VIOLATION if selected_rule is None else (
+                        DECISION_CONFIRM if selected_rule == linked["violation_type"] else DECISION_CORRECT
+                    )
+                    result = apply_review_decision(
+                        db, int(linked["id"]), reviewer_id, decision=decision,
+                        reason=f"Motorcycle Detail Review: reviewer inspected the evidence and selected {label}.",
+                        selected_canonical_rule=selected_rule if decision == DECISION_CORRECT else None,
+                        idempotency_key=f"motorcycle-detail:{candidate_id}:{revision}:{choice}",
+                    )
+        review_ids = [linked["id"] for linked in targets]
         if selected_rule is not None:
-            queue_detail_review_ocr(db, linked["id"], row, kind="motorcycle")
+            for review_id in review_ids:
+                queue_detail_review_ocr(db, review_id, row, kind="motorcycle")
         if send_to_review:
             return jsonify({
-                "success": True, "review_id": linked["id"], "review_status": "pending",
+                "success": True, "review_id": review_ids[0], "review_ids": review_ids,
+                "review_status": "pending",
                 "review_url": url_for("review_queue", video_id=row["video_id"]),
-                "proposed_rule": linked["violation_type"], "creates_case": False,
+                "proposed_rule": targets[0]["violation_type"], "proposed_rules": selected_rules,
+                "creates_case": False,
             })
         return jsonify({"success": True, "choice": choice, "label": label,
-                        "creates_case": choice != "no_violation", "review_id": linked["id"], **result})
+                        **result, "review_id": review_ids[0], "review_ids": review_ids})
     except TemporalEvidenceNotReady as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
     except ReviewDecisionConflict as exc:

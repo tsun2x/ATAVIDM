@@ -4701,7 +4701,15 @@ def get_motorcycle_detail_no_helmet_review(candidate_id: int) -> dict[str, Any] 
 
 
 def list_motorcycle_detail_no_helmet_reviews(candidate_ids: list[int]) -> dict[int, dict[str, Any]]:
-    """Bulk lookup linked review rows for one page of detail candidates."""
+    """Return the most recent linked review for legacy single-item callers."""
+    return {
+        candidate_id: reviews[0]
+        for candidate_id, reviews in list_motorcycle_detail_linked_reviews(candidate_ids).items()
+    }
+
+
+def list_motorcycle_detail_linked_reviews(candidate_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    """Look up every review linked to each exact detail candidate."""
     ids = sorted({int(value) for value in candidate_ids if int(value) > 0})
     if not ids:
         return {}
@@ -4717,10 +4725,10 @@ def list_motorcycle_detail_no_helmet_reviews(candidate_ids: list[int]) -> dict[i
                ORDER BY rq.id DESC""",
             tuple(ids),
         ).fetchall()
-        result: dict[int, dict[str, Any]] = {}
+        result: dict[int, list[dict[str, Any]]] = {}
         for row in rows:
             candidate_id = int(row["candidate_id"])
-            result.setdefault(candidate_id, _row_to_dict(row))
+            result.setdefault(candidate_id, []).append(_row_to_dict(row))
         return result
 
 

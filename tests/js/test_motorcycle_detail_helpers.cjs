@@ -162,7 +162,7 @@ const queuedManualReview = detailUi.buildEvidenceMarkup({
     scan_state: "queued", can_review_saved_evidence: true,
     frames: [{ index: 1, scene_url: "/scene.jpg" }]
 });
-assert.match(queuedManualReview, /name="detailDecisionChoice" value="no_helmet">/);
+assert.match(queuedManualReview, /type="checkbox" name="detailDecisionChoice" value="no_helmet">/);
 assert.match(queuedManualReview, /data-detail-submit-choice>/);
 assert.match(queuedManualReview, /saved evidence/i);
 
@@ -171,6 +171,19 @@ const missingEvidence = detailUi.buildEvidenceMarkup({
 });
 assert.match(missingEvidence, /name="detailDecisionChoice" value="no_helmet" disabled>/);
 assert.match(missingEvidence, /data-detail-submit-choice disabled>/);
+
+const helmet = { value: "no_helmet", checked: true };
+const mirror = { value: "no_side_mirror", checked: true };
+const noViolation = { value: "no_violation", checked: false };
+const selections = [helmet, mirror, noViolation];
+detailUi.enforceExclusiveMotorcycleChoice(selections, mirror);
+assert.deepStrictEqual(selections.map(item => item.checked), [true, true, false]);
+noViolation.checked = true;
+detailUi.enforceExclusiveMotorcycleChoice(selections, noViolation);
+assert.deepStrictEqual(selections.map(item => item.checked), [false, false, true]);
+helmet.checked = true;
+detailUi.enforceExclusiveMotorcycleChoice(selections, helmet);
+assert.deepStrictEqual(selections.map(item => item.checked), [true, false, false]);
 
 // Attribution context: older rows say nearby motorcycles were not recorded.
 assert.ok(detailUi.describeAttribution({ context: { recorded: false } }).includes("not recorded"));

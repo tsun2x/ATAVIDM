@@ -90,6 +90,7 @@ list_review_queue = _adapter.list_review_queue
 get_review_item = _adapter.get_review_item
 get_motorcycle_detail_no_helmet_review = _adapter.get_motorcycle_detail_no_helmet_review
 list_motorcycle_detail_no_helmet_reviews = _adapter.list_motorcycle_detail_no_helmet_reviews
+list_motorcycle_detail_linked_reviews = _adapter.list_motorcycle_detail_linked_reviews
 count_review_pending = _adapter.count_review_pending
 confirm_review_item = _adapter.confirm_review_item
 dismiss_review_item = _adapter.dismiss_review_item
