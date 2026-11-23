@@ -55,6 +55,17 @@ body {
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+button.sidebar-brand {
+    background: transparent;
+    border-width: 0 0 1px;
+    text-align: left;
+}
+
+button.sidebar-brand:focus-visible {
+    outline: 2px solid var(--sidebar-text-active);
+    outline-offset: -4px;
+}
+
 .brand-icon {
     width: 42px; height: 42px;
     background: linear-gradient(135deg, var(--brand-accent), #b91c1c);

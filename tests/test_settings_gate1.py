@@ -169,9 +169,12 @@ class TestSettingsRouteGate1:
 
     def test_settings_uses_number_field_for_confidence_and_live_monitor_has_both_windows(self, admin_client):
         settings_html = admin_client.get("/settings").get_data(as_text=True)
+        assert 'id="confidenceThresholdToggle" aria-controls="confidenceThresholdSetting" aria-expanded="false"' in settings_html
+        assert 'id="confidenceThresholdSetting" hidden' in settings_html
         assert 'type="number" class="form-control" id="confidenceThreshold" min="50" max="100"' in settings_html
         assert 'type="range" class="form-range" id="confidenceThreshold"' not in settings_html
         live_html = admin_client.get("/live-monitor").get_data(as_text=True)
+        assert 'id="confidenceThresholdToggle"' not in live_html
         for field in ("liveTruckBanStart", "liveTruckBanEnd", "liveTruckBanStart2", "liveTruckBanEnd2"):
             assert f'id="{field}"' in live_html
 

@@ -8,6 +8,19 @@
     // --- Rule parameter form -------------------------------------------------
 
     const confidenceInput = document.getElementById("confidenceThreshold");
+    const confidenceToggle = document.getElementById("confidenceThresholdToggle");
+    const confidenceSetting = document.getElementById("confidenceThresholdSetting");
+    confidenceToggle?.addEventListener("click", function () {
+        const expanded = confidenceSetting.hidden;
+        confidenceSetting.hidden = !expanded;
+        confidenceToggle.setAttribute("aria-expanded", String(expanded));
+        if (expanded) {
+            const sidebarOverlay = document.getElementById("sidebarOverlay");
+            if (sidebarOverlay?.classList.contains("show")) sidebarOverlay.click();
+            confidenceInput.focus();
+        }
+    });
+
     document.getElementById("btnSaveSettings")?.addEventListener("click", function () {
         const enabledViolations = [];
         document.querySelectorAll(".violation-group-toggle").forEach(function (el) {
@@ -49,7 +62,8 @@
             max_concurrent_jobs_per_account: document.getElementById("maxConcurrentJobsPerAccount")?.value,
             enabled_violations: enabledViolations,
         };
-        if (Number.isFinite(confidencePercent) && confidencePercent >= 50 && confidencePercent <= 100) {
+        if (confidenceInput?.value !== confidenceInput?.defaultValue &&
+            Number.isFinite(confidencePercent) && confidencePercent >= 50 && confidencePercent <= 100) {
             body.confidence_threshold = (confidencePercent / 100).toFixed(2);
         }
         fetch("/api/settings", {
@@ -60,6 +74,9 @@
             .then(function (r) { return r.json(); })
             .then(function (payload) {
                 if (payload.success) {
+                    if (body.confidence_threshold !== undefined) {
+                        confidenceInput.defaultValue = String(confidencePercent);
+                    }
                     showToast("Settings Saved", "Rule parameters, processing capacity, and violation toggles updated.", "success");
                 } else {
                     showToast("Error", payload.error || "Save failed.", "danger");

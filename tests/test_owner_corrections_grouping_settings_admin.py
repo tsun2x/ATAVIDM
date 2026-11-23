@@ -305,7 +305,8 @@ class TestGroupedSettings:
         html = open("templates/settings.html", encoding="utf-8").read()
         assert "violation-group-toggle" in html
         assert "violation_groups" in html
-        assert "Pending legal verification" in html
+        for label in ("Pending legal verification", "unverified", "Partial", "Implemented"):
+            assert f">{label}</span>" not in html
         js = open("static/js/settings.js", encoding="utf-8").read()
         assert "violation-group-toggle" in js
         switch_js = open("static/js/violation_switch.js", encoding="utf-8").read()

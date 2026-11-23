@@ -18,15 +18,18 @@
 <body{% if current_user %} data-tavidm-role="{{ current_user.role }}" data-tavidm-user="{{ current_user.username }}"{% endif %}>
     <div class="app-wrapper">
         <aside class="sidebar" id="sidebar">
-            <div class="sidebar-brand">
-                <div class="brand-icon">
-                    <i class="bi bi-shield-check"></i>
-                </div>
-                <div class="brand-text">
+            {% set brand_tag = 'button' if request.endpoint == 'settings' else 'div' %}
+            <{{ brand_tag }} class="sidebar-brand"{% if brand_tag == 'button' %} type="button"
+                id="confidenceThresholdToggle" aria-controls="confidenceThresholdSetting" aria-expanded="false"
+                aria-label="{{ app_name }} detection confidence threshold"{% endif %}>
+                <span class="brand-icon">
+                    <i class="bi bi-shield-check" aria-hidden="true"></i>
+                </span>
+                <span class="brand-text">
                     <span class="brand-name">{{ app_name }}</span>
                     <span class="brand-subtitle">Violation Monitoring</span>
-                </div>
-            </div>
+                </span>
+            </{{ brand_tag }}>
 
             <nav class="sidebar-nav">
                 <ul class="nav flex-column">

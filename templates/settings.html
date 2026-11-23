@@ -81,13 +81,8 @@
                                     {% if group.is_official_group %}
                                     <span class="badge bg-primary-subtle text-primary ms-1">Grouped</span>
                                     {% endif %}
-                                    {% if group.pending_legal_verification %}
-                                    <span class="badge bg-warning-subtle text-warning ms-1">Pending legal verification</span>
-                                    {% endif %}
                                     {% if group.legal_status == 'flag_only' %}
                                     <span class="badge bg-secondary-subtle text-secondary ms-1">flag_only</span>
-                                    {% elif group.legal_status == 'unverified' %}
-                                    <span class="badge bg-secondary-subtle text-secondary ms-1">unverified</span>
                                     {% elif group.legal_status == 'verified' %}
                                     <span class="badge bg-success-subtle text-success ms-1">verified</span>
                                     {% endif %}
@@ -96,9 +91,7 @@
                                     Underlying behaviors:
                                     {% for m in group.members %}
                                     <span class="me-2"><code>{{ m.canonical_rule }}</code>
-                                        {% if m.status == 'implemented' %}<span class="badge bg-success-subtle text-success">Implemented</span>
-                                        {% elif m.status == 'model_dependent' %}<span class="badge bg-warning-subtle text-warning">Model-dependent</span>
-                                        {% elif m.status == 'partial' %}<span class="badge bg-info-subtle text-info">Partial</span>
+                                        {% if m.status == 'model_dependent' %}<span class="badge bg-warning-subtle text-warning">Model-dependent</span>
                                         {% elif m.status == 'planned' %}<span class="badge bg-secondary-subtle text-secondary">Planned</span>
                                         {% endif %}
                                         {% if not m.toggleable %}(not toggleable){% endif %}
@@ -161,7 +154,7 @@
         <div class="card card-panel mt-4" id="detection-rule-parameters">
             <div class="card-header"><h5 class="card-title mb-0"><i class="bi bi-sliders2 me-2"></i>Detection &amp; Rule Parameters</h5></div>
             <div class="card-body">
-                <div class="mb-4">
+                <div class="mb-4" id="confidenceThresholdSetting" hidden>
                     <div class="d-flex justify-content-between mb-1">
                         <label class="form-label mb-0" for="confidenceThreshold">Detection Confidence Threshold</label>
                         <span class="threshold-value">50–100%</span>
