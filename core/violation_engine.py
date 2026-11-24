@@ -1250,43 +1250,51 @@ def check_illegal_terminal(
         if not in_activity:
             return TriState.UNKNOWN
 
-        # A pedestrian approaching a PUV is not boarding evidence. Require a
-        # tracked person to cross the vehicle-box boundary between consecutive
-        # frames while the PUV is in an annotated boarding/alighting area.
+        # Require a tracked person to cross the box boundary. Measure movement
+        # over the preceding overlap phase so gradual crossings can count.
         pair_state = state.contextual.setdefault("_terminal_transitions", {})
         timestamp = float(det.get("timestamp_sec", 0.0))
         max_gap = max(0.5, float(params.get("terminal_transition_max_gap_sec", 1.5)))
         for key, sample in list(pair_state.items()):
-            if timestamp - float(sample.get("timestamp_sec", timestamp)) > max_gap:
+            if timestamp - sample["samples"][-1][0] > max_gap:
                 pair_state.pop(key, None)
+        stationary = _is_stationary(det, float(params["stationary_px"]), geometry)
         evidence = 0
         transitioned_people: list[int] = []
         for person in frame_persons:
-            pair_key = (int(det["track_id"]), int(person["track_id"]))
+            pair_key = (
+                int(det["track_id"]), det.get("track_identity_epoch"),
+                int(person["track_id"]), person.get("track_identity_epoch"),
+            )
             overlaps = _boxes_overlap(det, person)
             previous = pair_state.get(pair_key)
             px = float(person["bbox_x"] + person["bbox_w"] / 2)
             py = float(person["bbox_y"] + person["bbox_h"] / 2)
             distance = _math.hypot(cx - px, cy - py)
-            if (
-                previous is not None
-                and timestamp - float(previous["timestamp_sec"]) <= max_gap
-                and bool(previous["overlaps"]) != overlaps
-            ):
-                # Entering the PUV box indicates boarding; leaving indicates
-                # alighting only when the tracked person's distance changes in
-                # the matching direction, reducing bbox jitter as a trigger.
-                delta = distance - float(previous["distance"])
+            samples = [
+                (t, d) for t, d in previous["samples"] if timestamp - t <= max_gap
+            ] if previous else []
+            stopped_at = previous["stopped_at"] if previous else None
+            if samples and previous["overlaps"] != overlaps:
+                delta = distance - samples[0][1]
                 min_delta = max(float(person["bbox_w"]), float(person["bbox_h"])) * 0.15
-                entering = not bool(previous["overlaps"]) and overlaps and delta <= -min_delta
-                leaving = bool(previous["overlaps"]) and not overlaps and delta >= min_delta
+                recently_stopped = (
+                    stopped_at is not None and timestamp - stopped_at <= MOTION_WINDOW_SEC
+                )
+                entering = overlaps and stationary and delta <= -min_delta
+                leaving = not overlaps and (stationary or recently_stopped) and delta >= min_delta
                 if entering or leaving:
                     evidence += 1
                     transitioned_people.append(int(person["track_id"]))
+                samples = []
+                stopped_at = None
+            if stationary and overlaps and point_in_polygon(cx, cy, polygon):
+                stopped_at = timestamp
+            samples.append((timestamp, distance))
             pair_state[pair_key] = {
                 "overlaps": overlaps,
-                "timestamp_sec": timestamp,
-                "distance": distance,
+                "samples": samples,
+                "stopped_at": stopped_at,
             }
         if evidence:
             det["_terminal_transition_people"] = transitioned_people
@@ -1305,7 +1313,6 @@ def check_illegal_terminal(
         if (
             activity.is_true()
             and in_loading_zone
-            and _is_stationary(det, float(params["stationary_px"]), geometry)
             and det.get("_terminal_transition_people")
         ):
             score = score_from_persistence(

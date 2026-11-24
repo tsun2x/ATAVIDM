@@ -440,8 +440,17 @@ class TestIllegalTerminal:
 
         assert events == []
 
-    def test_tracked_person_entering_jeepney_in_loading_zone_creates_review_candidate(
-        self, rule_params, no_parking_zone
+    @pytest.mark.parametrize("vehicle_class", ["jeepney", "tricycle"])
+    @pytest.mark.parametrize(
+        ("person_positions", "expected"),
+        [
+            ((100, 125), True),
+            ((100, 109, 110, 111), True),
+            ((109, 110, 111), False),
+        ],
+    )
+    def test_tracked_person_entering_puv_in_loading_zone(
+        self, rule_params, no_parking_zone, vehicle_class, person_positions, expected
     ):
         from core.scene_annotation import load_scene_annotation
         from core.violation_engine import RuleEngineState, check_illegal_terminal
@@ -457,8 +466,8 @@ class TestIllegalTerminal:
             "lanes": [], "flow_arrows": [], "threshold_lines": [],
             "markings": [], "signs": [],
         }).to_rule_context()
-        jeepney = {
-            "class_label": "jeepney", "track_id": 2, "bbox_x": 120, "bbox_y": 110,
+        vehicle = {
+            "class_label": vehicle_class, "track_id": 2, "bbox_x": 120, "bbox_y": 110,
             "bbox_w": 40, "bbox_h": 20, "confidence": 0.95,
             "speed_px_per_sec": 0.0,
         }
@@ -468,20 +477,17 @@ class TestIllegalTerminal:
             "speed_px_per_sec": 0.0,
         }
         state = RuleEngineState()
-        check_illegal_terminal(
-            [jeepney], no_parking_zone, state, 0, params,
-            all_tracked=[jeepney, pedestrian],
-        )
-        jeepney["timestamp_sec"] = pedestrian["timestamp_sec"] = 0.5
-        pedestrian["bbox_x"] = 125
-        events = check_illegal_terminal(
-            [jeepney], no_parking_zone, state, 1, params,
-            all_tracked=[jeepney, pedestrian],
-        )
+        events = []
+        for frame, x in enumerate(person_positions):
+            vehicle["timestamp_sec"] = pedestrian["timestamp_sec"] = frame * 0.25
+            pedestrian["bbox_x"] = x
+            events.extend(check_illegal_terminal(
+                [vehicle], no_parking_zone, state, frame, params,
+                all_tracked=[vehicle, pedestrian],
+            ))
 
-        assert len(events) == 1
-        assert events[0].violation_type == VIOLATION_ILLEGAL_TERMINAL
-        assert events[0].outcome == "review"
+        expected_events = [(VIOLATION_ILLEGAL_TERMINAL, "review")] if expected else []
+        assert [(event.violation_type, event.outcome) for event in events] == expected_events
 
 
 class TestTruckBanApplicability:
