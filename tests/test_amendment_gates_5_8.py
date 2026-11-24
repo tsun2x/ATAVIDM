@@ -45,43 +45,65 @@ def _det(**kwargs):
 
 
 class TestPerLaneCounterflowGate5:
+    def _scene_document(self):
+        return {
+            "schema_version": 2,
+            "zones": [],
+            "lanes": [
+                {
+                    "id": "lane-right",
+                    "type": "active_lane",
+                    "points": [[0, 0], [200, 0], [200, 100], [0, 100]],
+                },
+                {
+                    "id": "lane-left",
+                    "type": "active_lane",
+                    "points": [[0, 120], [200, 120], [200, 220], [0, 220]],
+                },
+            ],
+            "flow_arrows": [
+                {
+                    "id": "a-r",
+                    "type": "lane_flow",
+                    "points": [[20, 50], [180, 50]],
+                    "lane_ids": ["lane-right"],
+                },
+                {
+                    "id": "a-l",
+                    "type": "lane_flow",
+                    "points": [[180, 170], [20, 170]],
+                    "lane_ids": ["lane-left"],
+                },
+            ],
+            "threshold_lines": [],
+            "markings": [],
+            "signs": [],
+            "activity_regions": [],
+        }
+
     def _scene(self):
-        return load_scene_annotation(
-            {
-                "schema_version": 2,
-                "zones": [],
-                "lanes": [
-                    {
-                        "id": "lane-right",
-                        "type": "active_lane",
-                        "points": [[0, 0], [200, 0], [200, 100], [0, 100]],
-                    },
-                    {
-                        "id": "lane-left",
-                        "type": "active_lane",
-                        "points": [[0, 120], [200, 120], [200, 220], [0, 220]],
-                    },
-                ],
-                "flow_arrows": [
-                    {
-                        "id": "a-r",
-                        "type": "lane_flow",
-                        "points": [[20, 50], [180, 50]],
-                        "lane_ids": ["lane-right"],
-                    },
-                    {
-                        "id": "a-l",
-                        "type": "lane_flow",
-                        "points": [[180, 170], [20, 170]],
-                        "lane_ids": ["lane-left"],
-                    },
-                ],
-                "threshold_lines": [],
-                "markings": [],
-                "signs": [],
-                "activity_regions": [],
-            }
-        ).to_rule_context()
+        return load_scene_annotation(self._scene_document()).to_rule_context()
+
+    def test_wrong_saved_link_recovers_both_lane_directions(self):
+        document = self._scene_document()
+        document["flow_arrows"][1]["lane_ids"] = ["lane-right"]
+        document["flow_arrows"].reverse()
+        scene = load_scene_annotation(document)
+        assert scene.to_storage_dict()["flow_arrows"][0]["lane_ids"] == ["lane-right"]
+        assert {flow.lane_id: flow.arrow_id for flow in scene.to_rule_context().lane_flows} == {
+            "lane-right": "a-r", "lane-left": "a-l",
+        }
+
+    def test_competing_arrows_suppress_only_the_affected_lane(self):
+        document = self._scene_document()
+        document["flow_arrows"].append({
+            "id": "conflicting-arrow", "type": "lane_flow",
+            "points": [[180, 55], [20, 55]], "lane_ids": ["lane-right"],
+        })
+        scene = load_scene_annotation(document).to_rule_context()
+        assert [(flow.lane_id, flow.arrow_id) for flow in scene.lane_flows] == [
+            ("lane-left", "a-l"),
+        ]
 
     def test_opposing_lane_triggers(self):
         scene = self._scene()

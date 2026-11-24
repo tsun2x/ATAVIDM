@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from core.trajectory import point_in_polygon
+
 SCHEMA_VERSION_V2 = 2
 
 LEGACY_ZONE_KEYS: tuple[str, ...] = (
@@ -491,28 +493,38 @@ def project_rule_scene_context(scene: SceneAnnotation) -> RuleSceneContext:
     legacy = scene.legacy_zones()
     flows: list[LaneFlow] = []
     if scene.is_v2():
-        arrows_by_lane: dict[str, IdentifiedSceneObject] = {}
+        flows_by_lane: dict[str, list[LaneFlow]] = {}
         for arrow in scene.flow_arrows:
-            for lane_id in arrow.lane_ids:
-                arrows_by_lane.setdefault(lane_id, arrow)
-        for lane in scene.lanes:
-            arrow = arrows_by_lane.get(lane.id)
-            if arrow is None or len(arrow.points) < 2:
+            if len(arrow.points) < 2:
                 continue
             (x0, y0), (x1, y1) = arrow.points[0], arrow.points[-1]
             dx, dy = x1 - x0, y1 - y0
             if dx == 0 and dy == 0:
                 continue
+            lane_ids = set(arrow.lane_ids)
+            # Repair the old editor's default-first-lane link when the drawing
+            # identifies a single lane. Preserve explicit shared arrows.
+            if len(lane_ids) == 1:
+                midpoint = ((x0 + x1) / 2, (y0 + y1) / 2)
+                samples = (arrow.points[0], midpoint, arrow.points[-1])
+                matching_lanes = [
+                    lane.id for lane in scene.lanes
+                    if all(point_in_polygon(point, lane.points) for point in samples)
+                ]
+                if len(matching_lanes) == 1:
+                    lane_ids = set(matching_lanes)
             degrees = math.degrees(math.atan2(dy, dx)) % 360.0
-            length = math.hypot(dx, dy) or 1.0
-            flows.append(
-                LaneFlow(
-                    lane_id=lane.id,
-                    degrees=degrees,
-                    vector=(dx / length, dy / length),
-                    arrow_id=arrow.id,
+            length = math.hypot(dx, dy)
+            vector = (dx / length, dy / length)
+            for lane_id in lane_ids:
+                flows_by_lane.setdefault(lane_id, []).append(
+                    LaneFlow(lane_id=lane_id, degrees=degrees, vector=vector, arrow_id=arrow.id)
                 )
-            )
+        for lane in scene.lanes:
+            candidates = flows_by_lane.get(lane.id, [])
+            # A lane with competing arrows has no reliable direction.
+            if len(candidates) == 1:
+                flows.append(candidates[0])
     return RuleSceneContext(
         legacy_zones=legacy,
         lanes=tuple(scene.lanes),

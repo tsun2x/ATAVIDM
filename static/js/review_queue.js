@@ -328,6 +328,7 @@ if (typeof document !== "undefined") {
             const details = {
                 plate_machine: payload.plate_machine || null,
                 plate_ocr_can_rescan: payload.plate_ocr_can_rescan === true,
+                plate_ocr_rescan_note: payload.plate_ocr_rescan_note || null,
                 review_plate_choice: payload.review_plate_choice || null,
             };
             const running = ["queued", "processing"].includes(details.plate_machine?.state);
@@ -429,7 +430,9 @@ if (typeof document !== "undefined") {
         const machine = item.plate_machine || {};
         const state = machine.state || "none";
         const noUsableFrame = state === "no_candidate_detected" &&
-            machine.quality_rejections?.includes("collection_ended:detail_evidence_unavailable");
+            machine.quality_rejections?.some(reason => [
+                "collection_ended:detail_evidence_unavailable", "collection_ended:review_evidence_unavailable",
+            ].includes(reason));
         const copy = noUsableFrame ? {
             label: "No usable frame",
             css: "text-bg-secondary",
@@ -441,6 +444,9 @@ if (typeof document !== "undefined") {
         if (plateRescanButton) plateRescanButton.hidden = !item.plate_ocr_can_rescan;
 
         let html = '<p class="small mb-2">' + escapeHtml(copy.text) + "</p>";
+        if (item.plate_ocr_rescan_note) {
+            html += '<p class="small text-muted mb-2">' + escapeHtml(item.plate_ocr_rescan_note) + '</p>';
+        }
         if (item.review_plate_choice && item.review_plate_choice.accepted_plate_text) {
             html += '<p class="small mb-2"><span class="badge bg-success">Admin verified in Review Queue</span> ' +
                 '<strong>' + escapeHtml(item.review_plate_choice.accepted_plate_text) + '</strong> — will transfer to the case if confirmed.</p>';

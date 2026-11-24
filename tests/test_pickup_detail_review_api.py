@@ -1,4 +1,4 @@
-"""Pickup review UI never promotes evidence leads to violation cases."""
+"""Pickup review APIs and handoff to the standard review queue."""
 
 from __future__ import annotations
 
@@ -80,6 +80,24 @@ def test_enforcer_page_and_api_show_review_lead(pickup_candidate):
     assert result["total"] == 1
     assert result["items"][0]["id"] == candidate_id
     assert result["items"][0]["association"]["evidence_source"] == "main_detector_and_bytetrack"
+
+
+def test_uncertain_bed_lead_shows_full_observation_interval(pickup_candidate):
+    client, db, _video_id, candidate_id = pickup_candidate
+    with db.db_session() as conn:
+        conn.execute(
+            "UPDATE pickup_detail_candidates SET association_json = ? WHERE id = ?",
+            (json.dumps({
+                "state": "moving_with_pickup_bed_uncertain",
+                "observations": [{"timestamp_sec": 0.0}, {"timestamp_sec": 3.2}],
+            }), candidate_id),
+        )
+
+    page = client.get("/pickup-detail-review")
+    assert page.status_code == 200
+    assert "Person moving with pickup · bed location uncertain" in page.get_data(as_text=True)
+    assert "#t=0,3.2" in page.get_data(as_text=True)
+    assert db.get_pickup_detail_candidate(candidate_id)["human_outcome"] == "pending"
 
 
 def test_enforcer_sees_shared_live_camera_pickup_lead(pickup_candidate):
@@ -164,6 +182,9 @@ def test_api_filters_candidates_by_the_signed_in_video_owner(pickup_candidate):
     assert client.get(
         f"/api/pickup-detail-review/{foreign_id}/evidence/scene"
     ).status_code == 404
+    assert client.post(f"/api/pickup-detail-review/{foreign_id}/send", json={
+        "approved": True, "expected_outcome": "pending", "expected_processing_run_id": 9,
+    }).status_code == 404
 
 
 def test_invalid_outcome_and_viewer_are_rejected(pickup_candidate, test_db):
@@ -182,6 +203,18 @@ def test_invalid_outcome_and_viewer_are_rejected(pickup_candidate, test_db):
     viewer = app.test_client()
     viewer.post("/login", data={"username": "pickup_viewer", "password": password})
     assert viewer.get("/pickup-detail-review").status_code in (302, 403)
+    response = viewer.post(f"/api/pickup-detail-review/{candidate_id}/send", json={
+        "approved": True, "expected_outcome": "pending",
+        "expected_processing_run_id": test_db.get_pickup_detail_candidate(candidate_id)["processing_run_id"],
+    })
+    assert response.status_code == 403
+    sent = _send_pickup(client, test_db, candidate_id)
+    assert sent.status_code == 201
+    decision = viewer.post(f"/api/review-queue/{sent.json['review_id']}/decision", json={
+        "decision": "confirm_proposed", "reason": "Unauthorized account tried to confirm.",
+    })
+    assert decision.status_code == 403
+    assert test_db.get_review_item(sent.json["review_id"])["status"] == "pending"
 
 
 def _send_pickup(client, db, candidate_id, **overrides):
@@ -247,6 +280,67 @@ def test_pending_detail_review_can_queue_and_rescan_ocr_from_its_saved_lead(
     assert submissions[-1] == (review_id, candidate_id, kind, "current-attempt")
 
 
+def test_send_creates_one_pending_review_with_private_evidence_and_audit(pickup_candidate):
+    from core.detection_config import VIOLATION_CARGO_PASSENGERS
+
+    client, db, video_id, candidate_id = pickup_candidate
+    assert b"Send to Violation Review" in client.get("/pickup-detail-review").data
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    sent = _send_pickup(client, db, candidate_id)
+    assert sent.status_code == 201, sent.get_json()
+    review_id = sent.json["review_id"]
+    assert sent.json["review_status"] == "pending"
+    retry = _send_pickup(client, db, candidate_id, notes="A retry must not replace the original notes.")
+    assert retry.status_code == 200
+    assert retry.json["review_id"] == review_id
+    assert retry.json["idempotent"] is True
+
+    assert len(db.list_review_items_for_video(video_id, status=None)) == 1
+    assert db.get_review_decision(review_id) is None
+    assert db.list_violation_rows_for_video(video_id) == []
+    [handoff] = [event for event in db.list_video_history_events(video_id)
+                 if event["event_type"] == "pickup_detail_sent_to_review"]
+    assert handoff["actor_user_id"] == db.get_user_by_username("enforcer_test")["id"]
+    assert json.loads(handoff["detail_json"])["review_id"] == review_id
+
+    [item] = client.get(f"/api/review-queue?video_id={video_id}").json["items"]
+    assert item["violation_type"] == VIOLATION_CARGO_PASSENGERS
+    assert item["status"] == "pending"
+    assert item["confidence"] is None
+    assert item["frame_number"] == lead["frame_number"]
+    provenance = item["pickup_provenance"]
+    assert provenance["candidate_id"] == candidate_id
+    assert provenance["processing_run_id"] == lead["processing_run_id"]
+    assert provenance["pickup_track_id"] == 1 and provenance["person_track_id"] == 2
+    assert provenance["pickup_identity_epoch"] == 1 and provenance["person_identity_epoch"] == 1
+    assert provenance["reviewer_notes"].startswith("Check the passenger")
+    assert provenance["association"]["state"] == "shared_motion_candidate"
+    for url in (item["evidence_url"], item["vehicle_evidence_url"]):
+        response = client.get(url)
+        assert response.status_code == 200 and response.data.startswith(b"\xff\xd8")
+    assert client.get(item["source_video_url"]).data == b"test source video"
+    assert f"Pickup Review · PU-{candidate_id:05d}" in client.get(
+        f"/review-queue?video_id={video_id}"
+    ).get_data(as_text=True)
+    [lead_item] = client.get("/api/pickup-detail-review?outcome=all").json["items"]
+    assert lead_item["sent_to_review"]["review_id"] == review_id
+    assert b"Sent to Violation Review" in client.get("/pickup-detail-review?outcome=all").data
+
+
+def test_send_pickup_starts_ocr_for_committed_review(pickup_candidate, monkeypatch):
+    client, db, _, candidate_id = pickup_candidate
+    calls = []
+
+    def queue(adapter, review_id, lead, *, kind):
+        assert adapter.get_review_item(review_id)["status"] == "pending"
+        calls.append((review_id, lead["id"], kind))
+
+    monkeypatch.setattr("core.plate_runtime.queue_detail_review_ocr", queue, raising=False)
+    response = _send_pickup(client, db, candidate_id)
+    assert response.status_code == 201
+    assert calls == [(response.json["review_id"], candidate_id, "pickup")]
+
+
 def test_pickup_promotion_preserves_detector_scores_separate_from_rule_score(pickup_candidate):
     client, db, video_id, candidate_id = pickup_candidate
     lead = db.get_pickup_detail_candidate(candidate_id)
@@ -269,3 +363,110 @@ def test_pickup_promotion_preserves_detector_scores_separate_from_rule_score(pic
     page = client.get(f"/review-queue?video_id={video_id}").get_data(as_text=True)
     assert "74%" in page
     assert "Person detector 97%" in page
+
+
+@pytest.mark.parametrize("outcome", ["dismissed", "uncertain"])
+def test_send_rejects_closed_pickup_lead(pickup_candidate, outcome):
+    client, db, video_id, candidate_id = pickup_candidate
+    assert client.post(f"/api/pickup-detail-review/{candidate_id}/outcome", json={
+        "outcome": outcome, "expected_outcome": "pending",
+    }).status_code == 200
+    assert _send_pickup(client, db, candidate_id, expected_outcome=outcome).status_code == 409
+    assert db.list_review_items_for_video(video_id, status=None) == []
+
+
+def test_send_rejects_stale_source_missing_crop_and_cross_origin(pickup_candidate):
+    from pathlib import Path
+
+    client, db, video_id, candidate_id = pickup_candidate
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    url = f"/api/pickup-detail-review/{candidate_id}/send"
+    assert client.post(url, data={"approved": "true"}).status_code == 400
+    assert client.post(url, json={"approved": True}, headers={"Origin": "https://foreign.example"}).status_code == 403
+    assert _send_pickup(client, db, candidate_id, approved=False).status_code == 400
+    assert _send_pickup(client, db, candidate_id, expected_processing_run_id=lead["processing_run_id"] + 1).status_code == 409
+    Path(json.loads(lead["frames_json"])[0]["crop_path"]).unlink()
+    assert _send_pickup(client, db, candidate_id).status_code == 409
+    assert db.list_review_items_for_video(video_id, status=None) == []
+
+
+def test_reprocessing_same_occurrence_preserves_original_pending_review(pickup_candidate):
+    client, db, video_id, candidate_id = pickup_candidate
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    first = _send_pickup(client, db, candidate_id)
+    assert first.status_code == 201
+    review_id = first.json["review_id"]
+    next_run = db.create_processing_run(video_id, "[]")
+    db.finish_processing_run(next_run)
+    payload = {k: lead[k] for k in (
+        "video_id", "pickup_track_id", "person_track_id", "pickup_identity_epoch", "person_identity_epoch",
+        "occurrence_key", "selector_version", "timestamp_sec", "episode_start_sec", "frame_number",
+        "source_width", "source_height", "frame_count", "frames_json", "association_json", "size_bytes",
+    )}
+    assert db.upsert_pickup_detail_candidate(
+        **payload, run_key=f"run_{next_run}", processing_run_id=next_run,
+    ) == candidate_id
+    retry = _send_pickup(client, db, candidate_id, expected_outcome="reviewed")
+    assert retry.status_code == 200 and retry.json["review_id"] == review_id
+    [review] = db.list_review_items_for_video(video_id, status=None)
+    assert review["processing_run_id"] == lead["processing_run_id"]
+    replacement = db.upsert_pickup_detail_candidate(
+        **{**payload, "selector_version": "pickup-review-2"},
+        run_key=f"run_{next_run}", processing_run_id=next_run,
+    )
+    assert replacement != candidate_id
+    assert _send_pickup(client, db, replacement).json["review_id"] == review_id
+    assert len(db.list_review_items_for_video(video_id, status=None)) == 1
+
+
+def test_simultaneous_approvals_share_one_review_then_standard_decision_can_confirm(pickup_candidate):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from core.pickup_review_handoff import send_pickup_to_review
+
+    client, db, video_id, candidate_id = pickup_candidate
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    owner = db.get_user_by_username("enforcer_test")
+
+    def send():
+        return send_pickup_to_review(
+            db, candidate_id, owner["id"], expected_outcome="pending",
+            expected_processing_run_id=lead["processing_run_id"], notes="Inspect the source interval.",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(send) for _ in range(2)]
+        first, second = [future.result() for future in futures]
+    assert {first["idempotent"], second["idempotent"]} == {False, True}
+    assert first["review_id"] == second["review_id"]
+    [review] = db.list_review_items_for_video(video_id, status=None)
+    assert review["status"] == "pending"
+    assert db.list_violation_rows_for_video(video_id) == []
+
+    decision = client.post(f"/api/review-queue/{review['id']}/decision", json={
+        "decision": "confirm_proposed",
+        "reason": "Test reviewer inspected the source and confirmed the proposed rule.",
+    })
+    assert decision.status_code == 200, decision.get_json()
+    assert db.get_review_item(review["id"])["status"] == "confirmed"
+    assert len(db.list_violation_rows_for_video(video_id)) == 1
+
+
+def test_send_rolls_back_if_audit_write_fails(pickup_candidate, monkeypatch):
+    from core.pickup_review_handoff import send_pickup_to_review
+
+    _client, db, video_id, candidate_id = pickup_candidate
+    lead = db.get_pickup_detail_candidate(candidate_id)
+    owner = db.get_user_by_username("enforcer_test")
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit service failed")
+
+    monkeypatch.setattr(db, "insert_video_history_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit service failed"):
+        send_pickup_to_review(
+            db, candidate_id, owner["id"], expected_outcome="pending",
+            expected_processing_run_id=lead["processing_run_id"], notes=None,
+        )
+    assert db.get_pickup_detail_candidate(candidate_id)["human_outcome"] == "pending"
+    assert db.list_review_items_for_video(video_id, status=None) == []

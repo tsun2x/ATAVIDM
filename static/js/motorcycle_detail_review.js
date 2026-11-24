@@ -156,6 +156,42 @@ function enforceExclusiveMotorcycleChoice(checkboxes, changed) {
     }
 }
 
+function buildUnverifiedHeadBoxes(scanned, frame) {
+    const rider = (scanned.association || {}).rider;
+    const crop = scanned.crop || frame.crop;
+    if (!rider || !["unassociated", "ambiguous"].includes(rider.state) || !crop) return "";
+
+    const { x, y, w, h } = crop;
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) return "";
+    const labels = {
+        helmet_acceptable: "Helmet",
+        helmet_nut_shell: "Nut-shell helmet",
+        no_helmet: "Uncovered head"
+    };
+    const percent = function (value, origin, size) {
+        return Math.min(100, Math.max(0, (value - origin) / size * 100));
+    };
+    return (scanned.detections || []).map(function (detection) {
+        const label = Object.hasOwn(labels, detection.class_label) ? labels[detection.class_label] : null;
+        const box = detection.source_bbox;
+        if (!label || detection.attributed !== false || !Array.isArray(box) || box.length !== 4 ||
+            !box.every(Number.isFinite)) return "";
+
+        const left = percent(box[0], x, w);
+        const top = percent(box[1], y, h);
+        const width = percent(box[2], x, w) - left;
+        const height = percent(box[3], y, h) - top;
+        if (width <= 0 || height <= 0) return "";
+        const confidence = Number.isFinite(detection.confidence)
+            ? " · " + Math.round(detection.confidence * 100) + "%" : "";
+        return '<span class="position-absolute border-warning" aria-hidden="true" style="pointer-events:none;border:2px dashed;left:' +
+            left + '%;top:' + top + '%;width:' + width + '%;height:' + height + '%"></span>' +
+            '<span class="position-absolute badge text-bg-dark text-wrap text-start" style="pointer-events:none;left:min(' +
+            left + '%, max(0px, calc(100% - 12rem)));top:' + top + '%">' +
+            escapeHtml(label + confidence + " · rider unverified") + '</span>';
+    }).join("");
+}
+
 function buildEvidenceMarkup(item) {
     const frames = Array.isArray(item.frames) ? item.frames : [];
     const tabs = [];
@@ -174,11 +210,14 @@ function buildEvidenceMarkup(item) {
         const crop = frame.crop_url
             ? '<img src="' + escapeHtml(frame.crop_url) + '" alt="Padded crop ' + i + '" class="evidence-preview img-fluid rounded">'
             : '<div class="text-muted py-4">No padded crop.</div>';
-        const overlayImage = frame.overlay_url
-            ? '<img src="' + escapeHtml(frame.overlay_url) + '" alt="Mapped boxes ' + i + '" class="evidence-preview img-fluid rounded">'
-            : '<div class="text-muted py-4">Not scanned yet — mapped boxes appear after the crop pass.</div>';
         const detections = frameDetections(item, frame.index);
         const scanned = scanFrame(item, frame.index) || {};
+        const unverifiedBoxes = scanned.helmet_overlay_summarized && frame.overlay_url
+            ? buildUnverifiedHeadBoxes(scanned, frame) : "";
+        const overlayImage = frame.overlay_url
+            ? '<div class="evidence-preview position-relative overflow-hidden"><img src="' + escapeHtml(frame.overlay_url) +
+              '" alt="Mapped boxes ' + i + '" class="d-block w-100 h-auto">' + unverifiedBoxes + '</div>'
+            : '<div class="text-muted py-4">Not scanned yet - mapped boxes appear after the crop pass.</div>';
         const overlay = frame.overlay_url && !scanned.helmet_overlay_summarized
             ? '<details><summary class="small">Original detection overlay</summary>' + overlayImage + '</details>'
             : overlayImage;

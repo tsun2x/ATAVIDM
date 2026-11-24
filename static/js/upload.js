@@ -740,12 +740,12 @@
             showToast("Incomplete Zones", "Draw at least one zone or lane; each drawn polygon needs at least 3 points.", "warning");
             return;
         }
+        const check = window.TAVIDMZoneEditor.validateSceneDocument(wizardState.pendingScene);
+        if (!check.ok) {
+            showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
+            return;
+        }
         if (wizardState.camera) {
-            const check = window.TAVIDMZoneEditor.validateSceneDocument(wizardState.pendingScene);
-            if (!check.ok) {
-                showToast("Invalid Scene", check.error || "Scene document is invalid.", "warning");
-                return;
-            }
             saveCameraScene(wizardState.pendingScene, false);
             return;
         }

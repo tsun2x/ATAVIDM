@@ -271,11 +271,29 @@
         return null;
     };
 
-    ZoneEditor.prototype._selectedOrFirstLane = function () {
-        var found = this.scene.findById(this.scene.selectedId);
-        if (found && found.kind === "lanes") return found.object;
-        return this.scene.objects.lanes[0] || null;
-    };
+    function pointInPolygon(point, polygon) {
+        var x = point[0], y = point[1];
+        var inside = false;
+        for (var i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            var a = polygon[i], b = polygon[j];
+            if ((a[1] > y) !== (b[1] > y) &&
+                x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    function uniqueArrowLane(points, lanes) {
+        var start = points[0], end = points[points.length - 1];
+        var midpoint = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+        var matches = lanes.filter(function (lane) {
+            return lane.points.length >= 3 && [start, midpoint, end].every(function (point) {
+                return pointInPolygon(point, lane.points);
+            });
+        });
+        return matches.length === 1 ? matches[0].id : null;
+    }
 
     ZoneEditor.prototype._ensureCreating = function (coords) {
         var found = this.scene.findById(this.scene.selectedId);
@@ -285,13 +303,13 @@
             found.object.type === this.objectType
         ) {
             found.object.points.push([coords[0], coords[1]]);
+            if (found.kind === "flow_arrows" && !found.object.lane_ids?.length) {
+                var laneId = uniqueArrowLane(found.object.points, this.scene.objects.lanes);
+                if (laneId) found.object.lane_ids = [laneId];
+            }
             return found.object;
         }
         var fields = {};
-        if (this.objectKind === "flow_arrows") {
-            var lane = this._selectedOrFirstLane();
-            if (lane) fields.lane_ids = [lane.id];
-        }
         if (
             this.objectKind === "markings" &&
             ["double_solid", "single_solid", "solid_broken"].indexOf(this.objectType) >= 0
@@ -695,7 +713,6 @@
                 arr = arr.filter(function (obj) {
                     var min = MIN_POINTS[key] || 2;
                     if (!obj.points || obj.points.length < min) return false;
-                    if (key === "flow_arrows" && (!obj.lane_ids || !obj.lane_ids.length)) return false;
                     if (
                         key === "markings" &&
                         ["double_solid", "single_solid", "solid_broken"].indexOf(obj.type) >= 0 &&
@@ -811,6 +828,32 @@
                     if (obj.prohibited_from && ["left", "right", "both"].indexOf(obj.prohibited_from) < 0) {
                         return { ok: false, error: "prohibited_from must be left|right|both." };
                     }
+                }
+            }
+            var lanes = doc.lanes || [];
+            var laneIds = new Set(lanes.map(function (lane) { return lane.id; }));
+            var lanesWithArrow = new Set();
+            for (var arrow of doc.flow_arrows || []) {
+                if (arrow.points.length < 2) continue;
+                var start = arrow.points[0], end = arrow.points[arrow.points.length - 1];
+                if (start[0] === end[0] && start[1] === end[1]) {
+                    return { ok: false, error: arrow.id + " needs distinct start and end points." };
+                }
+                if (!arrow.lane_ids?.length) {
+                    return { ok: false, error: "Select " + arrow.id + " and choose Apply to lane." };
+                }
+                var drawnLane = uniqueArrowLane(arrow.points, lanes);
+                if (arrow.lane_ids.length === 1 && drawnLane && arrow.lane_ids[0] !== drawnLane) {
+                    return { ok: false, error: arrow.id + " is drawn in " + drawnLane + ". Use Apply to lane to correct its link." };
+                }
+                for (var laneId of new Set(arrow.lane_ids)) {
+                    if (!laneIds.has(laneId)) {
+                        return { ok: false, error: arrow.id + " links to a missing lane. Choose Apply to lane." };
+                    }
+                    if (lanesWithArrow.has(laneId)) {
+                        return { ok: false, error: laneId + " has more than one flow arrow. Link or remove the extra arrow." };
+                    }
+                    lanesWithArrow.add(laneId);
                 }
             }
             return { ok: true };

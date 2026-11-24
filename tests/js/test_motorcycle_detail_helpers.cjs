@@ -235,4 +235,29 @@ assert.match(attributedMarkup, /Rider: no rider associated/);
 assert.match(attributedMarkup, /Helmet: helmet detected \(acceptable shape\)/);
 assert.match(attributedMarkup, /Unattributed: implausible helmet size/);
 
+const unverifiedFrame = {
+    index: 1, helmet_overlay_summarized: true, scan_scale_x: 2, scan_scale_y: 2,
+    crop: { x: 1000, y: 80, w: 200, h: 200 },
+    association: { rider: { state: "unassociated" }, helmet: { state: "unknown" } },
+    detections: [
+        { class_label: "helmet_acceptable", confidence: 0.41, attributed: false, source_bbox: [1060, 100, 1100, 140] },
+        { class_label: "no_helmet", confidence: 0.31, attributed: false, source_bbox: [980, 180, 1040, 220] },
+        { class_label: "side_mirror", confidence: 0.52, attributed: false, source_bbox: [1000, 160, 1020, 175] },
+        { class_label: "helmet_nut_shell", confidence: 0.5, attributed: false, source_bbox: [800, 180, 900, 220] }
+    ]
+};
+const unverifiedItem = {
+    frames: [{ index: 1, overlay_url: "/saved-overlay.jpg" }],
+    observations: { frames: [unverifiedFrame] }
+};
+const unverifiedMarkup = detailUi.buildEvidenceMarkup(unverifiedItem);
+assert.match(unverifiedMarkup, /left:30%;top:10%;width:20%;height:20%/);
+assert.match(unverifiedMarkup, /Helmet · 41% · rider unverified/);
+assert.match(unverifiedMarkup, /left:0%;top:50%;width:20%;height:20%/);
+assert.match(unverifiedMarkup, /Uncovered head · 31% · rider unverified/);
+assert.equal((unverifiedMarkup.match(/rider unverified/g) || []).length, 2);
+assert.match(unverifiedMarkup, /Helmet: helmet unknown/);
+unverifiedFrame.association.rider.state = "associated";
+assert.doesNotMatch(detailUi.buildEvidenceMarkup(unverifiedItem), /rider unverified/);
+
 console.log("Motorcycle detail review helper tests passed");

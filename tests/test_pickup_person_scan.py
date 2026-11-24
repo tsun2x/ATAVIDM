@@ -219,3 +219,135 @@ def test_person_track_survives_box_jitter_and_vehicle_class_flapping():
 
     assert len(first) == len(second) == 1
     assert first[0]["track_id"] == second[0]["track_id"]
+
+
+def test_rider_geometry_matches_stored_img_7440_cases():
+    """Boxes from Runs #53/#54: the bed rider is elevated; lot pedestrians are not."""
+    from core.pickup_person_scan import rider_geometry
+
+    # Run #54, pickup track 204 at 38.4 s.
+    assert rider_geometry((1231, 229, 35, 49), (1184, 269, 166, 162))["label"] == "elevated"
+    # Run #53 track 7: legs visible down to the pickup's lower edge.
+    assert rider_geometry((678, 254, 10, 32), (482, 223, 194, 78))["label"] == "ground_level"
+    # Run #53 track 146: a distant pedestrian entirely above the pickup box.
+    assert rider_geometry((127, 282, 22, 18), (149, 336, 274, 116))["label"] == "detached_above"
+    # A cab occupant whose head stays below the roofline.
+    assert rider_geometry((140, 88, 20, 24), (100, 80, 100, 80))["label"] == "ambiguous"
+
+
+def test_scan_logs_filter_decisions_and_summary_counters():
+    """Rejected and sub-threshold boxes are logged for missed-rider diagnosis."""
+    from core.pickup_person_scan import SCANNER_VERSION, PickupPersonCropScanner
+
+    class Model:
+        names = {0: "person"}
+
+        def predict(self, source, **kwargs):
+            assert kwargs["conf"] == 0.10
+            return [_Result([
+                _Box([38, 34, 58, 114]),             # standing on the ground
+                _Box([60, 10, 75, 40], conf=0.12),   # below person confidence
+                _Box([30, 5, 50, 40]),               # rider above the bed
+            ])]
+
+    scanner = PickupPersonCropScanner(enabled=True, model_loader=lambda _path: Model())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    pickup = {
+        "track_id": 204, "track_identity_epoch": 1, "class_label": "pickup_truck",
+        "resolved_track_class": "pickup_truck",
+        "bbox_x": 100, "bbox_y": 80, "bbox_w": 100, "bbox_h": 80,
+    }
+    detections = scanner.scan(frame, [pickup], timestamp_sec=38.4, frame_number=1152)
+
+    assert len(detections) == 1
+    assert detections[0]["bbox_x"] == 122
+    assert detections[0]["rider_geometry"]["label"] == "elevated"
+    rows = scanner.scan_log_rows()
+    assert len(rows) == 1
+    assert rows[0]["frame"] == 1152
+    assert rows[0]["pickup_track_id"] == 204
+    assert rows[0]["scan_reason"] == "resolved_track_class"
+    assert [p["decision"] for p in rows[0]["persons"]] == [
+        "ground_level", "below_confidence", "kept",
+    ]
+    assert rows[0]["persons"][2]["track_id"] == detections[0]["track_id"]
+    summary = scanner.summary()
+    assert summary["version"] == SCANNER_VERSION
+    assert summary["counters"]["decision_kept"] == 1
+    assert summary["pickups"][0]["raw_person_boxes"] == 3
+    assert summary["pickups"][0]["kept_person_boxes"] == 1
+
+
+def test_person_seen_in_overlapping_pickup_crops_links_to_one_pickup():
+    """One person is never attached to two pickups whose crops overlap."""
+    from core.pickup_person_scan import PickupPersonCropScanner
+
+    class Model:
+        names = {0: "person"}
+
+        def predict(self, source, **kwargs):
+            # Both crops contain the same frame box (160, 50, 20, 40).
+            return [_Result([_Box([68, 14, 88, 54])]), _Result([_Box([18, 9, 38, 49])])]
+
+    scanner = PickupPersonCropScanner(enabled=True, model_loader=lambda _path: Model())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    pickups = [
+        {"track_id": 1, "track_identity_epoch": 1, "class_label": "pickup_truck",
+         "resolved_track_class": "pickup_truck",
+         "bbox_x": 100, "bbox_y": 80, "bbox_w": 100, "bbox_h": 80},
+        {"track_id": 2, "track_identity_epoch": 1, "class_label": "pickup_truck",
+         "resolved_track_class": "pickup_truck",
+         "bbox_x": 150, "bbox_y": 85, "bbox_w": 100, "bbox_h": 80},
+    ]
+    detections = scanner.scan(frame, pickups, timestamp_sec=0.0)
+
+    assert len(detections) == 1
+    assert detections[0]["source_pickup_track_id"] == 1
+    assert detections[0]["pickup_ownership_contested"] is True
+    decisions = {
+        row["pickup_track_id"]: row["persons"][0]["decision"]
+        for row in scanner.scan_log_rows()
+    }
+    assert decisions == {1: "kept", 2: "assigned_to_other_pickup"}
+
+
+def test_scan_log_is_written_as_json_lines_in_the_run_evidence_folder(tmp_path, monkeypatch):
+    import json
+
+    import core.evidence as evidence
+
+    monkeypatch.setattr(evidence, "EVIDENCE_FOLDER", str(tmp_path))
+    assert evidence.save_pickup_detail_scan_log("run_54", []) is None
+    stored = evidence.save_pickup_detail_scan_log(
+        "run_54", [{"t": 38.4, "pickup_track_id": 204}, {"t": 38.5, "pickup_track_id": 204}]
+    )
+
+    log_file = tmp_path / "pickup_detail" / "run_54" / "scan_log.jsonl"
+    assert stored is not None and log_file.is_file()
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["t"] for line in lines] == [38.4, 38.5]
+
+
+def test_crop_person_overlapping_main_detector_person_is_kept_and_annotated():
+    from core.pickup_person_scan import PickupPersonCropScanner
+
+    class Model:
+        names = {0: "person"}
+
+        def predict(self, source, **kwargs):
+            return [_Result([_Box([68, 14, 88, 54])])]
+
+    scanner = PickupPersonCropScanner(enabled=True, model_loader=lambda _path: Model())
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    tracked = [
+        {"track_id": 1, "track_identity_epoch": 1, "class_label": "pickup_truck",
+         "resolved_track_class": "pickup_truck",
+         "bbox_x": 100, "bbox_y": 80, "bbox_w": 100, "bbox_h": 80},
+        {"track_id": 55, "track_identity_epoch": 1, "class_label": "person",
+         "bbox_x": 160, "bbox_y": 50, "bbox_w": 20, "bbox_h": 40},
+    ]
+    detections = scanner.scan(frame, tracked, timestamp_sec=0.0)
+
+    assert len(detections) == 1
+    assert detections[0]["overlaps_primary_track_id"] == 55
+    assert detections[0]["source_pickup_track_id"] == 1

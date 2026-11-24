@@ -3372,7 +3372,7 @@ def _pending_detail_plate_source(row: dict) -> tuple[str, int] | None:
 @app.route("/api/review-queue/<int:review_id>/plate-details", methods=["GET", "POST"])
 @auth.role_required("enforcer")
 def api_review_plate_details(review_id: int):
-    """Load OCR evidence or submit a missing detail attempt from saved frames."""
+    """Load OCR evidence or start an attempt from saved review evidence."""
     if request.method == "POST":
         origin = request.headers.get("Origin")
         if (origin is not None and origin != request.host_url.rstrip("/")) or request.headers.get("Sec-Fetch-Site") == "cross-site":
@@ -3380,13 +3380,19 @@ def api_review_plate_details(review_id: int):
     row = db.get_review_item(review_id)
     if row is None or not _accessible_video_link(row.get("video_id")):
         return jsonify({"success": False, "error": "Review item not found."}), 404
+    rescan_note = None
     try:
         from core.plate_review import machine_result_for_review
-        from core.plate_runtime import LEGACY_DETAIL_FRAME_SKIP, get_runtime, queue_detail_review_ocr
+        from core.plate_runtime import (
+            LEGACY_DETAIL_FRAME_SKIP, get_runtime, queue_detail_review_ocr,
+            queue_saved_review_ocr, saved_review_vehicle_crop,
+        )
 
         machine = machine_result_for_review(review_id)
         source = _pending_detail_plate_source(row)
-        runtime = get_runtime() if source else None
+        pending = row.get("status") == "pending"
+        runtime = get_runtime() if pending else None
+        crop = saved_review_vehicle_crop(row) if runtime is not None and not source else None
         can_queue = source is not None and (
             machine["state"] == "none"
             or (
@@ -3397,24 +3403,32 @@ def api_review_plate_details(review_id: int):
         payload = request.get_json(silent=True) if request.method == "POST" else None
         manual = isinstance(payload, dict) and "rescan_from" in payload
         rescan_from = payload["rescan_from"] if manual else None
+        current_rescan = (
+            manual and runtime is not None and rescan_from == machine["attempt_id"]
+            and machine["state"] not in ("queued", "processing")
+        )
         if source and request.method == "POST" and (
-            (not manual and can_queue)
-            or (
-                manual and runtime is not None and rescan_from == machine["attempt_id"]
-                and machine["state"] not in ("queued", "processing")
-            )
+            (not manual and can_queue) or current_rescan
         ):
             kind, candidate_id = source
             getter = db.get_pickup_detail_candidate if kind == "pickup" else db.get_motorcycle_detail_candidate
             lead = getter(candidate_id)
             if lead:
                 queue_detail_review_ocr(db, review_id, lead, kind=kind, rescan_from=rescan_from)
-                machine = machine_result_for_review(review_id)
             else:
                 source = None
+                crop = saved_review_vehicle_crop(row) if runtime is not None else None
+                if crop and current_rescan:
+                    rescan_note = queue_saved_review_ocr(db, review_id, rescan_from=rescan_from)
+            machine = machine_result_for_review(review_id)
             if machine["state"] == "none":
                 machine["state"] = "disabled" if runtime is None else "unavailable"
-        can_rescan = bool(source and runtime is not None and machine["state"] not in ("queued", "processing"))
+        elif crop and request.method == "POST" and current_rescan:
+            rescan_note = queue_saved_review_ocr(db, review_id, rescan_from=rescan_from)
+            machine = machine_result_for_review(review_id)
+        if runtime is not None and not (source or crop):
+            rescan_note = "No saved vehicle crop is available for this review."
+        can_rescan = bool((source or crop) and runtime is not None and machine["state"] not in ("queued", "processing"))
     except Exception:  # noqa: BLE001 - optional OCR must not block core review
         can_queue = False
         can_rescan = False
@@ -3443,6 +3457,7 @@ def api_review_plate_details(review_id: int):
         "plate_machine": machine,
         "plate_ocr_can_queue": can_queue and request.method == "GET",
         "plate_ocr_can_rescan": can_rescan,
+        "plate_ocr_rescan_note": rescan_note,
         "review_plate_choice": choice,
     })
 

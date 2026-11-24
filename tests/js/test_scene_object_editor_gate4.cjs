@@ -199,6 +199,26 @@ function run() {
     assert.ok(roundTrip.flow_arrows.length >= 1);
     assert.ok(roundTrip.activity_regions.length >= 1);
 
+    canvasEditor.setObjectKind("flow_arrows", "lane_flow");
+    canvasEditor._ensureCreating([240, 30]);
+    const secondLaneArrow = canvasEditor._ensureCreating([280, 30]);
+    assert.strictEqual(secondLaneArrow.lane_ids[0], extraLane.id);
+    assert.ok(api.validateSceneDocument(canvasEditor.getSceneDocument({ completeOnly: true })).ok);
+
+    secondLaneArrow.lane_ids = ["lane-keep"];
+    assert.match(api.validateSceneDocument(canvasEditor.getSceneDocument()).error, /is drawn in/);
+    secondLaneArrow.lane_ids = [extraLane.id];
+
+    canvasEditor.newObject();
+    canvasEditor._ensureCreating([100, 30]);
+    const crossLaneArrow = canvasEditor._ensureCreating([250, 30]);
+    assert.strictEqual(crossLaneArrow.lane_ids, undefined);
+    const withUnlinkedArrow = canvasEditor.getSceneDocument({ completeOnly: true });
+    assert.ok(withUnlinkedArrow.flow_arrows.some(arrow => arrow.id === crossLaneArrow.id));
+    assert.match(api.validateSceneDocument(withUnlinkedArrow).error, /choose Apply to lane/);
+    crossLaneArrow.lane_ids = [extraLane.id];
+    assert.match(api.validateSceneDocument(canvasEditor.getSceneDocument()).error, /more than one flow arrow/);
+
     console.log("PASS gate4 scene object editor behavioral tests");
 }
 

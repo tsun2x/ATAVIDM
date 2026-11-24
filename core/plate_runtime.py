@@ -337,6 +337,93 @@ def worker_state_for(review_id: int | None) -> str | None:
     return runtime.worker.state_for(review_id)
 
 
+def _review_attempt(runtime: PlateRuntime, review_id: int, rescan_from: str | None) -> dict | None:
+    """Check the attempt token while holding the review submission lock."""
+    if runtime.worker.state_for(review_id):
+        return None
+    attempts = manifests.attempts_for_review(review_id)
+    latest = attempts[0] if attempts else None
+    if rescan_from != (latest.attempt_id if latest else None):
+        return None
+    return (latest.data or {}) if latest else {}
+
+
+def _stored_review_image(stored_path: str | None) -> Path | None:
+    import config
+    from core.media_serve import resolve_under_roots
+
+    if not stored_path:
+        return None
+    base = Path(config.BASE_DIR)
+    try:
+        return resolve_under_roots(base / stored_path, [base / config.EVIDENCE_FOLDER, base / "static" / "evidence"])
+    except (ValueError, OSError):
+        return None
+
+
+def saved_review_vehicle_crop(review: dict[str, Any]) -> Path | None:
+    return _stored_review_image(review.get("vehicle_evidence_path"))
+
+
+def queue_saved_review_ocr(adapter: Any, review_id: int, *, rescan_from: str | None) -> str | None:
+    """Rescan evidence attributed to an ordinary uploaded or live review."""
+    import cv2
+    from core.detection_config import VEHICLE_CLASSES
+    from core.evidence import raw_scene_sidecar_path
+
+    runtime = get_runtime()
+    if runtime is None:
+        return None
+    with _DETAIL_SUBMISSION_LOCK:
+        latest = _review_attempt(runtime, review_id, rescan_from)
+        review = adapter.get_review_item(review_id)
+        if latest is None or not review or review["status"] != "pending":
+            return None
+        crop = saved_review_vehicle_crop(review)
+        if crop is None:
+            return "No saved vehicle crop is available for this review."
+
+        track_id = review["track_id"]
+        frame_number = review["frame_number"]
+        timestamp = review["timestamp_sec"]
+        video_id = review.get("video_id")
+        run_id = review.get("processing_run_id")
+        frame = None
+        vehicles = []
+        scene = _stored_review_image(review.get("evidence_path")) if video_id and run_id else None
+        raw_scene = raw_scene_sidecar_path(scene) if scene else None
+        if raw_scene:
+            vehicles = [det for det in adapter.get_detections_by_video(
+                video_id, frame_number, frame_number, processing_run_id=run_id,
+            ) if det.get("class_label") in VEHICLE_CLASSES]
+            if sum(det["track_id"] == track_id for det in vehicles) == 1:
+                frame = cv2.imread(str(raw_scene))
+        if frame is None:
+            # A tight saved crop is attributable even on older and live rows.
+            # A previously ambiguous observation needs the tracked scene instead.
+            if latest.get("association_uncertain"):
+                return "Rescan needs a saved frame with tracking data to check which vehicle owns the plate."
+            frame = cv2.imread(str(crop))
+            if frame is not None:
+                height, width = frame.shape[:2]
+                vehicles = [dict(track_id=track_id, bbox_x=0, bbox_y=0, bbox_w=width, bbox_h=height)]
+
+        collector = runtime.new_collector(
+            source="live" if video_id is None else "video",
+            run_key=f"run_{run_id}" if run_id else crop.parent.name,
+        )
+        collector.register(
+            review_id=review_id, track_id=track_id, identity_epoch=None,
+            violation_type=review["violation_type"], frame_number=frame_number, timestamp_sec=timestamp,
+        )
+        try:
+            if frame is not None:
+                collector.observe(frame, frame_number, timestamp, vehicles)
+        finally:
+            collector.flush("stored_review_evidence" if frame is not None else "review_evidence_unavailable")
+    return None
+
+
 def queue_detail_review_ocr(
     adapter: Any, review_id: int, lead: dict[str, Any], *,
     kind: str, rescan_from: str | None = None,

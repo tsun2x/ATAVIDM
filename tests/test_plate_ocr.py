@@ -303,6 +303,110 @@ class FakeBackend:
         }
 
 
+@pytest.mark.parametrize("video_id,overlap", [(None, False), (7, False), (7, True)])
+def test_saved_review_ocr_rescans_vehicle_crop(plate_root_env, tmp_path, monkeypatch, video_id, overlap):
+    from types import SimpleNamespace
+    import cv2
+    from core.plate_runtime import queue_saved_review_ocr
+
+    settings = enabled_settings(tmp_path)
+    backend = FakeBackend(settings)
+    worker, _memory = build_worker(settings, backend)
+    runtime = SimpleNamespace(
+        worker=worker,
+        new_collector=lambda **kwargs: PlateObservationCollector(settings, backend, worker, **kwargs),
+    )
+    monkeypatch.setattr("core.plate_runtime.get_runtime", lambda: runtime)
+    evidence = tmp_path / "review_evidence"
+    evidence.mkdir()
+    monkeypatch.setattr("config.EVIDENCE_FOLDER", str(evidence))
+    monkeypatch.setattr("core.evidence.EVIDENCE_FOLDER", str(evidence))
+    crop = evidence / "vehicle_f000011_t007.jpg"
+    assert cv2.imwrite(str(crop), make_vehicle_frame()[100:200, 80:240])
+    review = dict(
+        status="pending", video_id=video_id, processing_run_id=9 if video_id else None,
+        track_id=7, frame_number=11, timestamp_sec=1.0, violation_type="Counterflow",
+        vehicle_evidence_path=str(crop),
+    )
+    adapter = SimpleNamespace(get_review_item=lambda _id: review)
+    if overlap:
+        scene = evidence / "scene.jpg"
+        scene.touch()
+        raw_scene = scene.with_name("raw_scene.jpg")
+        assert cv2.imwrite(str(raw_scene), make_vehicle_frame())
+        review["evidence_path"] = str(scene)
+
+        def detections(video, start, end, *, processing_run_id):
+            assert (video, start, end, processing_run_id) == (7, 11, 11, 9)
+            box = dict(class_label="car", bbox_x=80, bbox_y=100, bbox_w=160, bbox_h=100)
+            return [dict(box, track_id=7), dict(box, track_id=8)]
+
+        adapter.get_detections_by_video = detections
+    try:
+        queue_saved_review_ocr(adapter, 1, rescan_from=None)
+        assert drain(worker)
+        first = current_attempt_for_review(1)
+        assert first.data["source"]["kind"] == ("video" if video_id else "live")
+        if overlap:
+            assert first.data["association_uncertain"] is True
+            assert backend.detector_calls == 0
+            raw_scene.unlink()
+            assert queue_saved_review_ocr(adapter, 1, rescan_from=first.attempt_id)
+            assert current_attempt_for_review(1).attempt_id == first.attempt_id
+            return
+        assert first.data["outcome"] == "candidate_found"
+        assert backend.detect_shapes == [(100, 160, 3)]
+
+        queue_saved_review_ocr(adapter, 1, rescan_from=first.attempt_id)
+        assert drain(worker)
+        second = current_attempt_for_review(1)
+        assert second.attempt_id != first.attempt_id
+        queue_saved_review_ocr(adapter, 1, rescan_from=first.attempt_id)
+        review["status"] = "confirmed"
+        queue_saved_review_ocr(adapter, 1, rescan_from=second.attempt_id)
+        assert drain(worker)
+        assert current_attempt_for_review(1).attempt_id == second.attempt_id
+    finally:
+        worker.stop()
+
+
+def test_ordinary_live_review_offers_manual_plate_rescan(enforcer_client, test_db, tmp_path, monkeypatch):
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    crop = evidence / "vehicle.jpg"
+    crop.touch()
+    monkeypatch.setattr("config.EVIDENCE_FOLDER", str(evidence))
+    monkeypatch.setattr("core.plate_runtime.get_runtime", lambda: object())
+    machine = {"state": "none", "attempt_id": None}
+    monkeypatch.setattr("core.plate_review.machine_result_for_review", lambda _: dict(machine))
+    submissions = []
+
+    def queue(_adapter, review_id, *, rescan_from):
+        submissions.append((review_id, rescan_from))
+        machine.update(state="queued")
+
+    monkeypatch.setattr("core.plate_runtime.queue_saved_review_ocr", queue)
+    review_id = test_db.insert_review_queue(
+        video_id=None, track_id=5, violation_type="Counterflow", confidence=0.9,
+        frame_number=11, timestamp_sec=1.0, vehicle_evidence_path=str(crop),
+    )
+    url = f"/api/review-queue/{review_id}/plate-details"
+    details = enforcer_client.get(url).get_json()
+    assert details["plate_ocr_can_rescan"] is True
+    assert details["plate_ocr_can_queue"] is False
+    enforcer_client.post(url)
+    enforcer_client.post(url, json={"rescan_from": "stale"})
+    assert submissions == []
+    queued = enforcer_client.post(url, json={"rescan_from": None}).get_json()
+    assert submissions == [(review_id, None)]
+    assert queued["plate_machine"]["state"] == "queued"
+    assert queued["plate_ocr_can_rescan"] is False
+    crop.unlink()
+    details = enforcer_client.get(url).get_json()
+    assert details["plate_ocr_can_rescan"] is False
+    assert details["plate_ocr_rescan_note"] == "No saved vehicle crop is available for this review."
+
+
 def make_vehicle_frame(width=320, height=240):
     """A vehicle region at (80,100)-(240,200) holding one sharp plate.
 
