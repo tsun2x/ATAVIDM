@@ -20,6 +20,7 @@
     let currentCaseActions = {};
 
     const searchInput = document.getElementById("searchInput");
+    const plateSearchInput = document.getElementById("plateSearchInput");
     const filterType = document.getElementById("filterType");
     const filterVideo = document.getElementById("filterVideo");
     const filterStatus = document.getElementById("filterStatus");
@@ -92,18 +93,11 @@
     }
 
     function applyFilters() {
-        const query = (searchInput?.value || "").toLowerCase().trim();
-        const type = filterType?.value || "";
-        const video = filterVideo?.value || "";
-        const status = filterStatus?.value || "";
-        const date = filterDate?.value || "";
-
         currentPage = 1;
-        loadPage({ search: query, violation_type: type, video_name: video, status: status,
-            date_from: date || "", date_to: date || "" });
+        loadPage();
     }
 
-    function loadPage(filters, onLoaded) {
+    function loadPage(onLoaded) {
         const sequence = ++requestSequence;
         const params = new URLSearchParams({
             page: String(currentPage),
@@ -112,8 +106,9 @@
         });
         const uploaderId = new URLSearchParams(window.location.search).get("uploader_id");
         if (uploaderId) params.set("uploader_id", uploaderId);
-        const active = filters || {
+        const active = {
             search: (searchInput?.value || "").trim(),
+            plate: (plateSearchInput?.value || "").trim(),
             violation_type: filterType?.value || "",
             video_name: filterVideo?.value || "",
             status: filterStatus?.value || "",
@@ -121,8 +116,8 @@
             date_to: filterDate?.value || "",
         };
         Object.keys(active).forEach(function (key) { if (active[key]) params.set(key, active[key]); });
-        const endpoint = displayMode === "vehicle"
-            ? "/api/violations/vehicle-groups?" : "/api/violations?";
+        if (displayMode === "plate") params.set("group_by", "plate");
+        const endpoint = displayMode === "individual" ? "/api/violations?" : "/api/violations/vehicle-groups?";
         fetch(endpoint + params.toString())
             .then(function (response) {
                 return response.json().catch(function () { return {}; }).then(function (payload) {
@@ -167,7 +162,10 @@
                 verifiedVehicleTotal + (verifiedVehicleTotal === 1 ? " proven vehicle · " : " proven vehicles · ") +
                 unassociatedEventTotal + (unassociatedEventTotal === 1 ? " unassociated event · " : " unassociated events · ") +
                 groupedEventTotal + (groupedEventTotal === 1 ? " event" : " events")
-            : totalRecords;
+            : displayMode === "plate"
+                ? totalRecords + (totalRecords === 1 ? " plate group · " : " plate groups · ") +
+                    groupedEventTotal + (groupedEventTotal === 1 ? " event" : " events")
+                : totalRecords;
 
         if (tbody) {
             const eventRow = function (v, nested) {
@@ -189,11 +187,11 @@
                     "</div></td></tr>"
                 );
             };
-            if (displayMode === "vehicle") {
+            if (displayMode !== "individual") {
                 tbody.innerHTML = vehicleGroups.length ? vehicleGroups.map(function (group, index) {
                     const first = group.events[0] || {};
                     const detailsId = "vehicleEvents-" + index;
-                    const label = group.vehicle_identity_verified
+                    const label = displayMode === "plate" ? group.plate_text : group.vehicle_identity_verified
                         ? (first.vehicle_class && first.vehicle_class !== "—" ? first.vehicle_class : "Vehicle") +
                             " · track " + group.track_id
                         : "Identity unavailable · individual event";
@@ -201,10 +199,10 @@
                     const childRows = (group.events || []).map(function (event) { return eventRow(event, true); }).join("");
                     return '<tr class="vehicle-group-summary">' +
                         '<td colspan="3"><button type="button" class="btn btn-sm btn-link p-0 btn-toggle-vehicle-events" aria-expanded="false" aria-controls="' + detailsId + '"><i class="bi bi-chevron-right me-1"></i>' + escapeHtml(label) + '</button>' +
-                        '<div class="small text-muted">' + escapeHtml(first.video_name || "") + ' · ' + escapeHtml(typeLabel) + '</div></td>' +
+                        '<div class="small text-muted">' + (displayMode === "plate" ? "" : escapeHtml(first.video_name || "") + " · ") + escapeHtml(typeLabel) + '</div></td>' +
                         '<td>' + escapeHtml(first.timestamp || "") + '</td>' +
                         '<td colspan="2"><span class="badge bg-secondary-subtle text-secondary">' + Number(group.event_count || 0) + ' event(s)</span></td>' +
-                        '<td>' + escapeHtml(first.vehicle_class || "—") + '</td><td>—</td><td>—</td></tr>' +
+                        '<td>' + escapeHtml(displayMode === "plate" ? "—" : first.vehicle_class || "—") + '</td><td>—</td><td>—</td></tr>' +
                         '<tr id="' + detailsId + '" class="vehicle-group-children d-none"><td colspan="9"><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>ID</th><th>Violation Type</th><th>Video</th><th>Date / Time</th><th>Rule Evidence Score</th><th>Status</th><th>Vehicle</th><th>Plate</th><th>Actions</th></tr></thead><tbody>' + childRows + '</tbody></table></div></td></tr>';
                 }).join("") : '<tr><td colspan="9" class="text-center text-muted py-4">No violation display groups match these filters.</td></tr>';
             } else {
@@ -234,12 +232,13 @@
     function updatePaginationInfo() {
         if (!paginationInfo) return;
         const start = totalRecords ? (currentPage - 1) * pageSize + 1 : 0;
-        const end = Math.min((currentPage - 1) * pageSize + (displayMode === "vehicle" ? vehicleGroups.length : allViolations.length), totalRecords);
+        const end = Math.min((currentPage - 1) * pageSize + (displayMode === "individual" ? allViolations.length : vehicleGroups.length), totalRecords);
         paginationInfo.textContent = "Showing " + start + "\u2013" + end + " of " + totalRecords +
             (displayMode === "vehicle" ? (totalRecords === 1 ? " display group (" : " display groups (") +
                 verifiedVehicleTotal + (verifiedVehicleTotal === 1 ? " proven vehicle, " : " proven vehicles, ") +
                 unassociatedEventTotal + (unassociatedEventTotal === 1 ? " unassociated event, " : " unassociated events, ") +
-                groupedEventTotal + (groupedEventTotal === 1 ? " matching event)" : " matching events)") : "");
+                groupedEventTotal + (groupedEventTotal === 1 ? " matching event)" : " matching events)") :
+                displayMode === "plate" ? (totalRecords === 1 ? " plate group" : " plate groups") : "");
     }
 
     function showDetail(v) {
@@ -503,7 +502,7 @@
                         detailModal.hide();
                     }
                     const selectedId = selectedViolation ? Number(selectedViolation.db_id) : null;
-                    loadPage(null, function () {
+                    loadPage(function () {
                         if (selectedId === null) return;
                         const refreshed = allViolations.find(function (item) {
                             return Number(item.db_id) === selectedId;
@@ -589,7 +588,7 @@
         evidenceModal.show();
     }
 
-    [searchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) {
+    [searchInput, plateSearchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) {
         if (!el) return;
         el.addEventListener("input", function () {
             window.clearTimeout(filterTimer);
@@ -600,13 +599,13 @@
 
     sortSelect?.addEventListener("change", function () { currentPage = 1; loadPage(); });
     groupingSelect?.addEventListener("change", function () {
-        displayMode = groupingSelect.value === "vehicle" ? "vehicle" : "individual";
+        displayMode = groupingSelect.value;
         currentPage = 1;
         loadPage();
     });
 
     document.getElementById("resetFilters")?.addEventListener("click", function () {
-        [searchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) { if (el) el.value = ""; });
+        [searchInput, plateSearchInput, filterType, filterVideo, filterStatus, filterDate].forEach(function (el) { if (el) el.value = ""; });
         window.clearTimeout(filterTimer);
         applyFilters();
     });

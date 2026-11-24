@@ -47,11 +47,15 @@ const window = {
     setTimeout,
     clearTimeout,
 };
+let lastRequest;
 const context = {
     window,
     document,
     bootstrap: { Modal: function Modal() { this.show = () => {}; this.hide = () => {}; } },
-    fetch: async () => ({ ok: true, status: 200, json: async () => nextPayload }),
+    fetch: async (url) => {
+        lastRequest = url;
+        return { ok: true, status: 200, json: async () => nextPayload };
+    },
     URLSearchParams,
     setTimeout,
     clearTimeout,
@@ -84,6 +88,23 @@ async function settle() {
     await settle();
     assert.match(getElementById("violationsBody").innerHTML, /No violation display groups match these filters/);
     assert.match(getElementById("resultCount").textContent, /^0 display groups/);
+
+    nextPayload = {
+        success: true, total: 1, event_total: 2, page: 1,
+        groups: [{ plate_text: "ABC 1234", event_count: 2, violation_types: ["Illegal Parking", "Obstruction"],
+            events: [provenEvent, { ...provenEvent, id: 2, video_name: "other.mp4" }] }],
+    };
+    getElementById("plateSearchInput").value = "abc-1234";
+    grouping.value = "plate";
+    grouping.listeners.change();
+    await settle();
+    assert.match(lastRequest, /^\/api\/violations\/vehicle-groups\?/);
+    const params = new URLSearchParams(lastRequest.split("?")[1]);
+    assert.strictEqual(params.get("plate"), "abc-1234");
+    assert.strictEqual(params.get("group_by"), "plate");
+    assert.match(getElementById("resultCount").textContent, /1 plate group/);
+    assert.match(getElementById("violationsBody").innerHTML, /ABC 1234/);
+    assert.match(getElementById("violationsBody").innerHTML, /other\.mp4/);
     console.log("vehicle grouping presentation checks passed");
 })().catch((error) => {
     console.error(error);

@@ -695,6 +695,7 @@ def _review_to_ui(
         ),
         "plate_text": row.get("plate_text") or None,
         "plate_status": row.get("plate_status") or "not_attempted",
+        "verified_plate_text": row.get("verified_plate_text"),
         "reason_log": reason_log,
         "queued_at": row.get("queued_at"),
         "status": row.get("status"),
@@ -1136,7 +1137,7 @@ def api_list_violations():
         sort = "newest"
     filters = {
         key: request.args.get(key)
-        for key in ("search", "violation_type", "video_name", "date_from", "date_to", "status")
+        for key in ("search", "plate", "violation_type", "video_name", "date_from", "date_to", "status")
         if request.args.get(key)
     }
     video_id = request.args.get("video_id", "")
@@ -1169,9 +1170,12 @@ def api_list_vehicle_groups():
         sort = "newest"
     filters = {
         key: request.args.get(key)
-        for key in ("search", "violation_type", "video_name", "date_from", "date_to", "status")
+        for key in ("search", "plate", "violation_type", "video_name", "date_from", "date_to", "status")
         if request.args.get(key)
     }
+    by_plate = request.args.get("group_by") == "plate"
+    if by_plate:
+        filters["verified_plates_only"] = True
     video_id = request.args.get("video_id", "")
     if video_id.isdigit():
         filters["video_id"] = int(video_id)
@@ -1190,25 +1194,34 @@ def api_list_vehicle_groups():
     if event_total > group_event_limit:
         return jsonify({
             "success": False,
-            "error": "Vehicle grouping is limited to 100 matching events. Narrow the filters or switch to Individual events.",
+            "error": "Grouping is limited to 100 matching events. Narrow the filters or switch to Individual events.",
             "event_total": event_total,
         }), 413
 
-    from core.vehicle_grouping import group_vehicle_events
+    if by_plate:
+        from core.vehicle_grouping import group_plate_events
 
-    provenance = db.list_vehicle_grouping_provenance(
-        [int(row["id"]) for row in rows if type(row.get("id")) is int]
-    )
-    groups = group_vehicle_events(
-        rows,
-        evidence_root=Path(config.EVIDENCE_FOLDER),
-        provenance_by_case=provenance,
-    )
+        groups = group_plate_events(rows)
+    else:
+        from core.vehicle_grouping import group_vehicle_events
+
+        provenance = db.list_vehicle_grouping_provenance(
+            [int(row["id"]) for row in rows if type(row.get("id")) is int]
+        )
+        groups = group_vehicle_events(
+            rows,
+            evidence_root=Path(config.EVIDENCE_FOLDER),
+            provenance_by_case=provenance,
+        )
     group_total = len(groups)
-    verified_vehicle_total = sum(bool(group["vehicle_identity_verified"]) for group in groups)
-    unassociated_event_total = sum(
-        int(group["event_count"]) for group in groups if not group["vehicle_identity_verified"]
-    )
+    group_counts = {}
+    if not by_plate:
+        group_counts = {
+            "verified_vehicle_total": sum(bool(group["vehicle_identity_verified"]) for group in groups),
+            "unassociated_event_total": sum(
+                int(group["event_count"]) for group in groups if not group["vehicle_identity_verified"]
+            ),
+        }
     last_page = max(1, (group_total + per_page - 1) // per_page)
     page = min(page, last_page)
     start = (page - 1) * per_page
@@ -1225,8 +1238,7 @@ def api_list_vehicle_groups():
         "case_actions": _case_actions_for_user(actor),
         "total": group_total,
         "group_total": group_total,
-        "verified_vehicle_total": verified_vehicle_total,
-        "unassociated_event_total": unassociated_event_total,
+        **group_counts,
         "event_total": event_total,
         "page": page,
         "per_page": per_page,
@@ -1452,16 +1464,17 @@ def review_queue():
     videos = _video_name_map(**scope)
     page = max(1, _int_query_arg("page", 1))
     per_page = min(100, max(1, _int_query_arg("per_page", 20)))
+    plate = request.args.get("plate", "").strip()
     rows, total = db.list_review_queue(
         status="pending", page=page, per_page=per_page,
-        video_id=selected_video_id, **scope
+        video_id=selected_video_id, plate=plate, include_verified_plate=True, **scope
     )
     last_page = max(1, (total + per_page - 1) // per_page)
     if page > last_page:
         page = last_page
         rows, total = db.list_review_queue(
             status="pending", page=page, per_page=per_page,
-            video_id=selected_video_id, **scope
+            video_id=selected_video_id, plate=plate, include_verified_plate=True, **scope
         )
     return render_template(
         "review_queue.html",
@@ -1469,6 +1482,7 @@ def review_queue():
         review_total=total,
         review_page=page,
         review_per_page=per_page,
+        plate_filter=plate,
         canonical_violations=list(CANONICAL_VIOLATIONS),
         uploader_accounts=db.list_users() if _is_admin_actor(actor) else [],
         selected_uploader_id=selected_uploader_id,

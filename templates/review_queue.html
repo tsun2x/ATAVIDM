@@ -5,8 +5,15 @@
 {% block page_subtitle %}Manual validation of detected violations before confirmation{% endblock %}
 
 {% block content %}
-{% if uploader_accounts or videos %}
 <form class="mb-3 d-flex flex-wrap align-items-center gap-2" method="get" aria-label="Filter review queue">
+    <input type="hidden" name="per_page" value="{{ review_per_page }}">
+    <label class="form-label mb-0" for="reviewPlateSearch">Verified plate</label>
+    <input type="search" class="form-control form-control-sm" id="reviewPlateSearch" name="plate"
+           value="{{ plate_filter }}" placeholder="ABC 1234" maxlength="32" style="max-width: 170px">
+    <button class="btn btn-sm btn-outline-primary" type="submit">Search</button>
+    {% if plate_filter %}
+    <a class="btn btn-sm btn-link" href="{{ url_for('review_queue', uploader_id=selected_uploader_id, video_id=selected_video_id, per_page=review_per_page) }}">Clear plate</a>
+    {% endif %}
     {% if uploader_accounts %}
     <label class="form-label mb-0" for="reviewUploader">Uploaded by</label>
     <select class="form-select form-select-sm" id="reviewUploader" name="uploader_id" style="max-width: 260px" onchange="this.form.submit()">
@@ -20,7 +27,6 @@
         {% for video in videos %}<option value="{{ video.db_id }}" {% if selected_video_id == video.db_id %}selected{% endif %}>{{ video.filename }}</option>{% endfor %}
     </select>
 </form>
-{% endif %}
 <div class="card card-panel mb-4">
     <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
         <div>
@@ -44,11 +50,11 @@
 <nav class="mt-3" aria-label="Review queue pages">
     <ul class="pagination pagination-sm justify-content-end">
         <li class="page-item {% if review_page <= 1 %}disabled{% endif %}">
-            <a class="page-link" href="{{ url_for('review_queue', page=review_page-1, per_page=review_per_page, uploader_id=selected_uploader_id, video_id=selected_video_id) }}" aria-label="Previous page">Previous</a>
+            <a class="page-link" href="{{ url_for('review_queue', page=review_page-1, per_page=review_per_page, uploader_id=selected_uploader_id, video_id=selected_video_id, plate=plate_filter or none) }}" aria-label="Previous page">Previous</a>
         </li>
         <li class="page-item disabled"><span class="page-link">Page {{ review_page }} of {{ review_pages }}</span></li>
         <li class="page-item {% if review_page >= review_pages %}disabled{% endif %}">
-            <a class="page-link" href="{{ url_for('review_queue', page=review_page+1, per_page=review_per_page, uploader_id=selected_uploader_id, video_id=selected_video_id) }}" aria-label="Next page">Next</a>
+            <a class="page-link" href="{{ url_for('review_queue', page=review_page+1, per_page=review_per_page, uploader_id=selected_uploader_id, video_id=selected_video_id, plate=plate_filter or none) }}" aria-label="Next page">Next</a>
         </li>
     </ul>
 </nav>
@@ -66,6 +72,7 @@
                         <th>Source</th>
                         <th>Track</th>
                         <th>Vehicle Class</th>
+                        <th>Verified Plate</th>
                         <th title="Rule evidence and detector scores">Evidence Scores</th>
                         <th>Evidence</th>
                         <th>Queued At</th>
@@ -95,6 +102,7 @@
                         </td>
                         <td>#{{ item.track_id }}</td>
                         <td class="small">{{ item.vehicle_class }}</td>
+                        <td class="small">{{ item.verified_plate_text or '—' }}</td>
                         <td>
                             {% if item.confidence is none %}
                             <span class="small text-muted">Rule score unavailable</span>
@@ -138,7 +146,7 @@
                     </tr>
                     {% else %}
                     <tr id="reviewEmptyRow">
-                        <td colspan="9" class="text-center text-muted py-4">No pending detections. Process a video or start a live stream to populate the queue.</td>
+                        <td colspan="10" class="text-center text-muted py-4">{% if plate_filter %}No pending detections match this verified plate.{% else %}No pending detections. Process a video or start a live stream to populate the queue.{% endif %}</td>
                     </tr>
                     {% endfor %}
                 </tbody>

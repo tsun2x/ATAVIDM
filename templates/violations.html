@@ -17,12 +17,16 @@
 <div class="card card-panel mb-4">
     <div class="card-body">
         <div class="row g-3 align-items-end">
-            <div class="col-md-3">
+            <div class="col-md-2">
                 <label class="form-label" for="searchInput">Search</label>
                 <div class="input-group">
                     <span class="input-group-text"><i class="bi bi-search"></i></span>
                     <input type="text" class="form-control" id="searchInput" placeholder="ID, type, video...">
                 </div>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label" for="plateSearchInput">Verified Plate</label>
+                <input type="search" class="form-control" id="plateSearchInput" placeholder="ABC 1234" maxlength="32">
             </div>
             <div class="col-md-2">
                 <label class="form-label" for="filterType">Violation Type</label>
@@ -53,12 +57,12 @@
             </div>
             <div class="col-md-2">
                 <label class="form-label" for="filterDate">Date</label>
-                <input type="date" class="form-control" id="filterDate">
-            </div>
-            <div class="col-md-1">
-                <button class="btn btn-outline-secondary w-100" id="resetFilters" aria-label="Reset violation filters">
-                    <i class="bi bi-arrow-counterclockwise"></i>
-                </button>
+                <div class="input-group">
+                    <input type="date" class="form-control" id="filterDate">
+                    <button class="btn btn-outline-secondary" id="resetFilters" aria-label="Reset violation filters">
+                        <i class="bi bi-arrow-counterclockwise"></i>
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -75,6 +79,7 @@
             <select class="form-select form-select-sm" id="vehicleGrouping" style="width:auto;">
                 <option value="individual" selected>Individual events</option>
                 <option value="vehicle">Vehicle groups (expandable)</option>
+                <option value="plate">Verified plate groups (expandable)</option>
             </select>
             <label class="form-label mb-0 small text-muted" for="sortSelect">Sort</label>
             <select class="form-select form-select-sm" id="sortSelect" style="width:auto;">

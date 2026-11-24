@@ -3244,6 +3244,21 @@ def _video_owner_scope_sql(
     return clauses, params
 
 
+def _normalize_plate_search(value: str) -> str:
+    """Match case and common display separators in plate searches."""
+    return value.upper().replace(" ", "").replace("-", "")
+
+
+def _normalized_plate_sql(column: str) -> str:
+    return f"UPPER(REPLACE(REPLACE({column}, ' ', ''), '-', ''))"
+
+
+_VERIFIED_CASE_PLATE_SQL = (
+    "(SELECT pv.accepted_plate_text FROM plate_verifications pv "
+    "WHERE pv.violation_id = violations.id AND pv.plate_status = 'verified_readable')"
+)
+
+
 def _build_violation_filters(
     filters: dict[str, Any],
     *,
@@ -3281,6 +3296,15 @@ def _build_violation_filters(
         )
         pattern = f"%{search}%"
         params.extend([pattern, pattern, pattern, pattern, pattern])
+
+    plate = filters.get("plate")
+    if plate:
+        needle = _normalize_plate_search(plate)
+        clauses.append(f"INSTR({_normalized_plate_sql(_VERIFIED_CASE_PLATE_SQL)}, ?) > 0" if needle else "0")
+        if needle:
+            params.append(needle)
+    if filters.get("verified_plates_only"):
+        clauses.append(f"{_normalized_plate_sql(_VERIFIED_CASE_PLATE_SQL)} <> ''")
 
     video_name = filters.get("video_name")
     if video_name:
@@ -3344,6 +3368,12 @@ def list_violations(
     )
     order_by = VIOLATION_SORT_OPTIONS.get(sort, VIOLATION_SORT_OPTIONS["newest"])
     offset = max(page - 1, 0) * per_page
+    columns = "violations.*"
+    if filters.get("verified_plates_only"):
+        columns += (
+            f", {_VERIFIED_CASE_PLATE_SQL} AS verified_plate_text"
+            f", {_normalized_plate_sql(_VERIFIED_CASE_PLATE_SQL)} AS verified_plate_key"
+        )
 
     with db_session() as conn:
         count_row = conn.execute(
@@ -3354,7 +3384,7 @@ def list_violations(
 
         rows = conn.execute(
             f"""
-            SELECT * FROM violations
+            SELECT {columns} FROM violations
             {where_clause}
             ORDER BY {order_by}
             LIMIT ? OFFSET ?
@@ -3838,6 +3868,8 @@ def list_review_queue(
     owner_user_id: int | None = None,
     uploader_id: int | None = None,
     video_id: int | None = None,
+    plate: str | None = None,
+    include_verified_plate: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     offset = max(page - 1, 0) * per_page
     ownership_clauses, ownership_params = _video_owner_scope_sql(
@@ -3848,19 +3880,54 @@ def list_review_queue(
     if video_id is not None:
         clauses.append("video_id = ?")
         params.append(int(video_id))
+    # The latest admin choice is authoritative. Read only accepted text from
+    # its audit event, leaving the machine OCR candidate outside the lookup.
+    plate_cte = """
+        WITH latest_plate_actions AS (
+            SELECT review_id, MAX(id) AS id FROM case_action_events
+            WHERE action_type = 'plate_verified' AND review_id IS NOT NULL
+            GROUP BY review_id
+        ), verified_review_plates AS (
+            SELECT latest.review_id,
+                   CASE WHEN json_valid(event.detail_json) THEN
+                       CASE WHEN json_extract(event.detail_json, '$.pending_review_plate_choice') = 1
+                             AND json_extract(event.detail_json, '$.plate_status') = 'verified_readable'
+                            THEN json_extract(event.detail_json, '$.accepted_plate_text') END
+                   END AS verified_plate_text
+            FROM latest_plate_actions latest
+            JOIN case_action_events event ON event.id = latest.id
+        )
+    """
+    plate_join = (
+        "LEFT JOIN verified_review_plates p ON p.review_id = review_queue.id"
+    )
+    order = "queued_at DESC, review_queue.id DESC"
+    if plate:
+        needle = _normalize_plate_search(plate)
+        plate_key = _normalized_plate_sql("p.verified_plate_text")
+        clauses.append(f"INSTR({plate_key}, ?) > 0" if needle else "0")
+        if needle:
+            params.append(needle)
+        order = f"{plate_key}, {order}"
+    include_plate = include_verified_plate or bool(plate)
+    columns = "review_queue.*" + (", p.verified_plate_text" if include_plate else "")
+    if not include_plate:
+        plate_cte = plate_join = ""
     where = " AND ".join(clauses)
     with db_session() as conn:
         count_row = conn.execute(
-            f"SELECT COUNT(*) AS total FROM review_queue WHERE {where}",
+            f"{plate_cte if plate else ''} SELECT COUNT(*) AS total FROM review_queue "
+            f"{plate_join if plate else ''} WHERE {where}",
             params,
         ).fetchone()
         total = count_row["total"] if count_row else 0
 
         rows = conn.execute(
             f"""
-            SELECT * FROM review_queue
+            {plate_cte}
+            SELECT {columns} FROM review_queue {plate_join}
             WHERE {where}
-            ORDER BY queued_at DESC, id DESC
+            ORDER BY {order}
             LIMIT ? OFFSET ?
             """,
             [*params, per_page, offset],

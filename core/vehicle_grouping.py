@@ -251,3 +251,22 @@ def group_vehicle_events(
             if group["vehicle_identity_verified"] else "Identity unavailable"
         )
     return result
+
+
+def group_plate_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group records by the searchable, human-verified plate supplied by storage."""
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        plate = row["verified_plate_key"]
+        group = groups.setdefault(plate, {
+            "group_key": f"plate:{plate}",
+            "plate_key": plate,
+            "plate_text": row["verified_plate_text"],
+            "events": [],
+        })
+        group["events"].append(row)
+    for group in groups.values():
+        events = group["events"]
+        group["event_count"] = len(events)
+        group["violation_types"] = list(dict.fromkeys(event["violation_type"] for event in events))
+    return list(groups.values())
